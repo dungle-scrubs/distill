@@ -1,0 +1,44 @@
+[project]
+name = "saccade"
+version = "0.1.0"
+description = "Video transcript, keyframe, OCR, and local vision bundle CLI"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "imagehash>=4.3.2",
+    "pillow>=10.0.0",
+    "pytesseract>=0.3.13",
+    "scenedetect>=0.7",
+    "yt-dlp>=2026.3.17",
+]
+
+[project.scripts]
+saccade = "saccade.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+    "ty>=0.0.1a21",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "ARG", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["saccade"]
+
+[tool.pytest.ini_options]
+markers = [
+    "network: tests that require external network access",
+]
