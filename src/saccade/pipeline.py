@@ -49,6 +49,7 @@ from .redact_secrets import redact_text
 from .render import render_markdown
 from .source import (
     cached_youtube_source,
+    normalize_youtube_url,
     resolve_local_source,
     validate_output_root,
     youtube_source_info,
@@ -104,7 +105,7 @@ def process_youtube_video(args: dict[str, Any]) -> dict[str, Any]:
     options = SaccadeOptions.from_args({**args, "cache_mode": "fingerprint"})
     root = validate_output_root(options.output_dir)
     progress = ProgressReporter(emitter=progress_emitter(options.job_id))
-    url = str(args.get("url", ""))
+    url = normalize_youtube_url(str(args.get("url", "")))
     if not options.force_reprocess:
         cached = cached_youtube_source(url, options, root)
         if cached is not None:
@@ -427,7 +428,7 @@ def playlist_folder_name(url: str) -> str:
 
 
 def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
-    url = str(args.get("url", ""))
+    url = normalize_youtube_url(str(args.get("url", "")))
     if not url:
         raise SaccadeError("E_BAD_URL", "youtube", "url is required")
     options = SaccadeOptions.from_args({**args, "cache_mode": "fingerprint"})

@@ -14,6 +14,7 @@ from saccade.source import (
     CONTENT_HASH_LIMIT_BYTES,
     YoutubeDownloader,
     local_fingerprint,
+    normalize_youtube_url,
     parse_byte_amount,
     parse_youtube_url,
     parse_ytdlp_progress,
@@ -121,6 +122,24 @@ def test_youtube_url_parsing_and_lock_key() -> None:
     with pytest.raises(SaccadeError, match="https://www.youtube.com/feed/trending"):
         parse_youtube_url("https://www.youtube.com/feed/trending")
     assert youtube_lock_key("abc123") == hashlib.sha256(b"abc123").hexdigest()
+
+
+def test_normalize_youtube_url_strips_timestamp() -> None:
+    assert (
+        normalize_youtube_url("https://www.youtube.com/watch?v=ow1we5PzK-o&t=900s")
+        == "https://www.youtube.com/watch?v=ow1we5PzK-o"
+    )
+    assert (
+        normalize_youtube_url("https://youtu.be/abc123?t=42")
+        == "https://youtu.be/abc123"
+    )
+    assert (
+        normalize_youtube_url("https://www.youtube.com/watch?v=abc&t=10&list=PL1")
+        == "https://www.youtube.com/watch?v=abc&list=PL1"
+    )
+    unchanged = "https://www.youtube.com/watch?v=abc&list=PL1"
+    assert normalize_youtube_url(unchanged) == unchanged
+    assert normalize_youtube_url("https://example.com/watch?v=abc&t=10") == "https://example.com/watch?v=abc&t=10"
 
 
 def test_ytdlp_progress_parses_percent_and_bytes() -> None:

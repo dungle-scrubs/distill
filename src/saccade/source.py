@@ -18,7 +18,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from .errors import SaccadeError, warning
 from .options import SaccadeOptions
@@ -275,6 +275,22 @@ def sensitive_path_match(
         if candidate in root_text:
             return sensitive
     return None
+
+
+YOUTUBE_STRIP_QUERY_KEYS = {"t", "start", "end", "time_continue"}
+
+
+def normalize_youtube_url(url: str) -> str:
+    """Drop player-state query params (e.g. `t=900s`) so the full video is consumed."""
+    parsed = urlparse(url)
+    if parsed.netloc.lower() not in YOUTUBE_HOSTS:
+        return url
+    kept = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if k not in YOUTUBE_STRIP_QUERY_KEYS]
+    if len(kept) == len(parse_qsl(parsed.query, keep_blank_values=True)):
+        return url
+    new_query = urlencode(kept)
+    fragment = "" if parsed.fragment.startswith("t=") else parsed.fragment
+    return urlunparse(parsed._replace(query=new_query, fragment=fragment))
 
 
 def parse_youtube_url(url: str) -> str:
