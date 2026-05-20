@@ -7,12 +7,15 @@ helpers.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from .bundle import (
     active_paths,
@@ -415,18 +418,33 @@ def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()][:max_items]
 
 
+def playlist_folder_name(url: str) -> str:
+    parsed = urlparse(url)
+    playlist_id = parse_qs(parsed.query).get("list", [""])[0]
+    raw_name = playlist_id or f"url-{hashlib.sha256(url.encode()).hexdigest()[:16]}"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip(".-")
+    return safe_name[:120] or f"url-{hashlib.sha256(url.encode()).hexdigest()[:16]}"
+
+
 def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
     url = str(args.get("url", ""))
     if not url:
         raise SaccadeError("E_BAD_URL", "youtube", "url is required")
     options = SaccadeOptions.from_args({**args, "cache_mode": "fingerprint"})
     root = validate_output_root(options.output_dir)
+    playlist_root = root / "playlists" / playlist_folder_name(url)
+    ensure_safe_directory(playlist_root, root)
     max_items = int(args.get("max_items", 25))
     urls = youtube_playlist_urls(url, max_items)
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     for index, video_url in enumerate(urls, start=1):
-        child_args = {**args, "url": video_url, "job_id": f"{options.job_id}-{index}"}
+        child_args = {
+            **args,
+            "url": video_url,
+            "output_dir": str(playlist_root),
+            "job_id": f"{options.job_id}-{index}",
+        }
         try:
             result = process_youtube_video(child_args)
             result["batch_index"] = index
@@ -438,12 +456,16 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
     summary = {
         "job_id": options.job_id,
         "playlist_url": url,
+        "playlist_output_dir": str(playlist_root),
         "video_count": len(urls),
         "processed_count": len(results),
         "error_count": len(errors),
         "results": results,
         "errors": errors,
     }
+    playlist_summary_path = playlist_root / "playlist.json"
+    summary["playlist_summary_path"] = str(playlist_summary_path)
+    playlist_summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     write_job_status(
         root, options.job_id, status="completed", tool="process_youtube_playlist", result=summary
     )

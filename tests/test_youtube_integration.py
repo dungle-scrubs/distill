@@ -249,6 +249,60 @@ def test_concurrent_youtube_calls_for_same_video_share_lock_key() -> None:
     assert first == second
 
 
+def test_youtube_playlist_uses_playlist_output_subdirectory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    url = "https://www.youtube.com/playlist?list=PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH"
+    child_urls = ["https://www.youtube.com/watch?v=one", "https://www.youtube.com/watch?v=two"]
+    seen_child_args: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        saccade_session,
+        "youtube_playlist_urls",
+        lambda _url, _max_items: child_urls,
+    )
+
+    def fake_process_youtube_video(args: dict[str, object]) -> dict[str, object]:
+        seen_child_args.append(args)
+        return {
+            "markdown_path": str(Path(str(args["output_dir"])) / "hash" / "g1" / "video.md"),
+            "transcript_path": str(Path(str(args["output_dir"])) / "hash" / "g1" / "transcript.json"),
+            "manifest_path": str(Path(str(args["output_dir"])) / "hash" / "_manifest.json"),
+            "frames": [],
+            "duration_sec": 1.0,
+            "frame_count": 0,
+            "source_hash": "hash",
+            "source_resolved_path": "source.mp4",
+            "cached": False,
+            "pipeline_version": 1,
+            "saccade_version": "test",
+            "job_id": str(args["job_id"]),
+            "summary": "Processed 1.0s video with 0 keyframes",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(saccade_session, "process_youtube_video", fake_process_youtube_video)
+
+    response = saccade_session.process_youtube_playlist(
+        {
+            "url": url,
+            "output_dir": str(tmp_path),
+            "job_id": "playlist-job",
+        }
+    )
+
+    expected_playlist_root = tmp_path / "playlists" / "PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH"
+    assert Path(response["playlist_output_dir"]) == expected_playlist_root
+    assert Path(response["playlist_summary_path"]) == expected_playlist_root / "playlist.json"
+    assert Path(response["playlist_summary_path"]).exists()
+    assert [Path(str(args["output_dir"])) for args in seen_child_args] == [
+        expected_playlist_root,
+        expected_playlist_root,
+    ]
+    assert [args["job_id"] for args in seen_child_args] == ["playlist-job-1", "playlist-job-2"]
+
+
 @pytest.mark.network
 def test_youtube_network_smoke_is_skippable() -> None:
     if os.environ.get("SACCADE_RUN_NETWORK_TESTS") != "1":

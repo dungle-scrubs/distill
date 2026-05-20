@@ -113,8 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     playlist.add_argument(
         "--continue-on-error", action=argparse.BooleanOptionalAction, default=None
     )
-    playlist.add_argument("--output-dir")
-    playlist.add_argument("--job-id")
+    _add_common_processing_options(playlist)
 
     cleanup = subcommands.add_parser("cleanup-cache", help="Prune Saccade cache bundles")
     cleanup.add_argument("--output-dir")
@@ -161,7 +160,7 @@ def main(argv: list[str] | None = None) -> None:
             keys = ("recursive", "max_items", "continue_on_error", "output_dir", "job_id")
             _print_json(process_video_directory({**_args_payload(args, keys), "path": args.path}))
         elif args.command == "process-youtube-playlist":
-            keys = ("max_items", "continue_on_error", "output_dir", "job_id")
+            keys = (*PROCESSING_KEYS, "max_items", "continue_on_error")
             _print_json(process_youtube_playlist({**_args_payload(args, keys), "url": args.url}))
         elif args.command == "cleanup-cache":
             keys = ("output_dir", "max_age_days", "keep_generations", "dry_run")
