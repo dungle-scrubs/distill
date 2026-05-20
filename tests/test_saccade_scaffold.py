@@ -49,6 +49,26 @@ def test_timeout_config_is_90_minutes() -> None:
     assert configured_timeout_ms() == 5_400_000
 
 
+def test_playlist_cli_accepts_child_processing_options() -> None:
+    from saccade.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "process-youtube-playlist",
+            "https://www.youtube.com/playlist?list=PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH",
+            "--no-ocr",
+            "--no-caption-frames",
+            "--whisper-model",
+            "base",
+        ]
+    )
+
+    assert args.command == "process-youtube-playlist"
+    assert args.ocr is False
+    assert args.caption_frames is False
+    assert args.whisper_model == "base"
+
+
 def test_timeout_diagnostics_report_configured_and_effective_timeout() -> None:
     result = subprocess.run(
         [
