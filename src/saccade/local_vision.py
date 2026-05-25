@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
+
 DEFAULT_OLLAMA_MODEL = "qwen3-vl:8b"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_TIMEOUT_SEC = 30.0
@@ -61,6 +63,13 @@ class LocalVisionResult:
     backend: str
     model: str
     prompt_profile: str
+    frame_kind: str = ""
+    verbatim_text: str = ""
+    text_confidence: str = "none"
+
+    @property
+    def has_interpretation(self) -> bool:
+        return bool(self.interpretation.strip() or self.detected_elements)
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -331,8 +340,9 @@ def _interpret_with_ollama(
         ) from exc
     request_prompt = (
         f"{prompt}\n\n"
-        "Return compact JSON with string fields visual_summary, interpretation, "
-        "uncertainty, and detected_elements as an array of strings."
+        "Return compact JSON with string fields frame_kind, verbatim_text, text_confidence, "
+        "visual_summary, interpretation, uncertainty, and detected_elements as an array of strings. "
+        "Leave verbatim_text empty and set text_confidence to \"none\" if you cannot read the text."
     )
     payload = {
         "model": config.model,
@@ -387,7 +397,20 @@ def _interpret_with_ollama(
         backend=config.backend,
         model=config.model,
         prompt_profile=prompt_profile,
+        frame_kind=_normalize_frame_kind(interpreted.get("frame_kind")),
+        verbatim_text=str(interpreted.get("verbatim_text", "")).strip(),
+        text_confidence=_normalize_text_confidence(interpreted.get("text_confidence")),
     )
+
+
+def _normalize_frame_kind(value: Any) -> str:
+    kind = str(value or "").strip().lower()
+    return kind if kind in FRAME_KINDS else ""
+
+
+def _normalize_text_confidence(value: Any) -> str:
+    level = str(value or "").strip().lower()
+    return level if level in TEXT_CONFIDENCE_LEVELS else "none"
 
 
 def parse_interpretation_json(raw_response: str) -> dict[str, Any] | None:

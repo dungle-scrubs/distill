@@ -259,6 +259,9 @@ def test_interpret_image_returns_structured_result(
         "backend": "ollama",
         "model": "qwen3-vl:8b",
         "prompt_profile": "technical",
+        "frame_kind": "",
+        "verbatim_text": "",
+        "text_confidence": "none",
     }
 
 
