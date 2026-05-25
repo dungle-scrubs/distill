@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -27,8 +28,9 @@ from .bundle import (
     write_bundle_files,
     write_partial,
 )
-from .errors import SaccadeError
+from .errors import SaccadeError, warning
 from .frame_selection import select_keyframes
+from .grounding import UNGROUNDED, assess_grounding
 from .local_vision import (
     local_vision_config_from_args,
     probe_local_vision,
@@ -248,7 +250,13 @@ def process_resolved_source(
             warnings.extend(ocr_partial.get("warnings", []))
             progress.skip_cached("ocr", detail={"source": "partial_resume"})
         else:
-            frames, ocr_warnings = ocr_frames(frames, options.ocr_language, options.ocr, progress)
+            frames, ocr_warnings = ocr_frames(
+                frames,
+                options.ocr_language,
+                options.ocr,
+                progress,
+                options.ocr_preprocess,
+            )
             heartbeat.check()
             warnings.extend(ocr_warnings)
             write_partial(staged, "ocr", {"frames": frames, "warnings": ocr_warnings})
@@ -532,20 +540,38 @@ def interpret_frames_with_local_vision(
         return frames, warnings
     for index, frame in enumerate(frames):
         copied = dict(frame)
-        prompt = build_technical_frame_prompt(
-            "ui_interface",
-            ocr_text=str(copied.get("ocr_text", "")) or None,
-        )
-        result, warning = try_interpret_image(
+        ocr_text = str(copied.get("ocr_text", ""))
+        prompt = build_technical_frame_prompt(ocr_text=ocr_text or None)
+        result, frame_warning = try_interpret_image(
             config,
             Path(str(copied["path"])),
             prompt.prompt,
             prompt_profile=prompt.profile,
         )
-        if warning:
-            warnings.append(warning)
+        if frame_warning:
+            warnings.append(frame_warning)
         if result:
+            if options.redact_secrets and result.verbatim_text:
+                redaction = redact_text(result.verbatim_text)
+                result = replace(result, verbatim_text=redaction.text)
+                warnings.extend(redaction.warnings)
+            assessment = assess_grounding(
+                ocr_text=ocr_text,
+                verbatim_text=result.verbatim_text,
+                text_confidence=result.text_confidence,
+                has_interpretation=result.has_interpretation,
+            )
             copied["visual_interpretation"] = result.public_dict()
+            copied["visual_confidence"] = assessment.public_dict()
+            if assessment.level == UNGROUNDED:
+                warnings.append(
+                    warning(
+                        "local_vision",
+                        "frame_text_ungrounded",
+                        f"frame {copied.get('index', index + 1)} interpretation is not grounded in "
+                        f"readable text: {assessment.reason}",
+                    )
+                )
         interpreted_frames.append(copied)
         if progress:
             progress.update(

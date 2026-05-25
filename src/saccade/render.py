@@ -122,9 +122,22 @@ def _frame_lines(frame: dict) -> list[str]:
     visual_interpretation = frame.get("visual_interpretation")
     if isinstance(visual_interpretation, dict):
         lines.extend(["Visual interpretation:", ""])
+        confidence = frame.get("visual_confidence")
+        if isinstance(confidence, dict) and confidence.get("level") != "grounded":
+            reason = str(confidence.get("reason", "")).strip()
+            level = str(confidence.get("level", "")).strip() or "low"
+            lines.extend(
+                [
+                    f"> ⚠ Low-confidence frame ({level}): {reason}. "
+                    "On-screen text may be unreadable; treat the interpretation below as unverified.",
+                    "",
+                ]
+            )
         summary = str(visual_interpretation.get("visual_summary", "")).strip()
         interpretation = str(visual_interpretation.get("interpretation", "")).strip()
         uncertainty = str(visual_interpretation.get("uncertainty", "")).strip()
+        verbatim = str(visual_interpretation.get("verbatim_text", "")).strip()
+        text_confidence = str(visual_interpretation.get("text_confidence", "")).strip()
         elements = visual_interpretation.get("detected_elements", [])
         if summary:
             lines.extend([f"- Summary: {summary}"])
@@ -132,9 +145,13 @@ def _frame_lines(frame: dict) -> list[str]:
             lines.extend([f"- Detected elements: {', '.join(str(item) for item in elements)}"])
         if interpretation:
             lines.extend([f"- Interpretation: {interpretation}"])
+        if text_confidence:
+            lines.extend([f"- Text confidence: {text_confidence}"])
         if uncertainty:
             lines.extend([f"- Uncertainty: {uncertainty}"])
         lines.append("")
+        if verbatim:
+            lines.extend(["Verbatim slide text:", "", "```text", verbatim, "```", ""])
     if ocr_text:
         lines.extend(["OCR:", "", "```text", ocr_text, "```", ""])
     return lines

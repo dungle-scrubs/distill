@@ -173,7 +173,7 @@ def test_ocr_reports_frame_index_progress(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(
         ocr,
         "ocr_frame",
-        lambda _path, _language, _cmd=None: ("detected text", None),
+        lambda _path, _language, _cmd=None, _preprocess=True: ("detected text", None),
     )
     progress = ProgressReporter()
 
@@ -237,3 +237,71 @@ def test_no_content_escalates() -> None:
     with pytest.raises(SaccadeError) as exc:
         render_markdown("x", 1.0, None, [], [])
     assert exc.value.code == "E_NO_CONTENT"
+
+
+def test_low_confidence_frame_renders_warning_marker_and_verbatim_block() -> None:
+    markdown = render_markdown(
+        "demo.mp4",
+        10.0,
+        None,
+        [
+            {
+                "index": 1,
+                "timestamp_sec": 2.0,
+                "relative_path": "frames/frame_0001.png",
+                "ocr_text": "",
+                "visual_interpretation": {
+                    "visual_summary": "A dark slide",
+                    "detected_elements": ["title"],
+                    "interpretation": "The slide discusses something.",
+                    "uncertainty": "High",
+                    "verbatim_text": "",
+                    "text_confidence": "none",
+                },
+                "visual_confidence": {
+                    "level": "ungrounded",
+                    "text_overlap": None,
+                    "reason": "interpretation present but no readable on-screen text supports it",
+                },
+            }
+        ],
+        [],
+    )
+
+    assert "⚠ Low-confidence frame (ungrounded)" in markdown
+    assert "treat the interpretation below as unverified" in markdown
+    assert "- Text confidence: none" in markdown
+
+
+def test_grounded_frame_omits_warning_marker_and_shows_verbatim() -> None:
+    markdown = render_markdown(
+        "demo.mp4",
+        10.0,
+        None,
+        [
+            {
+                "index": 1,
+                "timestamp_sec": 2.0,
+                "relative_path": "frames/frame_0001.png",
+                "ocr_text": "We're closer than you think",
+                "visual_interpretation": {
+                    "visual_summary": "A title slide",
+                    "detected_elements": ["title"],
+                    "interpretation": "Closing slide.",
+                    "uncertainty": "Low",
+                    "verbatim_text": "We're closer than you think",
+                    "text_confidence": "high",
+                },
+                "visual_confidence": {
+                    "level": "grounded",
+                    "text_overlap": 1.0,
+                    "reason": "OCR corroborates the transcribed text",
+                },
+            }
+        ],
+        [],
+    )
+
+    assert "Low-confidence frame" not in markdown
+    assert "Verbatim slide text:" in markdown
+    assert "```text\nWe're closer than you think\n```" in markdown
