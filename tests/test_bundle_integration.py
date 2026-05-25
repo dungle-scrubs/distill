@@ -89,7 +89,7 @@ def test_response_shape(tmp_path: Path) -> None:
     assert response["transcript_path"].endswith("transcript.json")
     assert response["manifest_path"].endswith("_manifest.json")
     assert response["cached"] is False
-    assert response["pipeline_version"] == 5
+    assert response["pipeline_version"] == 6
 
 
 def test_response_can_include_progress_summary(tmp_path: Path) -> None:
