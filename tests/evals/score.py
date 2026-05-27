@@ -118,6 +118,10 @@ def evaluate(with_vision: bool) -> list[CaseResult]:
                     has_interpretation=result.has_interpretation,
                 )
                 flagged = assessment.is_low_confidence
+            else:
+                # The model produced nothing usable: the pipeline now treats this
+                # as a low-confidence (ungrounded) frame, so the eval does too.
+                flagged = True
 
         results.append(
             CaseResult(

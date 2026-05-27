@@ -152,6 +152,20 @@ def _frame_lines(frame: dict) -> list[str]:
         lines.append("")
         if verbatim:
             lines.extend(["Verbatim slide text:", "", "```text", verbatim, "```", ""])
+    else:
+        confidence = frame.get("visual_confidence")
+        if isinstance(confidence, dict) and confidence.get("level") != "grounded":
+            reason = str(confidence.get("reason", "")).strip()
+            level = str(confidence.get("level", "")).strip() or "low"
+            lines.extend(
+                [
+                    "Visual interpretation:",
+                    "",
+                    f"> ⚠ Low-confidence frame ({level}): {reason}. "
+                    "The vision model returned no usable output for this frame.",
+                    "",
+                ]
+            )
     if ocr_text:
         lines.extend(["OCR:", "", "```text", ocr_text, "```", ""])
     return lines

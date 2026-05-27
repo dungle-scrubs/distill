@@ -21,6 +21,9 @@ from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
 DEFAULT_OLLAMA_MODEL = "qwen3-vl:8b"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_TIMEOUT_SEC = 30.0
+# Small vision models intermittently emit non-JSON; one retry recovers most of
+# them. Transport errors (timeout, unreachable) are not retried.
+DEFAULT_MAX_ATTEMPTS = 2
 CONFIG_FILENAMES = ("saccade.local-vision.json", "saccade.json")
 
 
@@ -351,6 +354,27 @@ def _interpret_with_ollama(
         "stream": False,
         "format": "json",
     }
+
+    last_preview = ""
+    for _attempt in range(DEFAULT_MAX_ATTEMPTS):
+        raw_response = _ollama_generate(config, payload)
+        interpreted = parse_interpretation_json(raw_response)
+        if interpreted is not None:
+            return _result_from_payload(interpreted, config, prompt_profile)
+        last_preview = raw_response[:200]
+    raise LocalVisionFailure(
+        "local_vision_malformed_response",
+        "Ollama local vision returned a malformed interpretation; continuing with OCR-only output.",
+        {"response_preview": last_preview, "attempts": DEFAULT_MAX_ATTEMPTS},
+    )
+
+
+def _ollama_generate(config: LocalVisionConfig, payload: dict[str, Any]) -> str:
+    """Run one /api/generate call and return the raw model text.
+
+    Transport-level failures raise; a well-formed envelope with unparseable model
+    output returns the raw string so the caller can retry the generation.
+    """
     request = urllib.request.Request(
         f"{config.base_url.rstrip('/')}/api/generate",
         data=json.dumps(payload).encode("utf-8"),
@@ -359,7 +383,7 @@ def _interpret_with_ollama(
     )
     try:
         with urllib.request.urlopen(request, timeout=config.timeout_sec) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            envelope = json.loads(response.read().decode("utf-8"))
     except TimeoutError as exc:
         raise LocalVisionFailure(
             "local_vision_timeout",
@@ -378,14 +402,14 @@ def _interpret_with_ollama(
             "Ollama local vision returned malformed JSON; continuing with OCR-only output.",
             {"error": str(exc)},
         ) from exc
-    raw_response = str(payload.get("response") or payload.get("thinking") or "")
-    interpreted = parse_interpretation_json(raw_response)
-    if interpreted is None:
-        raise LocalVisionFailure(
-            "local_vision_malformed_response",
-            "Ollama local vision returned a malformed interpretation; continuing with OCR-only output.",
-            {"response_preview": raw_response[:200]},
-        )
+    return str(envelope.get("response") or envelope.get("thinking") or "")
+
+
+def _result_from_payload(
+    interpreted: dict[str, Any],
+    config: LocalVisionConfig,
+    prompt_profile: str,
+) -> LocalVisionResult:
     elements = interpreted.get("detected_elements", [])
     if not isinstance(elements, list):
         elements = []

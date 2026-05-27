@@ -30,7 +30,7 @@ from .bundle import (
 )
 from .errors import SaccadeError, warning
 from .frame_selection import select_keyframes
-from .grounding import UNGROUNDED, assess_grounding
+from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .local_vision import (
     local_vision_config_from_args,
     probe_local_vision,
@@ -67,6 +67,16 @@ TOOLS = {
     "get_job_status": "Read a Saccade job status record by job id",
 }
 DEFAULT_CONFIGURED_TIMEOUT_MS = 5_400_000
+
+# Per-frame vision failures that still leave the frame usable from OCR. These are
+# surfaced as ungrounded (not silently dropped), unlike a backend-wide outage.
+_FRAME_READ_FAILURE_CODES = frozenset(
+    {
+        "local_vision_malformed_response",
+        "local_vision_timeout",
+        "local_vision_image_read_failed",
+    }
+)
 TIMEOUT_ENV = "TOOL_PROXY_EFFECTIVE_TIMEOUT_MS"
 LONG_TIMEOUT_PROBE_ENV = "SACCADE_ENABLE_LONG_TIMEOUT_PROBE"
 TIMEOUT_PROBE_LIMIT_MS = 1_000
@@ -572,6 +582,14 @@ def interpret_frames_with_local_vision(
                         f"readable text: {assessment.reason}",
                     )
                 )
+        elif frame_warning and frame_warning.get("code") in _FRAME_READ_FAILURE_CODES:
+            # The model gave us nothing usable on this frame. Flag it as
+            # ungrounded so it surfaces in the bundle instead of vanishing.
+            copied["visual_confidence"] = GroundingAssessment(
+                UNGROUNDED,
+                None,
+                f"vision model produced no usable output ({frame_warning.get('code')})",
+            ).public_dict()
         interpreted_frames.append(copied)
         if progress:
             progress.update(
