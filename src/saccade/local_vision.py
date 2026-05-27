@@ -16,9 +16,14 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
+
 DEFAULT_OLLAMA_MODEL = "qwen3-vl:8b"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_TIMEOUT_SEC = 30.0
+# Small vision models intermittently emit non-JSON; one retry recovers most of
+# them. Transport errors (timeout, unreachable) are not retried.
+DEFAULT_MAX_ATTEMPTS = 2
 CONFIG_FILENAMES = ("saccade.local-vision.json", "saccade.json")
 
 
@@ -61,6 +66,13 @@ class LocalVisionResult:
     backend: str
     model: str
     prompt_profile: str
+    frame_kind: str = ""
+    verbatim_text: str = ""
+    text_confidence: str = "none"
+
+    @property
+    def has_interpretation(self) -> bool:
+        return bool(self.interpretation.strip() or self.detected_elements)
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -331,8 +343,9 @@ def _interpret_with_ollama(
         ) from exc
     request_prompt = (
         f"{prompt}\n\n"
-        "Return compact JSON with string fields visual_summary, interpretation, "
-        "uncertainty, and detected_elements as an array of strings."
+        "Return compact JSON with string fields frame_kind, verbatim_text, text_confidence, "
+        "visual_summary, interpretation, uncertainty, and detected_elements as an array of strings. "
+        "Leave verbatim_text empty and set text_confidence to \"none\" if you cannot read the text."
     )
     payload = {
         "model": config.model,
@@ -341,6 +354,27 @@ def _interpret_with_ollama(
         "stream": False,
         "format": "json",
     }
+
+    last_preview = ""
+    for _attempt in range(DEFAULT_MAX_ATTEMPTS):
+        raw_response = _ollama_generate(config, payload)
+        interpreted = parse_interpretation_json(raw_response)
+        if interpreted is not None:
+            return _result_from_payload(interpreted, config, prompt_profile)
+        last_preview = raw_response[:200]
+    raise LocalVisionFailure(
+        "local_vision_malformed_response",
+        "Ollama local vision returned a malformed interpretation; continuing with OCR-only output.",
+        {"response_preview": last_preview, "attempts": DEFAULT_MAX_ATTEMPTS},
+    )
+
+
+def _ollama_generate(config: LocalVisionConfig, payload: dict[str, Any]) -> str:
+    """Run one /api/generate call and return the raw model text.
+
+    Transport-level failures raise; a well-formed envelope with unparseable model
+    output returns the raw string so the caller can retry the generation.
+    """
     request = urllib.request.Request(
         f"{config.base_url.rstrip('/')}/api/generate",
         data=json.dumps(payload).encode("utf-8"),
@@ -349,7 +383,7 @@ def _interpret_with_ollama(
     )
     try:
         with urllib.request.urlopen(request, timeout=config.timeout_sec) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            envelope = json.loads(response.read().decode("utf-8"))
     except TimeoutError as exc:
         raise LocalVisionFailure(
             "local_vision_timeout",
@@ -368,14 +402,14 @@ def _interpret_with_ollama(
             "Ollama local vision returned malformed JSON; continuing with OCR-only output.",
             {"error": str(exc)},
         ) from exc
-    raw_response = str(payload.get("response") or payload.get("thinking") or "")
-    interpreted = parse_interpretation_json(raw_response)
-    if interpreted is None:
-        raise LocalVisionFailure(
-            "local_vision_malformed_response",
-            "Ollama local vision returned a malformed interpretation; continuing with OCR-only output.",
-            {"response_preview": raw_response[:200]},
-        )
+    return str(envelope.get("response") or envelope.get("thinking") or "")
+
+
+def _result_from_payload(
+    interpreted: dict[str, Any],
+    config: LocalVisionConfig,
+    prompt_profile: str,
+) -> LocalVisionResult:
     elements = interpreted.get("detected_elements", [])
     if not isinstance(elements, list):
         elements = []
@@ -387,7 +421,20 @@ def _interpret_with_ollama(
         backend=config.backend,
         model=config.model,
         prompt_profile=prompt_profile,
+        frame_kind=_normalize_frame_kind(interpreted.get("frame_kind")),
+        verbatim_text=str(interpreted.get("verbatim_text", "")).strip(),
+        text_confidence=_normalize_text_confidence(interpreted.get("text_confidence")),
     )
+
+
+def _normalize_frame_kind(value: Any) -> str:
+    kind = str(value or "").strip().lower()
+    return kind if kind in FRAME_KINDS else ""
+
+
+def _normalize_text_confidence(value: Any) -> str:
+    level = str(value or "").strip().lower()
+    return level if level in TEXT_CONFIDENCE_LEVELS else "none"
 
 
 def parse_interpretation_json(raw_response: str) -> dict[str, Any] | None:

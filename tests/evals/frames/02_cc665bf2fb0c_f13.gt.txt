@@ -1,0 +1,17 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Tiny status badges were hard to read; best-effort in brackets — please verify.
+The Fractal SDLC
+The SDLC is not five steps
+
+Plan
+Develop
+Test
+Review
+Ship
+
+Inside "Ship"   3 micro-steps, 3 gates
+1 Final CI check   [CI green?]
+2 Resolve conflicts   [No conflict?]
+3 Merge PR   [Approved?]
+
+A human does this implicitly. An agent needs a gate at every step.

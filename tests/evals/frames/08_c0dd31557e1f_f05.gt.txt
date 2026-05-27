@@ -1,0 +1,5 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Chrome (AI Engineer - Factory, 2026, page number) excluded.
+How they work
+The validation loop
+Tests written after implementation don't catch bugs. They confirm decisions.

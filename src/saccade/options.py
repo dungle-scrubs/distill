@@ -21,6 +21,7 @@ class SaccadeOptions:
     whisper_language: str = "en"
     ocr: bool = True
     ocr_language: str = "eng"
+    ocr_preprocess: bool = True
     redact_secrets: bool = True
     max_keyframes: int = 80
     min_interval_sec: float = 4.0
@@ -46,6 +47,7 @@ class SaccadeOptions:
             whisper_language=str(args.get("whisper_language", cls.whisper_language)),
             ocr=bool(args.get("ocr", cls.ocr)),
             ocr_language=str(args.get("ocr_language", cls.ocr_language)),
+            ocr_preprocess=bool(args.get("ocr_preprocess", cls.ocr_preprocess)),
             redact_secrets=bool(args.get("redact_secrets", cls.redact_secrets)),
             max_keyframes=int(args.get("max_keyframes", cls.max_keyframes)),
             min_interval_sec=float(args.get("min_interval_sec", cls.min_interval_sec)),
@@ -102,6 +104,7 @@ class SaccadeOptions:
             "whisper_language": self.whisper_language,
             "ocr": self.ocr,
             "ocr_language": self.ocr_language,
+            "ocr_preprocess": self.ocr_preprocess,
             "redact_secrets": self.redact_secrets,
             "max_keyframes": self.max_keyframes,
             "min_interval_sec": self.min_interval_sec,

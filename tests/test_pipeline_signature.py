@@ -18,8 +18,9 @@ def test_pipeline_signature_matches_output_affecting_modules() -> None:
         "options.py",
         "local_vision.py",
         "vision_prompts.py",
+        "grounding.py",
         "pipeline.py",
     ]:
         digest.update((scripts / name).read_bytes())
-    assert PIPELINE_VERSION == 5
+    assert PIPELINE_VERSION == 7
     assert digest.hexdigest() == PIPELINE_SIGNATURE

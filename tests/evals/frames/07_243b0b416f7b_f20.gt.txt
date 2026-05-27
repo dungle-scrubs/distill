@@ -1,0 +1,6 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Chrome (AIE logo, AI Engineer EUROPE banner) excluded.
+ABLY
+AI Transport
+A drop-in durable session layer for AI apps.
+Build durable, steerable, multi-device experiences – without rebuilding your whole stack.

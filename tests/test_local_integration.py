@@ -239,6 +239,7 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
         _language: str,
         _enabled: bool,
         _progress: object,
+        _preprocess: bool = True,
     ) -> tuple[list[dict], list[dict[str, str]]]:
         copied = []
         for frame in frames:

@@ -259,6 +259,9 @@ def test_interpret_image_returns_structured_result(
         "backend": "ollama",
         "model": "qwen3-vl:8b",
         "prompt_profile": "technical",
+        "frame_kind": "",
+        "verbatim_text": "",
+        "text_confidence": "none",
     }
 
 
@@ -316,6 +319,67 @@ def test_interpret_image_accepts_qwen_thinking_json_fallback(
     assert warning is None
     assert result is not None
     assert result.visual_summary == "A dashboard"
+
+
+def test_interpret_image_retries_past_one_malformed_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeTagsResponse:
+        def __enter__(self) -> FakeTagsResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"models": [{"name": "qwen3-vl:8b"}]}).encode()
+
+    class FakeResponse:
+        def __init__(self, body: str) -> None:
+            self._body = body
+
+        def __enter__(self) -> FakeResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({"response": self._body}).encode()
+
+    good = json.dumps(
+        {
+            "visual_summary": "A slide",
+            "detected_elements": ["title"],
+            "interpretation": "Recovered on retry.",
+            "uncertainty": "Low",
+            "verbatim_text": "Recovered",
+            "text_confidence": "high",
+        }
+    )
+    calls = 0
+
+    def fake_urlopen(*_args: Any, **_kwargs: Any) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return FakeTagsResponse()  # availability probe
+        if calls == 2:
+            return FakeResponse("not json")  # first generate attempt: malformed
+        return FakeResponse(good)  # retry succeeds
+
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    result, warning = try_interpret_image(
+        LocalVisionConfig(model="qwen3-vl:8b"), image, "Interpret."
+    )
+
+    assert warning is None
+    assert result is not None
+    assert result.verbatim_text == "Recovered"
 
 
 def test_interpret_image_model_missing_returns_warning(

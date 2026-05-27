@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -27,8 +28,9 @@ from .bundle import (
     write_bundle_files,
     write_partial,
 )
-from .errors import SaccadeError
+from .errors import SaccadeError, warning
 from .frame_selection import select_keyframes
+from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .local_vision import (
     local_vision_config_from_args,
     probe_local_vision,
@@ -65,6 +67,16 @@ TOOLS = {
     "get_job_status": "Read a Saccade job status record by job id",
 }
 DEFAULT_CONFIGURED_TIMEOUT_MS = 5_400_000
+
+# Per-frame vision failures that still leave the frame usable from OCR. These are
+# surfaced as ungrounded (not silently dropped), unlike a backend-wide outage.
+_FRAME_READ_FAILURE_CODES = frozenset(
+    {
+        "local_vision_malformed_response",
+        "local_vision_timeout",
+        "local_vision_image_read_failed",
+    }
+)
 TIMEOUT_ENV = "TOOL_PROXY_EFFECTIVE_TIMEOUT_MS"
 LONG_TIMEOUT_PROBE_ENV = "SACCADE_ENABLE_LONG_TIMEOUT_PROBE"
 TIMEOUT_PROBE_LIMIT_MS = 1_000
@@ -248,7 +260,13 @@ def process_resolved_source(
             warnings.extend(ocr_partial.get("warnings", []))
             progress.skip_cached("ocr", detail={"source": "partial_resume"})
         else:
-            frames, ocr_warnings = ocr_frames(frames, options.ocr_language, options.ocr, progress)
+            frames, ocr_warnings = ocr_frames(
+                frames,
+                options.ocr_language,
+                options.ocr,
+                progress,
+                options.ocr_preprocess,
+            )
             heartbeat.check()
             warnings.extend(ocr_warnings)
             write_partial(staged, "ocr", {"frames": frames, "warnings": ocr_warnings})
@@ -532,20 +550,46 @@ def interpret_frames_with_local_vision(
         return frames, warnings
     for index, frame in enumerate(frames):
         copied = dict(frame)
-        prompt = build_technical_frame_prompt(
-            "ui_interface",
-            ocr_text=str(copied.get("ocr_text", "")) or None,
-        )
-        result, warning = try_interpret_image(
+        ocr_text = str(copied.get("ocr_text", ""))
+        prompt = build_technical_frame_prompt(ocr_text=ocr_text or None)
+        result, frame_warning = try_interpret_image(
             config,
             Path(str(copied["path"])),
             prompt.prompt,
             prompt_profile=prompt.profile,
         )
-        if warning:
-            warnings.append(warning)
+        if frame_warning:
+            warnings.append(frame_warning)
         if result:
+            if options.redact_secrets and result.verbatim_text:
+                redaction = redact_text(result.verbatim_text)
+                result = replace(result, verbatim_text=redaction.text)
+                warnings.extend(redaction.warnings)
+            assessment = assess_grounding(
+                ocr_text=ocr_text,
+                verbatim_text=result.verbatim_text,
+                text_confidence=result.text_confidence,
+                has_interpretation=result.has_interpretation,
+            )
             copied["visual_interpretation"] = result.public_dict()
+            copied["visual_confidence"] = assessment.public_dict()
+            if assessment.level == UNGROUNDED:
+                warnings.append(
+                    warning(
+                        "local_vision",
+                        "frame_text_ungrounded",
+                        f"frame {copied.get('index', index + 1)} interpretation is not grounded in "
+                        f"readable text: {assessment.reason}",
+                    )
+                )
+        elif frame_warning and frame_warning.get("code") in _FRAME_READ_FAILURE_CODES:
+            # The model gave us nothing usable on this frame. Flag it as
+            # ungrounded so it surfaces in the bundle instead of vanishing.
+            copied["visual_confidence"] = GroundingAssessment(
+                UNGROUNDED,
+                None,
+                f"vision model produced no usable output ({frame_warning.get('code')})",
+            ).public_dict()
         interpreted_frames.append(copied)
         if progress:
             progress.update(

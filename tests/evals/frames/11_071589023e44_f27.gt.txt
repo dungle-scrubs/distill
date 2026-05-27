@@ -1,0 +1,12 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Phone app mockup. Status bar / icons ignored; list content included.
+Codex
+All   Mac Mini   MacBook Pro
+Assistant
+Messages monitor
+Calendar monitor
+launch
+Realtime 2 launch radar
+Voice demo outline
+Creative review notes
+Studio schedule check
