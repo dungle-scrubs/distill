@@ -99,5 +99,42 @@ uv run python tests/evals/score.py --with-vision --json
   hard/unreadable frames (recall) without crying wolf on clean ones (precision).
 
 Use the scores to decide whether a prompt tweak, an OCR setting, or a different vision
-model is actually worth it — measured, not guessed. Findings so far: MLX
-`Qwen3-VL-8B-Instruct-8bit` is the strongest reader; bigger models did not help.
+model is actually worth it — measured, not guessed.
+
+## Findings
+
+A record of what's already been measured, so it isn't re-litigated. Numbers are from
+this 16-frame set; treat WER/recall deltas under ~0.03 as run-to-run noise (single run
+per model). Re-run with `score.py --with-vision --backend … --model …` to reproduce.
+
+### Reader comparison (transcription)
+
+| Reader | token recall | vision WER | notes |
+|---|---|---|---|
+| Ollama `qwen3-vl:8b` | — | 0.25–0.30 | cross-platform default |
+| Ollama `qwen3-vl:30b-a3b` | — | 0.24 | 3× size, **no quality gain** |
+| MLX `Qwen3-VL-8B-4bit` | — | 0.27 | fast; quantization misses (e.g. frame 09) |
+| **MLX `Qwen3-VL-8B-8bit`** | **0.91** | **0.13** | ★ best reader; recommended MLX model |
+| MLX `InternVL3-8B-8bit` | — | 0.26 | doc reputation didn't translate; worse |
+| MLX `PaddleOCR-VL-8bit` | — | n/a | OCR-first; doesn't emit our JSON contract |
+
+Conclusions:
+- **8-bit Qwen3-VL-8B is the strongest reader**; 8-bit clearly beats 4-bit.
+- **Bigger is not better** here — 30B gave no gain. A real accuracy jump would need a
+  fundamentally different (e.g. frontier cloud) reader, not a larger local one.
+- **MLX ran ~28% faster than Ollama** (warm) on Apple Silicon at equal quality.
+
+### OCR specialists are not worth a backend
+
+Tested PaddleOCR-VL as a Tesseract replacement (raw-text recall vs ground truth):
+
+- Mean recall **Tesseract 0.53 ≈ PaddleOCR-VL 0.53** — and both are dwarfed by the
+  vision model's **0.91**. The VLM's `verbatim_text` is already the best text source, so
+  no OCR engine improves transcription.
+- The two OCR engines are **complementary, not redundant**: PaddleOCR wins on dark slides
+  (frame 01: 0.94 vs Tesseract 0.00), Tesseract wins elsewhere (frame 10: 0.94 vs 0.08).
+- The only real value would be as the grounding cross-check's *independent* reader on
+  dark slides (where empty Tesseract forces trusting the model's self-confidence). If ever
+  needed, the cheap form is a targeted "union OCR" fallback for the cross-check input —
+  **not** a full OCR-backend abstraction. Not built; cost (VLM latency, layout failures on
+  frames 06/10) outweighs the narrow benefit.
