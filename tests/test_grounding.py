@@ -53,13 +53,26 @@ def test_disagreeing_readers_are_weak() -> None:
     assert assessment.text_overlap == 0.0
 
 
-def test_vision_text_uncorroborated_by_empty_ocr_is_weak() -> None:
+def test_short_vision_text_uncorroborated_by_empty_ocr_is_weak() -> None:
     assessment = assess_grounding(
         ocr_text="",
-        verbatim_text="some readable heading",
+        verbatim_text="some heading",  # too short to trust on its own
         text_confidence="medium",
         has_interpretation=True,
     )
 
     assert assessment.level == WEAK
     assert assessment.text_overlap is None
+
+
+def test_confident_substantive_vision_with_empty_ocr_is_grounded() -> None:
+    # The false-positive fix: the model read a dark slide well, but OCR (which
+    # struggles on dark backgrounds) returned nothing. Trust the model.
+    assessment = assess_grounding(
+        ocr_text="",
+        verbatim_text="What a software factory needs Agent Runtimes Orchestration",
+        text_confidence="high",
+        has_interpretation=True,
+    )
+
+    assert assessment.level == GROUNDED

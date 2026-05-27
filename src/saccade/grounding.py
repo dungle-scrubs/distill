@@ -21,6 +21,12 @@ UNGROUNDED = "ungrounded"
 STRONG_OVERLAP = 0.5
 WEAK_OVERLAP = 0.2
 
+# When OCR gives no corroboration, a vision transcription this long and this
+# confident is trusted as grounded rather than flagged — otherwise the model gets
+# penalized for reading slides that OCR (e.g. on dark backgrounds) returns nothing for.
+MIN_TRUSTED_VISION_TOKENS = 4
+TRUSTED_CONFIDENCE = frozenset({"high", "medium"})
+
 _TOKEN = re.compile(r"[a-z0-9]{2,}")
 
 
@@ -75,6 +81,13 @@ def assess_grounding(
         )
 
     if vision_tokens and not ocr_tokens:
+        # OCR returned nothing (common on dark slides). Trust a substantive,
+        # confident transcription instead of flagging the model for reading what
+        # OCR missed; flag only thin or low-confidence transcriptions.
+        if len(vision_tokens) >= MIN_TRUSTED_VISION_TOKENS and text_confidence in TRUSTED_CONFIDENCE:
+            return GroundingAssessment(
+                GROUNDED, None, "confident substantive transcription; OCR returned nothing"
+            )
         return GroundingAssessment(
             WEAK, None, "vision transcribed text that OCR did not corroborate"
         )
