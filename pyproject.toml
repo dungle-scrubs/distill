@@ -16,6 +16,19 @@ dependencies = [
 [project.scripts]
 saccade = "saccade.cli:main"
 
+[project.optional-dependencies]
+mlx = [
+    "mlx-vlm>=0.5.0",
+]
+
+[tool.uv]
+# mlx-vlm pulls fastapi/uvicorn only for its server mode, which Saccade never
+# imports (we use load/generate in-process). Its open `fastapi>=0.95.1` bound
+# resolved to 0.136.3, which Socket flags as a malicious release (an undocumented
+# `fastar` dependency injected into the [standard] extra). Pin fastapi to a known
+# clean version so the flagged release is never installed.
+override-dependencies = ["fastapi==0.115.6"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

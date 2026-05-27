@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-PIPELINE_VERSION = 7
+PIPELINE_VERSION = 9
 SACCADE_VERSION = "0.1.0"
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "487df30144382845580183f6a687240f31a2c706c0d3f764ce2f0e1bab4be5f9"
+PIPELINE_SIGNATURE = "faed3b52ec91c56d797a630518d42d9b9a9ced511d7a0edd23269daed3476c21"
