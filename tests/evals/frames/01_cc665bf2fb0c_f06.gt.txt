@@ -1,0 +1,9 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Slide content only; recurring chrome (ONA, page number, ona.com, AI Engineer EUROPE) excluded.
+What a software factory needs
+
+Agent Runtimes
+Where agents execute — environments, filesystems, tools. The sandbox market is blowing up.
+
+Orchestration
+Kick off agents, manage workflow runs. Ona Automations, GitHub Actions, Cursor Cloud.

@@ -1,0 +1,8 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Agent trace viewer. Right-aligned durations included; status dots ignored.
+TRACE: SEND INVOICE REQUEST
+agent   invoke_agent Emma   ~45s
+chain   processor_run WorkingMemory   3ms
+chain   processor_run MessageHistory   5ms
+llm   chat claude-sonnet-4-20250514   ~44s
+llm   model_step Emma   → delegates to ledger ~12s

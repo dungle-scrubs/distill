@@ -1,0 +1,2 @@
+# NEGATIVE CASE — interview/podcast shot, two people, no on-screen text (tiny corner logo only).
+# Leave the body empty. The system passes if it produces no text and/or flags low confidence here.

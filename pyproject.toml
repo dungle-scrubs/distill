@@ -41,4 +41,5 @@ known-first-party = ["saccade"]
 [tool.pytest.ini_options]
 markers = [
     "network: tests that require external network access",
+    "eval: scores Saccade against the human-verified eval frames (see tests/evals/)",
 ]

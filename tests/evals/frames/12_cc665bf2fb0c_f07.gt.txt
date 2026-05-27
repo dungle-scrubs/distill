@@ -1,0 +1,6 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Slide text only; the embedded product screenshot is unreadable and intentionally not transcribed.
+ONA · THE PLATFORM FOR BACKGROUND AGENTS
+This is what we've been building
+Ona gives every agent a full cloud development environment — the same workspace a human engineer would use.
+Parallelize tasks to the cloud — spin up isolated environments per agent, per task.

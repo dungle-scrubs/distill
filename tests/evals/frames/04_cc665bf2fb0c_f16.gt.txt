@@ -1,0 +1,11 @@
+# GROUND TRUTH from the speaker's crisp slide screenshot (shared by Kevin), not read off this frame.
+# In THIS frame the slide is small/low-res — that is the point: the model must not hallucinate it.
+# Confirm provenance, then set verified = true in cases.toml.
+ALMOST THERE
+We're closer than you think
+The primitives exist — they just haven't been assembled for agents yet. CI is not the answer.
+
+State machines — model agent work as explicit states with transitions and ownership, not labels on a PR.
+Durable execution — long-running workflows that survive restarts, with built-in retry, timeout, and checkpointing.
+Gates — human-in-the-loop approval points, quality checks, and policy enforcement baked into the workflow.
+Packaged as a CLI — composable, scriptable, version-controlled.

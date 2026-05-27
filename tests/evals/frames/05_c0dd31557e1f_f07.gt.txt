@@ -1,0 +1,16 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Chrome (AI Engineer - Factory, 2026, page number) excluded. Diagram labels included.
+How they work
+Structured handoffs
+How agents stay coherent over days, not just minutes.
+
+Every worker reports
+What was implemented
+What was left undone
+Commands run + exit codes
+Issues discovered
+Whether procedures were followed
+
+New Task
+Execute
+Continuous Learning

@@ -1,0 +1,2 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+Step away without stopping progress

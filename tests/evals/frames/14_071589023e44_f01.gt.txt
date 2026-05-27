@@ -1,0 +1,2 @@
+# NEGATIVE CASE — no on-screen text (near-black transition frame, tiny speaker webcam only).
+# Leave the body empty. The system passes if it produces no text and/or flags low confidence here.
