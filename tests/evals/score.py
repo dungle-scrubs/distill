@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import tomllib
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -53,6 +54,25 @@ def word_error_rate(truth: str, hypothesis: str) -> float:
     return prev[-1] / len(ref)
 
 
+def token_prf(truth: str, hypothesis: str) -> tuple[float, float, float]:
+    """Order-insensitive token precision/recall/F1 over word multisets.
+
+    WER is sequence-based, so it over-penalizes multi-region slides where the
+    model reads the same words in a different order, and chrome the model adds
+    that truth omits. Recall ("did it capture the content?") ignores both; this
+    is the fairer headline for transcription quality. Returns (precision, recall, f1).
+    """
+    ref = Counter(normalize(truth))
+    hyp = Counter(normalize(hypothesis))
+    if not ref:
+        return (0.0, 1.0, 0.0) if hyp else (1.0, 1.0, 1.0)
+    overlap = sum((ref & hyp).values())
+    recall = overlap / sum(ref.values())
+    precision = overlap / sum(hyp.values()) if hyp else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return precision, recall, f1
+
+
 @dataclass
 class CaseResult:
     id: str
@@ -60,6 +80,8 @@ class CaseResult:
     has_text: bool
     ocr_wer: float | None
     vision_wer: float | None
+    vision_recall: float | None  # order-insensitive token recall (content captured)
+    vision_f1: float | None
     flagged: bool | None  # grounding marked it low-confidence
     should_flag: bool  # human says it is not cleanly legible
 
@@ -107,12 +129,15 @@ def evaluate(
         ocr_wer = word_error_rate(truth, ocr_text) if has_text else None
 
         vision_wer: float | None = None
+        vision_recall: float | None = None
+        vision_f1: float | None = None
         flagged: bool | None = None
         if interpret is not None:
             result = interpret(image, ocr_text)
             if result is not None:
                 if has_text:
                     vision_wer = word_error_rate(truth, result.verbatim_text)
+                    _, vision_recall, vision_f1 = token_prf(truth, result.verbatim_text)
                 assessment = assess_grounding(
                     ocr_text=ocr_text,
                     verbatim_text=result.verbatim_text,
@@ -132,6 +157,8 @@ def evaluate(
                 has_text=has_text,
                 ocr_wer=ocr_wer,
                 vision_wer=vision_wer,
+                vision_recall=vision_recall,
+                vision_f1=vision_f1,
                 flagged=flagged,
                 should_flag=str(case.get("legibility", "")) != "clean",
             )
@@ -168,6 +195,8 @@ def _mean(values: list[float]) -> float | None:
 def summarize(results: list[CaseResult]) -> dict:
     ocr_wers = [r.ocr_wer for r in results if r.ocr_wer is not None]
     vision_wers = [r.vision_wer for r in results if r.vision_wer is not None]
+    vision_recalls = [r.vision_recall for r in results if r.vision_recall is not None]
+    vision_f1s = [r.vision_f1 for r in results if r.vision_f1 is not None]
     flag_known = [r for r in results if r.flagged is not None]
     true_pos = sum(1 for r in flag_known if r.flagged and r.should_flag)
     flagged_total = sum(1 for r in flag_known if r.flagged)
@@ -176,6 +205,8 @@ def summarize(results: list[CaseResult]) -> dict:
         "cases_scored": len(results),
         "ocr_wer_mean": _mean(ocr_wers),
         "vision_wer_mean": _mean(vision_wers),
+        "vision_token_recall_mean": _mean(vision_recalls),
+        "vision_token_f1_mean": _mean(vision_f1s),
         "grounding_precision": (true_pos / flagged_total) if flagged_total else None,
         "grounding_recall": (true_pos / should_total) if should_total else None,
     }
@@ -202,10 +233,13 @@ def main() -> None:
         print("No verified cases yet. Fill in <id>.gt.txt and set verified = true in cases.toml.")
         return
     for r in results:
-        ocr = f"{r.ocr_wer:.2f}" if r.ocr_wer is not None else "  - "
-        vis = f"{r.vision_wer:.2f}" if r.vision_wer is not None else "  - "
+        vis = f"{r.vision_wer:.2f}" if r.vision_wer is not None else " -  "
+        rec = f"{r.vision_recall:.2f}" if r.vision_recall is not None else " -  "
+        f1 = f"{r.vision_f1:.2f}" if r.vision_f1 is not None else " -  "
         flag = "?" if r.flagged is None else ("flag" if r.flagged else "ok")
-        print(f"  {r.id:30s} legib={r.legibility:10s} ocr_wer={ocr} vis_wer={vis} grounding={flag}")
+        print(
+            f"  {r.id:30s} legib={r.legibility:10s} vis_wer={vis} recall={rec} f1={f1} grounding={flag}"
+        )
     print()
     for key, value in summary.items():
         shown = f"{value:.3f}" if isinstance(value, float) else value
