@@ -77,6 +77,11 @@ uv run python tests/evals/score.py
 # Also score the local vision model + grounding flags (needs Ollama running)
 uv run python tests/evals/score.py --with-vision
 
+# Compare a different model or backend (MLX needs the `mlx` extra: uv sync --extra mlx)
+uv run python tests/evals/score.py --with-vision --model qwen3-vl:30b-a3b
+uv run python tests/evals/score.py --with-vision --backend mlx \
+    --model mlx-community/Qwen3-VL-8B-Instruct-4bit
+
 # Machine-readable
 uv run python tests/evals/score.py --with-vision --json
 ```

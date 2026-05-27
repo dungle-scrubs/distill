@@ -136,6 +136,42 @@ def test_unsupported_lm_studio_backend_is_not_treated_as_ollama() -> None:
     assert probe.code == "local_vision_backend_unsupported"
 
 
+def test_mlx_backend_probe_reports_unavailable_without_mlx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+
+    import saccade.local_vision as lv
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "mlx_vlm":
+            raise ImportError("no mlx_vlm")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    probe = lv.probe_local_vision(LocalVisionConfig(backend="mlx", model="mlx-community/x"))
+
+    assert probe.available is False
+    assert probe.code == "local_vision_mlx_unavailable"
+    assert "mlx-vlm" in probe.message
+
+
+def test_mlx_backend_probe_available_when_mlx_importable() -> None:
+    pytest.importorskip("mlx_vlm")
+    probe = probe_local_vision(LocalVisionConfig(backend="mlx", model="mlx-community/x"))
+
+    assert probe.available is True
+    assert probe.code == "local_vision_available"
+
+
+def test_mlx_backend_is_accepted_by_options() -> None:
+    options = SaccadeOptions.from_args({"local_vision_backend": "mlx"})
+
+    assert options.local_vision_backend == "mlx"
+
+
 def test_local_vision_diagnostics_include_pull_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

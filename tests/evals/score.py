@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from saccade.grounding import assess_grounding
@@ -87,10 +87,12 @@ def _truth(case_id: str) -> str | None:
     return body.strip()
 
 
-def evaluate(with_vision: bool) -> list[CaseResult]:
+def evaluate(
+    with_vision: bool, model: str | None = None, backend: str | None = None
+) -> list[CaseResult]:
     if not find_tesseract_command():
         raise SystemExit("tesseract not found; install it before scoring OCR")
-    interpret = _vision_interpreter() if with_vision else None
+    interpret = _vision_interpreter(model, backend) if with_vision else None
     results: list[CaseResult] = []
     for case in _load_cases():
         case_id = str(case["id"])
@@ -137,13 +139,19 @@ def evaluate(with_vision: bool) -> list[CaseResult]:
     return results
 
 
-def _vision_interpreter():
+def _vision_interpreter(model: str | None = None, backend: str | None = None):
     from saccade.local_vision import LocalVisionConfig, probe_local_vision, try_interpret_image
     from saccade.vision_prompts import build_technical_frame_prompt
 
-    config = LocalVisionConfig()
-    if not probe_local_vision(config).available:
-        raise SystemExit("Ollama vision backend unavailable; omit --with-vision or start Ollama")
+    overrides: dict[str, str] = {}
+    if model:
+        overrides["model"] = model
+    if backend:
+        overrides["backend"] = backend
+    config = replace(LocalVisionConfig(), **overrides) if overrides else LocalVisionConfig()
+    probe = probe_local_vision(config)
+    if not probe.available:
+        raise SystemExit(f"vision backend unavailable ({probe.code}): {probe.message}")
 
     def interpret(image: Path, ocr_text: str):
         prompt = build_technical_frame_prompt(ocr_text=ocr_text or None)
@@ -176,10 +184,16 @@ def summarize(results: list[CaseResult]) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--with-vision", action="store_true", help="also score the vision model")
+    parser.add_argument("--backend", default=None, help="vision backend: ollama (default) or mlx")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="vision model: an Ollama tag (qwen3-vl:8b) or an MLX/HF repo for --backend mlx",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON for programmatic use")
     args = parser.parse_args()
 
-    results = evaluate(args.with_vision)
+    results = evaluate(args.with_vision, args.model, args.backend)
     summary = summarize(results)
     if args.json:
         print(json.dumps({"summary": summary, "cases": [vars(r) for r in results]}, indent=2))

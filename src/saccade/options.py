@@ -80,11 +80,11 @@ class SaccadeOptions:
             raise SaccadeError("E_BAD_OPTIONS", "options", "min_interval_sec must be >= 0")
         if options.max_duration_sec <= 0:
             raise SaccadeError("E_BAD_OPTIONS", "options", "max_duration_sec must be positive")
-        if options.local_vision_backend != "ollama":
+        if options.local_vision_backend not in {"ollama", "mlx"}:
             raise SaccadeError(
                 "E_BAD_OPTIONS",
                 "options",
-                "local_vision_backend must be 'ollama'",
+                "local_vision_backend must be 'ollama' or 'mlx'",
                 {"local_vision_backend": options.local_vision_backend},
             )
         return options

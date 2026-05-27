@@ -180,17 +180,44 @@ def _config_from_payload(
 
 
 def probe_local_vision(config: LocalVisionConfig) -> LocalVisionProbe:
-    if config.backend != "ollama":
+    if config.backend == "ollama":
+        return probe_ollama_availability(config)
+    if config.backend == "mlx":
+        return probe_mlx_availability(config)
+    return LocalVisionProbe(
+        available=False,
+        backend=config.backend,
+        model=config.model,
+        base_url=config.base_url,
+        code="local_vision_backend_unsupported",
+        message=f"Local vision backend '{config.backend}' is not supported; continuing with OCR-only output.",
+        detail={"backend": config.backend},
+    )
+
+
+def probe_mlx_availability(config: LocalVisionConfig) -> LocalVisionProbe:
+    """Confirm mlx-vlm is importable. The model itself is loaded lazily on first use."""
+    try:
+        import mlx_vlm  # noqa: F401
+    except ImportError as exc:
         return LocalVisionProbe(
             available=False,
             backend=config.backend,
             model=config.model,
             base_url=config.base_url,
-            code="local_vision_backend_unsupported",
-            message=f"Local vision backend '{config.backend}' is not supported; continuing with OCR-only output.",
-            detail={"backend": config.backend},
+            code="local_vision_mlx_unavailable",
+            message="mlx-vlm is not installed; continuing with OCR-only output. Run `uv add mlx-vlm`.",
+            detail={"error": str(exc)},
         )
-    return probe_ollama_availability(config)
+    return LocalVisionProbe(
+        available=True,
+        backend=config.backend,
+        model=config.model,
+        base_url=config.base_url,
+        code="local_vision_available",
+        message="MLX local vision is available.",
+        detail={},
+    )
 
 
 def probe_ollama_availability(config: LocalVisionConfig) -> LocalVisionProbe:
@@ -296,6 +323,8 @@ def interpret_image(
     *,
     prompt_profile: str = "technical",
 ) -> LocalVisionResult:
+    if config.backend == "mlx":
+        return _interpret_with_mlx(config, image_path, prompt, prompt_profile)
     if config.backend != "ollama":
         raise LocalVisionFailure(
             "local_vision_backend_unsupported",
@@ -403,6 +432,84 @@ def _ollama_generate(config: LocalVisionConfig, payload: dict[str, Any]) -> str:
             {"error": str(exc)},
         ) from exc
     return str(envelope.get("response") or envelope.get("thinking") or "")
+
+
+# Loaded MLX models are cached per repo: a load is seconds-to-minutes, so the
+# whole point of in-process MLX is to amortize it across every frame in a run.
+_MLX_MODELS: dict[str, Any] = {}
+
+
+def _load_mlx(model: str) -> Any:
+    cached = _MLX_MODELS.get(model)
+    if cached is not None:
+        return cached
+    try:
+        from mlx_vlm import load
+        from mlx_vlm.utils import load_config
+    except ImportError as exc:
+        raise LocalVisionFailure(
+            "local_vision_mlx_unavailable",
+            "mlx-vlm is not installed; continuing with OCR-only output.",
+            {"error": str(exc)},
+        ) from exc
+    try:
+        vlm, processor = load(model)
+        config = load_config(model)
+    except Exception as exc:  # model resolution / download / load failure
+        raise LocalVisionFailure(
+            "local_vision_mlx_load_failed",
+            f"Could not load MLX model '{model}'; continuing with OCR-only output.",
+            {"error": str(exc)},
+        ) from exc
+    _MLX_MODELS[model] = (vlm, processor, config)
+    return _MLX_MODELS[model]
+
+
+def _interpret_with_mlx(
+    config: LocalVisionConfig,
+    image_path: Path,
+    prompt: str,
+    prompt_profile: str,
+) -> LocalVisionResult:
+    from mlx_vlm import generate
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    vlm, processor, model_config = _load_mlx(config.model)
+    request_prompt = (
+        f"{prompt}\n\n"
+        "Respond with only a single compact JSON object — no prose, no code fence — "
+        "with string fields frame_kind, verbatim_text, text_confidence, visual_summary, "
+        "interpretation, uncertainty, and detected_elements as an array of strings. "
+        'Leave verbatim_text empty and set text_confidence to "none" if you cannot read the text.'
+    )
+    formatted = apply_chat_template(processor, model_config, request_prompt, num_images=1)
+
+    last_preview = ""
+    for _attempt in range(DEFAULT_MAX_ATTEMPTS):
+        try:
+            result = generate(
+                vlm,
+                processor,
+                formatted,
+                image=[str(image_path)],
+                verbose=False,
+            )
+        except Exception as exc:  # generation failure
+            raise LocalVisionFailure(
+                "local_vision_mlx_generate_failed",
+                f"MLX generation failed for {image_path.name}; continuing with OCR-only output.",
+                {"error": str(exc)},
+            ) from exc
+        raw_response = str(getattr(result, "text", result) or "")
+        interpreted = parse_interpretation_json(raw_response)
+        if interpreted is not None:
+            return _result_from_payload(interpreted, config, prompt_profile)
+        last_preview = raw_response[:200]
+    raise LocalVisionFailure(
+        "local_vision_malformed_response",
+        "MLX local vision returned a malformed interpretation; continuing with OCR-only output.",
+        {"response_preview": last_preview, "attempts": DEFAULT_MAX_ATTEMPTS},
+    )
 
 
 def _result_from_payload(

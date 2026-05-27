@@ -22,5 +22,5 @@ def test_pipeline_signature_matches_output_affecting_modules() -> None:
         "pipeline.py",
     ]:
         digest.update((scripts / name).read_bytes())
-    assert PIPELINE_VERSION == 7
+    assert PIPELINE_VERSION == 8
     assert digest.hexdigest() == PIPELINE_SIGNATURE
