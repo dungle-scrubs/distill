@@ -86,7 +86,18 @@ uv run python tests/evals/score.py --with-vision --backend mlx \
 uv run python tests/evals/score.py --with-vision --json
 ```
 
-`grounding_precision`/`recall` measure whether `grounding.assess_grounding`
-flags the hard/unreadable frames (recall) without crying wolf on clean ones
-(precision). Use the scores to decide whether a prompt tweak, an OCR setting, or
-a bigger vision model is actually worth it — measured, not guessed.
+## Metrics
+
+- **`vision_token_recall`** (headline): order-insensitive fraction of truth tokens
+  the model captured — "did it read the content?" Robust to word order and to chrome
+  the model adds, so it's the fairest transcription-quality signal.
+- **`vision_token_f1`**: balances recall with precision (precision drops when the model
+  adds chrome or hallucinates).
+- **`vision_wer`**: sequence word-error-rate. Kept for continuity, but it over-penalizes
+  multi-region slides where correct words appear in a different order — prefer recall/F1.
+- **`grounding_precision`/`recall`**: whether `grounding.assess_grounding` flags the
+  hard/unreadable frames (recall) without crying wolf on clean ones (precision).
+
+Use the scores to decide whether a prompt tweak, an OCR setting, or a different vision
+model is actually worth it — measured, not guessed. Findings so far: MLX
+`Qwen3-VL-8B-Instruct-8bit` is the strongest reader; bigger models did not help.

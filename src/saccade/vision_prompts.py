@@ -69,6 +69,8 @@ def build_technical_frame_prompt(
             "Transcribe only text you can actually read into verbatim_text. If the frame is too "
             'low-resolution, low-contrast, blurry, or cropped to read, leave verbatim_text empty '
             'and set text_confidence to "none".',
+            "Transcribe the slide or screen content only. Ignore recurring presentation chrome: "
+            "logos, sponsor or venue banners, watermarks, speaker-camera insets, and page numbers.",
             "Do not invent, infer, or guess any text, topic, technology, label, metric, or UI "
             "element that is not visibly present. Returning little is correct when the frame is unreadable.",
             "Base detected_elements and interpretation strictly on what is visible; never add "
