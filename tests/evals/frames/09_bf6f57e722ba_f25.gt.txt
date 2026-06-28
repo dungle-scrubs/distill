@@ -1,0 +1,5 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Title/transition card; the wordmark + URL are the only text.
+AI Engineer
+EUROPE
+HTTPS://AI.ENGINEER

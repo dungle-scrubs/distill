@@ -1,0 +1,14 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Chrome (AIE logo, AI Engineer EUROPE banner) excluded.
+ably
+Anatomy of a great AI UX
+Deliver a best-in-class experience.
+
+Resilient delivery
+Streams that survive disconnections
+
+Continuity across surfaces
+Seamless experience across devices
+
+Live control
+See what's happening, control what's next

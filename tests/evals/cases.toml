@@ -1,0 +1,138 @@
+# Distill text-recovery eval cases.
+#
+# Each [[case]] points at frames/<id>.png and frames/<id>.gt.txt. The .gt.txt
+# files hold DRAFT transcriptions Claude read off the frames — you must confirm
+# each one, then set `verified = true` here. The scorer skips any case that is
+# unverified, so nothing counts until a human has signed off.
+#
+# kind:       slide | ui_interface | terminal | code_screenshot | diagram | chart_graph | photo
+# legibility: clean (fully readable) | partial (some text too small/blurry) | unreadable (no readable text)
+# has_text:   false for true negatives — the system must NOT invent text on these.
+
+[[case]]
+id = "01_cc665bf2fb0c_f06"
+kind = "slide"
+legibility = "clean"
+has_text = true
+verified = true
+tags = ["dark-bg", "red-slide", "two-column"]
+
+[[case]]
+id = "02_cc665bf2fb0c_f13"
+kind = "slide"
+legibility = "partial"   # tiny status badges (CI green / no conflict / approved) are hard
+has_text = true
+verified = true
+tags = ["dark-bg", "diagram", "sdlc"]
+
+[[case]]
+id = "03_cc665bf2fb0c_f14"
+kind = "slide"
+legibility = "partial"   # embedded GitHub mock text is small
+has_text = true
+verified = true
+tags = ["mixed", "github-ui", "coordination"]
+
+[[case]]
+id = "04_cc665bf2fb0c_f16"
+kind = "slide"
+legibility = "partial"   # the slide is small + low-res in frame; this is the original hallucination case
+has_text = true
+verified = true
+tags = ["dark-slide", "podium", "low-res-slide", "regression"]
+
+[[case]]
+id = "05_c0dd31557e1f_f07"
+kind = "slide"
+legibility = "clean"
+has_text = true
+verified = true
+tags = ["dark-bg", "diagram", "bullets"]
+
+[[case]]
+id = "06_6a1b3dfba579_f05"
+kind = "ui_interface"
+legibility = "clean"
+has_text = true
+verified = true
+tags = ["dark-bg", "trace-viewer"]
+
+[[case]]
+id = "07_243b0b416f7b_f20"
+kind = "slide"
+legibility = "clean"
+has_text = true
+verified = true
+tags = ["dark-bg", "product-card"]
+
+[[case]]
+id = "08_c0dd31557e1f_f05"
+kind = "slide"
+legibility = "clean"
+has_text = true
+verified = true
+tags = ["dark-bg", "sparse"]
+
+[[case]]
+id = "09_bf6f57e722ba_f25"
+kind = "slide"
+legibility = "clean"
+has_text = true
+verified = true
+tags = ["dark-bg", "title-card", "branding"]
+
+[[case]]
+id = "10_243b0b416f7b_f06"
+kind = "diagram"
+legibility = "clean"
+has_text = true
+verified = true
+tags = ["dark-bg", "staircase"]
+
+[[case]]
+id = "11_071589023e44_f27"
+kind = "ui_interface"
+legibility = "clean"
+has_text = true
+verified = true
+tags = ["light-bg", "phone-mockup", "app-list"]
+
+[[case]]
+id = "12_cc665bf2fb0c_f07"
+kind = "slide"
+legibility = "clean"   # main text clean; embedded product screenshot is unreadable (don't transcribe it)
+has_text = true
+verified = true
+tags = ["light-bg", "product"]
+
+[[case]]
+id = "13_071589023e44_f26"
+kind = "slide"
+legibility = "clean"
+has_text = true
+verified = true
+tags = ["light-bg", "big-text"]
+
+[[case]]
+id = "14_071589023e44_f01"
+kind = "photo"
+legibility = "unreadable"
+has_text = false   # near-black transition frame, only a tiny speaker webcam
+verified = true
+tags = ["no-text", "black-frame", "negative"]
+
+[[case]]
+id = "15_bf6f57e722ba_f22"
+kind = "photo"
+legibility = "unreadable"
+has_text = false   # blank slide; only browser chrome + logo, no slide content
+verified = true
+tags = ["no-text", "browser-chrome", "negative"]
+
+[[case]]
+id = "16_85b9f9f6a4fc_f09"
+kind = "photo"
+legibility = "unreadable"
+has_text = false   # interview/podcast shot, two people, no on-screen text
+verified = true
+tags = ["no-text", "talking-heads", "negative"]

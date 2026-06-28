@@ -1,0 +1,719 @@
+"""Distill pipeline orchestration.
+
+This module owns the package-facing processing functions used by the CLI.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from .bundle import (
+    BundleGeneration,
+    active_paths,
+    ensure_safe_directory,
+    patch_manifest_progress,
+    response_from_paths,
+    write_bundle_files,
+)
+from .cache import cleanup_cache
+from .errors import DistillError
+from .frame_selection import select_keyframes
+from .jobs import read_job_status, write_job_status
+from .local_vision import (
+    FrameInterpreter,
+    local_vision_config_from_args,
+    probe_local_vision,
+    try_interpret_image,
+)
+from .ocr import ocr_frames
+from .options import DistillOptions
+from .progress import (
+    TERMINAL_PROGRESS_STATUSES,
+    OverallProgressAggregator,
+    ProgressCounter,
+    ProgressHeartbeat,
+    ProgressReporter,
+)
+from .redact_secrets import redact_text
+from .render import render_markdown
+from .source import (
+    normalize_youtube_url,
+    resolve_source_for_processing,
+    validate_output_root,
+)
+
+TOOLS = {
+    "process_local_video": "Process a local video into a transcript/keyframe markdown bundle",
+    "process_youtube_video": "Download and process one YouTube video into a transcript/keyframe markdown bundle",
+    "process_video_directory": "Process video files in a local directory into Distill bundles",
+    "process_youtube_playlist": "Process videos from a YouTube playlist or channel URL",
+    "cleanup_cache": "Prune old Distill cache bundles and generations",
+    "get_job_status": "Read a Distill job status record by job id",
+}
+DEFAULT_CONFIGURED_TIMEOUT_MS = 5_400_000
+
+TIMEOUT_ENV = "DISTILL_EFFECTIVE_TIMEOUT_MS"
+LONG_TIMEOUT_PROBE_ENV = "DISTILL_ENABLE_LONG_TIMEOUT_PROBE"
+TIMEOUT_PROBE_LIMIT_MS = 1_000
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    description: str
+    handler: Callable[[dict[str, Any]], dict[str, Any]]
+
+
+class DistillSession:
+    def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            result = call_registered_tool(name, args)
+            return {"result": {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}}
+        except DistillError as exc:
+            return {"error": {"message": exc.to_json_text()}}
+        except Exception as exc:
+            error = DistillError("E_INTERNAL", "internal", str(exc))
+            return {"error": {"message": error.to_json_text()}}
+
+
+def process_local_video(args: dict[str, Any]) -> dict[str, Any]:
+    options = DistillOptions.from_args(args)
+    resolution = resolve_source_for_processing("local", str(args.get("path", "")), options)
+    return process_resolved_source(
+        resolution.source,
+        options,
+        resolution.output_root,
+        progress=resolution.progress,
+        tool="process_local_video",
+    )
+
+
+def process_youtube_video(args: dict[str, Any]) -> dict[str, Any]:
+    options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
+    progress = ProgressReporter(emitter=progress_emitter(options.job_id))
+    resolution = resolve_source_for_processing(
+        "youtube",
+        str(args.get("url", "")),
+        options,
+        progress=progress,
+    )
+    return process_resolved_source(
+        resolution.source,
+        options,
+        resolution.output_root,
+        progress=resolution.progress,
+        tool="process_youtube_video",
+    )
+
+
+def progress_emitter(job_id: str) -> Any:
+    def emit(event: Any) -> None:
+        payload = event.to_dict()
+        payload["job_id"] = job_id
+        print(json.dumps(payload, sort_keys=True), file=sys.stderr, flush=True)
+
+    return emit
+
+
+def cache_hit_progress_summary(manifest: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
+    progress_summary = manifest.get("progress")
+    if isinstance(progress_summary, dict) and progress_summary_is_terminal(progress_summary):
+        return progress_summary
+
+    progress_summary = OverallProgressAggregator().cached_summary({"source": "cache"})
+    patch_manifest_progress(manifest_path, progress_summary)
+    return progress_summary
+
+
+def progress_summary_is_terminal(progress_summary: dict[str, Any]) -> bool:
+    if progress_summary.get("overall_percent") != 100.0:
+        return False
+    mechanisms = progress_summary.get("mechanisms")
+    if not isinstance(mechanisms, dict) or not mechanisms:
+        return False
+    return all(
+        isinstance(state, dict) and state.get("status") in TERMINAL_PROGRESS_STATUSES
+        for state in mechanisms.values()
+    )
+
+
+@dataclass
+class ProcessingRun:
+    source: Any
+    options: DistillOptions
+    output_root: Path
+    progress: ProgressReporter
+    tool: str
+
+    def execute(self) -> dict[str, Any]:
+        bundle_root = self.output_root / self.source.source_hash
+        ensure_safe_directory(bundle_root, self.output_root)
+        cached_response = self._cached_response(bundle_root)
+        if cached_response is not None:
+            return cached_response
+
+        heartbeat = ProgressHeartbeat(self.progress.counter).start()
+        generation = BundleGeneration.stage(bundle_root, reset=not self.options.resume_partial)
+        try:
+            response = self._produce_generation(generation, heartbeat)
+        finally:
+            heartbeat.stop()
+        write_job_status(
+            self.output_root,
+            self.options.job_id,
+            status="completed",
+            tool=self.tool,
+            result=response,
+        )
+        return response
+
+    def _cached_response(self, bundle_root: Path) -> dict[str, Any] | None:
+        cached_paths = active_paths(bundle_root)
+        if not cached_paths or self.options.force_reprocess:
+            return None
+        manifest = json.loads(cached_paths.manifest.read_text())
+        progress_summary = cache_hit_progress_summary(manifest, cached_paths.manifest)
+        response = response_from_paths(
+            cached_paths,
+            self.source,
+            manifest.get("frames", []),
+            bool(manifest.get("transcript_present")),
+            list(manifest.get("warnings", [])),
+            cached=True,
+            progress=progress_summary,
+            job_id=self.options.job_id,
+        )
+        write_job_status(
+            self.output_root,
+            self.options.job_id,
+            status="completed",
+            tool=self.tool,
+            result=response,
+        )
+        return response
+
+    def _run_stage(
+        self,
+        generation: BundleGeneration,
+        heartbeat: ProgressHeartbeat,
+        warnings: list[dict[str, str]],
+        name: str,
+        skipped_mechanisms: tuple[str, ...],
+        producer: Callable[[], dict[str, Any]],
+    ) -> dict[str, Any]:
+        def on_resume() -> None:
+            for mechanism in skipped_mechanisms:
+                self.progress.skip_cached(mechanism, detail={"source": "partial_resume"})
+
+        def after_produce(_payload: dict[str, Any]) -> None:
+            heartbeat.check()
+
+        payload = generation.run_stage(
+            name,
+            producer,
+            on_resume=on_resume,
+            after_produce=after_produce,
+        )
+        warnings.extend(list(payload.get("warnings", [])))
+        return payload
+
+    def _produce_ocr(self, frames: list[dict]) -> dict[str, Any]:
+        ocr = self.options.ocr_config()
+        ocr_frames_result, ocr_warnings = ocr_frames(
+            frames,
+            ocr.language,
+            ocr.enabled,
+            self.progress,
+            ocr.preprocess,
+        )
+        return {"frames": ocr_frames_result, "warnings": ocr_warnings}
+
+    def _produce_redaction(self, frames: list[dict]) -> dict[str, Any]:
+        redaction_warnings: list[dict[str, str]] = []
+        redacted_frames = []
+        for index, frame in enumerate(frames):
+            copied = dict(frame)
+            result = redact_text(str(copied.get("ocr_text", "")))
+            copied["ocr_text"] = result.text
+            redaction_warnings.extend(result.warnings)
+            redacted_frames.append(copied)
+            self.progress.update(
+                "redaction",
+                percent=((index + 1) / max(1, len(frames))) * 100,
+                detail={"frame": index + 1, "frames": len(frames)},
+            )
+        self.progress.complete("redaction", detail={"frames": len(frames)})
+        return {"frames": redacted_frames, "warnings": redaction_warnings}
+
+    def _produce_local_vision(self, frames: list[dict]) -> dict[str, Any]:
+        vision_frames, vision_warnings = interpret_frames_with_local_vision(
+            frames,
+            self.options,
+            self.progress,
+        )
+        return {"frames": vision_frames, "warnings": vision_warnings}
+
+    def _produce_generation(
+        self,
+        generation: BundleGeneration,
+        heartbeat: ProgressHeartbeat,
+    ) -> dict[str, Any]:
+        warnings = list(self.source.warnings)
+        paths = generation.paths
+
+        def produce_transcript() -> dict[str, Any]:
+            transcript, transcript_warnings = transcribe_with_imports(
+                self.source.resolved_path,
+                paths.generation,
+                self.options,
+                self.progress,
+            )
+            return {"transcript": transcript, "warnings": transcript_warnings}
+
+        transcript_payload = self._run_stage(
+            generation,
+            heartbeat,
+            warnings,
+            "transcript",
+            ("transcription", "audio_extraction"),
+            produce_transcript,
+        )
+        transcript = transcript_payload.get("transcript")
+
+        def produce_frames() -> dict[str, Any]:
+            frame_selection = self.options.frame_selection_config()
+            frames, frame_warnings = select_keyframes(
+                self.source.resolved_path,
+                paths.frames,
+                self.source.duration_sec,
+                frame_selection.max_keyframes,
+                frame_selection.min_interval_sec,
+                frame_selection.max_static_window_sec,
+                self.progress,
+            )
+            return {"frames": frames, "warnings": frame_warnings}
+
+        frames_payload = self._run_stage(
+            generation,
+            heartbeat,
+            warnings,
+            "frames",
+            ("frame_selection",),
+            produce_frames,
+        )
+        frames = frames_payload["frames"]
+
+        ocr_payload = self._run_stage(
+            generation,
+            heartbeat,
+            warnings,
+            "ocr",
+            ("ocr",),
+            lambda: self._produce_ocr(frames),
+        )
+        frames = ocr_payload["frames"]
+
+        if self.options.redact_secrets:
+            redaction_payload = self._run_stage(
+                generation,
+                heartbeat,
+                warnings,
+                "redaction",
+                ("redaction",),
+                lambda: self._produce_redaction(frames),
+            )
+            frames = redaction_payload["frames"]
+        else:
+            self.progress.skip_cached("redaction", detail={"reason": "disabled"})
+
+        if self.options.caption_frames:
+            vision_payload = self._run_stage(
+                generation,
+                heartbeat,
+                warnings,
+                "local_vision",
+                ("local_vision",),
+                lambda: self._produce_local_vision(frames),
+            )
+            frames = vision_payload["frames"]
+        else:
+            self.progress.skip_cached("local_vision", detail={"reason": "disabled"})
+
+        self.progress.update("rendering", status="running")
+        markdown = render_markdown(
+            str(self.source.resolved_path),
+            self.source.duration_sec,
+            transcript,
+            frames,
+            warnings,
+            getattr(self.source, "related_links", None),
+        )
+        self.progress.complete("rendering")
+        self.progress.update("bundle_publish", status="running")
+        manifest = write_bundle_files(
+            paths,
+            self.source,
+            self.options,
+            transcript,
+            markdown,
+            frames,
+            warnings,
+        )
+        generation_name = paths.generation.name.removeprefix(".tmp.")
+        self.progress.complete("bundle_publish", detail={"generation": generation_name})
+        progress_summary = self.progress.aggregator.terminal_summary(self.progress.states)
+        final_paths = generation.publish(manifest, progress_summary)
+
+        final_frames = []
+        for frame in frames:
+            copied = dict(frame)
+            copied["path"] = str(final_paths.frames / Path(str(frame["path"])).name)
+            final_frames.append(copied)
+        return response_from_paths(
+            final_paths,
+            self.source,
+            final_frames,
+            transcript is not None,
+            warnings,
+            cached=False,
+            progress=progress_summary,
+            job_id=self.options.job_id,
+        )
+
+
+def process_resolved_source(
+    source: Any,
+    options: DistillOptions,
+    output_root: Path | None = None,
+    progress: ProgressReporter | None = None,
+    *,
+    tool: str = "process_local_video",
+) -> dict[str, Any]:
+    output_root = output_root or validate_output_root(options.output_dir)
+    progress = progress or ProgressReporter(emitter=progress_emitter(options.job_id))
+    return ProcessingRun(source, options, output_root, progress, tool).execute()
+
+
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
+
+
+def bool_arg(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+@dataclass
+class BatchRunner:
+    root: Path
+    job_id: str
+    tool: str
+    item_key: str
+    items: list[str]
+    continue_on_error: bool
+
+    def run(
+        self, process_item: Callable[[str, int], dict[str, Any]]
+    ) -> tuple[list[dict], list[dict]]:
+        results: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        for index, item in enumerate(self.items, start=1):
+            try:
+                result = process_item(item, index)
+                result["batch_index"] = index
+                results.append(result)
+            except Exception as exc:
+                errors.append({self.item_key: item, "message": str(exc)})
+                if not self.continue_on_error:
+                    raise
+        return results, errors
+
+    def complete(self, summary: dict[str, Any]) -> dict[str, Any]:
+        write_job_status(self.root, self.job_id, status="completed", tool=self.tool, result=summary)
+        return summary
+
+
+def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
+    directory = Path(str(args.get("path", ""))).expanduser()
+    if not directory.exists() or not directory.is_dir():
+        raise DistillError(
+            "E_BAD_SOURCE", "source", "directory does not exist", {"path": str(directory)}
+        )
+    options = DistillOptions.from_args(args)
+    max_items = int(args.get("max_items", 50))
+    recursive = bool(args.get("recursive", False))
+    pattern = "**/*" if recursive else "*"
+    files = [
+        path
+        for path in sorted(directory.glob(pattern))
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+    ][:max_items]
+    root = validate_output_root(options.output_dir)
+
+    def process_item(path_text: str, index: int) -> dict[str, Any]:
+        child_args = {**args, "path": path_text, "job_id": f"{options.job_id}-{index}"}
+        return process_local_video(child_args)
+
+    runner = BatchRunner(
+        root=root,
+        job_id=options.job_id,
+        tool="process_video_directory",
+        item_key="path",
+        items=[str(path) for path in files],
+        continue_on_error=bool_arg(args.get("continue_on_error"), True),
+    )
+    results, errors = runner.run(process_item)
+    summary = {
+        "job_id": options.job_id,
+        "directory": str(directory.resolve()),
+        "video_count": len(files),
+        "processed_count": len(results),
+        "error_count": len(errors),
+        "results": results,
+        "errors": errors,
+    }
+    return runner.complete(summary)
+
+
+def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
+    import subprocess
+
+    proc = subprocess.run(
+        ["yt-dlp", "--flat-playlist", "--print", "webpage_url", url],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise DistillError(
+            "E_YTDLP",
+            "youtube",
+            "yt-dlp could not list playlist videos",
+            {"stderr": proc.stderr.strip()},
+        )
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()][:max_items]
+
+
+def playlist_folder_name(url: str) -> str:
+    parsed = urlparse(url)
+    playlist_id = parse_qs(parsed.query).get("list", [""])[0]
+    raw_name = playlist_id or f"url-{hashlib.sha256(url.encode()).hexdigest()[:16]}"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip(".-")
+    return safe_name[:120] or f"url-{hashlib.sha256(url.encode()).hexdigest()[:16]}"
+
+
+def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
+    url = normalize_youtube_url(str(args.get("url", "")))
+    if not url:
+        raise DistillError("E_BAD_URL", "youtube", "url is required")
+    options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
+    root = validate_output_root(options.output_dir)
+    playlist_root = root / "playlists" / playlist_folder_name(url)
+    ensure_safe_directory(playlist_root, root)
+    max_items = int(args.get("max_items", 25))
+    urls = youtube_playlist_urls(url, max_items)
+
+    def process_item(video_url: str, index: int) -> dict[str, Any]:
+        child_args = {
+            **args,
+            "url": video_url,
+            "output_dir": str(playlist_root),
+            "job_id": f"{options.job_id}-{index}",
+        }
+        return process_youtube_video(child_args)
+
+    runner = BatchRunner(
+        root=root,
+        job_id=options.job_id,
+        tool="process_youtube_playlist",
+        item_key="url",
+        items=urls,
+        continue_on_error=bool_arg(args.get("continue_on_error"), True),
+    )
+    results, errors = runner.run(process_item)
+    summary = {
+        "job_id": options.job_id,
+        "playlist_url": url,
+        "playlist_output_dir": str(playlist_root),
+        "video_count": len(urls),
+        "processed_count": len(results),
+        "error_count": len(errors),
+        "results": results,
+        "errors": errors,
+    }
+    playlist_summary_path = playlist_root / "playlist.json"
+    summary["playlist_summary_path"] = str(playlist_summary_path)
+    playlist_summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return runner.complete(summary)
+
+
+def cleanup_distill_cache(args: dict[str, Any]) -> dict[str, Any]:
+    root = validate_output_root(args.get("output_dir"))
+    return cleanup_cache(
+        root,
+        max_age_days=float(args["max_age_days"]) if args.get("max_age_days") is not None else None,
+        keep_generations=int(args.get("keep_generations", 3)),
+        dry_run=bool_arg(args.get("dry_run"), True),
+    )
+
+
+def get_job_status(args: dict[str, Any]) -> dict[str, Any]:
+    root = validate_output_root(args.get("output_dir"))
+    job_id = str(args.get("job_id", ""))
+    if not job_id:
+        raise DistillError("E_BAD_JOB", "job", "job_id is required")
+    status = read_job_status(root, job_id)
+    if status is None:
+        raise DistillError("E_JOB_NOT_FOUND", "job", "job status not found", {"job_id": job_id})
+    return status
+
+
+def transcribe_with_imports(
+    video_path: Path,
+    work_dir: Path,
+    options: DistillOptions,
+    progress: ProgressCounter | ProgressReporter,
+) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+    from .transcript import transcribe_video
+
+    return transcribe_video(
+        video_path,
+        work_dir,
+        options.whisper_model,
+        options.whisper_language,
+        options.vad_filter,
+        progress,
+    )
+
+
+def interpret_frames_with_local_vision(
+    frames: list[dict],
+    options: DistillOptions,
+    progress: ProgressReporter | None = None,
+) -> tuple[list[dict], list[dict[str, str]]]:
+    interpreter = FrameInterpreter(
+        config=options.local_vision_config(),
+        redact_secrets=options.redact_secrets,
+        progress=progress,
+        probe=probe_local_vision,
+        try_interpret=try_interpret_image,
+    )
+    return interpreter.interpret(frames)
+
+
+def tool_registry() -> dict[str, ToolSpec]:
+    return {
+        "process_local_video": ToolSpec(
+            TOOLS["process_local_video"],
+            process_local_video,
+        ),
+        "process_youtube_video": ToolSpec(
+            TOOLS["process_youtube_video"],
+            process_youtube_video,
+        ),
+        "process_video_directory": ToolSpec(
+            TOOLS["process_video_directory"],
+            process_video_directory,
+        ),
+        "process_youtube_playlist": ToolSpec(
+            TOOLS["process_youtube_playlist"],
+            process_youtube_playlist,
+        ),
+        "cleanup_cache": ToolSpec(TOOLS["cleanup_cache"], cleanup_distill_cache),
+        "get_job_status": ToolSpec(TOOLS["get_job_status"], get_job_status),
+    }
+
+
+def call_registered_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    spec = tool_registry().get(name)
+    if spec is None:
+        raise DistillError("E_UNKNOWN_TOOL", "protocol", f"Unknown tool: {name}")
+    return spec.handler(args)
+
+
+def list_tools() -> None:
+    print(json.dumps({"tools": sorted(tool_registry())}, indent=2))
+
+
+def configured_timeout_ms() -> int:
+    return DEFAULT_CONFIGURED_TIMEOUT_MS
+
+
+def timeout_diagnostics(effective_timeout_ms: int | None = None) -> dict[str, Any]:
+    configured = configured_timeout_ms()
+    effective = effective_timeout_ms
+    source = "argument"
+    if effective is None:
+        raw_effective = os.environ.get(TIMEOUT_ENV)
+        if raw_effective:
+            effective = int(raw_effective)
+            source = TIMEOUT_ENV
+        else:
+            effective = configured
+            source = "app.config.json"
+    return {
+        "configured_timeout_ms": configured,
+        "effective_timeout_ms": effective,
+        "effective_timeout_source": source,
+        "effective_meets_configured": effective >= configured,
+        "assumption": "A-004",
+    }
+
+
+def run_timeout_probe(probe_ms: int) -> dict[str, Any]:
+    if probe_ms < 0:
+        raise DistillError(
+            "E_BAD_ARGUMENT",
+            "timeout",
+            "timeout probe duration must be non-negative",
+            {"probe_ms": probe_ms},
+        )
+    long_probe_enabled = os.environ.get(LONG_TIMEOUT_PROBE_ENV) == "1"
+    if probe_ms > TIMEOUT_PROBE_LIMIT_MS and not long_probe_enabled:
+        raise DistillError(
+            "E_BAD_ARGUMENT",
+            "timeout",
+            "long timeout probes require DISTILL_ENABLE_LONG_TIMEOUT_PROBE=1",
+            {"probe_ms": probe_ms, "limit_ms": TIMEOUT_PROBE_LIMIT_MS},
+        )
+    started = time.monotonic()
+    time.sleep(probe_ms / 1000)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    return {
+        **timeout_diagnostics(),
+        "probe_requested_ms": probe_ms,
+        "probe_elapsed_ms": elapsed_ms,
+        "long_probe_enabled": long_probe_enabled,
+    }
+
+
+def local_vision_diagnostics(args: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = local_vision_config_from_args(args or {})
+    probe = probe_local_vision(config)
+    return {
+        "config": config.public_dict(),
+        "probe": {
+            "available": probe.available,
+            "backend": probe.backend,
+            "model": probe.model,
+            "base_url": probe.base_url,
+            "code": probe.code,
+            "message": probe.message,
+            "detail": probe.detail,
+        },
+        "setup_command": f"rapid-mlx serve {config.model}",
+        "rapid_mlx_note": "Distill posts OpenAI-compatible chat completions to the configured base_url (default http://127.0.0.1:8000/v1). The server must already be running.",
+    }

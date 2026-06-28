@@ -1,0 +1,2 @@
+# NEGATIVE CASE — blank slide; only browser chrome ("docs.google.com – to exit full screen, press Esc")
+# and the AI Engineer logo, no slide content. Leave the body empty.

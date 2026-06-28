@@ -1,0 +1,8 @@
+# DRAFT (Claude read off the frame) — confirm, then set verified = true in cases.toml.
+# Slide content + embedded GitHub mock. Chrome (ONA, page number) excluded.
+The Coordination Problem
+GitHub is not a coordination layer
+
+Open   feat: implement user authentication   #142
+ona-agent wants to merge into main
+0 comments   1 commits   0 human reviews

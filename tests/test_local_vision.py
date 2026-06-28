@@ -1,0 +1,697 @@
+from __future__ import annotations
+
+import json
+import os
+import struct
+import urllib.error
+import zlib
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from distill.errors import DistillError
+from distill.local_vision import (
+    DEFAULT_LOCAL_VISION_BASE_URL,
+    DEFAULT_LOCAL_VISION_MODEL,
+    FrameInterpreter,
+    LocalVisionConfig,
+    LocalVisionProbe,
+    LocalVisionResult,
+    _interpret_with_rapid_mlx,
+    load_local_vision_config,
+    local_vision_config_from_args,
+    parse_interpretation_json,
+    probe_local_vision,
+    probe_rapid_mlx_availability,
+    try_interpret_image,
+)
+from distill.options import DistillOptions
+from distill.pipeline import local_vision_diagnostics
+
+DEFAULT_MODEL = DEFAULT_LOCAL_VISION_MODEL
+
+
+def _models_body(*model_ids: str) -> dict[str, Any]:
+    return {"data": [{"id": mid} for mid in model_ids]}
+
+
+def _chat_envelope(content: str) -> dict[str, Any]:
+    return {"choices": [{"message": {"content": content}}]}
+
+
+def _frame_json(**overrides: Any) -> str:
+    payload = {
+        "visual_summary": "A line chart",
+        "detected_elements": ["axis", "trend line"],
+        "interpretation": "Values rise over time.",
+        "uncertainty": "Low",
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+class FakeRapidMlx:
+    """Records requests and serves canned /v1/models and /v1/chat/completions."""
+
+    def __init__(
+        self,
+        *,
+        models: list[str] | None = None,
+        chat_content: str | None = None,
+        models_error: Exception | None = None,
+        chat_error: Exception | None = None,
+    ) -> None:
+        self.models = models if models is not None else [DEFAULT_MODEL]
+        self.chat_content = chat_content
+        self.models_error = models_error
+        self.chat_error = chat_error
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, *, method: str, url: str, body: Any = None, timeout: float = 30.0) -> Any:
+        self.calls.append({"method": method, "url": url, "body": body, "timeout": timeout})
+        if method == "GET" and url.rstrip("/").endswith("/models"):
+            if self.models_error is not None:
+                raise self.models_error
+            return _models_body(*self.models)
+        if method == "POST" and url.rstrip("/").endswith("/chat/completions"):
+            if self.chat_error is not None:
+                raise self.chat_error
+            return _chat_envelope(self.chat_content or "")
+        raise RuntimeError(f"unexpected request {method} {url}")
+
+
+def test_default_local_vision_config_targets_rapid_mlx(tmp_path: Path) -> None:
+    config = load_local_vision_config(tmp_path)
+
+    assert config.backend == "rapid-mlx"
+    assert config.model == DEFAULT_MODEL
+    assert config.base_url == DEFAULT_LOCAL_VISION_BASE_URL
+    assert config.caption_frames is True
+
+
+def test_local_vision_config_loads_from_config_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "backend": "rapid-mlx",
+                "model": "qwen3-vl:32b",
+                "base_url": "http://127.0.0.1:9000/v1",
+                "timeout_sec": 12,
+                "caption_frames": True,
+            }
+        )
+    )
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+
+    options = DistillOptions.from_args({})
+
+    assert options.caption_frames is True
+    assert options.local_vision_backend == "rapid-mlx"
+    assert options.local_vision_model == "qwen3-vl:32b"
+    assert options.local_vision_base_url == "http://127.0.0.1:9000/v1"
+    assert options.local_vision_timeout_sec == 12.0
+
+
+def test_nested_distill_config_is_supported(tmp_path: Path) -> None:
+    (tmp_path / "distill.json").write_text(
+        json.dumps({"local_vision": {"model": "qwen3-vl:30b-a3b", "caption_frames": True}})
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert config.model == "qwen3-vl:30b-a3b"
+    assert config.caption_frames is True
+
+
+def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})
+    )
+
+    config = local_vision_config_from_args(
+        {"local_vision_model": "qwen3-vl:8b", "caption_frames": "false"},
+        tmp_path,
+    )
+
+    assert config.model == "qwen3-vl:8b"
+    assert config.caption_frames is False
+
+
+def test_probe_hits_models_endpoint_with_configured_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = FakeRapidMlx(models=["other-model", DEFAULT_MODEL])
+    config = LocalVisionConfig(
+        base_url="http://127.0.0.1:49181/v1",
+        model=DEFAULT_MODEL,
+        timeout_sec=12,
+    )
+
+    probe = probe_rapid_mlx_availability(config, requestor=server)
+
+    assert server.calls == [
+        {"method": "GET", "url": "http://127.0.0.1:49181/v1/models", "body": None, "timeout": 12}
+    ]
+    assert probe.available is True
+    assert probe.backend == "rapid-mlx"
+    assert probe.model == DEFAULT_MODEL
+    assert probe.base_url == "http://127.0.0.1:49181/v1"
+    assert probe.code == "local_vision_available"
+    assert probe.detail["served_models"] == ["other-model", DEFAULT_MODEL]
+
+
+def test_probe_reports_unavailable_when_server_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = LocalVisionConfig()
+
+    probe = probe_rapid_mlx_availability(
+        config,
+        requestor=FakeRapidMlx(models_error=urllib.error.URLError("connection refused")),
+    )
+
+    assert probe.available is False
+    assert probe.code == "local_vision_rapid_mlx_unavailable"
+    assert "connection refused" in probe.detail["error"]
+
+
+def test_probe_reports_model_unavailable_when_model_not_served(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = LocalVisionConfig(model="qwen3-vl:32b")
+
+    probe = probe_rapid_mlx_availability(config, requestor=FakeRapidMlx(models=["other"]))
+
+    assert probe.available is False
+    assert probe.code == "local_vision_model_unavailable"
+    assert probe.detail["configured_model"] == "qwen3-vl:32b"
+    assert probe.detail["served_models"] == ["other"]
+
+
+def test_probe_reports_malformed_models_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def requestor(*, method: str, url: str, body: Any = None, timeout: float = 30.0) -> Any:
+        raise RuntimeError("HTTP 500 from server: internal error")
+
+    probe = probe_rapid_mlx_availability(LocalVisionConfig(), requestor=requestor)
+
+    assert probe.available is False
+    assert probe.code == "local_vision_rapid_mlx_malformed_response"
+
+
+def test_probe_reports_timeout() -> None:
+    config = LocalVisionConfig()
+
+    probe = probe_rapid_mlx_availability(
+        config, requestor=FakeRapidMlx(models_error=TimeoutError("timed out"))
+    )
+
+    assert probe.available is False
+    assert probe.code == "local_vision_timeout"
+
+
+def test_unsupported_backend_is_rejected() -> None:
+    probe = probe_local_vision(LocalVisionConfig(backend="ollama"))
+
+    assert probe.available is False
+    assert probe.code == "local_vision_backend_unsupported"
+
+
+def test_rapid_mlx_backend_is_accepted_by_options() -> None:
+    options = DistillOptions.from_args({"local_vision_backend": "rapid-mlx"})
+
+    assert options.local_vision_backend == "rapid-mlx"
+
+
+def test_non_rapid_mlx_backend_is_rejected_by_options() -> None:
+    with pytest.raises(DistillError, match="must be 'rapid-mlx'"):
+        DistillOptions.from_args({"local_vision_backend": "ollama"})
+
+
+def test_local_vision_diagnostics_describe_rapid_mlx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+        return LocalVisionProbe(
+            available=False,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_rapid_mlx_unavailable",
+            message="missing",
+            detail={},
+        )
+
+    monkeypatch.setattr("distill.pipeline.probe_local_vision", fake_probe)
+
+    diagnostics = local_vision_diagnostics({})
+
+    assert diagnostics["setup_command"] == f"rapid-mlx serve {DEFAULT_MODEL}"
+    assert "127.0.0.1:8000" in diagnostics["rapid_mlx_note"]
+    assert diagnostics["probe"]["backend"] == "rapid-mlx"
+    assert "release_warning" not in diagnostics
+
+
+def test_interpret_image_returns_structured_result(tmp_path: Path) -> None:
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    server = FakeRapidMlx(
+        chat_content=_frame_json(
+            verbatim_text="Quarterly revenue",
+            text_confidence="high",
+            frame_kind="slide",
+        )
+    )
+    config = LocalVisionConfig()
+
+    result = _interpret_with_rapid_mlx(config, image, "Interpret.", "technical", requestor=server)
+
+    request = server.calls[0]
+    assert request["method"] == "POST"
+    assert request["url"] == f"{config.base_url}/chat/completions"
+    assert request["body"]["model"] == config.model
+    assert request["body"]["temperature"] == 0
+    assert request["body"]["response_format"] == {"type": "json_object"}
+    # The image is sent as a base64 data URI in an image_url content part.
+    content = request["body"]["messages"][0]["content"]
+    assert any(
+        part.get("type") == "image_url"
+        and part["image_url"]["url"].startswith("data:image/png;base64,")
+        for part in content
+    )
+    assert result.backend == "rapid-mlx"
+    assert result.verbatim_text == "Quarterly revenue"
+    assert result.text_confidence == "high"
+    assert result.frame_kind == "slide"
+
+
+def test_interpret_image_retries_past_one_malformed_response(tmp_path: Path) -> None:
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+
+    attempts = {"n": 0}
+
+    def requestor(*, method: str, url: str, body: Any = None, timeout: float = 30.0) -> Any:
+        if not url.rstrip("/").endswith("/chat/completions"):
+            return _models_body(DEFAULT_MODEL)
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return _chat_envelope("not json at all")
+        return _chat_envelope(_frame_json(verbatim_text="Hello", text_confidence="high"))
+
+    result = _interpret_with_rapid_mlx(
+        LocalVisionConfig(), image, "Interpret.", "technical", requestor=requestor
+    )
+
+    assert attempts["n"] == 2
+    assert result.verbatim_text == "Hello"
+
+
+def test_interpret_image_reports_unreachable_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+
+    # The probe succeeds (server up, model served); generation then fails to
+    # connect, which must surface as a transport-unavailable warning.
+    monkeypatch.setattr(
+        "distill.local_vision._urlopen_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            urllib.error.URLError("connection refused")
+        ),
+    )
+
+    result, warning = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert warning is not None
+    assert warning["code"] == "local_vision_rapid_mlx_unavailable"
+
+
+def test_interpret_image_reports_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+
+    monkeypatch.setattr(
+        "distill.local_vision._urlopen_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("timed out")),
+    )
+
+    result, warning = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert warning is not None
+    assert warning["code"] == "local_vision_timeout"
+
+
+def test_interpret_image_malformed_response_returns_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+
+    # Probe succeeds; the chat completion returns a body whose content is not
+    # valid JSON, so both retry attempts are exhausted -> malformed response.
+    monkeypatch.setattr(
+        "distill.local_vision._urlopen_json",
+        lambda method, url, body=None, timeout_sec=30.0: (
+            _models_body(DEFAULT_MODEL)
+            if url.rstrip("/").endswith("/models")
+            else _chat_envelope("definitely not json")
+        ),
+    )
+
+    result, warning = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert warning is not None
+    assert warning["code"] == "local_vision_malformed_response"
+
+
+def test_interpretation_parser_accepts_fenced_or_prefaced_json() -> None:
+    payload = {
+        "visual_summary": "A chart",
+        "detected_elements": ["bar"],
+        "interpretation": "Growth increases.",
+        "uncertainty": "Low",
+    }
+
+    assert parse_interpretation_json(f"```json\n{json.dumps(payload)}\n```") == payload
+    assert parse_interpretation_json(f"Here is the result:\n{json.dumps(payload)}") == payload
+
+
+def test_interpret_image_cancel_returns_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+
+    # Generation is the only network call on the interpret path (interpret_image
+    # no longer probes); raising KeyboardInterrupt there exercises the cancel path.
+    monkeypatch.setattr(
+        "distill.local_vision._urlopen_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+
+    result, warning = try_interpret_image(LocalVisionConfig(), image, "Interpret.")
+
+    assert result is None
+    assert warning is not None
+    assert warning["code"] == "local_vision_cancelled"
+
+
+def _available_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+    return LocalVisionProbe(
+        available=True,
+        backend=config.backend,
+        model="Qwen3-VL-8B-8bit",
+        base_url=config.base_url,
+        code="local_vision_available",
+        message="available",
+        detail={},
+    )
+
+
+def test_frame_interpreter_debug_info_tracks_run_state(tmp_path: Path) -> None:
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+
+    def fake_try_interpret(
+        config: LocalVisionConfig,
+        image_path: Path,
+        _prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[LocalVisionResult, None]:
+        return (
+            LocalVisionResult(
+                visual_summary=f"summary for {image_path.name}",
+                detected_elements=["caption"],
+                interpretation="A readable caption.",
+                uncertainty="Low",
+                backend=config.backend,
+                model=config.model,
+                prompt_profile=prompt_profile,
+                verbatim_text="Hello",
+                text_confidence="high",
+            ),
+            None,
+        )
+
+    interpreter = FrameInterpreter(
+        LocalVisionConfig(),
+        redact_secrets=False,
+        probe=_available_probe,
+        try_interpret=fake_try_interpret,
+        debug=True,
+    )
+
+    frames, warnings = interpreter.interpret(
+        [{"index": 1, "path": str(image), "ocr_text": "Hello"}]
+    )
+
+    assert warnings == []
+    assert frames[0]["visual_interpretation"]["visual_summary"] == "summary for frame.png"
+    debug_info = interpreter.debug_info()
+    assert debug_info["backend"] == "rapid-mlx"
+    assert debug_info["last_probe"] == {
+        "available": True,
+        "code": "local_vision_available",
+        "model": "Qwen3-VL-8B-8bit",
+    }
+    assert debug_info["frame_count"] == 1
+    assert debug_info["interpreted_count"] == 1
+    assert debug_info["max_parallel"] == 1
+    assert debug_info["warning_counts"] == {}
+    assert debug_info["trace_events"] == [
+        {"event": "interpret.start", "detail": {"frames": 1, "backend": "rapid-mlx"}},
+        {"event": "interpret.pool", "detail": {"frames": 1, "max_parallel": 1}},
+        {
+            "event": "frame.start",
+            "detail": {"index": 1, "path": str(image), "has_ocr_text": True},
+        },
+        {
+            "event": "frame.complete",
+            "detail": {"index": 1, "interpreted": True, "warning_code": None},
+        },
+        {
+            "event": "interpret.complete",
+            "detail": {"frames": 1, "interpreted_frames": 1, "warnings": 0},
+        },
+    ]
+
+
+def test_frame_interpreter_caps_pool_at_configured_max_parallel(tmp_path: Path) -> None:
+    import threading
+    import time
+
+    for index in range(4):
+        (tmp_path / f"frame{index}.png").write_bytes(b"png")
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fake_try_interpret(
+        config: LocalVisionConfig,
+        image_path: Path,
+        _prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[LocalVisionResult, None]:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return (
+            LocalVisionResult(
+                visual_summary=image_path.name,
+                detected_elements=[],
+                interpretation="ok",
+                uncertainty="Low",
+                backend=config.backend,
+                model=config.model,
+                prompt_profile=prompt_profile,
+            ),
+            None,
+        )
+
+    interpreter = FrameInterpreter(
+        LocalVisionConfig(),
+        redact_secrets=False,
+        probe=_available_probe,
+        try_interpret=fake_try_interpret,
+        max_parallel=2,
+    )
+
+    frames = [
+        # OCR text grounds the interpretation so no extraneous warnings appear.
+        {"index": i + 1, "path": str(tmp_path / f"frame{i}.png"), "ocr_text": f"frame{i}"}
+        for i in range(4)
+    ]
+    interpreted, _ = interpreter.interpret(frames)
+
+    assert len(interpreted) == 4
+    # Concurrency never exceeds the configured cap of 2.
+    assert peak <= 2
+    assert peak >= 2  # and the pool did run in parallel
+    # Output order is preserved despite parallel execution.
+    assert [f["visual_interpretation"]["visual_summary"] for f in interpreted] == [
+        "frame0.png",
+        "frame1.png",
+        "frame2.png",
+        "frame3.png",
+    ]
+    assert interpreter.debug_info()["interpreted_count"] == 4
+
+
+def test_frame_interpreter_runs_serially_when_max_parallel_is_one(tmp_path: Path) -> None:
+    import threading
+    import time
+
+    for index in range(3):
+        (tmp_path / f"frame{index}.png").write_bytes(b"png")
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fake_try_interpret(
+        config: LocalVisionConfig,
+        image_path: Path,
+        _prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[LocalVisionResult, None]:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return (
+            LocalVisionResult(
+                visual_summary=image_path.name,
+                detected_elements=[],
+                interpretation="ok",
+                uncertainty="Low",
+                backend=config.backend,
+                model=config.model,
+                prompt_profile=prompt_profile,
+            ),
+            None,
+        )
+
+    interpreter = FrameInterpreter(
+        LocalVisionConfig(),
+        redact_secrets=False,
+        probe=_available_probe,
+        try_interpret=fake_try_interpret,
+        max_parallel=1,
+    )
+
+    frames = [{"index": i + 1, "path": str(tmp_path / f"frame{i}.png")} for i in range(3)]
+    interpreted, _ = interpreter.interpret(frames)
+
+    # max_parallel<=1 is the serial fallback (A-004): never overlaps.
+    assert peak == 1
+    assert len(interpreted) == 3
+
+
+def test_frame_interpreter_records_unavailable_probe_warning() -> None:
+    def fake_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+        return LocalVisionProbe(
+            available=False,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_rapid_mlx_unavailable",
+            message="missing",
+            detail={},
+        )
+
+    interpreter = FrameInterpreter(
+        LocalVisionConfig(),
+        redact_secrets=False,
+        probe=fake_probe,
+        debug=True,
+    )
+
+    frames, warnings = interpreter.interpret([{"index": 1, "path": "/tmp/frame.png"}])
+
+    assert frames == [{"index": 1, "path": "/tmp/frame.png"}]
+    assert warnings == [
+        {
+            "stage": "local_vision",
+            "code": "local_vision_rapid_mlx_unavailable",
+            "message": "missing",
+        }
+    ]
+    assert interpreter.debug_info()["warning_counts"] == {
+        "local_vision_rapid_mlx_unavailable": 1
+    }
+
+
+def test_frame_interpreter_asserts_frame_path_invariant() -> None:
+    interpreter = FrameInterpreter(
+        LocalVisionConfig(),
+        redact_secrets=False,
+        probe=_available_probe,
+    )
+
+    with pytest.raises(AssertionError, match="missing required 'path'"):
+        interpreter.interpret([{"index": 1}])
+
+
+@pytest.mark.skipif(
+    os.environ.get("DISTILL_RUN_RAPID_MLX_SMOKE") != "1",
+    reason="set DISTILL_RUN_RAPID_MLX_SMOKE=1 after starting `rapid-mlx serve <model>`",
+)
+def test_rapid_mlx_qwen3_vl_image_smoke(tmp_path: Path) -> None:
+    image = tmp_path / "pixel.png"
+    image.write_bytes(_solid_png_bytes())
+
+    result, warning = try_interpret_image(LocalVisionConfig(), image, "Describe this image.")
+
+    assert warning is None
+    assert result is not None
+
+
+def _solid_png_bytes() -> bytes:
+    width = height = 32
+    raw = b"".join(b"\x00" + b"\xff\x00\x00" * width for _ in range(height))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        body = kind + data
+        return (
+            struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
