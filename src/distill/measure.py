@@ -1,5 +1,13 @@
 """Measurement harness for Distill spike tuning.
 
+This is an **evaluation/measurement tool, not part of the runtime pipeline.**
+It is not imported by ``distill.cli`` or ``distill.pipeline``; it is exercised
+only by ``tests/test_measure.py`` and the eval harness under ``tests/evals/``.
+The heavy measurement runs (the ffmpeg-backed corpus generation and benchmark
+loops below) need real video fixtures and system tools, so they are intentionally
+left uncovered by the hermetic default suite — the low coverage here reflects
+that scope, not a gap in runtime code.
+
 The harness records reproducible metadata for a small local screencast corpus.
 It intentionally writes JSON only; generated media and bundle artifacts stay
 outside committed source.

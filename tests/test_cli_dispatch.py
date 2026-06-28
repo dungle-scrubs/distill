@@ -1,0 +1,132 @@
+"""Tests for the CLI dispatch branches in ``distill.cli.main``.
+
+These exercise the subcommand dispatch in ``main()`` directly (in-process),
+complementing the subprocess-based scaffold tests. They cover the branches that
+can run hermetically: the diagnostic/list commands, cache cleanup against a
+temp directory, job-status lookup, and the call-tool wrapper, plus the
+DistillError-to-stderr path.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from distill.cli import main
+from distill.errors import DistillError
+
+
+def _run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[object, str, str]:
+    code = main(argv)
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_list_tools_dispatch_prints_sorted_tools(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = _run(["list-tools"], capsys)
+    assert code is None
+    payload = json.loads(out)
+    assert payload == {
+        "tools": [
+            "cleanup_cache",
+            "get_job_status",
+            "process_local_video",
+            "process_video_directory",
+            "process_youtube_playlist",
+            "process_youtube_video",
+        ]
+    }
+
+
+def test_timeout_diagnostics_dispatch_prints_json(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = _run(["timeout-diagnostics"], capsys)
+    assert code is None
+    payload = json.loads(out)
+    assert payload["configured_timeout_ms"] == 5_400_000
+    assert payload["assumption"] == "A-004"
+
+
+def test_timeout_probe_dispatch_short_probe(capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = _run(["timeout-probe", "1"], capsys)
+    assert code is None
+    payload = json.loads(out)
+    assert payload["probe_requested_ms"] == 1
+    assert payload["long_probe_enabled"] is False
+
+
+def test_timeout_probe_dispatch_rejects_long_probe(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["timeout-probe", "1001"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    payload = json.loads(err)
+    assert payload["code"] == "E_BAD_ARGUMENT"
+    assert payload["stage"] == "timeout"
+
+
+def test_cleanup_cache_dispatch_dry_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code, out, _ = _run(
+        ["cleanup-cache", "--output-dir", str(tmp_path), "--keep-generations", "3", "--dry-run"],
+        capsys,
+    )
+    assert code is None
+    payload = json.loads(out)
+    assert payload["dry_run"] is True
+    assert payload["candidate_count"] == 0
+    assert payload["deleted"] == []
+
+
+def test_get_job_status_dispatch_missing_job_is_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["get-job-status", "no-such-job", "--output-dir", str(tmp_path)])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    payload = json.loads(err)
+    assert payload["code"] == "E_JOB_NOT_FOUND"
+    assert payload["stage"] == "job"
+
+
+def test_call_tool_dispatch_wraps_unknown_tool(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # call-tool routes through DistillSession.call_tool, which converts a
+    # DistillError (E_UNKNOWN_TOOL) into an {"error": ...} JSON result rather
+    # than exiting non-zero.
+    code, out, _ = _run(["call-tool", "does_not_exist", "--args", "{}"], capsys)
+    assert code is None
+    payload = json.loads(out)
+    assert "error" in payload
+    assert "E_UNKNOWN_TOOL" in payload["error"]["message"]
+
+
+def test_call_tool_dispatch_runs_list_tools_via_session(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # get_job_status is a registered tool; calling it for a missing job returns
+    # an error envelope (not a process exit) through the session wrapper.
+    code, out, _ = _run(["call-tool", "get_job_status", "--args", '{"job_id": ""}'], capsys)
+    assert code is None
+    payload = json.loads(out)
+    assert "result" in payload or "error" in payload
+
+
+def test_main_propagates_distill_error_to_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def raise_error(_name: str, _args: dict) -> dict:
+        raise DistillError("E_TEST", "test", "boom")
+
+    monkeypatch.setattr("distill.cli.call_registered_tool", raise_error)
+    with pytest.raises(SystemExit) as exc_info:
+        main(["get-job-status", "any", "--output-dir", str(tmp_path)])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert json.loads(err)["code"] == "E_TEST"

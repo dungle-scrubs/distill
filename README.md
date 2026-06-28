@@ -9,6 +9,10 @@ screen recordings into LLM agents.
 
 ## Install
 
+> **Package name:** the distribution is published as **`distill-video`** (PyPI / git
+> install), but it installs the **`distill`** Python package and a **`distill`**
+> console script. The CLI you type is `distill`, not `distill-video`.
+
 Distill needs Python 3.13+ and a few system tools. With [uv](https://docs.astral.sh/uv/) installed:
 
 ```bash
@@ -58,6 +62,36 @@ distill cleanup-cache --keep-generations 3 --dry-run
 Each run writes a bundle: `transcript.json`, `frames/*.png`, a `video.md`
 render, and a `_manifest.json`. Output lands under `~/.distill` by default;
 override with `--output-dir`.
+
+## Commands
+
+`distill` exposes the following subcommands. All print JSON to stdout (except
+`list-tools`, which prints a JSON document); fatal errors print a JSON error
+object to stderr and exit with code 2.
+
+| Command | Purpose |
+| --- | --- |
+| `process-local-video PATH` | Process one local video file into a bundle. |
+| `process-youtube-video URL` | Download and process one personal-use YouTube video. |
+| `process-video-directory PATH` | Process every video in a directory. Flags: `--recursive`, `--max-items`, `--continue-on-error/--no-continue-on-error`, `--output-dir`, `--job-id`. |
+| `process-youtube-playlist URL` | Process videos from a YouTube playlist or channel URL. Flags: `--max-items`, `--continue-on-error/--no-continue-on-error`, plus the processing options. |
+| `cleanup-cache` | Prune old cache bundles. Flags: `--output-dir`, `--max-age-days`, `--keep-generations`, `--dry-run/--no-dry-run`. |
+| `get-job-status JOB_ID` | Read a Distill job status record. Flags: `--output-dir`. |
+| `list-tools` | Print the registered tool names as JSON. |
+| `timeout-diagnostics` | Show the configured vs. effective timeout (assumption A-004). |
+| `timeout-probe PROBE_MS` | Sleep for a bounded timeout probe; long probes require `DISTILL_ENABLE_LONG_TIMEOUT_PROBE=1`. |
+| `local-vision-diagnostics` | Probe the local Rapid-MLX vision server and print the resolved config. Flags: `--caption-frames/--no-caption-frames`, `--local-vision-backend`, `--local-vision-model`, `--local-vision-base-url`, `--local-vision-timeout-sec`. |
+| `call-tool TOOL [--args JSON]` | Call any registered tool by its MCP-style name with a JSON arguments object. |
+
+The processing commands (`process-local-video`, `process-youtube-video`,
+`process-youtube-playlist`) share these options: `--whisper-model`,
+`--whisper-language`, `--ocr`/`--no-ocr`, `--ocr-language`, `--ocr-preprocess`,
+`--redact-secrets`/`--no-redact-secrets`, `--max-keyframes`, `--min-interval-sec`,
+`--max-duration-sec`, `--vad-filter`/`--no-vad-filter`, `--max-static-window-sec`,
+`--output-dir`, `--force-reprocess`, `--job-id`, `--resume-partial`,
+`--caption-frames`/`--no-caption-frames`, `--local-vision-backend`,
+`--local-vision-model`, `--local-vision-base-url`, and
+`--local-vision-timeout-sec`. Run `distill <command> --help` for the full list.
 
 ## Local Vision
 
