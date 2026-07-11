@@ -28,6 +28,12 @@ from .progress import ProgressReporter
 CONTENT_HASH_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 YOUTUBE_DISK_FLOOR_BYTES = 1024 * 1024 * 1024
+# Wall-clock ceilings so a wedged tool or a stalled network call cannot hang the
+# whole run. yt-dlp additionally gets `--socket-timeout` so it aborts a stalled
+# connection on its own rather than blocking until the outer timeout fires.
+FFPROBE_TIMEOUT_SEC = 60.0
+YTDLP_METADATA_TIMEOUT_SEC = 120.0
+YTDLP_SOCKET_TIMEOUT_SEC = 30
 SENSITIVE_COMPONENTS = {
     ".ssh",
     ".gnupg",
@@ -102,8 +108,25 @@ class YouTubeDownloaderProtocol(Protocol):
     ) -> Path: ...
 
 
-def run_json_command(command: list[str]) -> dict:
-    proc = subprocess.run(command, capture_output=True, text=True, check=False)
+def run_json_command(command: list[str], *, timeout: float = FFPROBE_TIMEOUT_SEC) -> dict:
+    try:
+        proc = subprocess.run(
+            command, capture_output=True, text=True, check=False, timeout=timeout
+        )
+    except FileNotFoundError as exc:
+        raise DistillError(
+            "E_MISSING_TOOL",
+            "source",
+            f"required tool is not installed: {command[0]}",
+            {"tool": command[0]},
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DistillError(
+            "E_COMMAND",
+            "source",
+            f"command timed out: {command[0]}",
+            {"timeout_sec": timeout, "command": command},
+        ) from exc
     if proc.returncode != 0:
         raise DistillError(
             "E_COMMAND",
@@ -361,13 +384,62 @@ def parse_youtube_url(url: str) -> str:
     return video_id
 
 
+def _ytdlp_command(extra_args: list[str], url: str) -> list[str]:
+    """Build a yt-dlp argv with a stall guard and a `--` terminator.
+
+    The `--` before the URL stops a value that begins with `-` from being parsed
+    as a yt-dlp option (argument injection), and `--socket-timeout` lets yt-dlp
+    abort a stalled connection on its own.
+    """
+    return [
+        "yt-dlp",
+        "--socket-timeout",
+        str(YTDLP_SOCKET_TIMEOUT_SEC),
+        *extra_args,
+        "--",
+        url,
+    ]
+
+
+def _run_ytdlp(
+    extra_args: list[str],
+    url: str,
+    *,
+    timeout: float = YTDLP_METADATA_TIMEOUT_SEC,
+) -> subprocess.CompletedProcess[str]:
+    command = _ytdlp_command(extra_args, url)
+    try:
+        return subprocess.run(
+            command, capture_output=True, text=True, check=False, timeout=timeout
+        )
+    except FileNotFoundError as exc:
+        raise DistillError(
+            "E_MISSING_TOOL", "youtube", "yt-dlp is not installed", {"tool": "yt-dlp"}
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DistillError(
+            "E_YTDLP", "youtube", "yt-dlp timed out", {"timeout_sec": timeout}
+        ) from exc
+
+
 def youtube_description(url: str) -> tuple[str, list[dict[str, str]]]:
-    proc = subprocess.run(
-        ["yt-dlp", "--skip-download", "--print", "%(description)s", url],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            _ytdlp_command(["--skip-download", "--print", "%(description)s"], url),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=YTDLP_METADATA_TIMEOUT_SEC,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # Description is best-effort metadata; degrade rather than fail the run.
+        return "", [
+            warning(
+                "youtube",
+                "metadata_unavailable",
+                "yt-dlp could not read YouTube description",
+            )
+        ]
     if proc.returncode != 0:
         return "", [
             warning(
@@ -380,12 +452,7 @@ def youtube_description(url: str) -> tuple[str, list[dict[str, str]]]:
 
 
 def youtube_metadata(url: str) -> YouTubeMetadata:
-    proc = subprocess.run(
-        ["yt-dlp", "--skip-download", "--dump-json", url],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = _run_ytdlp(["--skip-download", "--dump-json"], url)
     if proc.returncode == 0:
         try:
             payload = json.loads(proc.stdout)
@@ -406,12 +473,7 @@ def youtube_metadata(url: str) -> YouTubeMetadata:
 
 def canonical_youtube_id(url: str) -> str:
     parse_youtube_url(url)
-    proc = subprocess.run(
-        ["yt-dlp", "--simulate", "--print", "id", url],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    proc = _run_ytdlp(["--simulate", "--print", "id"], url)
     if proc.returncode != 0:
         raise DistillError(
             "E_YTDLP",
@@ -528,6 +590,7 @@ class YoutubeDownloader:
                 "mp4",
                 "-o",
                 out_template,
+                "--",
                 url,
             ]
             proc = subprocess.Popen(
@@ -773,6 +836,8 @@ class SourceResolver:
 
         root = validate_output_root(options.output_dir)
         url = normalize_youtube_url(value)
+        # Reject non-YouTube hosts (and option-injection values) before yt-dlp runs.
+        parse_youtube_url(url)
         metadata = youtube_metadata(url)
         if not options.force_reprocess:
             cached = self.cached_youtube_source(url, options, root, metadata=metadata)

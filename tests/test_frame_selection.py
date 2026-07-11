@@ -60,6 +60,23 @@ def test_scene_midpoint_candidates_falls_back_to_adaptive_detector(
     assert frame_selection.scene_midpoint_candidates(Path("demo.mp4"), 10.0) == [2.0]
 
 
+def test_extract_frame_degrades_when_ffmpeg_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _missing(*_args: Any, **_kwargs: Any) -> object:
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr(frame_selection.subprocess, "run", _missing)
+
+    result = frame_selection.extract_frame(Path("demo.mp4"), 1.0, tmp_path / "frame.png")
+
+    assert result == {
+        "stage": "frames",
+        "code": "ffmpeg_missing",
+        "message": "ffmpeg is not installed; skipping keyframe extraction",
+    }
+
+
 def test_frame_selection_reports_scene_and_candidate_progress(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

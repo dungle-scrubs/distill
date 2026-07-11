@@ -6,9 +6,36 @@ import pytest
 
 from distill import ocr
 from distill.errors import DistillError
+from distill.local_vision import LocalVisionResult, _redact_result_fields
 from distill.progress import ProgressReporter
 from distill.redact_secrets import redact_text
 from distill.render import frames_are_useless, render_markdown, transcript_is_empty
+
+
+def test_all_vision_fields_are_redacted_not_only_verbatim_text() -> None:
+    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    result = LocalVisionResult(
+        visual_summary=f"summary {secret}",
+        detected_elements=[f"element {secret}"],
+        interpretation=f"interpretation {secret}",
+        uncertainty=f"uncertainty {secret}",
+        backend="rapid-mlx",
+        model="test-model",
+        prompt_profile="technical",
+        verbatim_text=f"verbatim {secret}",
+        text_confidence="high",
+    )
+
+    redacted, _warnings = _redact_result_fields(result)
+
+    assert secret not in redacted.visual_summary
+    assert secret not in redacted.interpretation
+    assert secret not in redacted.uncertainty
+    assert secret not in redacted.verbatim_text
+    assert all(secret not in element for element in redacted.detected_elements)
+    # Non-text metadata is preserved untouched.
+    assert redacted.backend == "rapid-mlx"
+    assert redacted.text_confidence == "high"
 
 
 def test_redacts_env_value_but_not_tutorial_placeholder() -> None:
@@ -32,6 +59,30 @@ def test_env_tutorial_variable_names_are_preserved() -> None:
 def test_confusable_secret_produces_warning() -> None:
     result = redact_text("ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef")
     assert any(item["code"] == "possible_confusable_secret" for item in result.warnings)
+
+
+def test_confusable_secret_is_redacted_not_just_warned() -> None:
+    result = redact_text("ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef")
+    assert "[REDACTED]" in result.text
+    assert "ｓｋ" not in result.text
+    assert result.redaction_count >= 1
+
+
+def test_additional_secret_formats_are_redacted() -> None:
+    google = "AIza" + "a" * 35
+    slack = "xoxb-1234567890abcdef"
+    stripe = "sk_live_0123456789abcdef"
+    jwt = "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12
+    result = redact_text(f"g={google} s={slack} p={stripe} j={jwt}")
+    for secret in (google, slack, stripe, jwt):
+        assert secret not in result.text
+    assert result.redaction_count >= 4
+
+
+def test_lowercase_colon_config_assignment_is_redacted() -> None:
+    result = redact_text("api_key: sk-abcdefghijklmnopqrstuvwxyz")
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in result.text
+    assert "[REDACTED]" in result.text
 
 
 def test_possible_secret_warnings_are_capped_with_aggregate_warning() -> None:

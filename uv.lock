@@ -193,7 +193,7 @@ requires-dist = [
     { name = "imagehash", specifier = ">=4.3.2" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pytesseract", specifier = ">=0.3.13" },
-    { name = "scenedetect", specifier = ">=0.7" },
+    { name = "scenedetect", specifier = ">=0.7,<0.8" },
     { name = "yt-dlp", specifier = ">=2025.10.22" },
 ]
 

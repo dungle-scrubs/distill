@@ -1,8 +1,11 @@
-"""Local vision backend configuration and availability checks for Distill.
+"""Local vision backend configuration, availability checks, and frame interpretation.
 
-This module owns local-only vision provider setup. It does not interpret frames
-or mutate bundle artifacts; pipeline integration calls it to decide whether a
-requested vision pass can run or should degrade to OCR-only output.
+This module owns local-only vision provider setup and the frame-interpretation
+pass: it decides whether a requested vision pass can run (or should degrade to
+OCR-only output), and when it can, ``FrameInterpreter`` reads each frame,
+requests an interpretation, redacts secrets, grounds the result against OCR
+text, and attaches ``visual_interpretation`` / ``visual_confidence`` to the
+frame.
 
 Distill talks to a local Rapid-MLX server directly over its OpenAI-compatible
 HTTP API. The server is assumed to already be running (``rapid-mlx serve
@@ -15,6 +18,7 @@ runtime shim.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import logging
 import os
@@ -301,6 +305,16 @@ def probe_rapid_mlx_availability(
             base_url=config.base_url,
             code="local_vision_rapid_mlx_unavailable",
             message="Rapid-MLX is unavailable for local vision; continuing with OCR-only output. Start it with `rapid-mlx serve <model>`.",
+            detail={"error": str(exc), "url": models_url},
+        )
+    except OSError as exc:
+        return LocalVisionProbe(
+            available=False,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_rapid_mlx_unavailable",
+            message="Rapid-MLX local vision connection dropped during probe; continuing with OCR-only output.",
             detail={"error": str(exc), "url": models_url},
         )
     except (ValueError, RuntimeError) as exc:
@@ -681,10 +695,9 @@ class FrameInterpreter:
         index: int,
         warnings: list[dict[str, str]],
     ) -> None:
-        if self.redact_secrets and result.verbatim_text:
-            redaction = redact_text(result.verbatim_text)
-            result = replace(result, verbatim_text=redaction.text)
-            warnings.extend(redaction.warnings)
+        if self.redact_secrets:
+            result, redaction_warnings = _redact_result_fields(result)
+            warnings.extend(redaction_warnings)
         assessment = assess_grounding(
             ocr_text=ocr_text,
             verbatim_text=result.verbatim_text,
@@ -732,6 +745,37 @@ class FrameInterpreter:
             raise AssertionError("frame index must be within frame_count")
         if "path" not in frame or not str(frame["path"]):
             raise AssertionError(f"frame at index {index} is missing required 'path'")
+
+
+def _redact_result_fields(
+    result: LocalVisionResult,
+) -> tuple[LocalVisionResult, list[dict[str, str]]]:
+    """Redact secrets from every model-produced free-text field.
+
+    The vision model echoes on-screen text into ``verbatim_text`` but also into
+    ``visual_summary``, ``interpretation``, ``uncertainty``, and
+    ``detected_elements``. All of them are persisted into the bundle via
+    ``public_dict()``/the markdown render, so redaction must cover every field,
+    not just ``verbatim_text``.
+    """
+    warnings: list[dict[str, str]] = []
+
+    def _clean(value: str) -> str:
+        if not value:
+            return value
+        redaction = redact_text(value)
+        warnings.extend(redaction.warnings)
+        return redaction.text
+
+    redacted = replace(
+        result,
+        visual_summary=_clean(result.visual_summary),
+        interpretation=_clean(result.interpretation),
+        uncertainty=_clean(result.uncertainty),
+        verbatim_text=_clean(result.verbatim_text),
+        detected_elements=[_clean(item) for item in result.detected_elements],
+    )
+    return redacted, warnings
 
 
 def _interpret_with_rapid_mlx(
@@ -786,6 +830,13 @@ def _interpret_with_rapid_mlx(
             raise LocalVisionFailure(
                 "local_vision_rapid_mlx_unavailable",
                 "Rapid-MLX local vision target was unreachable during generation; continuing with OCR-only output.",
+                {"error": str(exc), "url": completions_url},
+            ) from exc
+        except OSError as exc:
+            # e.g. ConnectionResetError while reading the response body.
+            raise LocalVisionFailure(
+                "local_vision_rapid_mlx_unavailable",
+                "Rapid-MLX local vision connection dropped during generation; continuing with OCR-only output.",
                 {"error": str(exc), "url": completions_url},
             ) from exc
         except (ValueError, RuntimeError) as exc:
@@ -890,6 +941,10 @@ def _urlopen_json(method: str, url: str, body: dict[str, Any] | None, timeout_se
         # the probe/interpret paths can map them onto warning codes.
         detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail[:200]}") from exc
+    except http.client.IncompleteRead as exc:
+        # A server that closes the connection mid-body (crash/restart) yields a
+        # truncated read; treat it as a malformed response so we degrade cleanly.
+        raise RuntimeError(f"incomplete response from {url}: {exc}") from exc
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:

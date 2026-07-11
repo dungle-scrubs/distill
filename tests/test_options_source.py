@@ -8,12 +8,13 @@ from pathlib import Path
 import pytest
 
 from distill.errors import DistillError
-from distill.options import DistillOptions
+from distill.options import OPTION_DEFAULTS, DistillOptions
 from distill.progress import ProgressReporter
 from distill.source import (
     CONTENT_HASH_LIMIT_BYTES,
     YoutubeDownloader,
     YouTubeMetadata,
+    _ytdlp_command,
     local_fingerprint,
     normalize_youtube_url,
     parse_byte_amount,
@@ -25,6 +26,36 @@ from distill.source import (
     youtube_lock_key,
     youtube_source_info,
 )
+
+
+def test_ytdlp_command_guards_against_argument_injection() -> None:
+    command = _ytdlp_command(["--skip-download", "--dump-json"], "--config-location=/etc/evil")
+    # The URL sits after a literal `--`, so a value beginning with `-` cannot be
+    # parsed as a yt-dlp option, and a socket timeout bounds a stalled connection.
+    assert command[-2:] == ["--", "--config-location=/etc/evil"]
+    assert "--socket-timeout" in command
+
+
+def test_non_youtube_host_is_rejected_before_download() -> None:
+    with pytest.raises(DistillError) as exc:
+        parse_youtube_url("https://evil.example.com/watch?v=abc")
+    assert exc.value.code == "E_BAD_URL"
+
+
+def test_non_positive_max_static_window_is_rejected() -> None:
+    for bad in (0.0, -5.0):
+        with pytest.raises(DistillError) as exc:
+            DistillOptions.from_args({"max_static_window_sec": bad})
+        assert exc.value.code == "E_BAD_OPTIONS"
+        assert "max_static_window_sec" in exc.value.message
+
+
+def test_dataclass_defaults_match_option_specs() -> None:
+    # Guards against the two default tables (OPTION_SPECS and the dataclass
+    # fields) drifting apart.
+    defaults = DistillOptions()
+    for name, expected in OPTION_DEFAULTS.items():
+        assert getattr(defaults, name) == expected, name
 
 
 def test_local_opts_hash_includes_cache_mode_but_youtube_excludes_it() -> None:

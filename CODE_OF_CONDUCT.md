@@ -46,7 +46,7 @@ when an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the repository maintainers at **kevin@kevinpurdy.com**.
+reported to the repository maintainers at **kevinfrilot@icloud.com**.
 
 All complaints will be reviewed and investigated promptly and fairly.
 

@@ -14,6 +14,9 @@ from .errors import warning
 from .progress import ProgressCounter, ProgressReporter
 
 PHASH_DISTANCE_THRESHOLD = 10
+# Wall-clock ceiling for a single ffmpeg frame grab so a wedged decode cannot
+# hang the whole run.
+FRAME_EXTRACT_TIMEOUT_SEC = 120.0
 
 
 def scene_midpoint_candidates(video_path: Path, duration_sec: float) -> list[float]:
@@ -79,22 +82,37 @@ def filtered_candidates(
 def extract_frame(
     video_path: Path, timestamp_sec: float, output_path: Path
 ) -> dict[str, str] | None:
-    proc = subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            f"{timestamp_sec:.3f}",
-            "-i",
-            str(video_path),
-            "-frames:v",
-            "1",
-            str(output_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{timestamp_sec:.3f}",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                str(output_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=FRAME_EXTRACT_TIMEOUT_SEC,
+        )
+    except FileNotFoundError:
+        # ffmpeg not installed: degrade to no-frame rather than crashing the run.
+        return warning(
+            "frames",
+            "ffmpeg_missing",
+            "ffmpeg is not installed; skipping keyframe extraction",
+        )
+    except subprocess.TimeoutExpired:
+        return warning(
+            "frames",
+            "frame_extract_timeout",
+            f"ffmpeg timed out extracting frame at {timestamp_sec:.3f}s",
+        )
     if proc.returncode != 0:
         return warning(
             "frames",

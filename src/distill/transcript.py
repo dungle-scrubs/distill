@@ -89,12 +89,16 @@ def extract_audio(
         command.extend(["-progress", "pipe:2"])
     command.append(str(audio_path))
 
-    proc = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        # ffmpeg not installed: degrade to no-transcript rather than crashing.
+        return warning("transcript", "audio_extract_failed", "ffmpeg is not installed")
     stderr_lines: list[str] = []
     if proc.stderr:
         for line in proc.stderr:

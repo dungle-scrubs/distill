@@ -30,14 +30,23 @@ CONFUSABLES = str.maketrans(
     }
 )
 SECRET_PATTERNS = [
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bghp_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),  # OpenAI-style
+    re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{10,}\b"),  # Stripe
+    re.compile(r"\bghp_[A-Za-z0-9_]{20,}\b"),  # GitHub PAT (classic)
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),  # GitHub PAT (fine-grained)
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),  # Google API key
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),  # Slack token
+    re.compile(  # JWT (header.payload.signature)
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+    ),
+    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),  # generic base64 blob
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id
 ]
+# Config-style assignments: case-insensitive, and either `=` or `:` separated,
+# so `API_KEY=...`, `api_key: ...`, and `access-token = ...` are all caught.
 ENV_ASSIGNMENT_RE = re.compile(
-    r"(?P<name>[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))\s*=\s*(?P<value>[^\s#]+)"
+    r"(?P<name>[A-Za-z][A-Za-z0-9_-]*(?:KEY|TOKEN|SECRET|PASSWORD))\s*[:=]\s*(?P<value>[^\s#]+)",
+    re.IGNORECASE,
 )
 TUTORIAL_PLACEHOLDERS = {
     "your_key_here",
@@ -82,9 +91,17 @@ def redact_text(text: str, max_possible_secret_warnings: int = 10) -> RedactionR
 
     normalized = normalize_confusables(text)
     if normalized != text:
+        # CONFUSABLES maps single char -> single char, so match offsets in the
+        # normalized string line up 1:1 with the raw text. Redact the raw slice
+        # (not just warn) so obfuscated secrets do not survive into the bundle.
         possible_matches: list[str] = []
         for pattern in SECRET_PATTERNS:
-            possible_matches.extend(pattern.findall(normalized))
+            for match in pattern.finditer(normalized):
+                possible_matches.append(match.group(0))
+                original_slice = text[match.start() : match.end()]
+                if original_slice and original_slice in redacted:
+                    count += redacted.count(original_slice)
+                    redacted = redacted.replace(original_slice, "[REDACTED]")
         capped = possible_matches[:max_possible_secret_warnings]
         for _match in capped:
             warnings.append(

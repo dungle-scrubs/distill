@@ -65,9 +65,8 @@ override with `--output-dir`.
 
 ## Commands
 
-`distill` exposes the following subcommands. All print JSON to stdout (except
-`list-tools`, which prints a JSON document); fatal errors print a JSON error
-object to stderr and exit with code 2.
+`distill` exposes the following subcommands. All print JSON to stdout on
+success; fatal errors print a JSON error object to stderr and exit with code 2.
 
 | Command | Purpose |
 | --- | --- |
@@ -148,4 +147,4 @@ is gated behind `DISTILL_RUN_RAPID_MLX_SMOKE=1`.
 
 ## License
 
-[MIT](LICENSE) © Kevin Purdy and Distill contributors.
+[MIT](LICENSE) © Kevin Frilot and Distill contributors.

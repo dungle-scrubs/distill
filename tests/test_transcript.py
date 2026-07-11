@@ -4,11 +4,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from distill import transcript
 from distill.progress import ProgressReporter
 from distill.transcript import (
     extract_audio,
     parse_ffmpeg_progress_time,
     transcribe_audio,
+    transcribe_video,
 )
 
 
@@ -179,3 +183,107 @@ def test_transcription_progress_uses_segment_end_over_duration(tmp_path: Path) -
         event for event in progress.events if event.mechanism == "transcription"
     ]
     assert transcription_events[-1].percent == 50.0
+
+
+def test_faster_whisper_missing_degrades_without_adapter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"wav")
+
+    def _raise(_model_name: str) -> object:
+        raise ImportError("faster-whisper is not installed")
+
+    monkeypatch.setattr(transcript, "FasterWhisperAdapter", _raise)
+
+    result, warnings = transcribe_audio(audio, "small", "en", True)
+
+    assert result is None
+    assert warnings == [
+        {
+            "stage": "transcript",
+            "code": "faster_whisper_missing",
+            "message": "faster-whisper is not installed",
+        }
+    ]
+
+
+def test_whisper_failure_is_caught_as_warning(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"wav")
+
+    class FailingAdapter:
+        def transcribe(self, *_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+            raise RuntimeError("model exploded")
+
+    result, warnings = transcribe_audio(audio, "small", "en", True, adapter=FailingAdapter())
+
+    assert result is None
+    assert warnings[0]["code"] == "whisper_failed"
+    assert "model exploded" in warnings[0]["message"]
+
+
+def test_low_confidence_segments_are_dropped_with_warning(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"wav")
+
+    class MixedAdapter:
+        def transcribe(self, *_args: Any, **_kwargs: Any) -> tuple[list[FakeSegment], FakeInfo]:
+            return (
+                [
+                    FakeSegment(0.0, 1.0, "kept", avg_logprob=-0.2, words=[]),
+                    FakeSegment(1.0, 2.0, "dropped", avg_logprob=-1.5, words=[]),
+                ],
+                FakeInfo(),
+            )
+
+    transcript_result, warnings = transcribe_audio(
+        audio, "small", "en", True, adapter=MixedAdapter()
+    )
+
+    assert transcript_result is not None
+    assert [segment["text"] for segment in transcript_result["segments"]] == ["kept"]
+    assert any(
+        w["code"] == "low_confidence_segments_dropped" and "dropped 1" in w["message"]
+        for w in warnings
+    )
+
+
+def test_extract_audio_degrades_when_ffmpeg_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _missing(*_args: Any, **_kwargs: Any) -> object:
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr("distill.transcript.subprocess.Popen", _missing)
+
+    result = extract_audio(tmp_path / "video.mp4", tmp_path / "audio.wav")
+
+    assert result == {
+        "stage": "transcript",
+        "code": "audio_extract_failed",
+        "message": "ffmpeg is not installed",
+    }
+
+
+def test_transcribe_video_returns_audio_warning_without_transcribing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    audio_warning = {
+        "stage": "transcript",
+        "code": "audio_extract_failed",
+        "message": "ffmpeg is not installed",
+    }
+    monkeypatch.setattr(transcript, "extract_audio", lambda *_a, **_k: audio_warning)
+
+    def _should_not_run(*_a: Any, **_k: Any) -> tuple[Any, Any]:
+        raise AssertionError("transcription must not run after an audio-extract failure")
+
+    monkeypatch.setattr(transcript, "transcribe_audio", _should_not_run)
+
+    result, warnings = transcribe_video(
+        tmp_path / "video.mp4", tmp_path, "small", "en", True
+    )
+
+    assert result is None
+    assert warnings == [audio_warning]

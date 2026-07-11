@@ -15,6 +15,7 @@ from distill.bundle import (
 from distill.errors import DistillError
 from distill.options import DistillOptions
 from distill.source import SourceInfo
+from distill.version import PIPELINE_VERSION
 
 
 def source(tmp_path: Path) -> SourceInfo:
@@ -142,7 +143,7 @@ def test_response_shape(tmp_path: Path) -> None:
     assert response["transcript_path"].endswith("transcript.json")
     assert response["manifest_path"].endswith("_manifest.json")
     assert response["cached"] is False
-    assert response["pipeline_version"] == 19
+    assert response["pipeline_version"] == PIPELINE_VERSION
 
 
 def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> None:

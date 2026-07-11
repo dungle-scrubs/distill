@@ -51,19 +51,23 @@ Land changes directly on `main`; keep the working tree green (`uv run pytest`).
 
 ## Pipeline signature
 
-`src/distill/version.py` carries `PIPELINE_VERSION` and `PIPELINE_SIGNATURE`
-(hash of output-affecting modules). Any change to `local_vision.py`,
-`options.py`, `pipeline.py`, or the other signed modules requires bumping the
-version and recomputing the signature so `test_pipeline_signature` stays green.
-To recompute:
+`src/distill/version.py` carries `PIPELINE_VERSION`, `PIPELINE_SIGNATURE`
+(hash of output-affecting modules), and `SIGNED_MODULES` (the single source of
+truth for which modules are signed). Any change to `local_vision.py`,
+`options.py`, `pipeline.py`, or the other signed modules requires **both**
+recomputing `PIPELINE_SIGNATURE` **and** bumping `PIPELINE_VERSION` (then
+appending the new `signature: version` pair to
+`tests/pipeline_signature_history.json`) so `test_pipeline_signature` stays
+green. To recompute the signature:
 
 ```bash
 uv run python -c "
 import hashlib
 from pathlib import Path
+from distill.version import SIGNED_MODULES
 scripts = Path('src/distill')
 digest = hashlib.sha256()
-for name in ['redact_secrets.py','frame_selection.py','transcript.py','ocr.py','bundle.py','links.py','options.py','local_vision.py','vision_prompts.py','grounding.py','pipeline.py']:
+for name in SIGNED_MODULES:
     digest.update((scripts / name).read_bytes())
 print(digest.hexdigest())
 "

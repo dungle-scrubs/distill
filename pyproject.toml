@@ -7,7 +7,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 authors = [
-    { name = "Kevin Purdy" },
+    { name = "Kevin Frilot" },
 ]
 keywords = ["video", "transcription", "ocr", "vision-language-model", "mlx", "llm", "keyframes", "whisper"]
 classifiers = [
@@ -28,7 +28,9 @@ dependencies = [
     "imagehash>=4.3.2",
     "pillow>=10.0.0",
     "pytesseract>=0.3.13",
-    "scenedetect>=0.7",
+    # Cap the pre-1.0 scenedetect: 0.x can break API/behavior on a minor bump.
+    # yt-dlp is intentionally uncapped — it must stay current for extraction.
+    "scenedetect>=0.7,<0.8",
     "yt-dlp>=2025.10.22",
 ]
 

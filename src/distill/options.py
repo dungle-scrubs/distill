@@ -10,7 +10,14 @@ from typing import Any
 from uuid import uuid4
 
 from .errors import DistillError
-from .local_vision import LocalVisionConfig, local_vision_config_from_args
+from .local_vision import (
+    DEFAULT_LOCAL_VISION_BACKEND,
+    DEFAULT_LOCAL_VISION_BASE_URL,
+    DEFAULT_LOCAL_VISION_MODEL,
+    DEFAULT_TIMEOUT_SEC,
+    LocalVisionConfig,
+    local_vision_config_from_args,
+)
 from .version import PIPELINE_VERSION
 
 DEFAULT_MAX_DURATION_SEC = 7200.0
@@ -115,10 +122,10 @@ class DistillOptions:
     output_dir: str | None = None
     force_reprocess: bool = False
     caption_frames: bool = True
-    local_vision_backend: str = "rapid-mlx"
-    local_vision_model: str = "mlx-community/Qwen3-VL-8B-Instruct-8bit"
-    local_vision_base_url: str = "http://127.0.0.1:8000/v1"
-    local_vision_timeout_sec: float = 30.0
+    local_vision_backend: str = DEFAULT_LOCAL_VISION_BACKEND
+    local_vision_model: str = DEFAULT_LOCAL_VISION_MODEL
+    local_vision_base_url: str = DEFAULT_LOCAL_VISION_BASE_URL
+    local_vision_timeout_sec: float = DEFAULT_TIMEOUT_SEC
     job_id: str = ""
     resume_partial: bool = True
 
@@ -171,6 +178,10 @@ class DistillOptions:
             raise DistillError("E_BAD_OPTIONS", "options", "min_interval_sec must be >= 0")
         if options.max_duration_sec <= 0:
             raise DistillError("E_BAD_OPTIONS", "options", "max_duration_sec must be positive")
+        if options.max_static_window_sec <= 0:
+            raise DistillError(
+                "E_BAD_OPTIONS", "options", "max_static_window_sec must be positive"
+            )
         if options.local_vision_backend != "rapid-mlx":
             raise DistillError(
                 "E_BAD_OPTIONS",
