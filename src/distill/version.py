@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-PIPELINE_VERSION = 20
+PIPELINE_VERSION = 21
 DISTILL_VERSION = "0.1.0"
 
 # Output-affecting source files covered by PIPELINE_SIGNATURE. This is the single
@@ -26,4 +26,4 @@ SIGNED_MODULES = (
 )
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "be83164da16d1fb7ea0bdcfed72080e3d7a2ac4ca6ec55fcfe2930b5d869cdec"
+PIPELINE_SIGNATURE = "c2c65ae6fff4bdf23988c29cac02e16ff630bfc608fdda5bd00a1c1bf0419628"

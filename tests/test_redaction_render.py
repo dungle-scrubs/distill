@@ -85,6 +85,32 @@ def test_lowercase_colon_config_assignment_is_redacted() -> None:
     assert "[REDACTED]" in result.text
 
 
+def test_bare_and_camelcase_secret_assignments_are_redacted() -> None:
+    for text in (
+        "password: hunter2length",
+        "secret: topsecretvalue",
+        "apiKey: abcdefghijklmnop",
+        "access-token: abcdefghijklmnop",
+    ):
+        result = redact_text(text)
+        assert "[REDACTED]" in result.text, text
+        assert result.redaction_count >= 1, text
+
+
+def test_ordinary_words_ending_in_a_suffix_are_not_redacted() -> None:
+    # These end in "key" / look assignment-ish but are plain prose, not secrets.
+    for text in (
+        "Turkey: 81 million people",
+        "monkey: a small primate",
+        "Whiskey: 40 percent",
+        "Key: Legend for the chart",
+        "Token: a single sign-in label",
+    ):
+        result = redact_text(text)
+        assert result.text == text, text
+        assert result.redaction_count == 0, text
+
+
 def test_possible_secret_warnings_are_capped_with_aggregate_warning() -> None:
     text = " ".join(["ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef"] * 4)
     result = redact_text(text, max_possible_secret_warnings=2)

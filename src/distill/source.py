@@ -364,11 +364,20 @@ def normalize_youtube_url(url: str) -> str:
     return urlunparse(parsed._replace(query=new_query, fragment=fragment))
 
 
+def ensure_youtube_host(url: str) -> None:
+    """Reject non-YouTube hosts (and option-injection values) before yt-dlp runs.
+
+    Playlist/channel URLs carry no video id, so this host-only check is the guard
+    the playlist path uses in place of ``parse_youtube_url``.
+    """
+    if urlparse(url).netloc.lower() not in YOUTUBE_HOSTS:
+        raise DistillError("E_BAD_URL", "youtube", "only YouTube URLs are supported", {"url": url})
+
+
 def parse_youtube_url(url: str) -> str:
+    ensure_youtube_host(url)
     parsed = urlparse(url)
     host = parsed.netloc.lower()
-    if host not in YOUTUBE_HOSTS:
-        raise DistillError("E_BAD_URL", "youtube", "only YouTube URLs are supported")
     if host == "youtu.be":
         video_id = parsed.path.strip("/").split("/")[0]
     elif any(parsed.path.startswith(prefix) for prefix in ("/shorts/", "/embed/", "/live/", "/v/")):

@@ -42,11 +42,19 @@ SECRET_PATTERNS = [
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),  # generic base64 blob
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id
 ]
-# Config-style assignments: case-insensitive, and either `=` or `:` separated,
-# so `API_KEY=...`, `api_key: ...`, and `access-token = ...` are all caught.
+# Config-style assignments: `API_KEY=...`, `api_key: ...`, `access-token = ...`,
+# `apiKey: ...`, and bare `password: ...` / `secret: ...`. The name must be a
+# compound identifier (a `_`/`-` separator or a camelCase boundary right before
+# the suffix) or one of the two strong bare words, so ordinary words that merely
+# end in a suffix ("monkey", "Turkey", a chart legend "Key:") are NOT treated as
+# assignments and their text is left intact.
+_SECRET_NAME = (
+    r"[A-Za-z0-9][A-Za-z0-9_-]*[_-](?i:key|token|secret|password)"  # separator: API_KEY, access-token
+    r"|[a-z0-9]+(?:Key|Token|Secret|Password)"  # camelCase: apiKey
+    r"|(?i:password|secret)"  # bare strong word
+)
 ENV_ASSIGNMENT_RE = re.compile(
-    r"(?P<name>[A-Za-z][A-Za-z0-9_-]*(?:KEY|TOKEN|SECRET|PASSWORD))\s*[:=]\s*(?P<value>[^\s#]+)",
-    re.IGNORECASE,
+    rf"(?P<name>\b(?:{_SECRET_NAME}))\s*[:=]\s*(?P<value>[^\s#]+)"
 )
 TUTORIAL_PLACEHOLDERS = {
     "your_key_here",

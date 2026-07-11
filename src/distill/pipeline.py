@@ -489,14 +489,11 @@ def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
-    import subprocess
+    from .source import _run_ytdlp
 
-    proc = subprocess.run(
-        ["yt-dlp", "--flat-playlist", "--print", "webpage_url", url],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    # _run_ytdlp adds `--socket-timeout`, a `--` terminator before the URL, and
+    # maps a missing/hung yt-dlp onto clean errors.
+    proc = _run_ytdlp(["--flat-playlist", "--print", "webpage_url"], url)
     if proc.returncode != 0:
         raise DistillError(
             "E_YTDLP",
@@ -519,6 +516,10 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
     url = normalize_youtube_url(str(args.get("url", "")))
     if not url:
         raise DistillError("E_BAD_URL", "youtube", "url is required")
+    from .source import ensure_youtube_host
+
+    # Reject non-YouTube hosts / option-injection values before any yt-dlp call.
+    ensure_youtube_host(url)
     options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
     root = validate_output_root(options.output_dir)
     playlist_root = root / "playlists" / playlist_folder_name(url)

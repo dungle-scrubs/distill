@@ -42,6 +42,42 @@ def test_non_youtube_host_is_rejected_before_download() -> None:
     assert exc.value.code == "E_BAD_URL"
 
 
+def test_ensure_youtube_host_rejects_injection_and_foreign_hosts() -> None:
+    from distill.source import ensure_youtube_host
+
+    for bad in ("--exec=touch /tmp/pwned", "-J", "https://evil.example.com/playlist?list=x"):
+        with pytest.raises(DistillError) as exc:
+            ensure_youtube_host(bad)
+        assert exc.value.code == "E_BAD_URL"
+    # A real playlist URL (no video id) passes the host-only check.
+    ensure_youtube_host("https://www.youtube.com/playlist?list=PLabc")
+
+
+def test_playlist_listing_uses_guarded_ytdlp_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    from distill import source
+    from distill.pipeline import youtube_playlist_urls
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        return subprocess.CompletedProcess(command, 0, "https://youtu.be/aaa\n", "")
+
+    monkeypatch.setattr(source.subprocess, "run", fake_run)
+
+    urls = youtube_playlist_urls("https://www.youtube.com/playlist?list=PLabc", 10)
+
+    assert urls == ["https://youtu.be/aaa"]
+    command = captured["command"]
+    # URL sits after a literal `--`, and yt-dlp gets a socket timeout.
+    assert command[-2:] == ["--", "https://www.youtube.com/playlist?list=PLabc"]
+    assert "--socket-timeout" in command
+
+
 def test_non_positive_max_static_window_is_rejected() -> None:
     for bad in (0.0, -5.0):
         with pytest.raises(DistillError) as exc:
