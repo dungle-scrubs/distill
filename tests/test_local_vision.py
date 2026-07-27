@@ -19,6 +19,7 @@ from distill.local_vision import (
     LocalVisionProbe,
     LocalVisionResult,
     _interpret_with_rapid_mlx,
+    config_dir,
     load_local_vision_config,
     local_vision_config_from_args,
     parse_interpretation_json,
@@ -105,7 +106,7 @@ def test_local_vision_config_loads_from_config_dir(
             }
         )
     )
-    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
 
     options = DistillOptions.from_args({})
 
@@ -114,6 +115,14 @@ def test_local_vision_config_loads_from_config_dir(
     assert options.local_vision_model == "qwen3-vl:32b"
     assert options.local_vision_base_url == "http://127.0.0.1:9000/v1"
     assert options.local_vision_timeout_sec == 12.0
+
+    monkeypatch.delenv("DISTILL_CONFIG_DIR")
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
+
+    options_with_generic_config_dir = DistillOptions.from_args({})
+
+    assert options_with_generic_config_dir.local_vision_model == DEFAULT_MODEL
+    assert options_with_generic_config_dir.local_vision_base_url == DEFAULT_LOCAL_VISION_BASE_URL
 
 
 def test_nested_distill_config_is_supported(tmp_path: Path) -> None:
@@ -233,6 +242,54 @@ def test_non_rapid_mlx_backend_is_rejected_by_options() -> None:
         DistillOptions.from_args({"local_vision_backend": "ollama"})
 
 
+def test_config_dir_env_overrides_a_config_planted_under_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Hermeticity: the autouse fixture's DISTILL_CONFIG_DIR beats the real HOME.
+
+    The suite pins DISTILL_CONFIG_DIR at an empty throwaway directory precisely so
+    a developer's ~/.distill config cannot steer a test run. This asserts that
+    precedence explicitly - DEFAULT_MODEL alone would be true for the wrong reason.
+    """
+    home_config_dir = tmp_path / ".distill"
+    home_config_dir.mkdir()
+    (home_config_dir / "distill.local-vision.json").write_text(
+        json.dumps({"model": "mlx-community/non-default-model"})
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    hermetic_config_dir = Path(os.environ["DISTILL_CONFIG_DIR"])
+
+    assert hermetic_config_dir != home_config_dir
+    assert config_dir() == hermetic_config_dir
+    assert DistillOptions.from_args({}).local_vision_model == DEFAULT_MODEL
+
+
+def test_config_dir_falls_back_to_home_when_env_var_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The HOME fallback the hermeticity fixture deliberately overrides still works.
+
+    Without DISTILL_CONFIG_DIR, ``config_dir()`` resolves ``~/.distill``, so a
+    config living there is read. This is the assertion that catches a regression
+    in the fallback; the hermeticity test above cannot, because its env var wins.
+    """
+    home_config_dir = tmp_path / ".distill"
+    home_config_dir.mkdir()
+    configured_model = "mlx-community/non-default-model"
+    assert configured_model != DEFAULT_MODEL
+    (home_config_dir / "distill.local-vision.json").write_text(
+        json.dumps({"model": configured_model})
+    )
+    monkeypatch.delenv("DISTILL_CONFIG_DIR")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert config_dir() == home_config_dir
+    assert DistillOptions.from_args({}).local_vision_model == configured_model
+
+
 def test_local_vision_diagnostics_describe_rapid_mlx(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -250,8 +307,10 @@ def test_local_vision_diagnostics_describe_rapid_mlx(
     monkeypatch.setattr("distill.pipeline.probe_local_vision", fake_probe)
 
     diagnostics = local_vision_diagnostics({})
+    options = DistillOptions.from_args({})
 
     assert diagnostics["setup_command"] == f"rapid-mlx serve {DEFAULT_MODEL}"
+    assert options.local_vision_model == DEFAULT_MODEL
     assert "127.0.0.1:8000" in diagnostics["rapid_mlx_note"]
     assert diagnostics["probe"]["backend"] == "rapid-mlx"
     assert "release_warning" not in diagnostics
