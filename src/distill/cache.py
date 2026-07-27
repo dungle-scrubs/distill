@@ -1,11 +1,25 @@
-"""Distill cache maintenance API."""
+"""The `cleanup-cache` tool's adapter onto **prune**.
+
+This module owns one thing: the argument and payload shape the public
+`cleanup_cache` tool has always had, expressed over `BundleStore.plan_prune` and
+`BundleStore.apply_prune`. The command keeps its name (D-042) while the
+vocabulary underneath it is **prune**.
+
+It owns no policy of its own. Which **generations** survive, which bundles
+expire, what counts as a live run and what may be deleted at all are decided in
+`bundle_store` - this module only turns a tool call into a `PrunePolicy` and a
+plan or an outcome back into JSON. Placing any rule here is what produced the
+duplicate, weaker prune the audit found.
+
+M3.6 migrates the caller onto the store directly and deletes this file.
+"""
 
 from __future__ import annotations
 
-import shutil
-import time
 from pathlib import Path
 from typing import Any
+
+from .bundle_store import BundleStore, PrunePolicy
 
 
 def cleanup_cache(
@@ -15,44 +29,37 @@ def cleanup_cache(
     keep_generations: int,
     dry_run: bool,
 ) -> dict[str, Any]:
-    """Prune old bundle generations and stale bundles from the cache root."""
+    """Prune the cache under `root`, or report what pruning would remove.
+
+    `dry_run` is the plan alone: a `PrunePlan` is advisory (D-023), so producing
+    one and not applying it is exactly what a preview is, and there is no second
+    code path whose answer could differ from what a real run would do.
+
+    The payload reports what was skipped and how many directories were
+    considered alongside what was deleted, so an empty result says which kind of
+    empty it is (R-57).
+    """
     root.mkdir(parents=True, exist_ok=True)
-    cutoff = time.time() - (max_age_days * 86400) if max_age_days is not None else None
-    candidates: list[Path] = []
-    markdown_names: tuple[str, ...] = ("video.md",)
-
-    for bundle in root.iterdir():
-        if not bundle.is_dir() or bundle.name.startswith("_"):
-            continue
-        generations = sorted(
-            [path for path in bundle.glob("g*") if path.is_dir() and path.name[1:].isdigit()],
-            key=lambda path: int(path.name[1:]),
-        )
-        for old_generation in generations[: max(0, len(generations) - keep_generations)]:
-            candidates.append(old_generation)
-        if cutoff is not None:
-            marker_mtime = bundle.stat().st_mtime
-            manifest = bundle / "_manifest.json"
-            if manifest.exists():
-                marker_mtime = manifest.stat().st_mtime
-            has_bundle = any(
-                (gen / name).exists() for gen in generations for name in markdown_names
-            )
-            if has_bundle and marker_mtime < cutoff:
-                candidates.append(bundle)
-
-    unique_candidates = sorted(set(candidates), key=lambda path: str(path))
-    deleted: list[str] = []
-    for candidate in unique_candidates:
-        if not dry_run and candidate.exists():
-            shutil.rmtree(candidate)
-            deleted.append(str(candidate))
-
-    return {
-        "root": str(root),
+    store = BundleStore.open(root)
+    plan = store.plan_prune(
+        PrunePolicy(keep_generations=keep_generations, max_age_days=max_age_days)
+    )
+    payload: dict[str, Any] = {
+        "root": str(store.root),
         "dry_run": dry_run,
-        "candidate_count": len(unique_candidates),
-        "deleted_count": len(deleted),
-        "candidates": [str(path) for path in unique_candidates],
-        "deleted": deleted,
+        "candidate_count": len(plan.targets),
+        "candidates": [str(target.path) for target in plan.targets],
+        "considered": plan.considered,
+        "skipped": [skip.to_dict() for skip in plan.skipped],
+        "skipped_count": len(plan.skipped),
+    }
+    if dry_run:
+        return {**payload, "deleted_count": 0, "deleted": [], "results": []}
+
+    outcome = store.apply_prune(plan)
+    return {
+        **payload,
+        "deleted_count": len(outcome.deleted),
+        "deleted": [str(path) for path in outcome.deleted],
+        "results": [result.to_dict() for result in outcome.results],
     }

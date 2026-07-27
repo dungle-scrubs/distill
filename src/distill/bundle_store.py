@@ -48,9 +48,27 @@ read by other processes and are written by atomic replace, while **stage
 results** are written into a **staging directory** held under the run lock,
 which nothing else may read, and are ordinary writes.
 
-Milestone note: the prune surface is declared here as the interface M3.4 fills
-in. It raises `NotImplementedError` rather than being omitted, so callers
-migrate onto one shape once.
+**Prune** is two operations, not one (D-018). *Generation retention* keeps the
+newest `keep_generations` **generations** of a bundle and never proposes the
+**active generation** at any value - the old code kept `len - keep_generations`
+oldest as candidates, so `keep_generations=0` proposed every generation
+including the active one and wiped a bundle a reader was entitled to (finding
+2). *Bundle expiry* removes an entire aged bundle, active generation included.
+Collapsing them is what made the critical finding possible: "never delete the
+active generation" is retention's rule, and expiry's whole purpose is to delete
+a bundle outright.
+
+A `PrunePlan` is advisory and the revalidation `apply_prune` performs under each
+target's lock is authoritative (D-023, R-10). Nothing else can make prune safe
+against a concurrent run: a plan is computed by walking a tree no lock covers,
+so by the time it is applied a run may have published into a bundle the plan
+proposed. Applying re-derives the same decision under the lock and deletes only
+what the re-derivation still proposes, which is why a **generation** that became
+active between the two steps survives (RV-1).
+
+What prune does not own: whether Distill may write under a root at all
+(`source.validate_output_root`), and what the CLI calls this - the public
+command stays `cleanup-cache` (D-042) while the vocabulary here is **prune**.
 """
 
 from __future__ import annotations
@@ -60,12 +78,13 @@ import fcntl
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -172,9 +191,42 @@ _LOCK_HELD_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 failure. Every other errno says this filesystem cannot give Distill the
 exclusion it asked for, and is fatal (R-09)."""
 
+DEFAULT_KEEP_GENERATIONS = 3
+"""How many **generations** of a bundle retention keeps when nobody says."""
+
+SECONDS_PER_DAY = 86400.0
+
+PRUNE_MAX_DEPTH = 6
+"""How deep prune walks looking for nested bundle roots (R-05).
+
+Bundles nest because a playlist run gives each item its own output root under
+`playlists/<playlist>/`, which is two levels below the root the user names - a
+walk of the top level alone never sees them, and they were unprunable
+(finding 17). The walk is bounded because the root is a directory a user chose:
+prune stops descending rather than walking an arbitrarily deep tree that has
+nothing to do with Distill, and reports the directories it stopped at.
+"""
+
 BUNDLE_EVENT_TYPE = "distill.bundle"
 
 MarkerKind = Literal["published", "owned", "foreign", "invalid", "absent"]
+
+PruneKind = Literal["bundle", "generation", "staging"]
+"""What a prune target is on disk: a whole **bundle**, one **generation**, or one
+**staging directory**."""
+
+PruneRule = Literal["retention", "expiry", "orphan", "staging"]
+"""Which rule proposed a target.
+
+`retention` and `expiry` are the two operations of D-018 and are never the same
+one: retention is governed by `keep_generations` and never proposes the **active
+generation**; expiry is governed by `max_age_days` and removes a whole bundle
+including its active generation. `orphan` is a **generation** nothing can serve
+because no **manifest** names it, and `staging` is scratch left by a run that is
+not live.
+"""
+
+PruneVerdict = Literal["deleted", "skipped"]
 
 
 def _bundle_log(event: str, **detail: Any) -> None:
@@ -338,6 +390,170 @@ class BundleLock:
 
 
 @dataclass(frozen=True)
+class PrunePolicy:
+    """How much of a **bundle** prune is allowed to reclaim.
+
+    Validated on construction rather than at the call site (R-03), so a policy
+    that exists is a policy that means something: `keep_generations=0` is the
+    input that wiped the **active generation** (finding 2), and it is now
+    refused where it is written rather than reinterpreted where it is used.
+    `max_age_days=None` means no **bundle expiry** at all, which is different
+    from an expiry horizon of zero days - that would expire every bundle the
+    moment it was published, and is refused.
+    """
+
+    keep_generations: int = DEFAULT_KEEP_GENERATIONS
+    max_age_days: float | None = None
+
+    def __post_init__(self) -> None:
+        keep = self.keep_generations
+        # bool is an int in Python, and `keep_generations=True` meaning 1 is a
+        # coincidence rather than an intention.
+        if isinstance(keep, bool) or not isinstance(keep, int) or keep < 1:
+            raise DistillError(
+                "E_BAD_OPTIONS",
+                "prune",
+                "keep_generations must be an integer of at least 1",
+                {"keep_generations": repr(keep)},
+            )
+        age = self.max_age_days
+        if age is None:
+            return
+        if isinstance(age, bool) or not isinstance(age, int | float):
+            raise DistillError(
+                "E_BAD_OPTIONS",
+                "prune",
+                "max_age_days must be a finite number greater than 0",
+                {"max_age_days": repr(age)},
+            )
+        if not math.isfinite(float(age)) or float(age) <= 0:
+            raise DistillError(
+                "E_BAD_OPTIONS",
+                "prune",
+                "max_age_days must be a finite number greater than 0",
+                {"max_age_days": repr(age)},
+            )
+
+
+@dataclass(frozen=True)
+class PruneTarget:
+    """One thing prune proposes to remove, and the rule that proposed it."""
+
+    path: Path
+    kind: PruneKind
+    rule: PruneRule
+    bundle_root: Path
+    bundle_key: str
+    reason: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "path": str(self.path),
+            "kind": self.kind,
+            "rule": self.rule,
+            "bundle_key": self.bundle_key,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class PruneSkip:
+    """One directory prune looked at and did not treat as prunable, and why.
+
+    Reported rather than silently passed over, because "prune considered nothing"
+    and "prune deleted nothing" are different answers and a caller that cannot
+    tell them apart cannot tell a healthy cache from a prune that skipped every
+    bundle it found (R-01, R-57).
+    """
+
+    path: Path
+    verdict: str
+    reason: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"path": str(self.path), "verdict": self.verdict, "reason": self.reason}
+
+
+@dataclass(frozen=True)
+class PrunePlan:
+    """What prune proposes to remove. Advisory: `apply_prune` decides (D-023).
+
+    `considered` counts the directories the walk looked at, so an empty plan over
+    a root full of bundles and an empty plan over an empty root are
+    distinguishable.
+    """
+
+    root: Path
+    policy: PrunePolicy
+    targets: tuple[PruneTarget, ...] = ()
+    skipped: tuple[PruneSkip, ...] = ()
+    considered: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "root": str(self.root),
+            "keep_generations": self.policy.keep_generations,
+            "max_age_days": self.policy.max_age_days,
+            "considered": self.considered,
+            "candidate_count": len(self.targets),
+            "candidates": [target.to_dict() for target in self.targets],
+            "skipped_count": len(self.skipped),
+            "skipped": [skip.to_dict() for skip in self.skipped],
+        }
+
+
+@dataclass(frozen=True)
+class PruneResult:
+    """What happened to one proposed target once the lock was held."""
+
+    target: PruneTarget
+    verdict: PruneVerdict
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self.target.to_dict(), "verdict": self.verdict, "reason": self.reason}
+
+
+@dataclass(frozen=True)
+class PruneOutcome:
+    """What prune actually did, per target, including everything it did not do."""
+
+    root: Path
+    results: tuple[PruneResult, ...] = ()
+    skipped: tuple[PruneSkip, ...] = ()
+    considered: int = 0
+
+    @property
+    def deleted(self) -> tuple[Path, ...]:
+        return tuple(result.target.path for result in self.results if result.verdict == "deleted")
+
+    @property
+    def retained(self) -> tuple[PruneResult, ...]:
+        """Targets the revalidation under lock refused to delete after all."""
+        return tuple(result for result in self.results if result.verdict == "skipped")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "root": str(self.root),
+            "considered": self.considered,
+            "deleted_count": len(self.deleted),
+            "deleted": [str(path) for path in self.deleted],
+            "results": [result.to_dict() for result in self.results],
+            "skipped_count": len(self.skipped),
+            "skipped": [skip.to_dict() for skip in self.skipped],
+        }
+
+
+@dataclass
+class _PruneScan:
+    """Mutable accumulator for the walk, so recursion has one place to add to."""
+
+    targets: list[PruneTarget] = field(default_factory=list)
+    skipped: list[PruneSkip] = field(default_factory=list)
+    considered: int = 0
+
+
+@dataclass(frozen=True)
 class BundleStore:
     """Every **bundle** under one output root."""
 
@@ -418,8 +634,7 @@ class BundleStore:
         root is refused here too: a lock file outside the root protects nothing
         that is under it.
         """
-        self.bundle_root(bundle_key)
-        return self.root / LOCK_DIR_NAME / f"{bundle_key}.lock"
+        return prune_lock_path(self.bundle_root(bundle_key))
 
     def begin(
         self,
@@ -584,13 +799,285 @@ class BundleStore:
             manifest=manifest,
         )
 
-    def plan_prune(self, policy: Any) -> Any:
-        """Propose **generations** and bundles to remove. Lands in M3.4."""
-        raise NotImplementedError("BundleStore.plan_prune lands with prune in M3.4")
+    def plan_prune(self, policy: PrunePolicy) -> PrunePlan:
+        """Propose what may be reclaimed under `policy`, deleting nothing.
 
-    def apply_prune(self, plan: Any) -> Any:
-        """Revalidate a plan under lock and delete what survives. Lands in M3.4."""
-        raise NotImplementedError("BundleStore.apply_prune lands with prune in M3.4")
+        The walk descends through directories that are not bundles, so a bundle
+        under a playlist root is subject to the same policy as one at the top
+        level (R-05), and stops at every directory that is one - a **generation**
+        is not a nested bundle. Directories that are neither are reported as
+        skips with the reason they were not treated as bundles (R-01), which is
+        what keeps "considered nothing" distinguishable from "deleted nothing".
+
+        Advisory by construction (D-023): nothing here holds a lock for longer
+        than the liveness probe, so every decision in the returned plan is a
+        decision about a moment that has already passed. `apply_prune` makes it
+        again under the lock.
+        """
+        if not self.root.is_dir():
+            return PrunePlan(root=self.root, policy=policy)
+        scan = _PruneScan()
+        self._scan_directory(self.root, depth=0, policy=policy, now=time.time(), scan=scan)
+        plan = PrunePlan(
+            root=self.root,
+            policy=policy,
+            targets=tuple(scan.targets),
+            skipped=tuple(scan.skipped),
+            considered=scan.considered,
+        )
+        _bundle_log(
+            "prune_planned",
+            root=str(self.root),
+            considered=plan.considered,
+            candidate_count=len(plan.targets),
+            skipped_count=len(plan.skipped),
+        )
+        return plan
+
+    def apply_prune(self, plan: PrunePlan) -> PruneOutcome:
+        """Delete what the plan proposes and the lock still agrees with (R-10).
+
+        Every target is revalidated while its bundle's lock is held, and the
+        revalidation is a full re-derivation rather than a spot check: marker,
+        **active generation**, staging liveness and root confinement all come
+        back out of the same code that produced the plan, so a target the
+        current state would not propose is not deleted whatever the plan says.
+
+        The lock is what makes staging liveness knowable at all (R-06): holding
+        it *is* the proof that the run which wrote a **staging directory** is
+        gone, where a timestamp is only a guess about it. A bundle whose lock
+        another run holds is skipped and reported, never waited for - prune is
+        maintenance, and blocking it behind a 40-minute run buys nothing.
+        """
+        results: list[PruneResult] = []
+        now = time.time()
+        for bundle_root, targets in _grouped_by_bundle(plan.targets):
+            try:
+                # Before the lock path is derived from it, let alone created:
+                # a bundle root outside the output root would put a `_locks`
+                # directory somewhere this store has no business writing, and
+                # every target under it is outside the root by construction.
+                confined_path(bundle_root, self.root)
+            except DistillError:
+                results.extend(
+                    PruneResult(target, "skipped", "target is not confined to the output root")
+                    for target in targets
+                )
+                continue
+            lock_path = prune_lock_path(bundle_root)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock = BundleLock.take(bundle_root.name, lock_path)
+            if lock is None:
+                results.extend(
+                    PruneResult(target, "skipped", "another run holds this bundle key")
+                    for target in targets
+                )
+                continue
+            try:
+                verdict = read_marker(bundle_root)
+                authoritative = self._bundle_targets(
+                    bundle_root, verdict, policy=plan.policy, now=now
+                )
+                allowed = {target.path for target in authoritative}
+                for target in targets:
+                    results.append(self._delete_target(target, verdict, allowed))
+            finally:
+                lock.release()
+
+        for result in results:
+            _bundle_log(
+                f"prune_{result.verdict}",
+                path=str(result.target.path),
+                kind=result.target.kind,
+                rule=result.target.rule,
+                bundle_key=result.target.bundle_key,
+                reason=result.reason,
+            )
+        outcome = PruneOutcome(
+            root=self.root,
+            results=tuple(results),
+            skipped=plan.skipped,
+            considered=plan.considered,
+        )
+        _bundle_log(
+            "prune_applied",
+            root=str(self.root),
+            considered=outcome.considered,
+            deleted_count=len(outcome.deleted),
+            retained_count=len(outcome.retained),
+            skipped_count=len(outcome.skipped),
+        )
+        return outcome
+
+    def _delete_target(
+        self, target: PruneTarget, verdict: MarkerVerdict, allowed: set[Path]
+    ) -> PruneResult:
+        """Remove one target, or say why the state under the lock forbade it."""
+        try:
+            confined_path(target.path, self.root)
+        except DistillError:
+            return PruneResult(target, "skipped", "target is not confined to the output root")
+        if not target.path.exists():
+            return PruneResult(target, "skipped", "target no longer exists")
+        active = active_generation_name(verdict)
+        if active is not None and target.path == target.bundle_root / active:
+            return PruneResult(target, "skipped", "target is now the active generation")
+        if target.path not in allowed:
+            return PruneResult(
+                target,
+                "skipped",
+                f"revalidation under lock no longer proposes this target ({verdict.reason})",
+            )
+        shutil.rmtree(target.path)
+        return PruneResult(target, "deleted", target.reason)
+
+    def _scan_directory(
+        self, directory: Path, *, depth: int, policy: PrunePolicy, now: float, scan: _PruneScan
+    ) -> None:
+        """Walk one level, recording bundles as targets and everything else as skips."""
+        for child in sorted(directory.iterdir()):
+            if child.is_symlink():
+                scan.considered += 1
+                scan.skipped.append(
+                    PruneSkip(child, "symlink", "prune never follows a symlinked directory")
+                )
+                continue
+            if not child.is_dir():
+                continue
+            scan.considered += 1
+            if child.name.startswith(("_", ".")):
+                scan.skipped.append(
+                    PruneSkip(child, "reserved", "reserved name, not a bundle directory")
+                )
+                continue
+            verdict = read_marker(child)
+            if verdict.is_distill_owned:
+                if lock_is_held(child):
+                    scan.skipped.append(
+                        PruneSkip(child, "locked", "another run holds this bundle key")
+                    )
+                    continue
+                scan.targets.extend(self._bundle_targets(child, verdict, policy=policy, now=now))
+                continue
+            scan.skipped.append(PruneSkip(child, verdict.kind, verdict.reason))
+            if verdict.kind != "absent":
+                # A manifest that is unreadable or records another directory's
+                # identity still says Distill is not free to reason about what is
+                # underneath it (R-01).
+                continue
+            if depth + 1 >= PRUNE_MAX_DEPTH:
+                scan.skipped.append(
+                    PruneSkip(child, "too-deep", f"deeper than {PRUNE_MAX_DEPTH} levels")
+                )
+                continue
+            self._scan_directory(child, depth=depth + 1, policy=policy, now=now, scan=scan)
+
+    def _bundle_targets(
+        self,
+        bundle_root: Path,
+        verdict: MarkerVerdict,
+        *,
+        policy: PrunePolicy,
+        now: float,
+    ) -> list[PruneTarget]:
+        """Everything `policy` proposes to remove from one bundle.
+
+        The single derivation both `plan_prune` and `apply_prune` run, which is
+        what makes a stale plan harmless: applying re-derives rather than trusts.
+
+        Liveness is the caller's question, not this one's: the plan probes the
+        lock before asking, and `apply_prune` already holds it - asking again
+        from the process that holds it would be refused by its own hold, and
+        every target would be dropped for the wrong reason.
+        """
+        if not verdict.is_distill_owned:
+            return []
+
+        key = bundle_root.name
+        targets: list[PruneTarget] = []
+        if verdict.kind == "owned":
+            # An ownership marker and no manifest: nothing here has ever been
+            # published, so there is no generation a reader is entitled to and
+            # no manifest that could name one later (RV-9).
+            return [
+                PruneTarget(
+                    path=bundle_root,
+                    kind="bundle",
+                    rule="orphan",
+                    bundle_root=bundle_root,
+                    bundle_key=key,
+                    reason="distill-owned directory has never published a generation",
+                )
+            ]
+
+        if policy.max_age_days is not None:
+            age_sec = now - bundle_mtime(bundle_root)
+            if age_sec > policy.max_age_days * SECONDS_PER_DAY:
+                # Expiry takes the bundle whole, active generation included
+                # (D-018). Retention has nothing left to say about it.
+                return [
+                    PruneTarget(
+                        path=bundle_root,
+                        kind="bundle",
+                        rule="expiry",
+                        bundle_root=bundle_root,
+                        bundle_key=key,
+                        reason=(
+                            f"whole bundle unchanged for {age_sec / SECONDS_PER_DAY:.1f} days, "
+                            f"past the {policy.max_age_days} day horizon"
+                        ),
+                    )
+                ]
+
+        generations = sorted_generations(bundle_root)
+        active = active_generation_name(verdict)
+        if active is not None and (bundle_root / active).is_dir():
+            # Retention: the newest `keep_generations`, and the active
+            # generation whether or not it is among them (R-02). The active
+            # generation is subtracted from the candidates before the count is
+            # applied, so no value of `keep_generations` can propose it.
+            retained = set(generations[-policy.keep_generations :])
+            retained.add(bundle_root / active)
+            targets.extend(
+                PruneTarget(
+                    path=generation,
+                    kind="generation",
+                    rule="retention",
+                    bundle_root=bundle_root,
+                    bundle_key=key,
+                    reason=(
+                        "superseded generation beyond the newest "
+                        f"{policy.keep_generations} kept"
+                    ),
+                )
+                for generation in generations
+                if generation not in retained
+            )
+        else:
+            targets.extend(
+                PruneTarget(
+                    path=generation,
+                    kind="generation",
+                    rule="orphan",
+                    bundle_root=bundle_root,
+                    bundle_key=key,
+                    reason="no manifest names this generation, so nothing can serve it",
+                )
+                for generation in generations
+            )
+
+        targets.extend(
+            PruneTarget(
+                path=staging,
+                kind="staging",
+                rule="staging",
+                bundle_root=bundle_root,
+                bundle_key=key,
+                reason="staging directory whose run no longer holds the bundle lock",
+            )
+            for staging in staging_directories(bundle_root)
+        )
+        return targets
 
 
 @dataclass
@@ -698,6 +1185,105 @@ class BundleRun:
         self.release()
 
 
+def prune_lock_path(bundle_root: Path) -> Path:
+    """The run lock for the bundle at `bundle_root`. Derives, creates nothing.
+
+    Stated against the directory rather than the **bundle key** because prune
+    finds bundles by walking, including bundles under a playlist root that a
+    different `BundleStore` produced. The rule is the same one `begin` uses -
+    `_locks/<name>.lock` beside the bundle - so both reach the same file, which
+    is the only reason prune's lock excludes a live run at all.
+    """
+    return bundle_root.parent / LOCK_DIR_NAME / f"{bundle_root.name}.lock"
+
+
+def lock_is_held(bundle_root: Path) -> bool:
+    """Whether a run is live on this bundle, asked of the lock rather than a clock.
+
+    R-06: liveness is the same question `begin` answers, so the answer is the
+    same lock. A timestamp cannot answer it - a **staging directory** that has
+    not been written to for an hour belongs either to a dead run or to a live one
+    doing a long download, and a staleness window picks between them by guessing
+    (finding 11's shape).
+
+    A lock file that does not exist means no run has ever reached staging here,
+    so nothing is created to find that out: a plan mutates nothing.
+    """
+    path = prune_lock_path(bundle_root)
+    if not path.is_file():
+        return False
+    lock = BundleLock.take(bundle_root.name, path)
+    if lock is None:
+        return True
+    lock.release()
+    return False
+
+
+def sorted_generations(bundle_root: Path) -> list[Path]:
+    """Every **generation** directory under `bundle_root`, oldest first."""
+    return sorted(
+        (
+            path
+            for path in bundle_root.iterdir()
+            if path.is_dir() and not path.is_symlink() and is_generation_name(path.name)
+        ),
+        key=lambda path: int(path.name[len(GENERATION_PREFIX) :]),
+    )
+
+
+def staging_directories(bundle_root: Path) -> list[Path]:
+    """Every **staging directory** left under `bundle_root`."""
+    return sorted(
+        path
+        for path in bundle_root.iterdir()
+        if path.is_dir() and not path.is_symlink() and path.name.startswith(STAGING_PREFIX)
+    )
+
+
+def active_generation_name(verdict: MarkerVerdict) -> str | None:
+    """The **active generation** a marker names, or `None` if it names none."""
+    if not verdict.is_bundle or verdict.manifest is None:
+        return None
+    name = verdict.manifest.get("active_generation")
+    if isinstance(name, str) and is_generation_name(name):
+        return name
+    return None
+
+
+def bundle_mtime(bundle_root: Path) -> float:
+    """When this **bundle** last changed, as the newest thing in it.
+
+    Expiry is about a bundle nobody has produced into for a while, so the
+    youngest of the **manifest** and the **generations** is the age that matters:
+    a bundle whose oldest generation is a year old but which was republished
+    yesterday is not aged. The old code read the bundle directory's own mtime,
+    which changes when anything at all is created beside it.
+    """
+    candidates = [bundle_root, bundle_root / MANIFEST_NAME, *sorted_generations(bundle_root)]
+    times = []
+    for path in candidates:
+        try:
+            times.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    return max(times, default=0.0)
+
+
+def _grouped_by_bundle(
+    targets: Iterable[PruneTarget],
+) -> list[tuple[Path, list[PruneTarget]]]:
+    """Targets grouped by bundle, in first-appearance order.
+
+    One lock per bundle rather than one per target: the lock is the bundle's, so
+    taking it again per generation would only widen the window in which a run
+    could slip between two deletions in the same bundle.
+    """
+    grouped: dict[Path, list[PruneTarget]] = {}
+    for target in targets:
+        grouped.setdefault(target.bundle_root, []).append(target)
+    return list(grouped.items())
+
+
 def write_ownership_marker(directory: Path, bundle_key: str) -> Path:
     """Claim `directory` as Distill's before anything is written into it (R-11).
 
@@ -777,8 +1363,8 @@ def read_marker(directory: Path) -> MarkerVerdict:
 
 def recorded_identity(manifest: dict[str, Any]) -> str | None:
     """The **bundle key** a manifest records, under either accepted field name."""
-    for field in IDENTITY_FIELDS:
-        value = manifest.get(field)
+    for name in IDENTITY_FIELDS:
+        value = manifest.get(name)
         if isinstance(value, str) and value:
             return value
     return None
@@ -877,18 +1463,13 @@ def next_generation(bundle_root: Path) -> str:
     return f"{GENERATION_PREFIX}{max(existing, default=0) + 1}"
 
 
-def ensure_safe_directory(path: Path, root: Path, *, create_leaf: bool = True) -> Path:
-    """Validate `path` as a write target under `root`, creating what is missing.
+def confined_path(path: Path, root: Path) -> Path:
+    """Refuse `path` unless it is under `root` and reached through no symlink.
 
-    The single symlink refusal in Distill (R-16, D-041). It walks every component
-    below `root`, refusing any that is a symlink, and refuses a target that
-    resolves outside `root` at all.
-
-    `create_leaf=False` validates a target without creating it, which is what
-    lets one checker serve a file write as well as a directory: the parents are
-    created, the final component is checked and left alone. A file target went
-    unchecked before, so a symlink pre-created at, say, `video.md` redirected the
-    write out of the bundle (S1).
+    The single symlink refusal in Distill (R-16, D-041), and the only thing that
+    decides whether a path may be *touched* at all - which is a question a
+    deletion asks as sharply as a write does. It creates nothing and follows
+    nothing, so prune can ask it about a path it is about to remove (R-10).
 
     Confinement is decided lexically and the walk is over the components as
     written, not as resolved. Resolving first and then walking inspects a path
@@ -907,11 +1488,8 @@ def ensure_safe_directory(path: Path, root: Path, *, create_leaf: bool = True) -
             "bundle path must stay under output_dir",
             {"path": str(target), "output_root": str(lexical_root)},
         )
-
-    relative_parts = lexical_target.relative_to(lexical_root).parts
     current = lexical_root
-    leaf_index = len(relative_parts) - 1
-    for index, part in enumerate(relative_parts):
+    for part in lexical_target.relative_to(lexical_root).parts:
         current = current / part
         if current.is_symlink():
             raise DistillError(
@@ -920,6 +1498,29 @@ def ensure_safe_directory(path: Path, root: Path, *, create_leaf: bool = True) -
                 "output tree must not contain symlink components",
                 {"path": str(current), "output_root": str(lexical_root)},
             )
+    return target
+
+
+def ensure_safe_directory(path: Path, root: Path, *, create_leaf: bool = True) -> Path:
+    """Validate `path` as a write target under `root`, creating what is missing.
+
+    Confinement is `confined_path`'s answer, checked in full before anything is
+    created, so a refused path leaves no half-built tree behind.
+
+    `create_leaf=False` validates a target without creating it, which is what
+    lets one checker serve a file write as well as a directory: the parents are
+    created, the final component is checked and left alone. A file target went
+    unchecked before, so a symlink pre-created at, say, `video.md` redirected the
+    write out of the bundle (S1).
+    """
+    target = confined_path(path, root)
+    lexical_root = Path(os.path.normpath(root.absolute()))
+    lexical_target = Path(os.path.normpath(target.absolute()))
+    relative_parts = lexical_target.relative_to(lexical_root).parts
+    current = lexical_root
+    leaf_index = len(relative_parts) - 1
+    for index, part in enumerate(relative_parts):
+        current = current / part
         if create_leaf or index < leaf_index:
             current.mkdir(exist_ok=True)
     return target
