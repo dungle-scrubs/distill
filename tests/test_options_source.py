@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from distill.options import OPTION_DEFAULTS, DistillOptions
 from distill.progress import ProgressReporter
 from distill.source import (
     CONTENT_HASH_LIMIT_BYTES,
+    FINGERPRINT_INTERIOR_ANCHORS,
+    FINGERPRINT_SAMPLE_BYTES,
     YoutubeDownloader,
     YouTubeMetadata,
     _ytdlp_command,
@@ -151,19 +154,91 @@ def test_content_mode_reports_byte_accurate_fingerprint_progress(
 
 def test_fingerprint_mode_reports_bounded_sample_progress(tmp_path: Path) -> None:
     path = tmp_path / "video.mp4"
-    path.write_bytes(b"a" * (64 * 1024 + 1))
+    path.write_bytes(b"a" * (1024 * 1024))
     progress = ProgressReporter()
 
     local_fingerprint(path, "fingerprint", progress)
 
     events = [event for event in progress.events if event.mechanism == "source_fingerprint"]
-    assert [event.percent for event in events] == [50.0, 100.0]
+    anchors = FINGERPRINT_INTERIOR_ANCHORS + 2
+    assert [event.detail["sample"] for event in events if event.detail] == [
+        "first",
+        *["interior"] * FINGERPRINT_INTERIOR_ANCHORS,
+        "last",
+    ]
+    assert [event.percent for event in events] == [
+        round((index + 1) / anchors * 100, 3) for index in range(anchors)
+    ]
     assert events[0].detail == {
         "cache_mode": "fingerprint",
         "sample": "first",
+        "offset": 0,
         "samples_done": 1,
-        "samples_total": 2,
+        "samples_total": anchors,
     }
+    assert events[-1].detail == {
+        "cache_mode": "fingerprint",
+        "sample": "last",
+        "offset": 1024 * 1024 - FINGERPRINT_SAMPLE_BYTES,
+        "samples_done": anchors,
+        "samples_total": anchors,
+    }
+
+
+def test_fingerprint_mode_anchor_count_does_not_grow_with_source_size(
+    tmp_path: Path,
+) -> None:
+    """Widening the anchors must not turn a cache lookup into a full read."""
+    path = tmp_path / "huge.mp4"
+    path.write_bytes(b"")
+    os.truncate(path, 512 * 1024 * 1024)
+    progress = ProgressReporter()
+
+    local_fingerprint(path, "fingerprint", progress)
+
+    events = [event for event in progress.events if event.mechanism == "source_fingerprint"]
+    assert len(events) == FINGERPRINT_INTERIOR_ANCHORS + 2
+    offsets = [event.detail["offset"] for event in events if event.detail]
+    assert offsets == sorted(offsets)
+    assert offsets[-1] == 512 * 1024 * 1024 - FINGERPRINT_SAMPLE_BYTES
+
+
+def _write_crafted_collision_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """Two files sharing size, mtime, and their first and last 64 KiB.
+
+    They differ across every byte of the interior, so any interior anchor at all
+    separates them; only a fingerprint that reads nothing but the two ends can
+    call them the same source.
+    """
+    head = b"H" * FINGERPRINT_SAMPLE_BYTES
+    tail = b"T" * FINGERPRINT_SAMPLE_BYTES
+    middle_len = 1024 * 1024 - 2 * FINGERPRINT_SAMPLE_BYTES
+    left = tmp_path / "left.mp4"
+    right = tmp_path / "right.mp4"
+    left.write_bytes(head + b"A" * middle_len + tail)
+    right.write_bytes(head + b"B" * middle_len + tail)
+    assert left.stat().st_size == right.stat().st_size
+    stamp = 1_700_000_000
+    for path in (left, right):
+        os.utime(path, ns=(stamp * 1_000_000_000, stamp * 1_000_000_000))
+    assert left.stat().st_mtime_ns == right.stat().st_mtime_ns
+    return left, right
+
+
+def test_distinct_sources_sharing_size_mtime_head_and_tail_do_not_collide(
+    tmp_path: Path,
+) -> None:
+    """RV-4: sampling only the two ends hands one source another's bundle."""
+    left, right = _write_crafted_collision_pair(tmp_path)
+
+    assert local_fingerprint(left, "fingerprint") != local_fingerprint(right, "fingerprint")
+
+
+def test_content_mode_distinguishes_the_crafted_pair(tmp_path: Path) -> None:
+    """Content mode reads every byte, so no sampled anchor set can hide a difference."""
+    left, right = _write_crafted_collision_pair(tmp_path)
+
+    assert local_fingerprint(left, "content") != local_fingerprint(right, "content")
 
 
 def test_output_dir_must_be_under_home_or_temp(tmp_path: Path) -> None:

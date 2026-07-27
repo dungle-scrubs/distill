@@ -27,6 +27,10 @@ from .progress import ProgressReporter
 
 CONTENT_HASH_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 FINGERPRINT_SAMPLE_BYTES = 64 * 1024
+# Interior anchors sampled between the head and tail anchors. The sampled set is
+# capped at FINGERPRINT_INTERIOR_ANCHORS + 2 anchors, so the default cache mode
+# reads at most 576 KiB no matter how large the source is.
+FINGERPRINT_INTERIOR_ANCHORS = 7
 YOUTUBE_DISK_FLOOR_BYTES = 1024 * 1024 * 1024
 # Wall-clock ceilings so a wedged tool or a stalled network call cannot hang the
 # whole run. yt-dlp additionally gets `--socket-timeout` so it aborts a stalled
@@ -175,11 +179,63 @@ def ensure_duration_allowed(duration_sec: float, max_duration_sec: float) -> Non
         )
 
 
+def fingerprint_anchor_offsets(size: int) -> list[int]:
+    """Byte offsets the sampling cache mode reads, derived only from ``size``.
+
+    The head anchor sits at 0 and the tail anchor at ``size - 64 KiB``, with
+    ``FINGERPRINT_INTERIOR_ANCHORS`` interior anchors spread evenly between
+    them. Offsets depend on nothing but the size, so the same file always yields
+    the same anchor set; coinciding offsets collapse, which is why a file barely
+    over one sample still reports two anchors rather than nine.
+    """
+    if size <= FINGERPRINT_SAMPLE_BYTES:
+        return [0]
+    last = size - FINGERPRINT_SAMPLE_BYTES
+    offsets = {0, last}
+    for index in range(1, FINGERPRINT_INTERIOR_ANCHORS + 1):
+        offsets.add(last * index // (FINGERPRINT_INTERIOR_ANCHORS + 1))
+    return sorted(offsets)
+
+
+def _anchor_label(offset: int, offsets: list[int]) -> str:
+    if offset == offsets[0]:
+        return "first"
+    if offset == offsets[-1]:
+        return "last"
+    return "interior"
+
+
 def local_fingerprint(
     path: Path,
     cache_mode: str,
     progress: ProgressReporter | None = None,
 ) -> str:
+    """Return the source fingerprint for a local file under ``cache_mode``.
+
+    ``content`` hashes every byte, so it distinguishes any two files whose
+    contents differ at all. It refuses files over 5 GB, because reading one is
+    not a cost a cache lookup may impose.
+
+    ``fingerprint`` - the default - samples instead. It hashes the file's size,
+    its mtime in nanoseconds, and 64 KiB read at each offset in
+    ``fingerprint_anchor_offsets``: the head, the tail, and seven evenly spread
+    interior anchors. Each anchor's offset is hashed alongside its bytes, so
+    overlapping or reordered anchors cannot alias. Reading is therefore bounded
+    at 576 KiB regardless of source size, which is what makes the default cheap
+    enough to run on every cache lookup of a file up to 5 GB.
+
+    Sampling is what it sounds like, and the property it buys is worth stating
+    plainly: two *distinct* sources collide iff they share a size, an mtime to
+    the nanosecond, and every sampled anchor's bytes. Two independently produced
+    videos do not do this - differing content gives differing sizes, and mtimes
+    are not byte-identical by accident. Constructing such a pair on purpose is
+    entirely possible, because the anchor offsets are public and deterministic;
+    an attacker who can write both files can leave every anchor untouched and
+    differ everywhere else. A colliding pair shares a bundle key, so one source
+    is served the other's bundle. Where sources are untrusted or adversarial,
+    ``content`` is the cache mode that removes the property; the default trades
+    it for bounded cost. See R-38, R-51.
+    """
     stat = path.stat()
     if cache_mode == "content":
         if stat.st_size > CONTENT_HASH_LIMIT_BYTES:
@@ -215,24 +271,15 @@ def local_fingerprint(
     digest = hashlib.sha256()
     digest.update(str(stat.st_size).encode())
     digest.update(str(stat.st_mtime_ns).encode())
-    sample_total = 2 if stat.st_size > FINGERPRINT_SAMPLE_BYTES else 1
+    offsets = fingerprint_anchor_offsets(stat.st_size)
+    sample_total = len(offsets)
     sample_done = 0
     with path.open("rb") as handle:
-        digest.update(handle.read(FINGERPRINT_SAMPLE_BYTES))
-        sample_done += 1
-        if progress:
-            progress.update(
-                "source_fingerprint",
-                percent=(sample_done / sample_total) * 100,
-                detail={
-                    "cache_mode": "fingerprint",
-                    "sample": "first",
-                    "samples_done": sample_done,
-                    "samples_total": sample_total,
-                },
-            )
-        if stat.st_size > FINGERPRINT_SAMPLE_BYTES:
-            handle.seek(max(0, stat.st_size - FINGERPRINT_SAMPLE_BYTES))
+        for offset in offsets:
+            handle.seek(offset)
+            # The offset is hashed with its bytes so two anchors reading the same
+            # region, or the same regions in another order, cannot alias.
+            digest.update(str(offset).encode())
             digest.update(handle.read(FINGERPRINT_SAMPLE_BYTES))
             sample_done += 1
             if progress:
@@ -241,7 +288,8 @@ def local_fingerprint(
                     percent=(sample_done / sample_total) * 100,
                     detail={
                         "cache_mode": "fingerprint",
-                        "sample": "last",
+                        "sample": _anchor_label(offset, offsets),
+                        "offset": offset,
                         "samples_done": sample_done,
                         "samples_total": sample_total,
                     },
