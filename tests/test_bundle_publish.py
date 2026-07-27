@@ -382,7 +382,10 @@ def test_a_stage_result_is_an_ordinary_write_not_an_atomic_replace(
     stage_result = run.paths.generation / "_ocr.json"
     assert written == [stage_result]
     assert replaced == []
-    assert json.loads(stage_result.read_text()) == {"frames": []}
+    # One write put the whole document down: the payload the stage produced,
+    # inside the envelope R-23 checks it by. Torn or not, nobody else may read
+    # it, which is what the single unreplaced write is here to show.
+    assert json.loads(stage_result.read_text())["payload"] == {"frames": []}
 
 
 def test_two_atomic_writers_of_one_path_do_not_share_a_temporary(

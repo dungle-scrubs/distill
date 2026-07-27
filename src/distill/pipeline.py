@@ -227,21 +227,6 @@ def _abandon_reason(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def _as_stage_payload(name: str, recorded: Any) -> dict[str, Any] | None:
-    """A recorded **stage result** in the shape this run expects, or `None`.
-
-    Anything else is treated as absent rather than as an error: a stage result
-    is scratch, so a shape a newer run does not recognize costs a recomputation
-    and nothing more. The one accommodation is a bare list under `frames`, which
-    is how an older run recorded that stage before payloads carried warnings.
-    """
-    if isinstance(recorded, dict):
-        return recorded
-    if name == "frames" and isinstance(recorded, list):
-        return {"frames": recorded, "warnings": []}
-    return None
-
-
 @dataclass
 class ProcessingRun:
     source: Any
@@ -322,17 +307,20 @@ class ProcessingRun:
 
         Resume is the store's answer, not this module's: `read_stage` reports
         `None` for every reason a recorded result cannot be used - the run is
-        not resuming, nothing was recorded, or what was recorded is unreadable -
-        and every one of them means the same thing here, which is compute it.
+        not resuming, nothing was recorded, what was recorded is unreadable, or
+        it failed the checks R-23 puts a resumed document through - and every
+        one of them means the same thing here, which is compute it. That is
+        D-030's whole point: a stage result that does not hold up costs this
+        run the work, and costs it nothing else.
         """
-        payload = _as_stage_payload(name, run.read_stage(name))
+        payload = run.read_stage(name)
         if payload is not None:
             for mechanism in skipped_mechanisms:
                 self.progress.skip_cached(mechanism, detail={"source": "partial_resume"})
         else:
             payload = producer()
             heartbeat.check()
-            run.write_stage(name, payload)
+            run.write_stage(name, payload, redaction=self._redaction_policy)
         warnings.extend(list(payload.get("warnings", [])))
         return payload
 

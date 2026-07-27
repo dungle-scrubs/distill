@@ -367,8 +367,11 @@ class StageResult(Carrier):
     normally finds nothing to do - it is here so that a stage recording
     something it built by hand is capped on the same terms.
 
-    The schema version and **bundle key** are carried here; validating them on
-    read is M4.3's, and this module does not do it.
+    The schema version and **bundle key** are carried here so that whoever reads
+    the document back can check them (R-23). Checking them is not this module's:
+    `bundle_store` writes the carrier, reads it, and decides whether a
+    **resume** may believe it - which it can only do because it is the one that
+    knows which bundle is asking.
     """
 
     EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = ("payload",)
