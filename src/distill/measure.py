@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -39,6 +38,7 @@ try:
     )
     from .pipeline import run_timeout_probe, timeout_diagnostics
     from .redact_secrets import redact_text
+    from .run_command import CommandTimeouts, run
     from .source import probe_duration
     from .transcript import FasterWhisperAdapter, extract_audio
 except ImportError:
@@ -54,11 +54,20 @@ except ImportError:
         timeout_diagnostics,
     )
     from distill.redact_secrets import redact_text  # type: ignore[no-redef]
+    from distill.run_command import (  # type: ignore[no-redef]
+        CommandTimeouts,
+        run,
+    )
     from distill.source import probe_duration  # type: ignore[no-redef]
     from distill.transcript import (  # type: ignore[no-redef]
         FasterWhisperAdapter,
         extract_audio,
     )
+
+# Corpus generation encodes a few seconds of synthetic video; generous, because
+# a slow machine is not a wedged one, and bounded, because nothing here should
+# outlive a coffee break.
+CORPUS_TIMEOUTS = CommandTimeouts(total_sec=600.0, idle_sec=120.0)
 
 SCHEMA_VERSION = 1
 MIN_CORPUS_ITEMS = 3
@@ -157,12 +166,20 @@ def require_ffmpeg() -> None:
         raise RuntimeError("ffprobe is required to measure synthetic corpus")
 
 
-def run_command(command: list[str]) -> None:
-    proc = subprocess.run(command, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"command failed: {command[0]}\nstdout={proc.stdout}\nstderr={proc.stderr}"
-        )
+def generate_corpus_media(command: list[str]) -> None:
+    """Run one corpus-generating ffmpeg invocation.
+
+    Offline harness or not, this is an external tool invocation and goes
+    through the one subprocess path (R-29), so it inherits both timeouts, its
+    own process group, concurrent draining and the shared failure taxonomy
+    instead of being the last place a wedged ffmpeg can hang forever.
+    """
+    run(
+        command,
+        stage="measure",
+        total_timeout_sec=CORPUS_TIMEOUTS.total_sec,
+        idle_timeout_sec=CORPUS_TIMEOUTS.idle_sec,
+    )
 
 
 def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
@@ -174,7 +191,7 @@ def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
     scene_cuts = output_dir / "distill-scene-cuts.mp4"
     quiet = output_dir / "distill-quiet-demo.mp4"
 
-    run_command(
+    generate_corpus_media(
         [
             "ffmpeg",
             "-y",
@@ -196,7 +213,7 @@ def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
             str(static),
         ]
     )
-    run_command(
+    generate_corpus_media(
         [
             "ffmpeg",
             "-y",
@@ -232,7 +249,7 @@ def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
             str(scene_cuts),
         ]
     )
-    run_command(
+    generate_corpus_media(
         [
             "ffmpeg",
             "-y",
@@ -277,12 +294,12 @@ def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
 
 
 def extract_sample_hashes(video_path: Path, work_dir: Path) -> list[str]:
-    duration = probe_duration(video_path)
+    duration, _ = probe_duration(video_path)
     hashes: list[str] = []
     for index, timestamp in enumerate(fixed_interval_candidates(duration, 1.0)):
         output_path = work_dir / f"sample-{index:04d}.png"
-        warning = extract_frame(video_path, timestamp, output_path)
-        if warning is None:
+        extracted, _ = extract_frame(video_path, timestamp, output_path)
+        if extracted:
             hashes.append(phash(output_path))
     return hashes
 
@@ -312,7 +329,7 @@ def detector_count(video_path: Path, detector_name: str) -> int | None:
 
 
 def scene_detector_comparison(video_path: Path) -> dict[str, Any]:
-    duration = probe_duration(video_path)
+    duration, _ = probe_duration(video_path)
     return {
         "content_detector_scenes": detector_count(video_path, "content"),
         "adaptive_detector_scenes": detector_count(video_path, "adaptive"),
@@ -327,11 +344,11 @@ def benchmark_whisper_models(
     models: list[str],
 ) -> list[dict[str, Any]]:
     audio_path = work_dir / f"{video_path.stem}.wav"
-    warning = extract_audio(video_path, audio_path)
-    if warning is not None:
-        return [{"error": warning["message"]}]
+    extracted, audio_warnings = extract_audio(video_path, audio_path)
+    if not extracted:
+        return [{"error": "; ".join(item["message"] for item in audio_warnings)}]
 
-    duration = probe_duration(video_path)
+    duration, _ = probe_duration(video_path)
     results: list[dict[str, Any]] = []
     for model_name in models:
         load_started = time.perf_counter()

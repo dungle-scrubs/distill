@@ -6,17 +6,20 @@ window safeguards, and PNG extraction. It does not OCR or render frames.
 
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 
-from .errors import warning
+from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
+from .errors import DistillError, warning
 from .progress import ProgressCounter, ProgressReporter
+from .run_command import CommandTimeouts, run
 
 PHASH_DISTANCE_THRESHOLD = 10
 # Wall-clock ceiling for a single ffmpeg frame grab so a wedged decode cannot
-# hang the whole run.
-FRAME_EXTRACT_TIMEOUT_SEC = 120.0
+# hang the whole run. Grabbing one frame is short even on a long source - the
+# seek is not a scan - so here the total deadline is the meaningful limit and
+# the idle timeout only catches a decode that stops talking sooner.
+FRAME_EXTRACT_TIMEOUTS = CommandTimeouts(total_sec=120.0, idle_sec=60.0)
 
 
 def scene_midpoint_candidates(video_path: Path, duration_sec: float) -> list[float]:
@@ -81,9 +84,16 @@ def filtered_candidates(
 
 def extract_frame(
     video_path: Path, timestamp_sec: float, output_path: Path
-) -> dict[str, str] | None:
+) -> tuple[bool, list[dict[str, str]]]:
+    """Grab one frame, reporting whether it landed and what the attempt cost.
+
+    Two answers rather than one warning, because they are independent: an
+    invocation can produce the frame *and* record a **warning** (truncated
+    capture, R-33), and a caller that read only a warning would throw the frame
+    away or, worse, keep the warning to itself.
+    """
     try:
-        proc = subprocess.run(
+        result = run(
             [
                 "ffmpeg",
                 "-y",
@@ -95,31 +105,37 @@ def extract_frame(
                 "1",
                 str(output_path),
             ],
-            capture_output=True,
-            text=True,
+            stage="frames",
+            total_timeout_sec=FRAME_EXTRACT_TIMEOUTS.total_sec,
+            idle_timeout_sec=FRAME_EXTRACT_TIMEOUTS.idle_sec,
             check=False,
-            timeout=FRAME_EXTRACT_TIMEOUT_SEC,
         )
-    except FileNotFoundError:
-        # ffmpeg not installed: degrade to no-frame rather than crashing the run.
-        return warning(
-            "frames",
-            "ffmpeg_missing",
-            "ffmpeg is not installed; skipping keyframe extraction",
+    except DistillError as exc:
+        # An absent tool is the capability table's decision, not this call
+        # site's: ffmpeg is classified a **required capability**, so this call
+        # raises rather than returning (ADR-0002, R-34). A wedged ffmpeg is a
+        # different matter - the tool is installed, one keyframe was lost, and
+        # that reduces the bundle without ending the run.
+        if exc.code == MISSING_TOOL_CODE:
+            return False, [missing_tool_consequence("frames", "ffmpeg", cause=exc)]
+        return False, [
+            warning(
+                "frames",
+                "frame_extract_timeout",
+                f"ffmpeg timed out extracting frame at {timestamp_sec:.3f}s",
+            )
+        ]
+    warnings = list(result.warnings)
+    if result.returncode != 0:
+        warnings.append(
+            warning(
+                "frames",
+                "frame_extract_failed",
+                f"could not extract frame at {timestamp_sec:.3f}s",
+            )
         )
-    except subprocess.TimeoutExpired:
-        return warning(
-            "frames",
-            "frame_extract_timeout",
-            f"ffmpeg timed out extracting frame at {timestamp_sec:.3f}s",
-        )
-    if proc.returncode != 0:
-        return warning(
-            "frames",
-            "frame_extract_failed",
-            f"could not extract frame at {timestamp_sec:.3f}s",
-        )
-    return None
+        return False, warnings
+    return True, warnings
 
 
 def phash(path: Path) -> str:
@@ -163,7 +179,7 @@ def select_keyframes(
         if len(frames) >= max_keyframes:
             break
         path = frames_dir / f"frame_{len(frames) + 1:04d}.png"
-        frame_warning = extract_frame(video_path, timestamp, path)
+        extracted, frame_warnings = extract_frame(video_path, timestamp, path)
         if isinstance(progress, ProgressReporter):
             progress.update(
                 "frame_extraction",
@@ -177,8 +193,8 @@ def select_keyframes(
             )
         elif progress:
             progress.increment()
-        if frame_warning:
-            warnings.append(frame_warning)
+        warnings.extend(frame_warnings)
+        if not extracted:
             continue
         try:
             frame_hash = phash(path)

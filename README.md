@@ -33,15 +33,26 @@ uv add "distill-video @ git+https://github.com/dungle-scrubs/distill.git"
 
 Install these with your package manager (e.g. [Homebrew](https://brew.sh) on macOS):
 
-| Tool | Purpose | Install |
-| --- | --- | --- |
-| `ffmpeg` / `ffprobe` | frame extraction, duration probing | `brew install ffmpeg` |
-| `tesseract` | OCR fallback / grounding cross-check | `brew install tesseract` |
-| `yt-dlp` | YouTube download | `brew install yt-dlp` |
-| `rapid-mlx[vision]` | local vision server (see below) | `brew install raullenchai/rapid-mlx/rapid-mlx` then `pip install 'rapid-mlx[vision]'` |
+| Tool | Capability | Class | Install |
+| --- | --- | --- | --- |
+| `ffmpeg` | audio extraction and keyframe extraction | required | `brew install ffmpeg` |
+| `ffprobe` | source duration probing | required | `brew install ffmpeg` |
+| `yt-dlp` | YouTube source acquisition and metadata | required | `brew install yt-dlp` |
+| `tesseract` | image-text extraction from keyframes | optional | `brew install tesseract` |
+| `rapid-mlx[vision]` | local vision server (see below) | optional | `brew install raullenchai/rapid-mlx/rapid-mlx` then `pip install 'rapid-mlx[vision]'` |
 
-If any are missing, Distill degrades gracefully: no vision server means
-OCR-only captions, no tesseract means vision-only captions, etc.
+The class decides what an absent tool costs. An **optional** one degrades: the
+run records a warning naming what is missing and continues, so no vision server
+means OCR-only captions and no tesseract means vision-only captions. A
+**required** one is fatal: the run stops immediately, naming the tool and what
+its absence costs, rather than doing the work and producing a bundle with
+nothing in it.
+
+Distill never installs any of them. `src/distill/capabilities.py` holds the
+table this section states in prose: every external tool Distill runs is listed
+above with the class that table records, and the test suite fails if the two
+disagree. The vision server is not a tool Distill runs, so it is described here
+only.
 
 ## Quickstart
 

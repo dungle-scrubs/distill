@@ -27,7 +27,6 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "imagehash>=4.3.2",
     "pillow>=10.0.0",
-    "pytesseract>=0.3.13",
     # Cap the pre-1.0 scenedetect: 0.x can break API/behavior on a minor bump.
     # yt-dlp is intentionally uncapped — it must stay current for extraction.
     "scenedetect>=0.7,<0.8",
