@@ -100,7 +100,40 @@ class RedactionPolicyNotApplied(DistillError):
         )
 
 
-def _cap_extracted_text(text: str, *, path: str, warnings: list[Mapping[str, str]]) -> str:
+@dataclass(frozen=True, slots=True)
+class _PolicyText:
+    """Text the **redaction** policy has already had its turn over.
+
+    A type rather than a comment, because the cap and the policy have now been
+    written in the wrong order twice - once in `link_label`, once here. A cut
+    applied first decides what the policy is allowed to see: a value straddling
+    the cut is sliced into a prefix that matches no pattern, and that prefix is
+    then durable in full. Inverting the two lines in `_freeze` published twelve
+    characters of a live key into a **manifest** and passed the whole suite.
+
+    `_redact` is what produces one and `_cap_extracted_text` is what consumes
+    one, so the inversion no longer type-checks and no longer runs - the cap
+    asked for a `str` before and asks for a step that has happened now. What it
+    does not claim is anything about the text itself: the policy is patterns,
+    and a secret shaped like none of them passes through untouched.
+    """
+
+    text: str
+
+    @classmethod
+    def policy_did_not_run(cls, text: str) -> _PolicyText:
+        """Text the cap may still take, although no policy ran over it.
+
+        Correct in exactly two cases, both already decided by the caller: the
+        field is not an extracted-text region, or the run is under
+        `--no-redact-secrets` - which D-020 records as an applied policy rather
+        than an absent one. Named so the one route past the policy is legible
+        instead of implicit.
+        """
+        return cls(text)
+
+
+def _cap_extracted_text(text: _PolicyText, *, path: str, warnings: list[Mapping[str, str]]) -> str:
     """Return `text` within the per-field cap, recording a **warning** if it was cut.
 
     The budget is bytes, because KiB is a byte unit and a character is not a
@@ -112,9 +145,9 @@ def _cap_extracted_text(text: str, *, path: str, warnings: list[Mapping[str, str
     untrusted-data boundary exists to prevent; the warning carried with the
     bundle is the record.
     """
-    encoded = text.encode("utf-8")
+    encoded = text.text.encode("utf-8")
     if len(encoded) <= EXTRACTED_TEXT_LIMIT_BYTES:
-        return text
+        return text.text
     truncated = encoded[:EXTRACTED_TEXT_LIMIT_BYTES].decode("utf-8", errors="ignore")
     warnings.append(
         _frozen_warning(
@@ -133,7 +166,7 @@ def _frozen_warning(payload: Mapping[str, str]) -> Mapping[str, str]:
     return MappingProxyType(dict(payload))
 
 
-def _redact(text: str, *, warnings: list[Mapping[str, str]]) -> str:
+def _redact(text: str, *, warnings: list[Mapping[str, str]]) -> _PolicyText:
     """Return `text` with secret-shaped values replaced, keeping the policy's warnings.
 
     Every string in an extracted-text region goes through this, every time,
@@ -143,11 +176,13 @@ def _redact(text: str, *, warnings: list[Mapping[str, str]]) -> str:
     fast enough.
 
     Redaction runs before the cap, because replacing a secret can lengthen the
-    text and the cap is what bounds what a carrier holds.
+    text and the cap is what bounds what a carrier holds - and because a cap
+    applied first hides a straddling secret from the policy. `_PolicyText` is
+    what makes that order the only one that compiles.
     """
     result = redact_text(text)
     warnings.extend(_frozen_warning(item) for item in result.warnings)
-    return result.text
+    return _PolicyText(result.text)
 
 
 def is_path_field(key: str) -> bool:
@@ -202,8 +237,12 @@ def _freeze(
     if value is None or isinstance(value, bool | int | float):
         return value
     if isinstance(value, str):
-        text = _redact(value, warnings=warnings) if redact else value
-        return _cap_extracted_text(text, path=path, warnings=warnings) if cap else text
+        text = (
+            _redact(value, warnings=warnings)
+            if redact
+            else _PolicyText.policy_did_not_run(value)
+        )
+        return _cap_extracted_text(text, path=path, warnings=warnings) if cap else text.text
     if isinstance(value, Mapping):
         return MappingProxyType(
             {
@@ -217,6 +256,14 @@ def _freeze(
                 for key, item in value.items()
             }
         )
+    if isinstance(value, bytes | bytearray | memoryview):
+        # Refused ahead of the Sequence branch, which every byte-shaped type
+        # satisfies. Frozen there, each byte becomes an `int`: a value no
+        # pattern ran over, no cap measured, and `json` encodes happily - so it
+        # is durable, unredacted and indistinguishable from a list of numbers a
+        # stage meant to record. Refusing is what the docstring above promises,
+        # and this is what makes it true of bytes as well (finding 6).
+        raise TypeError(f"{path} holds {type(value).__name__}, which a carrier cannot freeze")
     if isinstance(value, Sequence):
         return tuple(
             _freeze(item, path=f"{path}[{index}]", warnings=warnings, cap=cap, redact=redact)

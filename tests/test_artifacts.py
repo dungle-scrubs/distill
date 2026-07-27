@@ -38,6 +38,7 @@ from distill.artifacts import (
     Transcript,
     serialize,
 )
+from distill.bundle_store import BundleRun, BundleStore
 
 
 def make_frame(**overrides: Any) -> FrameArtifact:
@@ -323,6 +324,33 @@ def test_a_field_exactly_at_the_cap_is_not_truncated() -> None:
     assert document["warnings"] == []
 
 
+def test_a_secret_straddling_the_cap_is_redacted_before_it_is_cut() -> None:
+    """The 256 KiB cap must not decide what the redaction policy is allowed to see.
+
+    This is the primary site of the ordering `link_label` already got wrong
+    once. A value crossing the cap is sliced into a prefix that matches no
+    pattern, and that prefix is then durable in full: inverting the two lines
+    in `_freeze` published `...slide text sl` + `sk-live-0123`, twelve
+    characters of the key, into the **manifest**.
+
+    Both halves of the outcome are asserted, because each fails under the
+    inverted order for a different reason: no prefix of the key survives, and
+    nothing was truncated at all - redaction shortened the field back under the
+    cap, so there is no **warning** to raise.
+    """
+    secret = "sk-live-0123456789abcdefghij"
+    # The cut lands eleven characters into the key: long enough to be a durable
+    # prefix, short enough that no pattern in `redact_secrets` matches it.
+    text = f"{prose(EXTRACTED_TEXT_LIMIT_BYTES - 12)} {secret}"
+    assert len(text.encode()) > EXTRACTED_TEXT_LIMIT_BYTES
+
+    document = serialize(make_frame(extracted_text=text))
+
+    assert document["extracted_text"].endswith("[REDACTED]")
+    assert "sk-" not in document["extracted_text"]
+    assert document["warnings"] == []
+
+
 def test_the_cap_reaches_extracted_text_nested_inside_an_interpretation() -> None:
     """An **interpretation** is extracted text too - the model echoes the screen back."""
     frame = make_frame(
@@ -457,3 +485,47 @@ def test_a_mutable_value_a_carrier_cannot_freeze_is_refused() -> None:
     """An unsupported type is a defect at construction, not a hole at the writer."""
     with pytest.raises(TypeError):
         make_frame(interpretation={"detected_elements": {"a set is not frozen"}})
+
+
+def test_a_stage_results_payload_is_redacted_before_it_reaches_the_disk(tmp_path: Path) -> None:
+    """`StageResult`'s payload region is a claim, so it is exercised (D-022).
+
+    A **stage result** is durable the moment it is written - it sits in the
+    **staging directory** an interrupted run resumes from - which is what makes
+    it a **redaction sink** although no reader is ever served one (finding 4).
+    Naming `payload` an extracted-text region is how that holds for text a
+    stage built by hand rather than took from a carrier that was capped
+    already, and nothing failed when the region was emptied: this is the test
+    that does.
+
+    Asserted on the bytes on disk rather than on the document `serialize`
+    returned, because the region exists for what durability costs.
+    """
+    store = BundleStore.open(tmp_path / "output")
+    run = store.begin("abc123")
+    assert isinstance(run, BundleRun)
+    secret = "sk-live-0123456789abcdefghij"
+
+    try:
+        run.write_stage("ocr", {"frames": [{"note": f"API_KEY={secret}"}]})
+        recorded = (run.paths.generation / "_ocr.json").read_text()
+    finally:
+        run.release()
+
+    assert secret not in recorded
+    assert "API_KEY=[REDACTED]" in recorded
+
+
+def test_bytes_are_refused_rather_than_transcoded_past_the_policy() -> None:
+    """A `bytes` value is a `Sequence`, and freezing it silently made it a tuple of ints.
+
+    Which is a value the redaction policy never saw - it is not a `str`, so no
+    pattern ran over it - and one the cap never measured, and one `json`
+    encodes happily, so it survives a **publish** and a **resume** intact. That
+    is the refusal above being claimed and not held: an unfreezable type is a
+    defect at construction precisely so it cannot become a hole at the writer.
+    Every byte-shaped type is refused, not just the one that is immutable.
+    """
+    for value in (b"sk-live-0123456789abcdefghij", bytearray(b"secret"), memoryview(b"secret")):
+        with pytest.raises(TypeError, match="carrier cannot freeze"):
+            make_frame(interpretation={"verbatim_text": value})

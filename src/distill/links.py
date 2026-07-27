@@ -10,6 +10,13 @@ text** on both halves, label and destination alike: whoever wrote the
 description chose both. So `RelatedLink` is a carrier, and R-19's rule holds
 here as it does for keyframe text - the **redaction** policy runs at
 construction, which is `artifacts`' code and not this module's (R-21).
+
+What leaves this module is therefore the carrier and never its document. A
+related link that had already been flattened into a mapping was one no sink
+could check: `render` and `response` took whatever four keys they were given,
+so the layer that refuses text no policy ran over had nothing to refuse. The
+document is produced at the sink, by `serialize`, on the same terms as a
+**frame artifact**'s (R-20).
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlunparse
 
-from .artifacts import Carrier, RedactionState, serialize
+from .artifacts import Carrier, RedactionState
 
 URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+")
 TRAILING_PUNCTUATION = ".,;:!?"
@@ -138,6 +145,35 @@ class RelatedLink(Carrier):
         # the same reason.
         object.__setattr__(self, "label", self.label[:LABEL_LIMIT_CHARS])
 
+    @classmethod
+    def from_document(
+        cls, document: Mapping[str, Any], *, redaction: RedactionState
+    ) -> RelatedLink:
+        """Rebuild a link from the document a **manifest** recorded.
+
+        The cache-hit route: a **bundle** that is still servable already
+        described its links, and a run that reuses it must not re-read the
+        source's metadata to say so.
+
+        `redaction` is the *reading run's* policy and is required, never a
+        claim the document makes - the same rule, and the same reason, as
+        `FrameArtifact.from_document`. `redact_secrets` participates in the
+        **options hash** and so in the **bundle key**, so a manifest under this
+        bundle key was written by a run under this policy; the policy simply
+        runs again over text it has already cleaned, which changes nothing.
+
+        Tolerant on the way in, because a manifest written by an older Distill
+        may not carry every field: a missing one takes the empty string rather
+        than costing the link.
+        """
+        return cls(
+            url=str(document.get("url", "")),
+            label=str(document.get("label", "")),
+            source=str(document.get("source", "")),
+            reason=str(document.get("reason", "")),
+            redaction=redaction,
+        )
+
     def _payload(self) -> Mapping[str, Any]:
         return MappingProxyType(
             {
@@ -150,17 +186,17 @@ class RelatedLink(Carrier):
             }
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        return serialize(self)
-
 
 def extract_relevant_links(
     text: str,
     *,
     source: str = "metadata",
     redact: bool = True,
-) -> list[dict[str, Any]]:
+) -> list[RelatedLink]:
     """Extract code/reference links while filtering social and promotional links.
+
+    Carriers out, not documents: a caller holding a document has bypassed R-20
+    already, so the sinks would have nothing left to check (finding 5).
 
     Classification reads the *raw* line and the raw URL, and redaction happens
     when the carrier is built from them: what a link is about is a question
@@ -191,7 +227,7 @@ def extract_relevant_links(
                     redaction=policy,
                 )
             )
-    return [link.to_dict() for link in links]
+    return links
 
 
 def classify_link(url: str, context: str) -> str | None:

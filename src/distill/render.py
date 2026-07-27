@@ -5,10 +5,15 @@ or run extraction stages.
 
 It reads carriers rather than dicts (R-19, M4.4). What a **frame artifact**
 holds is `artifacts.FrameArtifact`'s to say, what an **interpretation** holds is
-`artifacts.Interpretation`'s, and what a **grounding** holds is
+`artifacts.Interpretation`'s, what a **related link** holds is
+`links.RelatedLink`'s, and what a **grounding** holds is
 `grounding.GroundingAssessment`'s - so this module asks each of them rather than
 restating their field names, and a field renamed at its source is a type error
 here instead of a section that silently stops rendering.
+
+Carriers rather than dicts is also what makes the render a **redaction sink**
+it can be one. A related link arrived here as a mapping until finding 5, which
+is text no policy was known to have run over reaching a document a user reads.
 
 What it still spells out itself: the shape of a **transcript** segment, which is
 `transcript.py`'s, and every heading, bullet and fence in the document, which is
@@ -20,9 +25,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .artifacts import FrameArtifact, Interpretation, Transcript, serialize
+from .artifacts import Carrier, FrameArtifact, Interpretation, Transcript, serialize
 from .errors import DistillError
 from .grounding import GroundingAssessment
+from .links import RelatedLink
 
 MIN_TRANSCRIPT_CHARS = 3
 
@@ -61,7 +67,7 @@ def ensure_content(transcript: Transcript | None, frames: list[FrameArtifact]) -
         )
 
 
-def _require_redaction_policy(transcript: Transcript | None, frames: list[FrameArtifact]) -> None:
+def _require_redaction_policy(*carriers: Carrier) -> None:
     """Refuse to render a carrier whose **redaction** policy has not been applied.
 
     R-20 names a **render** as a sink beside a **generation**, so the check that
@@ -69,11 +75,17 @@ def _require_redaction_policy(transcript: Transcript | None, frames: list[FrameA
     and it is asked here rather than reimplemented - a second copy of "has the
     policy run" is a second answer that can drift from the first.
 
+    Every carrier the render prints, not the two it started with: **related
+    links** reached this function as plain documents and so were checked by
+    nobody, which is the layer finding 5 found missing. Stated as varargs over
+    `Carrier` so a family added later is a type error at the call site rather
+    than a silent omission here.
+
     Nothing else is taken from the serialized documents. The render reads the
     carriers, because what it needs is their typed fields; this is the check and
     only the check.
     """
-    for carrier in (*frames, *(() if transcript is None else (transcript,))):
+    for carrier in carriers:
         serialize(carrier)
 
 
@@ -83,9 +95,13 @@ def render_markdown(
     transcript: Transcript | None,
     frames: list[FrameArtifact],
     warnings: list[dict[str, str]],
-    related_links: list[dict[str, str]] | None = None,
+    related_links: list[RelatedLink] | None = None,
 ) -> str:
-    _require_redaction_policy(transcript, frames)
+    _require_redaction_policy(
+        *frames,
+        *(() if transcript is None else (transcript,)),
+        *(related_links or ()),
+    )
     ensure_content(transcript, frames)
     lines = [
         "# Video Bundle",
@@ -100,12 +116,11 @@ def render_markdown(
     if related_links:
         lines.extend(["## Related links", ""])
         for link in related_links:
-            label = str(link.get("label", "")).strip() or str(link.get("url", "")).strip()
-            url = str(link.get("url", "")).strip()
-            reason = str(link.get("reason", "")).strip()
+            url = link.url.strip()
             if not url:
                 continue
-            suffix = f" ({reason})" if reason else ""
+            label = link.label.strip() or url
+            suffix = f" ({link.reason.strip()})" if link.reason.strip() else ""
             lines.append(f"- [{label}]({url}){suffix}")
         lines.append("")
     segments = list(transcript.segments) if transcript else []

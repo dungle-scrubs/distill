@@ -23,6 +23,7 @@ from typing import Any
 
 from .artifacts import FrameArtifact, serialize
 from .bundle_store import BundleSnapshot
+from .links import RelatedLink
 from .options import DistillOptions
 from .release import DISTILL_VERSION
 from .source import SourceInfo
@@ -49,6 +50,10 @@ def manifest_document(
     cache hit reads it back out of the manifest rather than rebuilding it, so
     there is one producer of that shape and no second one to disagree with it.
 
+    The **related links** on `source` arrive the other way round - as carriers,
+    because nothing before this has serialized them - and are turned into
+    documents here, which is the point their **redaction** policy is checked.
+
     Identity is recorded as `bundle_key` (D-008). The value hashes a **source
     fingerprint** together with an **options hash**, so it names a **bundle**
     rather than a source, and `bundle_store.IDENTITY_FIELDS` already said only
@@ -63,7 +68,7 @@ def manifest_document(
         "source_type": source.source_type,
         "bundle_key": source.source_hash,
         "source_resolved_path": str(source.resolved_path),
-        "related_links": list(source.related_links or []),
+        "related_links": response_related_links(source.related_links),
         "duration_sec": source.duration_sec,
         "options": options.public_dict(source.source_type),
         "frame_count": len(frames),
@@ -72,6 +77,29 @@ def manifest_document(
         "frames": frames,
         "warnings": warnings,
     }
+
+
+def response_related_links(links: list[RelatedLink] | None) -> list[dict[str, Any]]:
+    """The **related link** shape both documents carry, produced once like the frames'.
+
+    A carrier in and a document out, and the way out is `serialize`: a
+    manifest is durable and a response is what a caller reads, so both are the
+    sinks R-20 is stated about. Related links were the one carrier family
+    arriving here already flattened, which left nothing for either sink to
+    refuse (finding 5).
+
+    Four fields, and deliberately not six. `redaction` and `warnings` are how a
+    carrier records what was done to it, not what a link is: a **manifest** is
+    bundle content, and a reader asking what this bundle links to is not asking
+    about Distill's bookkeeping. The run's policy is already recorded once, in
+    the manifest's `options`, and the **warnings** a link raised at construction
+    travel with the source's warnings - so nothing is lost by leaving them out,
+    and the same four keys reach the caller as reach the manifest (finding 7).
+    """
+    return [
+        {key: document[key] for key in ("url", "label", "source", "reason")}
+        for document in (serialize(link) for link in links or ())
+    ]
 
 
 def response_frames(frames: list[FrameArtifact]) -> list[dict[str, Any]]:
@@ -158,7 +186,7 @@ def run_response(
         "summary": summary,
         "warnings": warnings,
     }
-    related_links = list(source.related_links or [])
+    related_links = response_related_links(source.related_links)
     if related_links:
         response["related_links"] = related_links
     if progress is not None:

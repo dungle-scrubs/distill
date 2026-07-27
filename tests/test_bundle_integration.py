@@ -23,7 +23,12 @@ from distill.bundle_store import (
 from distill.errors import DistillError
 from distill.links import extract_relevant_links
 from distill.options import DistillOptions
-from distill.response import manifest_document, response_frames, run_response
+from distill.response import (
+    manifest_document,
+    response_frames,
+    response_related_links,
+    run_response,
+)
 from distill.source import SourceInfo
 from distill.version import PIPELINE_VERSION
 
@@ -38,6 +43,8 @@ def spoken(*segments: dict[str, object]) -> Transcript:
     that could hand in a mapping would be a caller that had already skipped it.
     """
     return Transcript(language="en", segments=tuple(segments))
+
+
 # Secret-shaped by `redact_secrets.SECRET_PATTERNS`, placed in both halves of a
 # **related link** so the manifest is asked about the label and the destination.
 LINK_SECRET = "sk-live-0123456789abcdefghij"
@@ -172,6 +179,12 @@ def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> N
     old assertion was that the manifest matched the source byte for byte, which
     holds whether or not anything redacted them - so it is stated here as an
     absence of the secret as well as a presence of the links.
+
+    Carried byte-for-byte is also no longer what either document does: a source
+    holds carriers now, and each sink serializes them into the four fields that
+    describe a link. `redaction` and `warnings` are the carrier's bookkeeping
+    and stay out of both (finding 7) - the policy is recorded once, under
+    `options`, and a link's warnings travel with the source's.
     """
     store, run = begin(tmp_path / "output")
     source_info = youtube_source(tmp_path)
@@ -191,8 +204,10 @@ def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> N
 
     active = store.load_active(BUNDLE_KEY)
     assert active is not None
-    assert active.manifest["related_links"] == source_info.related_links
-    assert response["related_links"] == source_info.related_links
+    documents = response_related_links(source_info.related_links)
+    assert active.manifest["related_links"] == documents
+    assert response["related_links"] == documents
+    assert [sorted(link) for link in documents] == [["label", "reason", "source", "url"]]
     published = json.dumps(active.manifest) + json.dumps(response)
     assert LINK_SECRET not in published
     assert "github.com/example/catch-me-up" in published

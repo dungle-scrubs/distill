@@ -15,6 +15,7 @@ related-link labels and destinations.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -26,18 +27,26 @@ from distill import pipeline as distill_session
 from distill.artifacts import (
     FrameArtifact,
     Interpretation,
+    RedactionPolicyNotApplied,
     RedactionState,
     Transcript,
     serialize,
 )
-from distill.links import extract_relevant_links
+from distill.bundle_store import BundleRun, BundleStore
+from distill.links import RelatedLink, extract_relevant_links
 from distill.options import DistillOptions
 from distill.progress import DEFAULT_MECHANISM_WEIGHTS
+from distill.render import render_markdown
+from distill.response import manifest_document, response_related_links
 from distill.source import (
     AcquiredSource,
     AcquisitionLease,
     SourceInfo,
+    SourceRequest,
     YouTubeMetadata,
+    YouTubeSourceProvider,
+    _manifest_related_links,
+    source_hash,
     youtube_source_info,
 )
 
@@ -390,8 +399,8 @@ def test_a_secret_in_a_related_link_label_is_redacted() -> None:
     )
 
     assert len(links) == 1
-    assert SECRET not in links[0]["label"]
-    assert links[0]["redaction"] == "applied"
+    assert SECRET not in links[0].label
+    assert links[0].redaction is RedactionState.APPLIED
 
 
 def test_a_secret_in_a_related_link_destination_is_redacted() -> None:
@@ -402,7 +411,7 @@ def test_a_secret_in_a_related_link_destination_is_redacted() -> None:
     )
 
     assert len(links) == 1
-    assert SECRET not in links[0]["url"]
+    assert SECRET not in links[0].url
 
 
 def test_a_secret_straddling_the_label_cap_is_redacted_before_it_is_cut() -> None:
@@ -422,7 +431,7 @@ def test_a_secret_straddling_the_label_cap_is_redacted_before_it_is_cut() -> Non
         source="youtube_description",
     )
 
-    label = links[0]["label"]
+    label = links[0].label
     assert len(label) <= 160
     assert label.endswith("[REDACTED]")
     assert "sk-" not in label
@@ -436,14 +445,213 @@ def test_related_links_honour_the_opt_out() -> None:
         redact=False,
     )
 
-    assert SECRET in links[0]["url"]
-    assert links[0]["redaction"] == "disabled"
+    assert SECRET in links[0].url
+    assert links[0].redaction is RedactionState.DISABLED
+
+
+# 6b. The sinks a related link reaches enforce the policy, as they do for the
+#     other carriers
+
+
+def source_carrying(links: list[RelatedLink]) -> SourceInfo:
+    """A **source** whose metadata produced `links` and nothing else of interest."""
+    return SourceInfo(
+        source_type="youtube",
+        resolved_path=Path("/tmp/video.mp4"),
+        duration_sec=1.0,
+        source_fingerprint="fingerprint",
+        source_hash=BUNDLE_KEY,
+        warnings=[],
+        related_links=links,
+    )
+
+
+def test_a_related_link_whose_policy_never_ran_is_refused_by_the_render_and_the_manifest() -> None:
+    """The one carrier family whose sinks enforced nothing (R-20, R-21).
+
+    `_require_redaction_policy` covered the frames and the **transcript**, and
+    related links arrived at both sinks as plain documents that nothing looked
+    at - so a label and a destination could reach a **render** and a
+    **manifest** without the check that refuses text no policy ran over. That
+    is the hole `BundleRun.write_transcript` was written to close, stated for
+    the carrier it had not reached: a caller holding a document has bypassed
+    the check already, so it cannot be allowed to hand one in.
+
+    Live callers were correct, so this is the layer being made to hold rather
+    than a leak being stopped. The state below is the documented bypass -
+    construction cannot produce it - which is what makes the check reachable
+    at all.
+
+    The render is given a **transcript** it could render, so the refusal is the
+    only reason it can fail. Handed nothing to render it raises `E_NO_CONTENT`
+    instead, which passes a bare `DistillError` assertion whether or not the
+    link was ever checked.
+    """
+    link = extract_relevant_links(
+        f"Docs: https://github.com/example/repo?api_key={SECRET}",
+        source="youtube_description",
+    )[0]
+    object.__setattr__(link, "redaction", RedactionState.NOT_APPLIED)
+    spoken = Transcript(
+        language="en",
+        segments=({"start": 0.0, "end": 1.0, "text": "they said something"},),
+    )
+    assert render_markdown("demo.mp4", 1.0, spoken, [], [], [])
+
+    with pytest.raises(RedactionPolicyNotApplied):
+        render_markdown("demo.mp4", 1.0, spoken, [], [], [link])
+    with pytest.raises(RedactionPolicyNotApplied):
+        manifest_document(
+            source_carrying([link]),
+            DistillOptions(),
+            transcript_present=False,
+            frames=[],
+            warnings=[],
+        )
+
+
+def test_the_documents_a_reader_gets_carry_the_link_and_not_the_carriers_bookkeeping() -> None:
+    """A **related link** is bundle content; its policy state and warnings are not.
+
+    `redaction` and `warnings` are how a carrier records what was done to it,
+    and they were being written into the **manifest** and handed to the caller
+    beside the four fields that describe the link. They are stripped at the
+    boundary, on the same terms as a **frame artifact**'s: `response_frames`
+    has never carried them either, and the run's policy is already recorded
+    once, in the manifest's `options`.
+
+    Which leaves the **warnings** somewhere - they are a **degradation** and
+    dropping them would be losing one. They join the source's warnings, so a
+    truncated label is counted in `warning_count` like every other warning
+    rather than buried in the entry it came from.
+    """
+    links = extract_relevant_links(
+        "Docs: https://github.com/example/repo",
+        source="youtube_description",
+    )
+
+    documents = response_related_links(links)
+
+    assert documents == [
+        {
+            "url": "https://github.com/example/repo",
+            "label": "Docs",
+            "source": "youtube_description",
+            "reason": "code_or_reference_domain",
+        }
+    ]
+
+
+def test_a_cache_hit_reads_its_related_links_back_as_carriers(tmp_path: Path) -> None:
+    """The one route that produces a **related link** without reading a description.
+
+    A cache hit describes a **source** it never fetched, so its links come off
+    the **manifest** - and they have to come back as carriers, because the run
+    reusing them hands them to the same sinks a fresh run does. Reading them
+    back as the mappings the manifest holds is exactly the state finding 5
+    closed everywhere else: a document the sinks can no longer refuse.
+
+    The policy is the *reading* run's, on `FrameArtifact.from_document`'s terms,
+    which is why `from_document` takes it rather than believing the document.
+    Asserted here by the round trip landing on the same four fields the fresh
+    run published, with the secret still gone from both halves.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    options = DistillOptions()
+    video_id = "abc123"
+    key = source_hash(hashlib.sha256(video_id.encode()).hexdigest(), options.opts_hash("youtube"))
+    fresh = SourceInfo(
+        source_type="youtube",
+        resolved_path=tmp_path / "video.mp4",
+        duration_sec=12.0,
+        source_fingerprint="fingerprint",
+        source_hash=key,
+        warnings=[],
+        related_links=extract_relevant_links(
+            f"Skill repo: https://github.com/example/repo?api_key={SECRET}",
+            source="youtube_description",
+        ),
+    )
+    run = BundleStore.open(root).begin(key)
+    assert isinstance(run, BundleRun)
+    run.write_render("# Video\n")
+    run.commit(
+        manifest_document(fresh, options, transcript_present=False, frames=[], warnings=[])
+    )
+
+    served = YouTubeSourceProvider().cached(
+        SourceRequest(value=f"https://youtu.be/{video_id}", options=options, output_root=root),
+        metadata=YouTubeMetadata(video_id=video_id, description="", warnings=[]),
+    )
+
+    assert served is not None
+    assert served.related_links is not None
+    assert all(isinstance(link, RelatedLink) for link in served.related_links)
+    assert all(link.redaction is RedactionState.APPLIED for link in served.related_links)
+    assert response_related_links(served.related_links) == response_related_links(
+        fresh.related_links
+    )
+    assert SECRET not in json.dumps(response_related_links(served.related_links))
+
+
+def test_a_manifest_that_describes_no_links_usably_costs_the_links_and_not_the_cache_hit() -> None:
+    """Tolerance on the way in is a claim, so it is exercised rather than stated (D-022).
+
+    A **manifest** is something an older Distill may have written, so what it
+    records may not be the shape this one reads - and a cache hit is worth more
+    than the links it cannot rebuild. Called directly because no run this
+    version can perform publishes such a manifest: `response_related_links`
+    serializes carriers, so the shapes below only ever arrive off disk.
+    """
+    options = DistillOptions()
+
+    assert _manifest_related_links({}, options) is None
+    assert _manifest_related_links({"related_links": "https://example.com"}, options) is None
+    assert _manifest_related_links(
+        {"related_links": ["https://example.com", {"url": "https://github.com/example/repo"}]},
+        options,
+    ) == [
+        RelatedLink(
+            url="https://github.com/example/repo",
+            label="",
+            source="",
+            reason="",
+            redaction=RedactionState.APPLIED,
+        )
+    ]
+
+
+def test_a_warning_a_link_raised_at_construction_reaches_the_runs_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The **redaction** policy's own warning about a link is not lost at the boundary.
+
+    A confusable-obfuscated key in a description is redacted *and* reported -
+    the report is what tells a user their bundle met something shaped like a
+    secret. Stripping the carrier's bookkeeping from the manifest entry is only
+    correct if the warning has somewhere else to be, and the source's warnings
+    are where the rest of acquisition's already are.
+    """
+    obfuscated = "ｓk-live-0123456789abcdefghij"  # fullwidth s
+    source = resolve_youtube_source(
+        monkeypatch,
+        tmp_path,
+        DistillOptions(),
+        description=f"Skill repo: https://github.com/example/repo?api_key={obfuscated}",
+    )
+
+    assert [warning["code"] for warning in source.warnings] == ["possible_confusable_secret"]
+    assert source.related_links is not None
+    assert "[REDACTED]" in source.related_links[0].url
 
 
 def resolve_youtube_source(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     options: DistillOptions,
+    description: str | None = None,
 ) -> Any:
     """Resolve a YouTube **source** with everything outside the process faked.
 
@@ -462,14 +670,15 @@ def resolve_youtube_source(
             _ = (url, lock_key, progress)
             return AcquiredSource(path=video, lease=lease)
 
+    said = (
+        description
+        if description is not None
+        else f"Skill repo: https://github.com/example/repo?api_key={SECRET}"
+    )
     monkeypatch.setattr("distill.source.check_disk_floor", lambda _path: None)
     monkeypatch.setattr(
         "distill.source.youtube_metadata",
-        lambda _url: YouTubeMetadata(
-            video_id="abc123",
-            description=f"Skill repo: https://github.com/example/repo?api_key={SECRET}",
-            warnings=[],
-        ),
+        lambda _url: YouTubeMetadata(video_id="abc123", description=said, warnings=[]),
     )
     monkeypatch.setattr("distill.source.probe_duration", lambda _path: (12.0, []))
     try:
@@ -499,8 +708,10 @@ def test_the_link_policy_is_the_users_option_and_not_a_default(
         monkeypatch, tmp_path, DistillOptions(redact_secrets=False)
     )
 
-    assert SECRET not in json.dumps(redacted.related_links)
-    assert SECRET in json.dumps(opted_out.related_links)
+    # Asserted on the documents the sinks produce rather than on the carriers,
+    # because that is the form the user's option has to survive all the way to.
+    assert SECRET not in json.dumps(response_related_links(redacted.related_links))
+    assert SECRET in json.dumps(response_related_links(opted_out.related_links))
 
 
 # 7. The standalone redaction pipeline stage is DELETED
