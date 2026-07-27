@@ -4,12 +4,12 @@ import hashlib
 import json
 import logging
 import os
-import time
 from ast import literal_eval
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from conftest import unused_pid
 from fake_tools import FAKE_FFPROBE, FAKE_YTDLP_DOWNLOAD, FAKE_YTDLP_FAILING
 
 from distill.errors import DistillError
@@ -407,43 +407,28 @@ def test_options_payload_is_stable_json_hash() -> None:
 
 
 def test_youtube_stale_lock_takeover_is_covered(tmp_path: Path) -> None:
+    dead = unused_pid()
     lock = tmp_path / "video.lock"
     lock.write_text(
-        json.dumps(
-            {
-                "pid": 999999,
-                "created_wall": "2026-01-01T00:00:00Z",
-                "created_monotonic": 1.0,
-                "last_heartbeat_monotonic": 1.0,
-            }
-        )
+        json.dumps({"pid": dead, "created_wall": "2026-01-01T00:00:00Z"})
     )
-    downloader = YoutubeDownloader(tmp_path, stale_sec=0.001)
+    downloader = YoutubeDownloader(tmp_path)
 
     acquired, warnings = downloader._acquire(lock)
 
     assert acquired is True
     assert warnings == []
     payload = json.loads(lock.read_text())
-    assert payload["pid"] != 999999
+    assert payload["pid"] != dead
 
 
 def test_youtube_long_lock_wait_emits_warning(tmp_path: Path) -> None:
-    now = time.monotonic()
     lock = tmp_path / "video.lock"
     lock.write_text(
-        json.dumps(
-            {
-                "pid": 999999,
-                "created_wall": "2026-01-01T00:00:00Z",
-                "created_monotonic": now,
-                "last_heartbeat_monotonic": now,
-            }
-        )
+        json.dumps({"pid": unused_pid(), "created_wall": "2026-01-01T00:00:00Z"})
     )
     downloader = YoutubeDownloader(
         tmp_path,
-        stale_sec=0.01,
         lock_wait_sec=0.05,
         lock_poll_sec=0.005,
         lock_warn_after_sec=0.0,

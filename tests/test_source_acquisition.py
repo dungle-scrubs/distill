@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from conftest import unused_pid
 from fake_tools import (
     FAKE_FFPROBE,
     FAKE_FFPROBE_NO_DURATION,
@@ -35,6 +38,28 @@ def media_root(output_root: Path) -> Path:
 
 def staging_root(output_root: Path) -> Path:
     return output_root / "_youtube_staging" / LOCK_KEY
+
+
+def lock_path(output_root: Path) -> Path:
+    return output_root / "_youtube_locks" / f"{LOCK_KEY}.lock"
+
+
+def advance_monotonic_clock(monkeypatch: pytest.MonkeyPatch, by_sec: float) -> None:
+    """Make the module's clock read `by_sec` later, without any test sleeping.
+
+    Only the reading moves; intervals measured inside a single call are
+    unchanged, so a bounded wait still ends when it would have. This ages a
+    lock by an hour in the eyes of anything that reads a clock to judge it.
+    """
+
+    class ShiftedClock:
+        def __getattr__(self, name: str) -> object:
+            return getattr(time, name)
+
+        def monotonic(self) -> float:
+            return time.monotonic() + by_sec
+
+    monkeypatch.setattr(distill_source, "time", ShiftedClock())
 
 
 def promoted_names(output_root: Path) -> list[str]:
@@ -121,6 +146,95 @@ def test_second_run_with_different_options_cannot_disturb_media_being_read(
     second = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
     assert second.path.read_bytes() == b"clobbered"
     second.lease.release()
+
+
+def test_a_lease_a_live_run_holds_is_not_stealable_however_old_it_is(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (RV-2, R-36): age decided staleness, and every real run is old.
+
+    The lease covers the media's whole read lifetime, and nothing refreshes the
+    lock file, so any run that gets as far as transcription holds a lock older
+    than a staleness window worth waiting out. A second run that read age as
+    abandonment would take the lease, download, and `os.replace` its result onto
+    the path the first run is still reading. Liveness is the only thing that
+    says the holder has stopped reading, so the clock is moved forward by an
+    hour and the lock file aged on disk to match: neither may matter.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    first = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    lock = lock_path(tmp_path)
+    advance_monotonic_clock(monkeypatch, by_sec=3600.0)
+    os.utime(lock, (0, 0))
+
+    fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_LOCKED"
+    assert first.path.read_bytes() == b"video"
+    assert json.loads(lock.read_text())["pid"] == os.getpid()
+    first.lease.release()
+
+
+def test_a_lease_whose_holder_is_gone_is_reclaimed(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: a lock outliving its holder blocked everyone for the window.
+
+    A run killed mid-acquisition leaves its lock file behind, freshly written by
+    any clock. Waiting it out is waiting for a process that no longer exists, so
+    the lock is reclaimed the moment the holder is found to be gone. The lock
+    file here is the one production wrote, with only the holder changed, so the
+    test cannot pass by naming a field acquisition no longer keeps.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    abandoned = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    lock = lock_path(tmp_path)
+    payload = json.loads(lock.read_text())
+    lock.write_text(json.dumps({**payload, "pid": unused_pid()}))
+
+    fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
+    reclaimed = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+
+    assert reclaimed.path.read_bytes() == b"clobbered"
+    assert json.loads(lock.read_text())["pid"] == os.getpid()
+    reclaimed.lease.release()
+    abandoned.lease.release()
+
+
+def test_releasing_a_lease_this_run_no_longer_owns_leaves_the_holder_alone(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: release unlinked the lock file whoever had written it.
+
+    Once a run has lost its lock - reclaimed after a stall, or replaced by hand -
+    the file at that path is somebody else's lease. Releasing by unlinking
+    whatever is there destroys that lease and lets a third run in behind it, so
+    release checks that the lock still names this process and otherwise does
+    nothing. The parent process stands in for the second run: a live pid that is
+    not this one, with no child to spawn.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    first = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    lock = lock_path(tmp_path)
+    other_holder = os.getppid()
+    lock.write_text(json.dumps({"pid": other_holder, "created_wall": "2026-01-01T00:00:00Z"}))
+
+    first.lease.release()
+
+    assert lock.exists()
+    assert json.loads(lock.read_text())["pid"] == other_holder
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    assert exc.value.code == "E_LOCKED"
 
 
 def test_each_run_stages_its_download_in_its_own_directory(

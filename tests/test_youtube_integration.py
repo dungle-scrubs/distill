@@ -148,7 +148,10 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
         def __init__(self, output_root: Path) -> None:
             self.lock_path = output_root / "_youtube_locks" / "mock-video.lock"
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-            self.lock_path.write_text("{}")
+            # The same lock file the real downloader writes: release only drops
+            # a lock this process still holds, so a pid-less stand-in would be
+            # left behind and say nothing about the lease's lifetime.
+            self.lock_path.write_text(json.dumps({"pid": os.getpid()}))
 
         def acquire(
             self,

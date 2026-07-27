@@ -88,3 +88,22 @@ def hermetic_user_directories(
             environment, home=test_home, config_dir=config_dir
         )
         yield
+
+
+def unused_pid() -> int:
+    """A pid no live process holds, for standing in for a holder that is gone.
+
+    Acquisition decides a lock is abandoned by asking the kernel whether the
+    recorded pid still exists, so a test about an abandoned lock needs a pid
+    that genuinely does not. Searching downward from the top of the pid space
+    finds one without spawning and reaping a child, whose pid the kernel could
+    hand straight back to something else.
+    """
+    for candidate in range(2**15 - 1, 1024, -1):
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except OSError:
+            continue
+    raise RuntimeError("no unused pid found")

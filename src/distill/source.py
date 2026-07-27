@@ -136,6 +136,49 @@ def _acquisition_log(event: str, **detail: Any) -> None:
     )
 
 
+def _lock_owner_pid(lock_path: Path) -> int | None:
+    """The pid recorded in a lock file, or None if there is no usable one.
+
+    A missing, unreadable, malformed or pid-less lock file names no holder. It
+    is reported the same way as an absent one, because in both cases there is
+    nobody the lock can be said to belong to.
+    """
+    try:
+        payload = json.loads(lock_path.read_text())
+        pid = payload["pid"]
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
+def _holder_is_alive(pid: int) -> bool:
+    """Whether the process recorded in a lock file still exists.
+
+    Liveness, not age, is what says a lock is abandoned. The lease is held for
+    the media's whole read lifetime (R-36), which for any real run outlasts any
+    staleness window worth waiting out - transcription alone is minutes - so a
+    clock-based test would hand a live run's media to a second run. A signal 0
+    asks the kernel instead and is exact for as long as the pid is.
+
+    Residual risk: pid reuse. A holder that died and whose pid was handed to an
+    unrelated process still reads as alive, and - worse - a lock recorded by a
+    dead holder whose pid was reused can never be reclaimed here. R-07 replaces
+    this with `flock`, which the kernel releases when the holder exits: held for
+    the run's duration, no heartbeat, no staleness window, no pid to collide.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The process exists and belongs to another user. Existing is the whole
+        # question here, so this is a live holder.
+        return True
+    except OSError:
+        return True
+    return True
+
+
 @dataclass
 class AcquisitionLease:
     """The exclusive right to acquire and read one **source**'s media.
@@ -149,22 +192,37 @@ class AcquisitionLease:
     media - not when the download ends. `release` is idempotent, because the
     failure paths that release a lease early overlap with the caller's own
     cleanup.
+
+    `owner_pid` is what makes release safe: the lock file is a shared name, and
+    a lease that unlinked whatever happened to be at that name would destroy a
+    lock some other run had taken in the meantime.
     """
 
     lock_key: str
     lock_path: Path
     warnings: list[dict[str, str]] = field(default_factory=list)
     released: bool = False
+    owner_pid: int = field(default_factory=os.getpid)
 
     def release(self) -> None:
+        """Drop the lease, but only if the lock file still records this holder.
+
+        Unlinking unconditionally would let a run that has already lost its
+        lock - to a reclaim, or to a hand-edited directory - delete the lock a
+        different run now holds, and let a third run in behind it. So the file
+        is read back first, and a lock naming anyone else is left alone.
+        """
         if self.released:
             return
         self.released = True
-        self.lock_path.unlink(missing_ok=True)
+        held = _lock_owner_pid(self.lock_path) == self.owner_pid
+        if held:
+            self.lock_path.unlink(missing_ok=True)
         _acquisition_log(
             "lease_released",
             lock_key=self.lock_key,
             lock_path=str(self.lock_path),
+            held=held,
         )
 
 
@@ -850,13 +908,11 @@ class YoutubeDownloader:
     def __init__(
         self,
         output_root: Path,
-        stale_sec: float = 180.0,
         lock_wait_sec: float = 0.0,
         lock_poll_sec: float = 0.25,
         lock_warn_after_sec: float = 5.0,
     ) -> None:
         self.output_root = output_root
-        self.stale_sec = stale_sec
         self.lock_wait_sec = lock_wait_sec
         self.lock_poll_sec = lock_poll_sec
         self.lock_warn_after_sec = lock_warn_after_sec
@@ -1021,25 +1077,31 @@ class YoutubeDownloader:
             time.sleep(self.lock_poll_sec)
 
     def _try_acquire_once(self, lock: Path) -> bool:
-        now = time.monotonic()
+        """Take the lock file, reclaiming it only from a holder that is gone.
+
+        A lock is stale when the process that wrote it no longer exists - not
+        when it is old. Nothing refreshes a lock file, and the lease outlives
+        the download by design (R-36), so age says nothing about whether the
+        holder is still reading. A lock file that names no holder at all is
+        stale too: it cannot be waited out, because nobody will release it.
+        """
         payload = {
             "pid": os.getpid(),
             "created_wall": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "created_monotonic": now,
-            "last_heartbeat_monotonic": now,
         }
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            try:
-                current = json.loads(lock.read_text())
-                heartbeat = float(current.get("last_heartbeat_monotonic", 0))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                heartbeat = 0
-            if now - heartbeat <= self.stale_sec:
+            holder = _lock_owner_pid(lock)
+            if holder is not None and _holder_is_alive(holder):
                 return False
             lock.unlink(missing_ok=True)
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                # Another run reclaimed it inside the same window. It holds the
+                # lock now; the caller's poll loop decides whether to wait.
+                return False
         with os.fdopen(fd, "w") as handle:
             json.dump(payload, handle, sort_keys=True)
         return True
