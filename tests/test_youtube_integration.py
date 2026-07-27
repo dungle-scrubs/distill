@@ -281,12 +281,13 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     )
 
 
-def test_concurrent_youtube_calls_for_same_video_share_lock_key() -> None:
-    video_id = "same-video"
-    first = youtube_lock_key(video_id)
-    second = youtube_lock_key(video_id)
-
-    assert first == second
+# `test_concurrent_youtube_calls_for_same_video_share_lock_key` lived here and
+# was classified a *defect* under R-07: it called `youtube_lock_key` twice in one
+# thread and asserted a pure hash is stable, which exercises no concurrency at
+# all while reading as if it covered two runs meeting. Real mutual exclusion is
+# the kernel's, and it is proved by two real processes in
+# `tests/test_bundle_locking.py` (bundle lock) and
+# `tests/test_source_acquisition.py` (acquisition lease).
 
 
 def test_youtube_playlist_uses_playlist_output_subdirectory(

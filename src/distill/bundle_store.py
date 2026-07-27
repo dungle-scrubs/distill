@@ -26,22 +26,39 @@ or **options hash** that combine into a bundle key (`source.py`, `options.py`),
 and the output-root policy, which answers a different question - whether Distill
 may write under a root at all - and stays with `source.validate_output_root`.
 
-Milestone note: `begin`, `commit`, `patch_published` and the prune surface are
-declared here as the interface later milestones of this plan fill in (M3.2
-locking, M3.3 publish ordering, M3.4 prune). They raise `NotImplementedError`
-rather than being omitted, so callers migrate onto one shape once.
+Exclusion between runs is the kernel's, via `flock` on a descriptor `begin`
+holds for the run's duration. There is no heartbeat and no staleness window: a
+lock file whose *content* describes its holder has to be created before it can
+be written, and a contender reading it in between finds a lock nobody owns and
+takes it - two runs, one **bundle key** (finding 11). Here the lock exists for
+exactly as long as the descriptor does, so a holder that is killed outright
+releases it the moment the kernel closes its descriptors, and a live holder is
+never stealable however old its lock file is.
+
+Milestone note: `commit`, `patch_published` and the prune surface are declared
+here as the interface later milestones of this plan fill in (M3.3 publish
+ordering, M3.4 prune). They raise `NotImplementedError` rather than being
+omitted, so callers migrate onto one shape once.
 """
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
+import logging
 import os
 import shutil
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from .errors import DistillError
+
+LOGGER = logging.getLogger(__name__)
 
 MANIFEST_NAME = "_manifest.json"
 """The **published marker**: present only once a generation has been published."""
@@ -66,7 +83,70 @@ bundle rather than a source. Both are accepted as identity; only `bundle_key` is
 written from here on.
 """
 
+LOCK_DIR_NAME = "_locks"
+"""Where the run locks live: beside the bundles, not inside them.
+
+A lock file inside the bundle it protects is a lock **prune** deletes along with
+the bundle - and a waiter holding a descriptor on an unlinked inode locks that
+inode while the next run creates a fresh file at the same path and locks that,
+which is two runs holding one bundle key. Keeping the lock outside the bundle
+makes the path itself the identity of the lock, for as long as the output root
+exists.
+"""
+
+SINGLE_SOURCE_LOCK_WAIT_SEC = 300.0
+"""How long one video's run waits for a contended **bundle key** (D-044).
+
+The run a user is watching is worth waiting for: the likely holder is another
+run of the same video that is nearly done, and waiting for it costs less than
+failing and re-running.
+"""
+
+BATCH_ITEM_LOCK_WAIT_SEC = 5.0
+"""How long a batch or playlist item waits before failing `E_LOCKED` (D-044).
+
+Serializing a 25-item playlist behind another run's 40-minute video would cost
+hours of blocked waiting. `continue_on_error` already defaults true, so the item
+fails and the batch proceeds; re-running picks the item up as a cache hit.
+"""
+
+LOCK_POLL_SEC = 0.05
+"""How often a waiter re-asks the kernel for the lock.
+
+`flock` can block until the lock is free, but a blocking wait cannot be bounded
+by a budget without a signal, and a signal-based deadline would be a second
+concurrency mechanism to get right. Polling costs one cheap syscall per interval
+and makes the budget exact.
+"""
+
+_LOCK_HELD_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
+"""`flock` refusing a lock somebody else holds, which is an answer rather than a
+failure. Every other errno says this filesystem cannot give Distill the
+exclusion it asked for, and is fatal (R-09)."""
+
+BUNDLE_EVENT_TYPE = "distill.bundle"
+
 MarkerKind = Literal["published", "owned", "foreign", "invalid", "absent"]
+
+
+def _bundle_log(event: str, **detail: Any) -> None:
+    """Emit one bundle-store boundary event: lock taken, waited for, denied, refused.
+
+    Metadata only, in the shape `run_command` and `source` use, so one log stream
+    answers "what did this run do with this bundle key". Contention is otherwise
+    invisible: a run that took twenty minutes because it waited ten of them for a
+    lock looks exactly like a run that was slow.
+    """
+    LOGGER.debug(
+        json.dumps(
+            {
+                "type": BUNDLE_EVENT_TYPE,
+                "event": event,
+                "detail": {"pid": os.getpid(), **detail},
+            },
+            sort_keys=True,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -132,20 +212,108 @@ class BundleSnapshot:
         return self.generation / FRAMES_DIR_NAME
 
 
+@dataclass
+class BundleLock:
+    """One run's exclusive hold on a **bundle key**, granted by the kernel.
+
+    The lock *is* an open descriptor holding a `flock`, not a file whose contents
+    name a holder. That is what makes it exclusive and what makes it
+    self-releasing: there is nothing to publish, no staleness to guess at, and no
+    pid that could be reused. A holder killed outright releases it the moment the
+    kernel closes its descriptors (finding 11).
+
+    Held until `release`, which the run calls when it is finished - not when
+    staging ends. `release` is idempotent, because the failure paths that release
+    a lock early overlap with the caller's own cleanup.
+
+    Does not own: what the bundle contains, or the acquisition lease in
+    `source.py`, which is keyed by **lock key** and answers a different question -
+    "is another run fetching this source?" rather than "is another run producing
+    this bundle?".
+    """
+
+    bundle_key: str
+    path: Path
+    fd: int
+    released: bool = False
+
+    @classmethod
+    def take(cls, bundle_key: str, path: Path) -> BundleLock | None:
+        """Take the lock, or report `None` if another run holds it.
+
+        The descriptor stays open inside the returned lock: closing it is what
+        releasing means, so nothing else may close it. `flock` is per open file
+        description rather than per process, so a second lock taken against the
+        same path is refused even inside the process that holds the first.
+
+        A filesystem that cannot grant the lock is fatal (R-09): an errno other
+        than "held" means Distill cannot tell one run from two here, and the only
+        answer that does not silently reintroduce finding 6 is to stop.
+        """
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in _LOCK_HELD_ERRNOS:
+                return None
+            reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
+            raise DistillError(
+                "E_LOCK_UNSUPPORTED",
+                "bundle",
+                "filesystem cannot lock this bundle key",
+                {
+                    "bundle_key": bundle_key,
+                    "lock_path": str(path),
+                    "errno": reported or str(exc.errno),
+                },
+            ) from exc
+        except BaseException:
+            os.close(fd)
+            raise
+        return cls(bundle_key=bundle_key, path=path, fd=fd)
+
+    def release(self) -> None:
+        """Give the lock up by closing the descriptor the kernel locked.
+
+        The lock file itself stays on disk, deliberately: unlinking it is a
+        second way to lose exclusivity, because a waiter that already opened the
+        path holds a descriptor on an inode that now has no name and can lock it
+        while the next run locks a fresh file at the same path. Reclaiming those
+        empty files is **prune**'s business, not a release's.
+        """
+        if self.released:
+            return
+        self.released = True
+        os.close(self.fd)
+        _bundle_log("lock_released", bundle_key=self.bundle_key, lock_path=str(self.path))
+
+
 @dataclass(frozen=True)
 class BundleStore:
     """Every **bundle** under one output root."""
 
     root: Path
+    clock: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
 
     @classmethod
-    def open(cls, root: Path) -> BundleStore:
+    def open(
+        cls,
+        root: Path,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> BundleStore:
         """Open the store over an output root already accepted by the root policy.
 
         Resolving here means every path this store derives is compared against a
         root free of symlinks, so confinement checks cannot be defeated by one.
+
+        `clock` and `sleep` exist so a wait budget can be asserted exactly rather
+        than waited out; production passes neither.
         """
-        return cls(Path(root).resolve())
+        return cls(Path(root).resolve(), clock, sleep)
 
     def bundle_root(self, bundle_key: str) -> Path:
         """The directory a **bundle key** names, refusing anything that escapes.
@@ -195,9 +363,134 @@ class BundleStore:
             manifest=verdict.manifest,
         )
 
-    def begin(self, bundle_key: str, *, resume: bool = True) -> Any:
-        """Take the run lock and open a **staging directory**. Lands in M3.2."""
-        raise NotImplementedError("BundleStore.begin lands with locking in M3.2")
+    def lock_path(self, bundle_key: str) -> Path:
+        """Where the run lock for one **bundle key** lives. Derives, creates nothing.
+
+        Validated through `bundle_root`, so a key that would escape the output
+        root is refused here too: a lock file outside the root protects nothing
+        that is under it.
+        """
+        self.bundle_root(bundle_key)
+        return self.root / LOCK_DIR_NAME / f"{bundle_key}.lock"
+
+    def begin(
+        self,
+        bundle_key: str,
+        *,
+        wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
+        resume: bool = True,
+    ) -> BundleRun | BundleSnapshot:
+        """Take the run lock for `bundle_key` and open a **staging directory**.
+
+        Returns a `BundleSnapshot` instead when an **active generation** is on
+        disk *once the lock is held* (R-08). The re-check has to happen under the
+        lock to be worth anything: a waiter that decided "cache miss" before
+        queueing would come out of a wait it spent behind the winner and redo
+        the work the winner just published (RV-1).
+
+        Ordering is the requirement here, not just the outcome:
+
+        1. the lock, which is also the capability probe - nothing is created
+           under the bundle key until the kernel has granted exclusion, so a
+           filesystem that cannot lock fails having mutated nothing (R-09);
+        2. the **ownership marker**, before any content, so a run that dies
+           anywhere after this leaves a directory identifiable as Distill's
+           rather than one that is neither a bundle nor anybody's (R-11, RV-9);
+        3. the staging directory.
+
+        The lock is held for the run's duration, released by `BundleRun.release`
+        (or by the kernel, if the holder dies). `wait_sec` is the caller's
+        budget: `SINGLE_SOURCE_LOCK_WAIT_SEC` for the run a user is watching,
+        `BATCH_ITEM_LOCK_WAIT_SEC` for one item of a batch or playlist, and
+        `E_LOCKED` when it runs out.
+        """
+        lock, waited_sec = self._take_lock(bundle_key, wait_sec)
+        try:
+            snapshot = self.load_active(bundle_key)
+            if snapshot is not None:
+                # A cache hit holds nothing: the question the lock was taken to
+                # answer has been answered, so the next run may have it.
+                lock.release()
+                return snapshot
+            directory = self.bundle_root(bundle_key)
+            ensure_safe_directory(directory, self.root)
+            write_ownership_marker(directory, bundle_key)
+            paths = stage_paths(directory, reset=not resume)
+        except BaseException:
+            lock.release()
+            raise
+        return BundleRun(
+            store=self,
+            bundle_key=bundle_key,
+            paths=paths,
+            lock=lock,
+            waited_sec=waited_sec,
+            resumed=resume,
+        )
+
+    def _take_lock(self, bundle_key: str, wait_sec: float) -> tuple[BundleLock, float]:
+        """Poll for the run lock within this caller's budget.
+
+        The budget is the only thing that ends the wait: a lock is held until its
+        holder gives it up or dies, and neither is something to time out on a
+        holder's behalf.
+        """
+        path = self.lock_path(bundle_key)
+        # The lock directory is the one thing that has to exist before the probe
+        # can run at all. It holds no bundle content: an empty file per bundle
+        # key, outside every bundle, is not a mutation of anything R-09 protects.
+        path.parent.mkdir(parents=True, exist_ok=True)
+        started = self.clock()
+        contended = False
+        while True:
+            try:
+                lock = BundleLock.take(bundle_key, path)
+            except DistillError as exc:
+                if exc.code == "E_LOCK_UNSUPPORTED":
+                    _bundle_log(
+                        "lock_unsupported",
+                        bundle_key=bundle_key,
+                        lock_path=str(path),
+                        errno=exc.details.get("errno"),
+                    )
+                raise
+            waited = self.clock() - started
+            if lock is not None:
+                if contended:
+                    _bundle_log(
+                        "lock_waited",
+                        bundle_key=bundle_key,
+                        lock_path=str(path),
+                        waited_sec=waited,
+                    )
+                _bundle_log(
+                    "lock_acquired",
+                    bundle_key=bundle_key,
+                    lock_path=str(path),
+                    waited_sec=waited,
+                )
+                return lock, waited
+            contended = True
+            if waited >= wait_sec:
+                _bundle_log(
+                    "lock_denied",
+                    bundle_key=bundle_key,
+                    lock_path=str(path),
+                    waited_sec=waited,
+                    wait_budget_sec=wait_sec,
+                )
+                raise DistillError(
+                    "E_LOCKED",
+                    "bundle",
+                    "another run holds this bundle",
+                    {
+                        "bundle_key": bundle_key,
+                        "lock_path": str(path),
+                        "waited_sec": waited,
+                        "wait_budget_sec": wait_sec,
+                    },
+                )
+            self.sleep(min(LOCK_POLL_SEC, wait_sec - waited))
 
     def patch_published(self, snapshot: BundleSnapshot, fields: dict[str, Any]) -> Any:
         """Amend a published **manifest** in place. Lands in M3.3."""
@@ -212,12 +505,33 @@ class BundleStore:
         raise NotImplementedError("BundleStore.apply_prune lands with prune in M3.4")
 
 
+@dataclass
 class BundleRun:
     """One run's exclusive hold on a **bundle**, from `begin` to `commit`.
 
-    Declared here so callers migrate onto one shape; M3.2 gives it a lock and a
-    **staging directory**, and M3.3 gives it the publish ordering.
+    The hold lasts as long as this object is in use, not as long as staging
+    takes: every stage after staging - the download, the vision pass, the
+    publish - runs against a **bundle key** no other run may take. M3.3 gives it
+    the publish ordering; until then `release` (or the context manager) is how a
+    run ends.
     """
+
+    store: BundleStore
+    bundle_key: str
+    paths: BundlePaths
+    lock: BundleLock
+    waited_sec: float = 0.0
+    resumed: bool = True
+
+    def release(self) -> None:
+        """End the hold. Idempotent, and safe to call from a failure path."""
+        self.lock.release()
+
+    def __enter__(self) -> BundleRun:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.release()
 
     def read_stage(self, name: str) -> Any:
         """The recorded **stage result** for `name`, if it may be reused."""
@@ -234,6 +548,35 @@ class BundleRun:
     def abandon(self, reason: str) -> None:
         """Give up the run, leaving the previous **active generation** intact."""
         raise NotImplementedError("BundleRun.abandon lands in M3.3")
+
+
+def write_ownership_marker(directory: Path, bundle_key: str) -> Path:
+    """Claim `directory` as Distill's before anything is written into it (R-11).
+
+    Written in place rather than by atomic replace, because recognition is by
+    presence: `read_marker` treats the file's existence as the claim and does not
+    parse it, so the directory is Distill's from the moment the file is created.
+    An atomic replace would keep the claim in a temp file until it completed,
+    which is the window RV-9 is about. The payload is for a human reading the
+    directory, and a truncated one costs nothing.
+
+    Rewritten on every `begin`, so the recorded pid is the run that holds the
+    bundle now rather than the first one that ever did.
+    """
+    marker = directory / OWNERSHIP_MARKER_NAME
+    ensure_safe_directory(marker, directory, create_leaf=False)
+    marker.write_text(
+        json.dumps(
+            {
+                "bundle_key": bundle_key,
+                "pid": os.getpid(),
+                "claimed_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    return marker
 
 
 def read_marker(directory: Path) -> MarkerVerdict:
