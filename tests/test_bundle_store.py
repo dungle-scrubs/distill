@@ -197,6 +197,10 @@ def test_an_ownership_marker_identifies_a_directory_distill_owns(tmp_path: Path)
 
     Such a directory is not a **bundle** - there is nothing to serve - but it is
     Distill's, so prune may reclaim it rather than having to skip it forever.
+
+    What makes it Distill's is the **bundle key** the marker records, not the
+    marker's filename: the verdict carries the identity it read back, so a
+    payload naming any other directory could not have produced this one.
     """
     root = tmp_path / "output"
     (root / "hash").mkdir(parents=True)
@@ -208,6 +212,7 @@ def test_an_ownership_marker_identifies_a_directory_distill_owns(tmp_path: Path)
     assert verdict.is_bundle is False
     assert verdict.kind == "owned"
     assert verdict.is_distill_owned is True
+    assert verdict.bundle_key == "hash"
     assert store.load_active("hash") is None
 
 

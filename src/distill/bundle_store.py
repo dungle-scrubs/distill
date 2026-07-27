@@ -10,15 +10,32 @@ The invariant it exists to hold: *a directory is a bundle only if it carries a
 bundle marker*. Before this module, any directory containing `g1/video.md` was
 one, so pointing `--output-dir` at a directory of a user's own made that
 directory prunable - audit finding 1. Recognition is now positive and identity
-bound: the marker is a schema-valid **manifest** whose recorded bundle identity
-equals the directory name, accepting either the current `bundle_key` field or
-the legacy `source_hash` field so bundles written before this plan stay
-recognizable and prunable (D-017).
+bound, and *both* markers are held to it: a marker is a non-symlink regular file
+holding a JSON object whose recorded bundle identity equals the directory name,
+accepting either the current `bundle_key` field or the legacy `source_hash`
+field so bundles written before this plan stay recognizable and prunable
+(D-017). The **published marker** is additionally schema-valid, because it also
+has to name an **active generation**.
+
+Both, because finding 1 survived the first fix at a narrower filename: the
+**ownership marker** was recognized by the presence of `_owner.json` alone -
+never opened, never parsed, never compared - and a directory that carries only
+an ownership marker is proposed for deletion *whole*, which is the one target
+the active-generation guard cannot spare. Any tool's file of that name in a
+user's directory deleted it. `is_file()` follows symlinks, so a link named like
+either marker was one too.
 
 A marker proves the directory is Distill's; it does not prove the bundle is
 servable. `load_active` additionally verifies the **active generation** and its
 **render** exist on disk, because a **manifest** is a promise, not evidence
 (R-04): retention that deleted a generation left the manifest still naming it.
+`publish_staging` proves the same **render** before it renames anything, so the
+promise is not made in the first place unless there is something to serve.
+
+Every question this module asks of the filesystem can be refused, and none of
+them may end a walk. A directory prune cannot read is a **skip with a reason**
+like any other (R-57), not a `PermissionError` out of `cache-doctor` - the
+read-only command that exists *because* the destructive ones were unpreviewable.
 
 What this module does not own: what a pipeline stage computes, what a
 **generation** contains, job records (`job_store`), the **source fingerprint**
@@ -82,6 +99,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -99,7 +117,10 @@ MANIFEST_NAME = "_manifest.json"
 OWNERSHIP_MARKER_NAME = "_owner.json"
 """The **ownership marker** `begin` writes first, so a directory is identifiable
 as Distill-owned from its first moment - before any manifest exists (R-11,
-D-025). A run that crashes before publishing leaves this and nothing else."""
+D-025). A run that crashes before publishing leaves this and nothing else.
+
+The filename is where to look, never what is proved: what makes the directory
+Distill's is the **bundle key** recorded inside, matching the directory's name."""
 
 RENDER_NAME = "video.md"
 TRANSCRIPT_NAME = "transcript.json"
@@ -212,7 +233,27 @@ nothing to do with Distill, and reports the directories it stopped at.
 
 BUNDLE_EVENT_TYPE = "distill.bundle"
 
-MarkerKind = Literal["published", "owned", "foreign", "invalid", "absent"]
+MarkerKind = Literal["published", "owned", "foreign", "invalid", "absent", "unreadable"]
+"""Why a directory is or is not a **bundle**.
+
+`unreadable` is the directory this process may not look inside, which is neither
+"no marker" nor "a bad marker": it is Distill declining to answer. Kept distinct
+because the answer a user needs for it - a permission to fix - is not the answer
+either of the others calls for, and because folding it into `absent` would make
+a directory prune descends into out of one it cannot see (finding 2-opus).
+"""
+
+FileState = Literal["regular", "irregular", "absent"]
+"""What is at a path Distill will only accept as an ordinary file.
+
+`irregular` is anything present under that name which is not a non-symlink
+regular file - a symlink, a directory, a device. It is a third answer rather than
+a second spelling of `absent` because it means somebody put something there:
+recognition refuses it, and reports it (finding 1b).
+"""
+
+EntryKind = Literal["symlink", "directory", "other"]
+"""What one entry of a directory listing is, before anything follows it."""
 
 PruneKind = Literal["bundle", "generation", "staging"]
 """What a prune target is on disk: a whole **bundle**, one **generation**, or one
@@ -231,13 +272,15 @@ not live.
 
 PruneVerdict = Literal["deleted", "skipped"]
 
-LockState = Literal["live", "stale", "absent"]
+LockState = Literal["live", "stale", "absent", "unknown"]
 """What a run lock is right now, asked of the kernel rather than of the file.
 
 `live` is a lock another run holds. `stale` is a lock file nobody holds - a
 release closes a descriptor and deliberately leaves the file, so its presence
 alone means nothing. `absent` is a **bundle key** no run has ever reached
-staging under.
+staging under. `unknown` is a lock file this process could not open at all,
+which is not the same as free: prune counts it as held, because "may not ask"
+must never resolve to "nobody is running".
 """
 
 
@@ -427,11 +470,18 @@ class ExclusiveLock:
 
         The lock is released immediately: holding it would answer the question
         by making the answer true.
+
+        A lock file that will not open is `unknown` rather than an exception:
+        the read-only inspection must be able to report on a root whatever its
+        permissions, and `lock_is_held` reads `unknown` as held so the
+        destructive side errs toward leaving the bundle alone.
         """
         try:
             fd = os.open(path, os.O_RDWR)
         except FileNotFoundError:
             return "absent"
+        except OSError:
+            return "unknown"
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
@@ -1142,7 +1192,14 @@ class BundleStore:
                 "skipped",
                 f"revalidation under lock no longer proposes this target ({verdict.reason})",
             )
-        shutil.rmtree(target.path)
+        try:
+            shutil.rmtree(target.path)
+        except OSError as exc:
+            # Removing an entry needs write on its parent, which nothing above
+            # proved and a user may have taken away. One target Distill cannot
+            # remove must not cost the report on every target it did - the
+            # command that deletes is the one that most has to say what it did.
+            return PruneResult(target, "skipped", f"removal failed: {_errno_name(exc)}")
         return PruneResult(target, "deleted", target.reason)
 
     def survey(self) -> StoreSurvey:
@@ -1210,15 +1267,36 @@ class BundleStore:
         reachable, stop at every directory that is one because a **generation**
         is not a nested bundle, and stop at every directory whose marker says
         Distill is not free to reason about what is underneath it.
+
+        A directory that cannot be listed stops the descent there and is
+        reported, rather than ending the walk: one unreadable directory under a
+        root must not cost a user the report on everything else in it.
         """
-        for child in sorted(directory.iterdir()):
-            if child.is_symlink():
+        entries, unlistable = _listing(directory)
+        if unlistable is not None:
+            scan.skipped.append(DirectorySkip(directory, "unlistable", unlistable))
+            return
+        for child in entries:
+            try:
+                child_kind = _entry_kind(child)
+            except OSError as exc:
+                # Listing a directory needs read and stat'ing what is in it
+                # needs execute, so a listing that succeeded proves nothing
+                # about the entries it returned.
+                scan.considered += 1
+                scan.skipped.append(
+                    DirectorySkip(
+                        child, "unreadable", f"entry could not be read: {_errno_name(exc)}"
+                    )
+                )
+                continue
+            if child_kind == "symlink":
                 scan.considered += 1
                 scan.skipped.append(
                     DirectorySkip(child, "symlink", "a symlinked directory is never followed")
                 )
                 continue
-            if not child.is_dir():
+            if child_kind != "directory":
                 continue
             scan.considered += 1
             if child.name.startswith(("_", ".")):
@@ -1283,8 +1361,12 @@ class BundleStore:
                 )
             ]
 
-        if policy.max_age_days is not None:
-            age_sec = now - bundle_mtime(bundle_root)
+        changed_at = bundle_mtime(bundle_root)
+        if policy.max_age_days is not None and changed_at is not None:
+            # An age nobody could learn proposes nothing: expiry is the one rule
+            # that deletes an **active generation**, so it acts on a measured
+            # age or not at all.
+            age_sec = now - changed_at
             if age_sec > policy.max_age_days * SECONDS_PER_DAY:
                 # Expiry takes the bundle whole, active generation included
                 # (D-018). Retention has nothing left to say about it.
@@ -1505,6 +1587,68 @@ class BundleRun:
         self.release()
 
 
+def _errno_name(exc: OSError) -> str:
+    """The symbolic errno of a refusal, for a reason a user can act on."""
+    return (errno.errorcode.get(exc.errno, "") if exc.errno is not None else "") or str(exc.errno)
+
+
+def _file_state(path: Path) -> FileState:
+    """What is at `path`: an ordinary file, something else, or nothing.
+
+    `lstat` rather than `Path.is_file()`, which follows symlinks - so a link
+    named `_owner.json` pointing at a marker Distill really did write made a
+    directory Distill never wrote recognizable as its own, and a link at
+    `video.md` let a publish serve bytes from outside the bundle (finding 1b).
+    The question recognition asks is about the name, not about what it points at.
+
+    Raises `OSError` for anything but "not there", because a directory this
+    process may not stat into is a different answer from one holding no such
+    file, and guessing between them is how a permission problem became a
+    deletion or a crash.
+    """
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    return "regular" if stat.S_ISREG(info.st_mode) else "irregular"
+
+
+def _entry_kind(directory_entry: Path) -> EntryKind:
+    """What one entry of a listing is, from a single `lstat` that follows nothing.
+
+    One question rather than the `is_symlink()`-then-`is_dir()` pair it replaces:
+    those are two stats of a path that may change between them, and both refuse
+    an entry this process may not stat by raising rather than by answering.
+    Raising is the right shape here - the walk has one place to put a reason -
+    but only if somebody catches it.
+    """
+    info = directory_entry.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        return "symlink"
+    return "directory" if stat.S_ISDIR(info.st_mode) else "other"
+
+
+def _listing(directory: Path) -> tuple[list[Path], str | None]:
+    """Everything directly under `directory`, or nothing and why.
+
+    The one place that knows a directory listing can fail, and the reason every
+    layout question below is total rather than throwing. A failed listing is not
+    exceptional here: prune walks a tree a *user* chose, so a directory this
+    process cannot read is ordinary, and two prunes over one root routinely
+    descend into a bundle the other already removed. Left bare, one such
+    directory ended `cleanup-cache` and `cache-doctor` alike - and `cache-doctor`
+    is the read-only command that exists *because* the destructive ones were
+    unpreviewable (finding 2-opus).
+
+    An empty listing with a reason attached is the shape R-57 already requires of
+    every skip, so the walk has somewhere to put it.
+    """
+    try:
+        return sorted(directory.iterdir()), None
+    except OSError as exc:
+        return [], f"directory could not be listed: {_errno_name(exc)}"
+
+
 def prune_lock_path(bundle_root: Path) -> Path:
     """The run lock for the bundle at `bundle_root`. Derives, creates nothing.
 
@@ -1530,8 +1674,12 @@ def lock_is_held(bundle_root: Path) -> bool:
     so nothing is created to find that out: a plan mutates nothing, and the
     probe is what guarantees it rather than an existence check the answer could
     race.
+
+    A lock the probe could not open counts as held. Prune is maintenance and
+    skipping costs a user disk; deciding a bundle is free because the question
+    was refused costs them the bundle.
     """
-    return ExclusiveLock.probe(prune_lock_path(bundle_root)) == "live"
+    return ExclusiveLock.probe(prune_lock_path(bundle_root)) in ("live", "unknown")
 
 
 def lock_report(subject: str, path: Path) -> LockReport:
@@ -1555,31 +1703,68 @@ def lock_reports(lock_dir: Path) -> list[LockReport]:
     return sorted(
         (
             lock_report(path.name.removesuffix(LOCK_SUFFIX), path)
-            for path in lock_dir.iterdir()
-            if path.is_file() and not path.is_symlink() and path.name.endswith(LOCK_SUFFIX)
+            for path in _listing(lock_dir)[0]
+            if _is_lock_file(path)
         ),
         key=lambda report: report.path,
     )
 
 
+def _is_lock_file(path: Path) -> bool:
+    """Whether `path` is a run lock this walk can report on.
+
+    An entry that cannot be stat'ed is not one: unlike a marker, where "may not
+    look" and "not there" lead to different verdicts, a lock nobody can ask
+    about is a lock nobody can report, and refusing to answer must not end an
+    inspection of everything else under the root.
+    """
+    if not path.name.endswith(LOCK_SUFFIX):
+        return False
+    try:
+        return _file_state(path) == "regular"
+    except OSError:
+        return False
+
+
+def _listed_kind(directory_entry: Path) -> EntryKind | None:
+    """`_entry_kind` for a listing walked without a place to put a reason.
+
+    `None` where the walk would record a skip: an entry a listing returned can
+    still refuse to be stat'ed, because listing needs read on the directory and
+    stat'ing what is in it needs execute. Every layout question below wants the
+    same answer for that - leave it out - since a generation nobody can stat is
+    one nothing may propose deleting, and a bundle nobody can describe is
+    reported empty rather than not at all.
+    """
+    try:
+        return _entry_kind(directory_entry)
+    except OSError:
+        return None
+
+
 def sorted_generations(bundle_root: Path) -> list[Path]:
-    """Every **generation** directory under `bundle_root`, oldest first."""
+    """Every **generation** directory under `bundle_root`, oldest first.
+
+    A bundle root that cannot be listed - gone, or unreadable - has no
+    generations rather than raising, so a prune racing another prune over the
+    same root reports a bundle it can no longer see instead of ending.
+    """
     return sorted(
         (
             path
-            for path in bundle_root.iterdir()
-            if path.is_dir() and not path.is_symlink() and is_generation_name(path.name)
+            for path in _listing(bundle_root)[0]
+            if _listed_kind(path) == "directory" and is_generation_name(path.name)
         ),
         key=lambda path: int(path.name[len(GENERATION_PREFIX) :]),
     )
 
 
 def staging_directories(bundle_root: Path) -> list[Path]:
-    """Every **staging directory** left under `bundle_root`."""
+    """Every **staging directory** left under `bundle_root`. Total, as above."""
     return sorted(
         path
-        for path in bundle_root.iterdir()
-        if path.is_dir() and not path.is_symlink() and path.name.startswith(STAGING_PREFIX)
+        for path in _listing(bundle_root)[0]
+        if _listed_kind(path) == "directory" and path.name.startswith(STAGING_PREFIX)
     )
 
 
@@ -1593,14 +1778,22 @@ def active_generation_name(verdict: MarkerVerdict) -> str | None:
     return None
 
 
-def bundle_mtime(bundle_root: Path) -> float:
-    """When this **bundle** last changed, as the newest thing in it.
+def bundle_mtime(bundle_root: Path) -> float | None:
+    """When this **bundle** last changed, or `None` if that cannot be learned.
 
     Expiry is about a bundle nobody has produced into for a while, so the
     youngest of the **manifest** and the **generations** is the age that matters:
     a bundle whose oldest generation is a year old but which was republished
     yesterday is not aged. The old code read the bundle directory's own mtime,
     which changes when anything at all is created beside it.
+
+    Every path this asks about may stop answering between the marker read and
+    this question - another prune removing the bundle, or one refused `stat` -
+    so each is guarded and the listing behind `sorted_generations` is total. The
+    answer for "nothing would say" is `None` and not `0.0`: the epoch is not
+    "unknown", it is *older than everything*, and an age is the sole input on
+    which **expiry** deletes an entire bundle including its **active
+    generation**. Unknown must propose nothing.
     """
     candidates = [bundle_root, bundle_root / MANIFEST_NAME, *sorted_generations(bundle_root)]
     times = []
@@ -1609,7 +1802,7 @@ def bundle_mtime(bundle_root: Path) -> float:
             times.append(path.stat().st_mtime)
         except OSError:
             continue
-    return max(times, default=0.0)
+    return max(times) if times else None
 
 
 def _grouped_by_bundle(
@@ -1630,12 +1823,18 @@ def _grouped_by_bundle(
 def write_ownership_marker(directory: Path, bundle_key: str) -> Path:
     """Claim `directory` as Distill's before anything is written into it (R-11).
 
-    Written in place rather than by atomic replace, because recognition is by
-    presence: `read_marker` treats the file's existence as the claim and does not
-    parse it, so the directory is Distill's from the moment the file is created.
-    An atomic replace would keep the claim in a temp file until it completed,
-    which is the window RV-9 is about. The payload is for a human reading the
-    directory, and a truncated one costs nothing.
+    The recorded **bundle key** is the claim, not the filename: `read_marker`
+    parses this file and compares what it records to the directory's name, so a
+    payload naming anything else claims nothing. That is what keeps a file some
+    other tool happens to call `_owner.json` from making a user's directory
+    prunable.
+
+    Written in place rather than by atomic replace. An atomic replace would keep
+    the claim in a temporary file until the rename completed, which is the window
+    RV-9 is about, and the failure it would avoid is not a failure here: a
+    torn marker records no bundle key, so it reads as invalid and the directory
+    is skipped rather than reclaimed. Unreclaimable is the safe side of that
+    trade, and it is reported with its reason (R-57).
 
     Rewritten on every `begin`, so the recorded pid is the run that holds the
     bundle now rather than the first one that ever did.
@@ -1657,29 +1856,57 @@ def write_ownership_marker(directory: Path, bundle_key: str) -> Path:
 
 
 def read_marker(directory: Path) -> MarkerVerdict:
-    """Decide whether `directory` carries a **bundle marker**.
+    """Decide whether `directory` carries a **bundle marker**, and which one.
 
     Every failure is a verdict rather than an exception: an unmarked or
     unreadable directory may not be Distill's at all, and refusing to claim it is
     the whole point (R-01). A malformed manifest is likewise not a reason to end
     a run - it is a reason to rebuild the bundle.
-    """
-    manifest_path = directory / MANIFEST_NAME
-    if not manifest_path.is_file():
-        if (directory / OWNERSHIP_MARKER_NAME).is_file():
-            return MarkerVerdict(
-                kind="owned",
-                reason="ownership marker present, nothing published yet",
-                bundle_key=directory.name,
-            )
-        return MarkerVerdict(kind="absent", reason="no bundle marker")
 
+    Both marker kinds prove the same thing on the same terms: a non-symlink
+    regular file, parseable as a JSON object, recording a **bundle key** equal to
+    this directory's name. The **published marker** always did. The **ownership
+    marker** proved only that a file of that name existed - never opened, never
+    parsed, never compared - so any tool's `_owner.json` sitting in a user's
+    directory made that directory Distill-owned, and `_bundle_targets` proposes
+    the *bundle root* for a directory that never published. That is finding 1
+    surviving at a narrower filename, inside the operation that closed it, and
+    the active-generation guard cannot help when the target is the root itself.
+
+    Identity is what is being proved, so it is proved once here for both files
+    rather than trusted from the one whose contents nobody read.
+    """
     try:
-        document = json.loads(manifest_path.read_text())
-    except (OSError, ValueError):
-        return MarkerVerdict(kind="invalid", reason="manifest is not readable JSON")
-    if not isinstance(document, dict):
-        return MarkerVerdict(kind="invalid", reason="manifest is not a JSON object")
+        manifest_state = _file_state(directory / MANIFEST_NAME)
+        owner_state = _file_state(directory / OWNERSHIP_MARKER_NAME)
+    except OSError as exc:
+        return MarkerVerdict(
+            kind="unreadable",
+            reason=f"directory could not be read: {_errno_name(exc)}",
+        )
+
+    for name, state in (
+        (MANIFEST_NAME, manifest_state),
+        (OWNERSHIP_MARKER_NAME, owner_state),
+    ):
+        if state == "irregular":
+            # A link named like a marker is refused rather than ignored: it is
+            # not "no marker", and descending past it would be treating a
+            # directory somebody planted a marker name in as ordinary (1b).
+            return MarkerVerdict(kind="invalid", reason=f"{name} is not a regular file")
+
+    if manifest_state == "regular":
+        return _published_marker(directory)
+    if owner_state == "regular":
+        return _ownership_marker(directory)
+    return MarkerVerdict(kind="absent", reason="no bundle marker")
+
+
+def _published_marker(directory: Path) -> MarkerVerdict:
+    """Read the **manifest** as a marker: schema-valid, and this directory's."""
+    document, why = _marker_document(directory / MANIFEST_NAME)
+    if document is None:
+        return MarkerVerdict(kind="invalid", reason=why)
 
     try:
         validate_manifest_schema(document, require_active_generation=True)
@@ -1702,6 +1929,51 @@ def read_marker(directory: Path) -> MarkerVerdict:
         bundle_key=identity,
         manifest=document,
     )
+
+
+def _ownership_marker(directory: Path) -> MarkerVerdict:
+    """Read the **ownership marker**: a **bundle key**, and this directory's.
+
+    No schema beyond identity, because that is all the file claims - a run that
+    crashed before publishing wrote nothing else worth trusting. Identity is not
+    optional though: it is the whole difference between "Distill made this
+    directory" and "a file with this name is in it".
+    """
+    document, why = _marker_document(directory / OWNERSHIP_MARKER_NAME)
+    if document is None:
+        return MarkerVerdict(kind="invalid", reason=why)
+
+    identity = recorded_identity(document)
+    if identity is None:
+        return MarkerVerdict(
+            kind="invalid",
+            reason=f"{OWNERSHIP_MARKER_NAME} records no bundle key",
+        )
+    if identity != directory.name:
+        return MarkerVerdict(
+            kind="foreign",
+            reason=(
+                f"{OWNERSHIP_MARKER_NAME} records bundle key {identity!r}, "
+                f"not {directory.name!r}"
+            ),
+            bundle_key=identity,
+        )
+    return MarkerVerdict(
+        kind="owned",
+        reason="ownership marker present, nothing published yet",
+        bundle_key=identity,
+    )
+
+
+def _marker_document(path: Path) -> tuple[dict[str, Any] | None, str]:
+    """The JSON object a marker holds, or `None` and why it is not one."""
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None, f"{path.name} is not readable JSON"
+    if not isinstance(document, dict):
+        return None, f"{path.name} is not a JSON object"
+    return document, ""
 
 
 def recorded_identity(manifest: dict[str, Any]) -> str | None:
@@ -1967,7 +2239,16 @@ def publish_staging(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePaths
     still servable, and the new directory is an **orphan generation** prune
     reclaims. Reversing the last two would instead point the manifest at a
     directory that does not exist - finding 2's shape, from the other side.
+
+    The **render** is proved on disk first, because everything after it is
+    irreversible for the generation being superseded: the rename and the
+    manifest replace both happen whatever staging holds, so a commit that never
+    called `write_render` published an empty generation over a servable one and
+    turned every later read into a cache miss (finding 4-codex). A manifest is a
+    promise and the file is the evidence, which is R-04 stated at the moment the
+    promise is made rather than at the moment it is read.
     """
+    _require_render(paths)
     final_paths = published_paths(paths)
     published = published_manifest(manifest, final_paths)
 
@@ -1976,6 +2257,38 @@ def publish_staging(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePaths
     paths.generation.rename(final_paths.generation)
     write_manifest(paths.root, published)
     return final_paths
+
+
+def _require_render(paths: BundlePaths) -> None:
+    """Refuse to publish a **staging directory** that holds no **render**.
+
+    The path is *derived* from the directory about to be renamed rather than
+    read off `paths.markdown`, because that field proves nothing about what the
+    rename will publish: aimed at the previous **generation**'s render it passes
+    every check while staging stays empty, and the empty directory becomes the
+    **active generation** over a servable one.
+
+    Confined first, so a symlink pre-created at the render's path is refused
+    rather than followed (R-16): `write_render` checks its own target, but
+    nothing stopped a link being put there afterwards, and a generation whose
+    render points out of the bundle serves bytes prune neither owns nor can
+    reclaim. Then a regular file, because that is what "there is something to
+    serve" means on disk.
+    """
+    render = paths.generation / RENDER_NAME
+    confined_path(render, paths.root)
+    try:
+        state = _file_state(render)
+    except OSError as exc:
+        state = "absent"
+        LOGGER.debug("render state unreadable: %s", _errno_name(exc))
+    if state != "regular":
+        raise DistillError(
+            "E_INCOMPLETE_GENERATION",
+            "bundle",
+            "a generation must carry a render before it can be published",
+            {"render": str(render), "render_state": state},
+        )
 
 
 def published_paths(paths: BundlePaths) -> BundlePaths:
@@ -2031,8 +2344,8 @@ def orphan_generations(bundle_root: Path) -> list[Path]:
             active = name
     return sorted(
         path
-        for path in bundle_root.iterdir()
-        if path.is_dir() and is_generation_name(path.name) and path.name != active
+        for path in _listing(bundle_root)[0]
+        if _listed_kind(path) == "directory" and is_generation_name(path.name) and path.name != active
     )
 
 

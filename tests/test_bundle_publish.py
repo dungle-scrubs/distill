@@ -30,6 +30,7 @@ from test_bundle_store import published_manifest
 
 from distill import bundle_store
 from distill.bundle_store import (
+    BundlePaths,
     BundleRun,
     BundleSnapshot,
     BundleStore,
@@ -655,3 +656,118 @@ def test_an_amendment_defers_to_a_run_that_holds_the_bundle(tmp_path: Path) -> N
 
     assert (root / BUNDLE_KEY / "_manifest.json").read_bytes() == on_disk
     assert amended.generation == snapshot.generation
+
+
+# --- A generation with no render is not publishable (finding 4-codex) -------
+
+
+def test_publish_refuses_a_generation_carrying_no_render(tmp_path: Path) -> None:
+    """A manifest is a promise; the **render** on disk is the evidence (R-04).
+
+    `publish_staging` validated the manifest and then renamed whatever was in
+    staging, so a commit that never called `write_render` still made a
+    generation active - and `load_active`, which does check the render exists,
+    then reported a cache miss for a bundle whose manifest named a live
+    generation. The previous active generation had already been superseded.
+    """
+    bundle_root = tmp_path / BUNDLE_KEY
+    bundle_root.mkdir()
+    staged = stage_paths(bundle_root)
+
+    with pytest.raises(DistillError) as failure:
+        publish_staging(staged, manifest_for())
+
+    assert failure.value.code == "E_INCOMPLETE_GENERATION"
+    assert staged.generation.is_dir(), "the staging directory must survive to be resumed"
+    assert not (bundle_root / "g1").exists()
+    assert not (bundle_root / "_manifest.json").exists()
+
+
+def test_a_commit_without_a_render_leaves_the_active_generation_alone(
+    tmp_path: Path,
+) -> None:
+    """The same refusal at the seam a run uses, with something to lose."""
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+    first = begin_run(store)
+    assemble(first.paths, "# published\n")
+    first.commit(manifest_for())
+
+    second = store.begin(BUNDLE_KEY, reuse_active=False)
+    assert isinstance(second, BundleRun)
+    try:
+        with pytest.raises(DistillError) as failure:
+            second.commit(manifest_for())
+    finally:
+        second.release()
+
+    assert failure.value.code == "E_INCOMPLETE_GENERATION"
+    active = store.load_active(BUNDLE_KEY)
+    assert active is not None
+    assert active.generation.name == "g1"
+    assert active.markdown.read_text() == "# published\n"
+
+
+def test_publish_refuses_a_render_that_is_a_symlink(tmp_path: Path) -> None:
+    """R-16 at the last moment before the rename, not only at the write.
+
+    `write_render` refuses to follow a link, but nothing stopped one being put
+    there afterwards - and a published generation whose render is a link out of
+    the bundle serves bytes prune does not own and cannot reclaim.
+    """
+    bundle_root = tmp_path / BUNDLE_KEY
+    bundle_root.mkdir()
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text("# not the run's output\n")
+    staged = stage_paths(bundle_root)
+    staged.markdown.symlink_to(outside)
+
+    with pytest.raises(DistillError):
+        publish_staging(staged, manifest_for())
+
+    assert not (bundle_root / "g1").exists()
+    assert outside.read_text() == "# not the run's output\n"
+
+
+def test_publish_proves_the_render_inside_the_generation_it_is_renaming(
+    tmp_path: Path,
+) -> None:
+    """The proof is derived from the staging directory, never taken on trust.
+
+    Checking whatever `BundlePaths.markdown` happens to point at proves nothing
+    about what is being renamed: a field aimed at the *previous* generation's
+    render passes every check and publishes an empty directory over a servable
+    bundle. Publish is destructive for what it supersedes, so it re-derives at
+    the boundary rather than trusting its input - the same reason `apply_prune`
+    re-derives under the lock (R-10).
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+    first = begin_run(store)
+    assemble(first.paths, "# published\n")
+    live = first.commit(manifest_for())
+
+    second = store.begin(BUNDLE_KEY, reuse_active=False)
+    assert isinstance(second, BundleRun)
+    # Staging holds no render; the field points at the live generation's.
+    misdirected = BundlePaths(
+        root=second.paths.root,
+        generation=second.paths.generation,
+        frames=second.paths.frames,
+        manifest=second.paths.manifest,
+        transcript=second.paths.transcript,
+        markdown=live.markdown,
+    )
+    try:
+        with pytest.raises(DistillError) as failure:
+            publish_staging(misdirected, manifest_for())
+    finally:
+        second.release()
+
+    assert failure.value.code == "E_INCOMPLETE_GENERATION"
+    active = store.load_active(BUNDLE_KEY)
+    assert active is not None
+    assert active.generation.name == "g1"
+    assert active.markdown.read_text() == "# published\n"

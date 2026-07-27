@@ -137,8 +137,12 @@ def test_cache_doctor_reports_the_active_generation_of_each_bundle(tmp_path: Pat
     """Finding 2's blind spot: which generation is the one a reader is entitled to."""
     root = tmp_path / "cache"
     write_bundle(root, "aaa", generations=("g1", "g2", "g3"), active="g3")
+    # An **ownership marker** records the **bundle key** it claims. `{}` claims
+    # nothing, and pinning it as valid asserted the defect finding 1 is: the
+    # marker must name this directory before anything treats the directory as
+    # Distill's.
     (root / "owned").mkdir()
-    (root / "owned" / "_owner.json").write_text("{}\n")
+    (root / "owned" / "_owner.json").write_text(json.dumps({"bundle_key": "owned"}) + "\n")
 
     report = inspect(root)
 
