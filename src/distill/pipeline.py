@@ -27,7 +27,7 @@ from .bundle_store import active_paths, ensure_safe_directory
 from .cache import cleanup_cache
 from .errors import DistillError
 from .frame_selection import select_keyframes
-from .jobs import read_job_status, write_job_status
+from .job_store import JobOutcome, JobStore
 from .local_vision import (
     FrameInterpreter,
     local_vision_config_from_args,
@@ -167,13 +167,6 @@ class ProcessingRun:
             response = self._produce_generation(generation, heartbeat)
         finally:
             heartbeat.stop()
-        write_job_status(
-            self.output_root,
-            self.options.job_id,
-            status="completed",
-            tool=self.tool,
-            result=response,
-        )
         return response
 
     def _cached_response(self, bundle_root: Path) -> dict[str, Any] | None:
@@ -191,13 +184,6 @@ class ProcessingRun:
             cached=True,
             progress=progress_summary,
             job_id=self.options.job_id,
-        )
-        write_job_status(
-            self.output_root,
-            self.options.job_id,
-            status="completed",
-            tool=self.tool,
-            result=response,
         )
         return response
 
@@ -391,6 +377,30 @@ class ProcessingRun:
         )
 
 
+def record_job(
+    store: JobStore,
+    job_id: str,
+    tool: str,
+    work: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run `work` with a **job record** covering both ways it can end (R-17).
+
+    One helper rather than a `start`/`finish` pair written out at each call site.
+    Finding 12 was a missing failure path: the record was written where the
+    result was, so every way of not producing a result wrote nothing. A pair a
+    caller assembles by hand is a pair a caller can assemble half of, and the
+    half that gets forgotten is the one nobody exercises.
+    """
+    store.start(job_id, tool)
+    try:
+        result = work()
+    except BaseException as exc:
+        store.finish(job_id, JobOutcome.failure(exc))
+        raise
+    store.finish(job_id, JobOutcome.success(result))
+    return result
+
+
 def process_resolved_source(
     source: Any,
     options: DistillOptions,
@@ -402,7 +412,12 @@ def process_resolved_source(
     try:
         output_root = output_root or validate_output_root(options.output_dir)
         progress = progress or ProgressReporter(emitter=progress_emitter(options.job_id))
-        return ProcessingRun(source, options, output_root, progress, tool).execute()
+        return record_job(
+            JobStore.open(output_root),
+            options.job_id,
+            tool,
+            lambda: ProcessingRun(source, options, output_root, progress, tool).execute(),
+        )
     finally:
         # The end of the media file's read lifetime (R-36). Transcription and
         # keyframe selection both read `source.resolved_path`, so the
@@ -427,7 +442,14 @@ def bool_arg(value: Any, default: bool) -> bool:
 
 @dataclass
 class BatchRunner:
-    root: Path
+    """The per-item loop of a batch tool. Owns no record of its own.
+
+    The batch's **job record** is the parent job's, written around the whole
+    batch by `record_job`, so an item that fails the batch is a batch that
+    records a failure. `job_id` is carried only to derive each item's own job
+    identifier.
+    """
+
     job_id: str
     tool: str
     item_key: str
@@ -449,10 +471,6 @@ class BatchRunner:
                 if not self.continue_on_error:
                     raise
         return results, errors
-
-    def complete(self, summary: dict[str, Any]) -> dict[str, Any]:
-        write_job_status(self.root, self.job_id, status="completed", tool=self.tool, result=summary)
-        return summary
 
 
 def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
@@ -477,24 +495,26 @@ def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
         return process_local_video(child_args)
 
     runner = BatchRunner(
-        root=root,
         job_id=options.job_id,
         tool="process_video_directory",
         item_key="path",
         items=[str(path) for path in files],
         continue_on_error=bool_arg(args.get("continue_on_error"), True),
     )
-    results, errors = runner.run(process_item)
-    summary = {
-        "job_id": options.job_id,
-        "directory": str(directory.resolve()),
-        "video_count": len(files),
-        "processed_count": len(results),
-        "error_count": len(errors),
-        "results": results,
-        "errors": errors,
-    }
-    return runner.complete(summary)
+
+    def work() -> dict[str, Any]:
+        results, errors = runner.run(process_item)
+        return {
+            "job_id": options.job_id,
+            "directory": str(directory.resolve()),
+            "video_count": len(files),
+            "processed_count": len(results),
+            "error_count": len(errors),
+            "results": results,
+            "errors": errors,
+        }
+
+    return record_job(JobStore.open(root), options.job_id, runner.tool, work)
 
 
 def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
@@ -546,28 +566,31 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
         return process_youtube_video(child_args)
 
     runner = BatchRunner(
-        root=root,
         job_id=options.job_id,
         tool="process_youtube_playlist",
         item_key="url",
         items=urls,
         continue_on_error=bool_arg(args.get("continue_on_error"), True),
     )
-    results, errors = runner.run(process_item)
-    summary = {
-        "job_id": options.job_id,
-        "playlist_url": url,
-        "playlist_output_dir": str(playlist_root),
-        "video_count": len(urls),
-        "processed_count": len(results),
-        "error_count": len(errors),
-        "results": results,
-        "errors": errors,
-    }
-    playlist_summary_path = playlist_root / "playlist.json"
-    summary["playlist_summary_path"] = str(playlist_summary_path)
-    playlist_summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    return runner.complete(summary)
+
+    def work() -> dict[str, Any]:
+        results, errors = runner.run(process_item)
+        summary = {
+            "job_id": options.job_id,
+            "playlist_url": url,
+            "playlist_output_dir": str(playlist_root),
+            "video_count": len(urls),
+            "processed_count": len(results),
+            "error_count": len(errors),
+            "results": results,
+            "errors": errors,
+        }
+        playlist_summary_path = playlist_root / "playlist.json"
+        summary["playlist_summary_path"] = str(playlist_summary_path)
+        playlist_summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        return summary
+
+    return record_job(JobStore.open(root), options.job_id, runner.tool, work)
 
 
 def cleanup_distill_cache(args: dict[str, Any]) -> dict[str, Any]:
@@ -583,12 +606,12 @@ def cleanup_distill_cache(args: dict[str, Any]) -> dict[str, Any]:
 def get_job_status(args: dict[str, Any]) -> dict[str, Any]:
     root = validate_output_root(args.get("output_dir"))
     job_id = str(args.get("job_id", ""))
-    if not job_id:
-        raise DistillError("E_BAD_JOB", "job", "job_id is required")
-    status = read_job_status(root, job_id)
-    if status is None:
+    # An identifier outside the domain names no record, so it is refused here
+    # rather than mapped onto whichever record it happens to resemble (R-18).
+    record = JobStore.open(root).read(job_id)
+    if record is None:
         raise DistillError("E_JOB_NOT_FOUND", "job", "job status not found", {"job_id": job_id})
-    return status
+    return record.to_dict()
 
 
 def transcribe_with_imports(

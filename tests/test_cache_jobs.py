@@ -1,4 +1,4 @@
-"""Unit tests for the public cache/jobs facades.
+"""Unit tests for the public `cleanup-cache` facade.
 
 The `cleanup-cache` tool keeps its name (D-042) and is now an adapter onto
 **prune**: `BundleStore.plan_prune` proposes, `BundleStore.apply_prune` decides
@@ -7,6 +7,10 @@ a **bundle marker** - the retention tests here used to prove the tool deleted
 generations out of directories Distill never wrote, which is finding 1, and one
 of them passed `keep_generations=0`, which is finding 2's input.
 `tests/test_bundle_prune.py` owns the prune rules themselves.
+
+The job-record tests that used to live here covered `jobs.py`'s free functions,
+which R-17 and R-18 replaced with the `JobStore` lifecycle;
+`tests/test_job_store.py` owns them now.
 """
 
 from __future__ import annotations
@@ -20,7 +24,6 @@ import pytest
 
 from distill.cache import cleanup_cache
 from distill.errors import DistillError
-from distill.jobs import job_dir, job_path, read_job_status, safe_job_id, write_job_status
 
 
 def _write_bundle(
@@ -140,57 +143,3 @@ def test_cleanup_cache_reports_what_it_considered(tmp_path: Path) -> None:
     assert result["deleted"] == []
     assert result["considered"] == 1
     assert result["skipped"][0]["reason"] == "no bundle marker"
-
-
-def test_write_then_read_job_status_roundtrip(tmp_path: Path) -> None:
-    root = tmp_path / "cache"
-    payload = write_job_status(
-        root,
-        "job-1",
-        status="completed",
-        tool="process_local_video",
-        result={"manifest_path": "/tmp/manifest.json"},
-    )
-
-    assert payload["status"] == "completed"
-    assert payload["tool"] == "process_local_video"
-    assert payload["job_id"] == "job-1"
-    assert "updated_at" in payload
-
-    record = read_job_status(root, "job-1")
-    assert record == payload
-
-    written = json.loads(job_path(root, "job-1").read_text())
-    assert written["result"]["manifest_path"] == "/tmp/manifest.json"
-
-
-def test_read_job_status_returns_none_when_missing(tmp_path: Path) -> None:
-    root = tmp_path / "cache"
-    assert read_job_status(root, "absent") is None
-
-
-def test_write_job_status_records_error(tmp_path: Path) -> None:
-    root = tmp_path / "cache"
-    payload = write_job_status(
-        root,
-        "job-err",
-        status="failed",
-        tool="process_local_video",
-        error={"code": "E_INTERNAL", "message": "boom"},
-    )
-
-    assert payload["error"] == {"code": "E_INTERNAL", "message": "boom"}
-    assert "result" not in payload
-
-
-def test_safe_job_id_sanitizes_path_characters() -> None:
-    assert safe_job_id("job/../escape") == "job____escape"
-    assert safe_job_id("ok-id_1") == "ok-id_1"
-
-
-def test_job_dir_is_idempotent(tmp_path: Path) -> None:
-    root = tmp_path / "cache"
-    first = job_dir(root)
-    second = job_dir(root)
-    assert first == second
-    assert first.is_dir()

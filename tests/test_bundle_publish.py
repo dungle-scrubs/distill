@@ -39,7 +39,7 @@ from distill.bundle_store import (
     stage_paths,
 )
 from distill.errors import DistillError
-from distill.jobs import job_path, write_job_status
+from distill.job_store import JobStore
 
 BUNDLE_KEY = "b0a1c2d3"
 
@@ -330,9 +330,10 @@ def test_job_records_are_written_by_atomic_replace(
     monkeypatch.setattr(Path, "write_text", write_text)
     monkeypatch.setattr(Path, "replace", replace)
 
-    write_job_status(root, "job-1", status="running", tool="process_local_video")
+    store = JobStore.open(root)
+    store.start("job-1", "process_local_video")
 
-    record = job_path(root, "job-1")
+    record = store.record_path("job-1")
     assert record not in written
     assert [target for _source, target in replaced] == [record]
     assert json.loads(record.read_text())["status"] == "running"
@@ -479,7 +480,7 @@ def test_a_job_record_does_not_follow_a_symlink_at_the_jobs_directory(
     (root / "_jobs").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(DistillError) as failure:
-        write_job_status(root, "job-1", status="running", tool="process_local_video")
+        JobStore.open(root).start("job-1", "process_local_video")
 
     assert failure.value.code == "E_BAD_OUTPUT_DIR"
     assert list(outside.iterdir()) == []

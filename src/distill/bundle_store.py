@@ -313,8 +313,14 @@ class BundleSnapshot:
 
 
 @dataclass
-class BundleLock:
-    """One run's exclusive hold on a **bundle key**, granted by the kernel.
+class ExclusiveLock:
+    """One holder's exclusive claim on a **subject**, granted by the kernel.
+
+    The subject is whatever the lock path stands for - a **bundle key** here, a
+    job identifier in `job_store`. The type is stated about the mechanism rather
+    than about bundles because there is exactly one right way to ask "is another
+    process live on this?", and a second copy of it is a second chance to get
+    finding 11 wrong.
 
     The lock *is* an open descriptor holding a `flock`, not a file whose contents
     name a holder. That is what makes it exclusive and what makes it
@@ -322,24 +328,24 @@ class BundleLock:
     pid that could be reused. A holder killed outright releases it the moment the
     kernel closes its descriptors (finding 11).
 
-    Held until `release`, which the run calls when it is finished - not when
+    Held until `release`, which the holder calls when it is finished - not when
     staging ends. `release` is idempotent, because the failure paths that release
     a lock early overlap with the caller's own cleanup.
 
-    Does not own: what the bundle contains, or the acquisition lease in
-    `source.py`, which is keyed by **lock key** and answers a different question -
-    "is another run fetching this source?" rather than "is another run producing
-    this bundle?".
+    Does not own: what the subject contains, which path a subject locks on, or
+    the acquisition lease in `source.py`, which is keyed by **lock key** and
+    answers a different question - "is another run fetching this source?" rather
+    than "is another run producing this bundle?".
     """
 
-    bundle_key: str
+    subject: str
     path: Path
     fd: int
     released: bool = False
 
     @classmethod
-    def take(cls, bundle_key: str, path: Path) -> BundleLock | None:
-        """Take the lock, or report `None` if another run holds it.
+    def take(cls, subject: str, path: Path, *, stage: str = "bundle") -> ExclusiveLock | None:
+        """Take the lock, or report `None` if another holder has it.
 
         The descriptor stays open inside the returned lock: closing it is what
         releasing means, so nothing else may close it. `flock` is per open file
@@ -360,10 +366,10 @@ class BundleLock:
             reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
             raise DistillError(
                 "E_LOCK_UNSUPPORTED",
-                "bundle",
-                "filesystem cannot lock this bundle key",
+                stage,
+                "filesystem cannot grant an exclusive lock here",
                 {
-                    "bundle_key": bundle_key,
+                    "subject": subject,
                     "lock_path": str(path),
                     "errno": reported or str(exc.errno),
                 },
@@ -371,7 +377,7 @@ class BundleLock:
         except BaseException:
             os.close(fd)
             raise
-        return cls(bundle_key=bundle_key, path=path, fd=fd)
+        return cls(subject=subject, path=path, fd=fd)
 
     def release(self) -> None:
         """Give the lock up by closing the descriptor the kernel locked.
@@ -386,7 +392,7 @@ class BundleLock:
             return
         self.released = True
         os.close(self.fd)
-        _bundle_log("lock_released", bundle_key=self.bundle_key, lock_path=str(self.path))
+        _bundle_log("lock_released", subject=self.subject, lock_path=str(self.path))
 
 
 @dataclass(frozen=True)
@@ -695,7 +701,7 @@ class BundleStore:
             resumed=resume,
         )
 
-    def _take_lock(self, bundle_key: str, wait_sec: float) -> tuple[BundleLock, float]:
+    def _take_lock(self, bundle_key: str, wait_sec: float) -> tuple[ExclusiveLock, float]:
         """Poll for the run lock within this caller's budget.
 
         The budget is the only thing that ends the wait: a lock is held until its
@@ -711,7 +717,7 @@ class BundleStore:
         contended = False
         while True:
             try:
-                lock = BundleLock.take(bundle_key, path)
+                lock = ExclusiveLock.take(bundle_key, path)
             except DistillError as exc:
                 if exc.code == "E_LOCK_UNSUPPORTED":
                     _bundle_log(
@@ -866,7 +872,7 @@ class BundleStore:
                 continue
             lock_path = prune_lock_path(bundle_root)
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            lock = BundleLock.take(bundle_root.name, lock_path)
+            lock = ExclusiveLock.take(bundle_root.name, lock_path)
             if lock is None:
                 results.extend(
                     PruneResult(target, "skipped", "another run holds this bundle key")
@@ -1098,7 +1104,7 @@ class BundleRun:
     store: BundleStore
     bundle_key: str
     paths: BundlePaths
-    lock: BundleLock
+    lock: ExclusiveLock
     staged_at: float = 0.0
     waited_sec: float = 0.0
     resumed: bool = True
@@ -1212,7 +1218,7 @@ def lock_is_held(bundle_root: Path) -> bool:
     path = prune_lock_path(bundle_root)
     if not path.is_file():
         return False
-    lock = BundleLock.take(bundle_root.name, path)
+    lock = ExclusiveLock.take(bundle_root.name, path)
     if lock is None:
         return True
     lock.release()

@@ -75,10 +75,14 @@ EXEMPT_MODULES: dict[str, str] = {
         "a bundle, so a change here cannot make a served bundle differ from what "
         "the current code would produce."
     ),
-    "jobs.py": (
-        "Writes job-status records under the cache root's _jobs/ directory. "
-        "Those records live outside every bundle generation, are never published "
-        "into a bundle, and are never read back as pipeline input."
+    "job_store.py": (
+        "Owns job records and their identifier domain, written under the cache "
+        "root's _jobs/ directory. Those records live outside every bundle "
+        "generation, are never published into a bundle, and are never read back "
+        "as pipeline input: a run reads a job record to answer a caller, never "
+        "to decide what to produce. Rejecting an out-of-domain job id can end a "
+        "run before it produces a bundle, which changes whether a bundle exists "
+        "rather than what a bundle contains."
     ),
     "measure.py": (
         "Offline spike-tuning harness, not imported by cli.py or pipeline.py. It "

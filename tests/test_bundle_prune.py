@@ -21,8 +21,8 @@ from pathlib import Path
 import pytest
 
 from distill.bundle_store import (
-    BundleLock,
     BundleStore,
+    ExclusiveLock,
     PrunePlan,
     PrunePolicy,
     PruneTarget,
@@ -92,11 +92,11 @@ def age_everything(directory: Path, days: float) -> None:
     os.utime(directory, (stamp, stamp))
 
 
-def hold_lock(bundle_root: Path) -> BundleLock:
+def hold_lock(bundle_root: Path) -> ExclusiveLock:
     """Hold the run lock for `bundle_root` the way a live run holds it."""
     path = prune_lock_path(bundle_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock = BundleLock.take(bundle_root.name, path)
+    lock = ExclusiveLock.take(bundle_root.name, path)
     assert lock is not None
     return lock
 
