@@ -35,8 +35,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from types import MappingProxyType
-from typing import Any, ClassVar
+from functools import cache
+from types import MappingProxyType, NoneType, UnionType
+from typing import Any, ClassVar, Union, get_args, get_origin, get_type_hints
 
 from .errors import DistillError, warning
 from .redact_secrets import redact_text
@@ -224,6 +225,88 @@ def _freeze(
     raise TypeError(f"{path} holds {type(value).__name__}, which a carrier cannot freeze")
 
 
+@cache
+def _declared_types(carrier: type) -> Mapping[str, Any]:
+    """The resolved annotations of `carrier`'s fields.
+
+    Cached per class: the annotations are written once and `from __future__ import
+    annotations` makes them strings, so resolving them is a per-class cost rather
+    than a per-frame one.
+    """
+    return get_type_hints(carrier)
+
+
+def _fits_declaration(value: Any, declared: Any) -> bool:
+    """Whether `value` is something the field declaring `declared` may hold.
+
+    Deliberately shallow: it answers the shape of the field, not of everything
+    nested inside it. A `segments` that must hold mappings is checked to hold
+    mappings, and what is *in* a segment stays `transcript.py`'s (D-041).
+
+    Two allowances, both about documents rather than about types. A field
+    declared `float` takes an `int`, because JSON writes `0` for a timestamp
+    that happens to be whole; and a field declared as a tuple takes a list,
+    because that is what JSON gives back for one. Neither reaches the carrier's
+    own state - `_freeze` copies both into the immutable form the declaration
+    asks for.
+
+    `bool` is refused where an `int` is declared, for the reason
+    `validated_stage_payload` refuses it in a schema version: `True` is an
+    instance of `int` and equals 1, so a document whose `index` is a boolean
+    would otherwise be a frame numbered 1.
+    """
+    origin = get_origin(declared)
+    if origin is UnionType or origin is Union:
+        return any(_fits_declaration(value, arm) for arm in get_args(declared))
+    if declared is Any:
+        return True
+    if declared is NoneType:
+        return value is None
+    if origin is not None:
+        if isinstance(origin, type) and issubclass(origin, Mapping):
+            return isinstance(value, Mapping)
+        if isinstance(origin, type) and issubclass(origin, Sequence):
+            if isinstance(value, str) or not isinstance(value, list | tuple):
+                return False
+            arms = [arm for arm in get_args(declared) if arm is not Ellipsis]
+            return not arms or all(_fits_declaration(item, arms[0]) for item in value)
+        return isinstance(value, origin)
+    if declared is float:
+        return isinstance(value, int | float) and not isinstance(value, bool)
+    if declared is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(declared, type):
+        return isinstance(value, declared)
+    return True
+
+
+def _refuse_undeclared_values(instance: Any) -> None:
+    """Refuse a value a field's own declaration does not allow.
+
+    Construction is where a document stops being a document, so it is where the
+    fields it claims have to be the fields this class declares. A **resume**
+    rebuilds carriers from JSON another process wrote (R-23), and a dataclass
+    checks nothing: a `relative_path` of `42` built a `FrameArtifact` that
+    survived freezing, redaction and the write, and then ended the run in
+    `render` on `42.strip()` - an `E_INTERNAL` over the run's own scratch, which
+    is the one thing a stage result must never cost (D-030, D-046).
+
+    Stated against the annotations rather than a second list of expected types,
+    so a field added later is covered by having been declared. Raised as
+    `TypeError` because that is what a caller rebuilding a carrier from a
+    document already handles: the pipeline's revivers turn it into a stage miss
+    and recompute, which is what an unusable document is worth.
+    """
+    declared = _declared_types(type(instance))
+    for field in dataclasses.fields(instance):
+        value = getattr(instance, field.name)
+        if not _fits_declaration(value, declared[field.name]):
+            raise TypeError(
+                f"{type(instance).__name__}.{field.name} holds "
+                f"{type(value).__name__}, which its declaration does not allow"
+            )
+
+
 def _thaw(value: Any) -> Any:
     """Rebuild `value` as plain, JSON-encodable, mutable Python.
 
@@ -275,6 +358,11 @@ class Carrier(ABC):
             raise AssertionError(
                 f"{type(self).__name__} names extracted-text fields it does not have: {unknown}"
             )
+        # Before anything is frozen, because a value the declaration does not
+        # allow must not become part of the carrier's state at all - and
+        # because freezing accepts far more than a field does: `_freeze` copies
+        # any scalar, so an `int` where a path belongs survives it intact.
+        _refuse_undeclared_values(self)
         # The policy runs unless it was explicitly disabled, on every route in -
         # the literal constructor and `dataclasses.replace` alike, since replace
         # re-runs this. A carrier rebuilt around new text is redacted again
@@ -367,6 +455,13 @@ class Interpretation:
     frame_kind: str = ""
     verbatim_text: str = ""
     text_confidence: str = "none"
+
+    def __post_init__(self) -> None:
+        # On the same terms as a carrier, and for the same reason: a reading is
+        # rebuilt from the mapping a frame artifact froze, which a **resume**
+        # read back off disk. A `visual_summary` of `42` reaches `render` as
+        # `42.strip()` otherwise.
+        _refuse_undeclared_values(self)
 
     @property
     def has_interpretation(self) -> bool:
@@ -513,12 +608,26 @@ class FrameArtifact(Carrier):
 
         Unknown keys are dropped rather than refused - the document is scratch,
         and a field this Distill does not know about is one an older one wrote.
+        A value a field's declaration does not allow is a different thing and is
+        refused, by `__post_init__`, along with a nested **interpretation** that
+        cannot become one: a frame promises its `reading`, so the refusal has to
+        land where the document is being rebuilt - where the caller's answer is
+        to recompute the stage - rather than later, in a render, where it is a
+        run ending over its own scratch.
+
+        What this does not reach is what a **grounding** or a **transcript**
+        segment *holds*: those are `grounding.py`'s and `transcript.py`'s
+        vocabulary, read by `render`, and hardening the render against the text
+        it is given is R-24's, not a carrier's.
         """
         fields = {field.name for field in dataclasses.fields(cls)}
         values = {key: value for key, value in document.items() if key in fields}
         values["redaction"] = redaction
         values["warnings"] = tuple(values.get("warnings", ()))
-        return cls(**values)
+        artifact = cls(**values)
+        if artifact.interpretation is not None:
+            Interpretation.from_document(artifact.interpretation)
+        return artifact
 
     def _payload(self) -> Mapping[str, Any]:
         return MappingProxyType(

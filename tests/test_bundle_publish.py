@@ -114,6 +114,37 @@ def test_a_published_generation_holds_no_stage_result(tmp_path: Path) -> None:
     )
 
 
+def test_the_strip_is_by_name_so_an_entry_that_is_not_a_file_goes_too(
+    tmp_path: Path,
+) -> None:
+    """R-13 is stated about the name, and only regular files were ever stripped.
+
+    A directory or a link called `_ocr.json` is not a **stage result**, and a
+    published **generation** must not carry one either way: the invariant is
+    that nothing in a generation is *named* like resume scratch. It could not
+    happen while `write_stage_result` ended the run over a non-regular target,
+    and it can as soon as that write refuses and carries on - which is what it
+    now does, so the strip has to answer for the same cases.
+
+    The link is removed rather than followed: what it points at is outside the
+    bundle, and R-16 is the same refusal here as everywhere else.
+    """
+    bundle_root = tmp_path / BUNDLE_KEY
+    bundle_root.mkdir()
+    staged = stage_paths(bundle_root)
+    assemble(staged)
+    (staged.generation / "_ocr.json").mkdir()
+    (staged.generation / "_ocr.json" / "_nested.json").write_text("{}\n")
+    outside = tmp_path / "co-tenant.json"
+    outside.write_text("{}\n")
+    (staged.generation / "_frames.json").symlink_to(outside)
+
+    final = publish_staging(staged, manifest_for())
+
+    assert list(final.generation.rglob("_*.json")) == []
+    assert outside.read_text() == "{}\n", "the strip followed the link out of the bundle"
+
+
 def test_commit_publishes_a_generation_holding_no_stage_result(tmp_path: Path) -> None:
     """R-13 at the seam a run actually uses: `write_stage` then `commit`."""
     root = tmp_path / "output"
@@ -363,18 +394,22 @@ def test_a_stage_result_is_an_ordinary_write_not_an_atomic_replace(
 
     written: list[Path] = []
     replaced: list[Path] = []
-    real_write_text = Path.write_text
+    real_open = os.open
     real_replace = Path.replace
 
-    def write_text(self: Path, *args: Any, **kwargs: Any) -> int:
-        written.append(self)
-        return real_write_text(self, *args, **kwargs)
+    def opened(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        # Observed at the open rather than at `Path.write_text`, because the
+        # stage-result write is an `O_NOFOLLOW` open: R-16 decided by the
+        # kernel at the moment of use rather than by a check that ran first.
+        if flags & (os.O_WRONLY | os.O_RDWR):
+            written.append(Path(path))
+        return real_open(path, flags, *args, **kwargs)
 
     def replace(self: Path, target: Any) -> Path:
         replaced.append(Path(target))
         return real_replace(self, target)
 
-    monkeypatch.setattr(Path, "write_text", write_text)
+    monkeypatch.setattr(os, "open", opened)
     monkeypatch.setattr(Path, "replace", replace)
 
     run.write_stage("ocr", {"frames": []})

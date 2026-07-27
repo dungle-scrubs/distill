@@ -11,7 +11,7 @@ import os
 import re
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -294,7 +294,7 @@ class ProcessingRun:
             job_id=self.options.job_id,
         )
 
-    def _run_stage(
+    def _run_stage[StageValue](
         self,
         run: BundleRun,
         heartbeat: ProgressHeartbeat,
@@ -302,27 +302,128 @@ class ProcessingRun:
         name: str,
         skipped_mechanisms: tuple[str, ...],
         producer: Callable[[], dict[str, Any]],
-    ) -> dict[str, Any]:
+        revive: Callable[[dict[str, Any]], _Recovered[StageValue] | None],
+    ) -> StageValue:
         """Recover a **stage result** or produce one, recording it either way.
 
-        Resume is the store's answer, not this module's: `read_stage` reports
-        `None` for every reason a recorded result cannot be used - the run is
-        not resuming, nothing was recorded, what was recorded is unreadable, or
-        it failed the checks R-23 puts a resumed document through - and every
-        one of them means the same thing here, which is compute it. That is
-        D-030's whole point: a stage result that does not hold up costs this
-        run the work, and costs it nothing else.
+        What a caller gets back is what the stage *speaks* - carriers - and
+        never the payload they were read out of, which is what makes the
+        recovery total. `revive` is the stage's own answer to "is this the shape
+        I produce", asked of a resumed document and of a fresh one alike, and
+        the only caller of it: nothing downstream subscripts a payload, so there
+        is no field left for a document to be missing.
+
+        Two reasons a stage runs, and this is deliberately one branch. `None`
+        from `read_stage` is the store's: the run is not resuming, nothing was
+        recorded, what was recorded is unreadable, or it failed the checks R-23
+        puts a resumed document through. `None` from `revive` is this module's:
+        the envelope held up but the payload inside it is not the shape this
+        stage reads - an older Distill's spelling, a truncated write, scratch
+        somebody edited. D-030 answers both the same way, which is compute it. A
+        resume that could *end* a run would be worse than the trust it replaced
+        (RV-8), and a shape check that raised would be exactly that with an
+        extra step (boundary review, finding 2).
+
+        A payload this run just produced is a different matter. If the stage's
+        own output is not the shape the stage reads, nothing about resuming is
+        wrong and recomputing would not fix it, so it is reported as the defect
+        it is rather than retried - and reported before it is recorded, because
+        scratch this run cannot read is scratch no later run could read either.
         """
-        payload = run.read_stage(name)
-        if payload is not None:
-            for mechanism in skipped_mechanisms:
-                self.progress.skip_cached(mechanism, detail={"source": "partial_resume"})
-        else:
-            payload = producer()
-            heartbeat.check()
-            run.write_stage(name, payload, redaction=self._redaction_policy)
-        warnings.extend(list(payload.get("warnings", [])))
-        return payload
+        recorded = run.read_stage(name)
+        if recorded is not None:
+            recovered = _revived(recorded, revive)
+            if recovered is not None:
+                for mechanism in skipped_mechanisms:
+                    self.progress.skip_cached(mechanism, detail={"source": "partial_resume"})
+                warnings.extend(_stage_warnings(recorded))
+                return recovered.value
+            run.discard_stage(name, "payload_shape_unusable")
+        payload = producer()
+        heartbeat.check()
+        produced = _revived(payload, revive)
+        if produced is None:
+            raise DistillError(
+                "E_BAD_STAGE_PAYLOAD",
+                "pipeline",
+                f"the {name} stage produced a payload of a shape it does not read",
+                {"stage": name},
+            )
+        run.write_stage(name, payload, redaction=self._redaction_policy)
+        warnings.extend(_stage_warnings(payload))
+        return produced.value
+
+    def _recovered_frames(
+        self, payload: dict[str, Any]
+    ) -> _Recovered[list[FrameArtifact]] | None:
+        """The **frame artifacts** `payload` holds, or `None` if it holds none.
+
+        A stage that just ran hands back carriers. A stage a **resume**
+        recovered hands back the documents `bundle_store` serialized them into,
+        because a stage result is JSON on disk and nothing else. Both are the
+        same frames, so the difference is settled here rather than by every
+        consumer downstream.
+
+        Total over both, which is the point: this is handed a document another
+        process wrote, so `frames` may be absent, may not be a list, may hold
+        strings, and may hold mappings that are missing a field a frame has.
+        None of those is a run's business - the frames stage can always select
+        the keyframes again - so each of them is `None` here and a recomputation
+        upstream.
+
+        `redaction` is this run's policy, applied to a rebuilt frame whatever
+        the document says about itself: R-23's premise is that a stage result's
+        claims are input rather than facts.
+        """
+        items = payload.get("frames")
+        if not isinstance(items, list | tuple):
+            return None
+        frames: list[FrameArtifact] = []
+        for item in items:
+            if isinstance(item, FrameArtifact):
+                frames.append(item)
+                continue
+            if not isinstance(item, Mapping):
+                return None
+            try:
+                frames.append(
+                    FrameArtifact.from_document(item, redaction=self._redaction_policy)
+                )
+            except Exception:
+                # Deliberately broad, for the reason `read_stage_result`'s guard
+                # is: every way a document can fail to become a carrier - a
+                # missing field, a type a carrier cannot freeze, a nesting depth
+                # that exhausts the walk - costs the same recomputation, and
+                # there is no way to fail here that is worth ending a run over.
+                return None
+        return _Recovered(frames)
+
+    def _recovered_transcript(self, payload: dict[str, Any]) -> _Recovered[Transcript | None] | None:
+        """The **transcript** carrier `payload` holds, on the same terms.
+
+        A run that produced no transcript carries nothing at all, which is why
+        the answer is wrapped: `_Recovered(None)` is a stage whose value is
+        legitimately absent, and a bare `None` is a payload this stage cannot
+        read. Collapsing the two would make "the video had no speech" and "the
+        scratch is unusable" the same answer.
+
+        Which is also why the field has to be *there*. A recorded `null` is this
+        stage saying it found no speech; a payload with no `transcript` key at
+        all is a payload that has not answered, and reading it as "no speech"
+        would publish a **generation** with no transcript for a video that has
+        one, having skipped the transcription that would have found it.
+        """
+        if "transcript" not in payload:
+            return None
+        item = payload["transcript"]
+        if item is None or isinstance(item, Transcript):
+            return _Recovered(item)
+        if not isinstance(item, Mapping):
+            return None
+        try:
+            return _Recovered(Transcript.from_document(item, redaction=self._redaction_policy))
+        except Exception:
+            return None
 
     def _produce_ocr(self, frames: list[FrameArtifact]) -> dict[str, Any]:
         """Read every **keyframe**'s image text onto the artifact that names it.
@@ -412,16 +513,14 @@ class ProcessingRun:
                 "warnings": [*transcript_warnings, *carrier_warnings],
             }
 
-        transcript_payload = self._run_stage(
+        transcript = self._run_stage(
             run,
             heartbeat,
             warnings,
             "transcript",
             ("transcription", "audio_extraction"),
             produce_transcript,
-        )
-        transcript = _transcript_carrier(
-            transcript_payload.get("transcript"), redaction=self._redaction_policy
+            self._recovered_transcript,
         )
 
         def produce_frames() -> dict[str, Any]:
@@ -438,25 +537,25 @@ class ProcessingRun:
             )
             return {"frames": frames, "warnings": frame_warnings}
 
-        frames_payload = self._run_stage(
+        frames = self._run_stage(
             run,
             heartbeat,
             warnings,
             "frames",
             ("frame_selection",),
             produce_frames,
+            self._recovered_frames,
         )
-        frames = _frame_carriers(frames_payload["frames"], redaction=self._redaction_policy)
 
-        ocr_payload = self._run_stage(
+        frames = self._run_stage(
             run,
             heartbeat,
             warnings,
             "ocr",
             ("ocr",),
             lambda: self._produce_ocr(frames),
+            self._recovered_frames,
         )
-        frames = _frame_carriers(ocr_payload["frames"], redaction=self._redaction_policy)
 
         # No redaction stage: the policy ran inside `_produce_ocr`, where the
         # text entered its carrier (D-019). A stage here would be a stage that
@@ -465,16 +564,14 @@ class ProcessingRun:
         # longer done in one place.
 
         if self.options.caption_frames:
-            vision_payload = self._run_stage(
+            frames = self._run_stage(
                 run,
                 heartbeat,
                 warnings,
                 "local_vision",
                 ("local_vision",),
                 lambda: self._produce_local_vision(frames),
-            )
-            frames = _frame_carriers(
-                vision_payload["frames"], redaction=self._redaction_policy
+                self._recovered_frames,
             )
         else:
             self.progress.skip_cached("local_vision", detail={"reason": "disabled"})
@@ -522,36 +619,51 @@ class ProcessingRun:
         )
 
 
-def _frame_carriers(items: Any, *, redaction: RedactionState) -> list[FrameArtifact]:
-    """The **frame artifacts** a stage payload holds, however the payload got here.
+@dataclass(frozen=True, slots=True)
+class _Recovered[StageValue]:
+    """What a stage payload turned into, kept distinct from having failed to.
 
-    A stage that just ran hands back carriers. A stage a **resume** recovered
-    hands back the documents `bundle_store` serialized them into, because a
-    stage result is JSON on disk and nothing else. Both are the same frames, so
-    the difference is settled here rather than by every consumer downstream.
-
-    `redaction` is this run's policy, applied to a rebuilt frame whatever the
-    document says about itself: a stage result is a document another process
-    wrote, and R-23's premise is that its claims are input rather than facts.
+    One wrapper rather than a bare optional, because a stage's value can itself
+    be `None`: a run whose video has no speech carries no **transcript**, and a
+    reviver returning `None` for both that and "this payload is not the shape I
+    read" would make `_run_stage` recompute a transcript that does not exist,
+    every time, forever.
     """
-    return [
-        item
-        if isinstance(item, FrameArtifact)
-        else FrameArtifact.from_document(item, redaction=redaction)
-        for item in items
-    ]
+
+    value: StageValue
 
 
-def _transcript_carrier(item: Any, *, redaction: RedactionState) -> Transcript | None:
-    """The **transcript** carrier a stage payload holds, or `None` if it has none.
+def _revived[StageValue](
+    payload: dict[str, Any],
+    revive: Callable[[dict[str, Any]], _Recovered[StageValue] | None],
+) -> _Recovered[StageValue] | None:
+    """`payload` as the value its stage speaks, or `None` if it is not one.
 
-    The resume case again, on the same terms: a recovered payload carries the
-    document and is rebuilt under this run's policy, and a run that produced no
-    transcript carries nothing at all.
+    The common half of every reviver: the **warnings** every stage payload
+    carries. A reviver is left owning only its own stage's field, and the
+    envelope both of them share is checked once.
+
+    Warnings are checked here rather than tolerated downstream because they are
+    published: a resumed `"warnings": "truncated"` was iterated as a string, so
+    a **generation**'s **manifest** recorded eleven warnings, one per character.
     """
-    if item is None or isinstance(item, Transcript):
-        return item
-    return Transcript.from_document(item, redaction=redaction)
+    recorded = payload.get("warnings", ())
+    if not isinstance(recorded, list | tuple):
+        return None
+    if not all(isinstance(item, Mapping) for item in recorded):
+        return None
+    return revive(payload)
+
+
+def _stage_warnings(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """The **warnings** a stage payload carries, as plain documents.
+
+    Copied out rather than passed through: a carrier's warnings are
+    `MappingProxyType`, which `json` cannot encode, and these end up in a
+    **manifest**. Reached only for a payload `_revived` accepted, so every item
+    is a mapping.
+    """
+    return [dict(item) for item in payload.get("warnings", ())]
 
 
 def record_job(
