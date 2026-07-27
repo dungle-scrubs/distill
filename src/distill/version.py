@@ -50,6 +50,7 @@ SIGNED_MODULES = (
     "redact_secrets.py",
     "release.py",
     "render.py",
+    "run_command.py",
     "source.py",
     "transcript.py",
     "vision_prompts.py",
