@@ -35,19 +35,33 @@ exactly as long as the descriptor does, so a holder that is killed outright
 releases it the moment the kernel closes its descriptors, and a live holder is
 never stealable however old its lock file is.
 
-Milestone note: `commit`, `patch_published` and the prune surface are declared
-here as the interface later milestones of this plan fill in (M3.3 publish
-ordering, M3.4 prune). They raise `NotImplementedError` rather than being
-omitted, so callers migrate onto one shape once.
+**Publish** is ordered rather than atomic, because no filesystem offers one
+operation that both renames a directory and rewrites a file: assemble in
+staging, strip every **stage result**, rename to `g<N>`, then atomically replace
+the **manifest** (R-12). Only the last step makes a generation active, so the
+one gap the order leaves - a renamed directory no manifest names yet - costs a
+reader nothing: the previous **active generation** stays servable and the new
+directory is an **orphan generation** prune can reclaim.
+
+Atomicity is scoped, not universal (D-033): the **manifest** and job records are
+read by other processes and are written by atomic replace, while **stage
+results** are written into a **staging directory** held under the run lock,
+which nothing else may read, and are ordinary writes.
+
+Milestone note: the prune surface is declared here as the interface M3.4 fills
+in. It raises `NotImplementedError` rather than being omitted, so callers
+migrate onto one shape once.
 """
 
 from __future__ import annotations
 
 import errno
 import fcntl
+import itertools
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from collections.abc import Callable
@@ -73,6 +87,40 @@ TRANSCRIPT_NAME = "transcript.json"
 FRAMES_DIR_NAME = "frames"
 GENERATION_PREFIX = "g"
 STAGING_PREFIX = ".tmp."
+
+STAGE_RESULT_PREFIX = "_"
+STAGE_RESULT_SUFFIX = ".json"
+STAGE_RESULT_GLOB = f"{STAGE_RESULT_PREFIX}*{STAGE_RESULT_SUFFIX}"
+"""How a **stage result** is recognized inside a **staging directory**.
+
+Recognition is by name because the strip has to be exhaustive rather than
+informed: R-13 forbids a stage result in a **generation**, and a strip driven by
+a list of stage names the run happens to remember would publish the one nobody
+added to the list. Everything matching this shape goes, whoever wrote it.
+
+The name is scoped to the generation directory. The **manifest** and the
+**ownership marker** carry the same underscore convention but live at the bundle
+root, which is not renamed and is never walked by the strip.
+"""
+
+ATOMIC_TEMP_SUFFIX = ".tmp"
+
+_TEMP_COUNTER = itertools.count()
+"""Distinguishes two atomic writes to one path from inside a single process,
+which a pid alone does not."""
+
+STAGE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+"""The bounded domain a stage name must fall in, matched in full.
+
+A **stage result**'s name becomes a filename inside the **staging directory**,
+so an unbounded name is a path: `x/../../_manifest` names the **manifest**, and
+`ocr/sub` names a file the strip's `_*.json` glob does not match, which
+publishes it. Neither is reachable from Distill's own call sites today, and
+neither may be reachable from a call site added later - R-13 is an invariant
+about what is on disk, not about the discipline of callers. Rejected rather
+than sanitized, on the same grounds as R-18: sanitizing maps two names onto one
+file.
+"""
 
 IDENTITY_FIELDS = ("bundle_key", "source_hash")
 """Manifest fields carrying the recorded **bundle key**, current name first.
@@ -424,6 +472,10 @@ class BundleStore:
             bundle_key=bundle_key,
             paths=paths,
             lock=lock,
+            # Started once the lock is held, so the staging duration a commit
+            # reports is the run's own cost. The wait that preceded it is
+            # already reported, separately, by `lock_acquired`.
+            staged_at=self.clock(),
             waited_sec=waited_sec,
             resumed=resume,
         )
@@ -492,9 +544,45 @@ class BundleStore:
                 )
             self.sleep(min(LOCK_POLL_SEC, wait_sec - waited))
 
-    def patch_published(self, snapshot: BundleSnapshot, fields: dict[str, Any]) -> Any:
-        """Amend a published **manifest** in place. Lands in M3.3."""
-        raise NotImplementedError("BundleStore.patch_published lands in M3.3")
+    def patch_published(
+        self, snapshot: BundleSnapshot, fields: dict[str, Any]
+    ) -> BundleSnapshot:
+        """Amend a published **manifest**, keeping it a valid marker throughout.
+
+        The amendment goes through the same atomic replace as the original
+        write (R-14): a manifest is the **bundle marker**, so a reader that
+        catches it half-rewritten sees a directory that is briefly not a bundle
+        at all. The merged document is validated before it is written, so an
+        amendment cannot turn a servable bundle into an unrecognizable one.
+
+        Identity and the **active generation** are not amendable. Both are
+        publish's to decide - the first is what makes the manifest a marker for
+        *this* directory, and the second is what makes a generation active, so
+        an amendment that could set either would be a publish that skipped the
+        rename, naming a generation that need not exist (finding 2's shape).
+        """
+        fixed = {
+            field: value
+            for field, value in fields.items()
+            if field in ("active_generation", *IDENTITY_FIELDS)
+            and value != snapshot.manifest.get(field)
+        }
+        if fixed:
+            raise DistillError(
+                "E_BAD_MANIFEST",
+                "bundle",
+                "identity and the active generation are set by publish, not by an amendment",
+                {"bundle_key": snapshot.bundle_key, "fields": sorted(fixed)},
+            )
+        manifest = {**snapshot.manifest, **fields}
+        validate_manifest_schema(manifest, require_active_generation=True)
+        write_manifest(snapshot.root, manifest)
+        return BundleSnapshot(
+            root=snapshot.root,
+            bundle_key=snapshot.bundle_key,
+            generation=snapshot.generation,
+            manifest=manifest,
+        )
 
     def plan_prune(self, policy: Any) -> Any:
         """Propose **generations** and bundles to remove. Lands in M3.4."""
@@ -511,15 +599,20 @@ class BundleRun:
 
     The hold lasts as long as this object is in use, not as long as staging
     takes: every stage after staging - the download, the vision pass, the
-    publish - runs against a **bundle key** no other run may take. M3.3 gives it
-    the publish ordering; until then `release` (or the context manager) is how a
-    run ends.
+    publish - runs against a **bundle key** no other run may take. It ends one
+    of two ways: `commit`, which publishes what was staged, or `abandon`, which
+    gives the run up and says why.
+
+    Does not own what a stage computes, or what goes into the **manifest** it is
+    handed: the run assembles the generation's files, and this object decides
+    when they stop being scratch.
     """
 
     store: BundleStore
     bundle_key: str
     paths: BundlePaths
     lock: BundleLock
+    staged_at: float = 0.0
     waited_sec: float = 0.0
     resumed: bool = True
 
@@ -533,21 +626,76 @@ class BundleRun:
     def __exit__(self, *_exc: object) -> None:
         self.release()
 
-    def read_stage(self, name: str) -> Any:
-        """The recorded **stage result** for `name`, if it may be reused."""
-        raise NotImplementedError("BundleRun.read_stage lands in M3.3")
+    @property
+    def staging_duration_sec(self) -> float:
+        """How long this run has spent assembling its **staging directory**."""
+        return self.store.clock() - self.staged_at
+
+    def read_stage(self, name: str) -> Any | None:
+        """The recorded **stage result** for `name`, or `None` to recompute it.
+
+        `None` for every reason a stage result cannot be used: the run is not
+        resuming, nothing was recorded, or what was recorded is unreadable. A
+        stage result is scratch - recomputing it is always available, so nothing
+        about it is worth ending a run over.
+        """
+        if not self.resumed:
+            return None
+        return read_stage_result(self.paths.generation, name)
 
     def write_stage(self, name: str, result: Any) -> None:
-        """Record a completed stage so an interrupted run can **resume**."""
-        raise NotImplementedError("BundleRun.write_stage lands in M3.3")
+        """Record a completed stage so an interrupted run can **resume**.
+
+        An ordinary write, deliberately (D-033). The target is inside a
+        **staging directory** held under this run's lock: no other process may
+        read it, and no reader is ever entitled to it, so there is nobody an
+        atomic replace would protect. A torn stage result costs the one run that
+        wrote it a recomputation.
+        """
+        write_stage_result(self.paths.generation, name, result, root=self.paths.root)
 
     def commit(self, manifest: dict[str, Any]) -> BundleSnapshot:
-        """**Publish** the staging directory as the **active generation**."""
-        raise NotImplementedError("BundleRun.commit lands in M3.3")
+        """**Publish** the staging directory as the **active generation**.
+
+        Ends the run: the lock is released once the manifest names the new
+        generation, because the question it was taken to answer has been
+        answered. A failure leaves the lock held for the caller to release,
+        along with the staging directory the next run resumes from.
+        """
+        final_paths = publish_staging(self.paths, manifest)
+        _bundle_log(
+            "generation_committed",
+            bundle_key=self.bundle_key,
+            generation=final_paths.generation.name,
+            staging_duration_sec=self.staging_duration_sec,
+        )
+        self.release()
+        return BundleSnapshot(
+            root=final_paths.root,
+            bundle_key=self.bundle_key,
+            generation=final_paths.generation,
+            manifest=published_manifest(manifest, final_paths),
+        )
 
     def abandon(self, reason: str) -> None:
-        """Give up the run, leaving the previous **active generation** intact."""
-        raise NotImplementedError("BundleRun.abandon lands in M3.3")
+        """Give up the run, leaving the previous **active generation** intact.
+
+        The **staging directory** stays: its **stage results** are what a later
+        run **resumes** from, and reclaiming them is prune's decision rather
+        than a failing run's. Nothing under the bundle root is touched, so a
+        bundle that already had an **active generation** still has it.
+
+        The reason is the record: a bundle that did not change is otherwise
+        indistinguishable from a run that never happened.
+        """
+        _bundle_log(
+            "run_abandoned",
+            bundle_key=self.bundle_key,
+            reason=reason,
+            staging=str(self.paths.generation),
+            staging_duration_sec=self.staging_duration_sec,
+        )
+        self.release()
 
 
 def write_ownership_marker(directory: Path, bundle_key: str) -> Path:
@@ -775,6 +923,196 @@ def ensure_safe_directory(path: Path, root: Path, *, create_leaf: bool = True) -
         if create_leaf or index < leaf_index:
             current.mkdir(exist_ok=True)
     return target
+
+
+def atomic_write_text(path: Path, text: str, *, root: Path) -> None:
+    """Write `text` so a concurrent reader sees the old bytes or the new ones.
+
+    The one durable-write helper for state another process may read (R-14,
+    D-033): the manifest, the job records, and anything later joining them.
+    Writing in place is readable half-written, and for a **manifest** that means
+    a directory that is briefly not a **bundle** - the marker is the file.
+
+    Both the target and the temporary file are checked against `root`, so
+    neither can be redirected by a symlink pre-created at either name (R-16).
+    The temporary sits beside the target because a replace has to stay on one
+    filesystem to be atomic at all.
+
+    The temporary name is unique per writer, which is what makes the property
+    hold under concurrency rather than only in a single process. A shared name
+    is worse than no temporary at all: a second writer truncating it while the
+    first replaces it publishes a half-written file *onto the target*, which is
+    exactly the torn read the replace exists to prevent. A writer that dies
+    mid-write therefore leaves its own temporary behind; that is prune's to
+    reclaim, and it is never mistaken for a marker, which is matched by name.
+    """
+    ensure_safe_directory(path, root, create_leaf=False)
+    unique = f"{os.getpid()}.{next(_TEMP_COUNTER)}"
+    temporary = path.with_name(f"{path.name}.{unique}{ATOMIC_TEMP_SUFFIX}")
+    ensure_safe_directory(temporary, root, create_leaf=False)
+    try:
+        temporary.write_text(text)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def write_manifest(bundle_root: Path, manifest: dict[str, Any]) -> Path:
+    """Replace a bundle's **manifest**, the step that makes a generation active.
+
+    Named rather than inlined into `publish_staging` because it is the last step
+    of the publish order and therefore the boundary the crash-survival property
+    is stated about (R-12).
+    """
+    path = bundle_root / MANIFEST_NAME
+    atomic_write_text(
+        path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", root=bundle_root
+    )
+    return path
+
+
+def stage_result_path(generation: Path, name: str) -> Path:
+    """Where the **stage result** for `name` lives inside a generation directory.
+
+    Refuses a name outside `STAGE_NAME_RE`, so the path is always one file
+    directly inside the generation directory - the only shape the strip that
+    holds R-13 can see.
+    """
+    if not STAGE_NAME_RE.fullmatch(name):
+        raise DistillError(
+            "E_BAD_STAGE_NAME",
+            "bundle",
+            "stage name must be alphanumeric with - or _, 64 characters or fewer",
+            {"stage_name": name},
+        )
+    return generation / f"{STAGE_RESULT_PREFIX}{name}{STAGE_RESULT_SUFFIX}"
+
+
+def read_stage_result(generation: Path, name: str) -> Any | None:
+    """The recorded **stage result** for `name`, or `None` if it cannot be used.
+
+    Unreadable scratch is a miss, not a failure: the stage that produced it can
+    always produce it again, and a run that ends over its own scratch is a run
+    that cannot recover from an interruption it was interrupted by.
+    """
+    path = stage_result_path(generation, name)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_stage_result(generation: Path, name: str, payload: Any, *, root: Path) -> None:
+    """Record a completed stage as resume scratch. An ordinary write (D-033)."""
+    path = stage_result_path(generation, name)
+    ensure_safe_directory(path, root, create_leaf=False)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+
+
+def strip_stage_results(generation: Path) -> list[str]:
+    """Remove every **stage result** under `generation`, returning what went.
+
+    R-13: a **generation** never contains a stage result. The removal walks the
+    directory rather than a list of the stages this run ran, because the
+    invariant is about what is on disk - a stage result written by an earlier,
+    interrupted run being resumed is exactly the one a list would miss.
+
+    This is defense in depth rather than the only protection: R-19 (D-019)
+    redacts **extracted text** at carrier construction, so a stage result is not
+    unredacted on disk in the first place. Both are needed - one keeps secrets
+    out of scratch, this one keeps scratch out of bundles.
+    """
+    removed = []
+    for path in sorted(generation.rglob(STAGE_RESULT_GLOB)):
+        if path.is_file():
+            path.unlink()
+            removed.append(path.name)
+    return removed
+
+
+def publish_staging(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePaths:
+    """Turn a **staging directory** into the **active generation**, in order.
+
+    Assemble (the caller's work, already done) -> strip **stage results** ->
+    rename to `g<N>` -> atomically replace the **manifest** (R-12).
+
+    The order is the survivability argument. The strip precedes the rename, so
+    there is no instant at which a generation on disk holds scratch. The
+    manifest replace comes last, so the only gap is a finished `g<N>` that no
+    manifest names yet: the previous **active generation** is untouched and
+    still servable, and the new directory is an **orphan generation** prune
+    reclaims. Reversing the last two would instead point the manifest at a
+    directory that does not exist - finding 2's shape, from the other side.
+    """
+    final_paths = published_paths(paths)
+    published = published_manifest(manifest, final_paths)
+
+    strip_stage_results(paths.generation)
+    ensure_safe_directory(final_paths.generation, paths.root, create_leaf=False)
+    paths.generation.rename(final_paths.generation)
+    write_manifest(paths.root, published)
+    return final_paths
+
+
+def published_paths(paths: BundlePaths) -> BundlePaths:
+    """Where a **staging directory**'s contents will live once published."""
+    generation = paths.root / paths.generation.name.removeprefix(STAGING_PREFIX)
+    return BundlePaths(
+        root=paths.root,
+        generation=generation,
+        frames=generation / FRAMES_DIR_NAME,
+        manifest=paths.root / MANIFEST_NAME,
+        transcript=generation / TRANSCRIPT_NAME,
+        markdown=generation / RENDER_NAME,
+    )
+
+
+def published_manifest(manifest: dict[str, Any], final_paths: BundlePaths) -> dict[str, Any]:
+    """The **manifest** a publish writes: the run's, addressed to the generation.
+
+    One function rather than a step inside `publish_staging`, so that what a
+    commit hands its caller and what is on disk cannot drift into two different
+    documents - the frame paths below are rewritten, and a caller reading the
+    pre-publish manifest would be reading paths to a directory that no longer
+    exists under that name.
+    """
+    published = dict(manifest)
+    published["active_generation"] = final_paths.generation.name
+    validate_manifest_schema(published, require_active_generation=True)
+    # Frame paths are recorded absolute and were recorded against the staging
+    # directory, which is about to stop existing under that name.
+    published["frames"] = [
+        {**frame, "path": str(final_paths.frames / Path(str(frame["path"])).name)}
+        if isinstance(frame, dict) and "path" in frame
+        else frame
+        for frame in published.get("frames", [])
+    ]
+    return published
+
+
+def orphan_generations(bundle_root: Path) -> list[Path]:
+    """Every **generation** on disk that the **manifest** does not name.
+
+    What a crash between the rename and the manifest replace leaves, and what a
+    superseded generation becomes once a newer one is published. Naming them is
+    what lets prune reclaim them (M3.4) instead of leaving unattributable disk;
+    a directory with no valid marker has no **active generation**, so every
+    generation under it is an orphan.
+    """
+    verdict = read_marker(bundle_root)
+    active = None
+    if verdict.is_bundle and verdict.manifest is not None:
+        name = verdict.manifest.get("active_generation")
+        if isinstance(name, str):
+            active = name
+    return sorted(
+        path
+        for path in bundle_root.iterdir()
+        if path.is_dir() and is_generation_name(path.name) and path.name != active
+    )
 
 
 def stage_paths(bundle_root: Path, *, reset: bool = True) -> BundlePaths:

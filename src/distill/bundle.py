@@ -17,9 +17,13 @@ from typing import Any
 
 from .bundle_store import (
     BundlePaths,
+    atomic_write_text,
     ensure_safe_directory,
+    publish_staging,
+    read_stage_result,
     stage_paths,
-    validate_manifest_schema,
+    stage_result_path,
+    write_stage_result,
 )
 from .options import DistillOptions
 from .release import DISTILL_VERSION
@@ -76,63 +80,25 @@ class BundleGeneration:
 
 
 def publish_generation(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePaths:
-    generation_name = paths.generation.name.removeprefix(".tmp.")
-    final_generation = paths.root / generation_name
-    paths.generation.rename(final_generation)
-    final_paths = BundlePaths(
-        root=paths.root,
-        generation=final_generation,
-        frames=final_generation / "frames",
-        manifest=paths.manifest,
-        transcript=final_generation / "transcript.json",
-        markdown=final_generation / "video.md",
-    )
-    manifest = dict(manifest)
-    manifest["active_generation"] = generation_name
-    validate_manifest_schema(manifest, require_active_generation=True)
-    for frame in manifest.get("frames", []):
-        if isinstance(frame, dict) and "path" in frame:
-            frame["path"] = str(final_paths.frames / Path(str(frame["path"])).name)
-    rewrite_published_partial_paths(paths.generation, final_generation)
-    tmp_manifest = paths.root / "_manifest.json.tmp"
-    ensure_safe_directory(tmp_manifest, paths.root, create_leaf=False)
-    tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    tmp_manifest.replace(paths.manifest)
-    return final_paths
+    """The pre-`BundleStore` entry point into the ordered publish.
 
-
-def rewrite_published_partial_paths(staged_generation: Path, final_generation: Path) -> None:
-    staged_prefix = str(staged_generation)
-    final_prefix = str(final_generation)
-    for path in final_generation.glob("_*.json"):
-        payload = json.loads(path.read_text())
-        rewritten = rewrite_path_prefix(payload, staged_prefix, final_prefix)
-        path.write_text(json.dumps(rewritten, indent=2, sort_keys=True, default=str) + "\n")
-
-
-def rewrite_path_prefix(value: Any, staged_prefix: str, final_prefix: str) -> Any:
-    if isinstance(value, str):
-        if value == staged_prefix:
-            return final_prefix
-        if value.startswith(f"{staged_prefix}/"):
-            return f"{final_prefix}{value[len(staged_prefix):]}"
-        return value
-    if isinstance(value, list):
-        return [rewrite_path_prefix(item, staged_prefix, final_prefix) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: rewrite_path_prefix(item, staged_prefix, final_prefix)
-            for key, item in value.items()
-        }
-    return value
+    The ordering itself is `bundle_store.publish_staging` (R-12, R-13); this
+    stays only until M3.6 migrates `pipeline.py` onto `BundleRun.commit`, so
+    that both routes to disk go through one implementation rather than two that
+    can drift.
+    """
+    return publish_staging(paths, manifest)
 
 
 def patch_manifest_progress(manifest_path: Path, progress: dict[str, Any]) -> None:
+    """Amend a published manifest's progress summary, by atomic replace (R-14)."""
     manifest = json.loads(manifest_path.read_text())
     manifest["progress"] = progress
-    tmp_manifest = manifest_path.with_suffix(".json.tmp")
-    tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    tmp_manifest.replace(manifest_path)
+    atomic_write_text(
+        manifest_path,
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        root=manifest_path.parent,
+    )
 
 
 def write_bundle_files(
@@ -170,20 +136,16 @@ def write_bundle_files(
 
 
 def partial_path(paths: BundlePaths, name: str) -> Path:
-    return paths.generation / f"_{name}.json"
+    """Where a **stage result** lives. Owned by `bundle_store`; M3.6 deletes this."""
+    return stage_result_path(paths.generation, name)
 
 
 def read_partial(paths: BundlePaths, name: str) -> Any | None:
-    path = partial_path(paths, name)
-    if not path.exists():
-        return None
-    return json.loads(path.read_text())
+    return read_stage_result(paths.generation, name)
 
 
 def write_partial(paths: BundlePaths, name: str, payload: Any) -> None:
-    path = partial_path(paths, name)
-    ensure_safe_directory(path, paths.root, create_leaf=False)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+    write_stage_result(paths.generation, name, payload, root=paths.root)
 
 
 def response_frames(frames: list[dict]) -> list[dict[str, Any]]:

@@ -107,31 +107,13 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
     assert active.generation == final.generation
 
 
-def test_publish_rewrites_staged_paths_in_partial_files(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    frame = staged.frames / "frame_0001.png"
-    frame.write_bytes(b"png")
-    partial = {
-        "frames": [
-            {
-                "index": 1,
-                "timestamp_sec": 0.0,
-                "path": str(frame),
-                "relative_path": "frames/frame_0001.png",
-            }
-        ],
-        "warnings": [{"detail": {"path": str(staged.generation / "log.txt")}}],
-    }
-    (staged.generation / "_ocr.json").write_text(json.dumps(partial, indent=2) + "\n")
-
-    final = publish_generation(staged, minimal_manifest(tmp_path))
-    rewritten = json.loads((final.generation / "_ocr.json").read_text())
-
-    assert rewritten["frames"][0]["path"] == str(final.frames / "frame_0001.png")
-    assert rewritten["warnings"][0]["detail"]["path"] == str(final.generation / "log.txt")
-    assert ".tmp.g1" not in (final.generation / "_ocr.json").read_text()
+# `test_publish_rewrites_staged_paths_in_partial_files` stood here. It required
+# `_ocr.json` to survive publication with its staged paths rewritten - a
+# **stage result** served as bundle content, which is finding 4's disk half
+# exactly. classification.md records it as a *defect* against R-13 with action
+# delete: R-13 forbids a stage result from existing in a **generation** at all,
+# so there is no path left to rewrite. `tests/test_bundle_publish.py` asserts
+# the invariant that replaces it.
 
 
 def test_response_shape(tmp_path: Path) -> None:
