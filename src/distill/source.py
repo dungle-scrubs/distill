@@ -1320,6 +1320,7 @@ class YouTubeSourceProvider:
             related_links = extract_relevant_links(
                 metadata.description,
                 source="youtube_description",
+                redact=options.redact_secrets,
             )
         except BaseException:
             acquired.lease.release()

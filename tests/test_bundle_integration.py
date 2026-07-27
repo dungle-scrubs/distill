@@ -20,12 +20,16 @@ from distill.bundle_store import (
     stage_paths,
 )
 from distill.errors import DistillError
+from distill.links import extract_relevant_links
 from distill.options import DistillOptions
 from distill.response import manifest_document, run_response
 from distill.source import SourceInfo
 from distill.version import PIPELINE_VERSION
 
 BUNDLE_KEY = "hash"
+# Secret-shaped by `redact_secrets.SECRET_PATTERNS`, placed in both halves of a
+# **related link** so the manifest is asked about the label and the destination.
+LINK_SECRET = "sk-live-0123456789abcdefghij"
 
 
 def source(tmp_path: Path) -> SourceInfo:
@@ -51,14 +55,15 @@ def youtube_source(tmp_path: Path) -> SourceInfo:
         source_fingerprint="fingerprint",
         source_hash=BUNDLE_KEY,
         warnings=[],
-        related_links=[
-            {
-                "url": "https://github.com/example/catch-me-up",
-                "label": "Skill repo",
-                "source": "youtube_description",
-                "reason": "code_or_reference_domain",
-            }
-        ],
+        # Built the way a run builds them - `extract_relevant_links` is where
+        # the carrier is constructed, and R-19 puts the **redaction** policy
+        # there - rather than hand-written, which would describe a source no
+        # run can produce.
+        related_links=extract_relevant_links(
+            f"Skill repo ({LINK_SECRET}): "
+            f"https://github.com/example/catch-me-up?api_key={LINK_SECRET}",
+            source="youtube_description",
+        ),
     )
 
 
@@ -147,6 +152,14 @@ def test_response_shape(tmp_path: Path) -> None:
 
 
 def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> None:
+    """Both documents carry the links, and neither carries what the policy removed.
+
+    R-21: a **related link**'s label and destination are **extracted text**, so
+    what reaches the durable **manifest** is what came out of the carrier. The
+    old assertion was that the manifest matched the source byte for byte, which
+    holds whether or not anything redacted them - so it is stated here as an
+    absence of the secret as well as a presence of the links.
+    """
     store, run = begin(tmp_path / "output")
     source_info = youtube_source(tmp_path)
     run.write_render("# Video\n")
@@ -167,6 +180,9 @@ def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> N
     assert active is not None
     assert active.manifest["related_links"] == source_info.related_links
     assert response["related_links"] == source_info.related_links
+    published = json.dumps(active.manifest) + json.dumps(response)
+    assert LINK_SECRET not in published
+    assert "github.com/example/catch-me-up" in published
 
 
 def test_response_can_include_progress_summary(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .artifacts import FrameArtifact, RedactionState, Transcript, serialize
 from .bundle_store import (
     BATCH_ITEM_LOCK_WAIT_SEC,
     DEFAULT_KEEP_GENERATIONS,
@@ -47,7 +48,6 @@ from .progress import (
     ProgressHeartbeat,
     ProgressReporter,
 )
-from .redact_secrets import redact_text
 from .render import render_markdown
 from .response import manifest_document, run_response
 from .source import (
@@ -345,24 +345,79 @@ class ProcessingRun:
             self.progress,
             ocr.preprocess,
         )
-        return {"frames": ocr_frames_result, "warnings": ocr_warnings}
+        carried, carrier_warnings = self._carry_frames(ocr_frames_result)
+        return {"frames": carried, "warnings": [*ocr_warnings, *carrier_warnings]}
 
-    def _produce_redaction(self, frames: list[dict]) -> dict[str, Any]:
-        redaction_warnings: list[dict[str, str]] = []
-        redacted_frames = []
-        for index, frame in enumerate(frames):
-            copied = dict(frame)
-            result = redact_text(str(copied.get("ocr_text", "")))
-            copied["ocr_text"] = result.text
-            redaction_warnings.extend(result.warnings)
-            redacted_frames.append(copied)
-            self.progress.update(
-                "redaction",
-                percent=((index + 1) / max(1, len(frames))) * 100,
-                detail={"frame": index + 1, "frames": len(frames)},
+    @property
+    def _redaction_policy(self) -> RedactionState:
+        """The **redaction** policy this run's carriers are constructed under.
+
+        `DISABLED` is `--no-redact-secrets` and is recorded in what the run
+        publishes; anything else means the policy runs (D-020).
+        """
+        return (
+            RedactionState.NOT_APPLIED
+            if self.options.redact_secrets
+            else RedactionState.DISABLED
+        )
+
+    def _carry_frames(self, frames: list[dict]) -> tuple[list[dict], list[dict[str, str]]]:
+        """Put each frame's **extracted text** through a carrier, which redacts it (R-19).
+
+        This is the seam finding 4 was hiding in. `ocr_frames` hands back image
+        text as the reader recovered it, and the *next* thing that happens to it
+        used to be a `write_stage` - so the raw text was on disk before the
+        redaction stage ran, and that stage only ever redacted a copy. Here the
+        policy has already run before this method returns, so the **stage
+        result** the caller records cannot hold it.
+
+        The frames stay dicts on the way out because the five producing modules
+        still speak dicts; M4.4 is where they speak carriers and this
+        translation goes away. What must not move is where the policy runs.
+        """
+        policy = self._redaction_policy
+        carried: list[dict] = []
+        warnings: list[dict[str, str]] = []
+        for frame in frames:
+            artifact = FrameArtifact(
+                index=int(frame["index"]),
+                timestamp_sec=float(frame["timestamp_sec"]),
+                path=str(frame["path"]),
+                relative_path=str(frame["relative_path"]),
+                phash=str(frame.get("phash", "")),
+                source_candidate_index=int(frame.get("source_candidate_index", -1)),
+                extracted_text=str(frame.get("ocr_text", "")),
+                redaction=policy,
             )
-        self.progress.complete("redaction", detail={"frames": len(frames)})
-        return {"frames": redacted_frames, "warnings": redaction_warnings}
+            copied = dict(frame)
+            copied["ocr_text"] = artifact.extracted_text
+            carried.append(copied)
+            warnings.extend(dict(item) for item in artifact.warnings)
+        return carried, warnings
+
+    def _carry_transcript(self, transcript: Any) -> tuple[dict[str, Any] | None, list[dict]]:
+        """Put the **transcript** through a carrier on the same terms (R-21).
+
+        Finding 15: no stage covered the transcript, so a secret somebody said
+        out loud was published verbatim in the transcript the store writes. It
+        is extracted text like any other - the person who recorded the video
+        chose the words - and the carrier is what makes "the same terms" mean
+        the same policy rather than a second implementation of it.
+
+        A run with no transcript carries nothing: `None` is the absence of the
+        document, not an empty one, and inventing an empty transcript here would
+        publish a transcript for a video that has none.
+        """
+        if transcript is None:
+            return None, []
+        carrier = Transcript(
+            language=str(transcript.get("language", "")),
+            language_probability=float(transcript.get("language_probability", 0.0)),
+            segments=tuple(transcript.get("segments", ())),
+            redaction=self._redaction_policy,
+        )
+        document = serialize(carrier)
+        return document, [dict(item) for item in carrier.warnings]
 
     def _produce_local_vision(self, frames: list[dict]) -> dict[str, Any]:
         vision_frames, vision_warnings = interpret_frames_with_local_vision(
@@ -387,7 +442,11 @@ class ProcessingRun:
                 self.progress,
                 duration_sec=self.source.duration_sec,
             )
-            return {"transcript": transcript, "warnings": transcript_warnings}
+            carried, carrier_warnings = self._carry_transcript(transcript)
+            return {
+                "transcript": carried,
+                "warnings": [*transcript_warnings, *carrier_warnings],
+            }
 
         transcript_payload = self._run_stage(
             run,
@@ -432,18 +491,11 @@ class ProcessingRun:
         )
         frames = ocr_payload["frames"]
 
-        if self.options.redact_secrets:
-            redaction_payload = self._run_stage(
-                run,
-                heartbeat,
-                warnings,
-                "redaction",
-                ("redaction",),
-                lambda: self._produce_redaction(frames),
-            )
-            frames = redaction_payload["frames"]
-        else:
-            self.progress.skip_cached("redaction", detail={"reason": "disabled"})
+        # No redaction stage: the policy ran inside `_produce_ocr`, where the
+        # text entered its carrier (D-019). A stage here would be a stage that
+        # runs after `write_stage` has already put the raw text on disk, which
+        # is finding 4, and it would report a progress mechanism for work no
+        # longer done in one place.
 
         if self.options.caption_frames:
             vision_payload = self._run_stage(

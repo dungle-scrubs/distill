@@ -5,10 +5,13 @@ it *enters* a carrier, and a carrier whose **redaction** policy was never
 applied cannot be serialized into a **generation** or a **render**.
 
 Enforcement is layered (D-022) and these tests are written against the layer
-each one can actually reach: the type expresses intent, so it is tested for
-frozen-ness and for immutable nesting; the serializer performs the runtime
-check, so it is tested for refusal. Neither test claims the pair is a guarantee
-against a caller that deliberately declares a policy it never ran.
+each one can actually reach: construction runs the policy (D-019), so it is
+tested for redacted text and a recorded state; the type expresses intent, so it
+is tested for frozen-ness and for immutable nesting; the serializer performs the
+runtime check, so it is tested for refusal of a state construction cannot
+produce. None of them claims the set is a guarantee that no secret survives -
+what ran is a policy of patterns, and a secret shaped like none of them is
+carried through untouched.
 """
 
 from __future__ import annotations
@@ -63,6 +66,32 @@ def make_transcript(**overrides: Any) -> Transcript:
     return Transcript(**fields)
 
 
+def prose(size_bytes: int) -> str:
+    """`size_bytes` of ASCII filler with no secret-shaped run in it.
+
+    The filler cannot be one long run of a single character. An unbroken
+    alphanumeric run of 40 characters or more is exactly what
+    `redact_secrets`' generic base64 rule matches, and M4.2 (D-019) redacts at
+    construction *before* the cap - so such a filler would test the redaction
+    policy rather than the cap the test is about.
+    """
+    unit = "slide text "
+    return (unit * (size_bytes // len(unit) + 1))[:size_bytes]
+
+
+def never_constructed(carrier: Any) -> Any:
+    """A carrier bearing `NOT_APPLIED`, which construction can no longer produce.
+
+    D-019 made construction the point the **redaction** policy runs, so this
+    state is only reachable by writing past the freeze: a subclass that
+    overrode `__post_init__`, or exactly this. `serialize`'s refusal is defence
+    in depth against that route, which makes this the only way to reach the
+    layer under test.
+    """
+    object.__setattr__(carrier, "redaction", RedactionState.NOT_APPLIED)
+    return carrier
+
+
 # 1. FrameArtifact and Transcript defined as frozen carriers
 
 
@@ -91,7 +120,7 @@ def test_frame_artifact_and_transcript_are_frozen() -> None:
 
 def test_serializing_a_frame_whose_redaction_policy_was_not_applied_raises() -> None:
     """Finding 4's shape: a frame reaches a writer without the policy having run."""
-    frame = make_frame(extracted_text="export API_KEY=sk-live-0123456789abcdefghij")
+    frame = never_constructed(make_frame(extracted_text="export API_KEY=sk-live-0123456789ab"))
 
     assert frame.redaction is RedactionState.NOT_APPLIED
     with pytest.raises(RedactionPolicyNotApplied) as raised:
@@ -101,7 +130,7 @@ def test_serializing_a_frame_whose_redaction_policy_was_not_applied_raises() -> 
 
 def test_serializing_a_transcript_whose_redaction_policy_was_not_applied_raises() -> None:
     """Finding 15's shape: the transcript took a path the redaction stage did not cover."""
-    transcript = make_transcript()
+    transcript = never_constructed(make_transcript())
 
     with pytest.raises(RedactionPolicyNotApplied):
         serialize(transcript)
@@ -109,11 +138,13 @@ def test_serializing_a_transcript_whose_redaction_policy_was_not_applied_raises(
 
 def test_serializing_a_stage_result_whose_redaction_policy_was_not_applied_raises() -> None:
     """A **stage result** is a **redaction sink** too - resume scratch is still on disk."""
-    stage_result = StageResult(
-        schema_version=1,
-        bundle_key="a" * 64,
-        stage="ocr",
-        payload={"frames": []},
+    stage_result = never_constructed(
+        StageResult(
+            schema_version=1,
+            bundle_key="a" * 64,
+            stage="ocr",
+            payload={"frames": []},
+        )
     )
 
     with pytest.raises(RedactionPolicyNotApplied):
@@ -123,29 +154,38 @@ def test_serializing_a_stage_result_whose_redaction_policy_was_not_applied_raise
 # 3. The runtime check is performed in the SERIALIZER, not only in the type
 
 
-def test_the_check_lives_in_the_serializer_and_not_in_construction() -> None:
-    """Constructing an unredacted carrier is legal; serializing one is not.
+def test_the_check_lives_in_the_serializer_and_not_only_in_the_type() -> None:
+    """The policy runs at construction, and the serializer still refuses.
 
-    This is the split D-022 asks for. Construction cannot be the check, because
-    the carrier is where extracted text is *held* before the policy runs; the
-    serializer is the last point before the text becomes durable, so that is
-    where the refusal has to be.
+    Two layers, and the second is not redundant. D-019 makes construction the
+    point the policy runs, so a constructed carrier is never `NOT_APPLIED` -
+    but the type cannot enforce that against a subclass that overrides
+    `__post_init__` or a caller that writes past the freeze. The serializer is
+    the last point before the text becomes durable, so the refusal stays there
+    for the carrier that was never really constructed.
     """
-    frame = make_frame()  # no raise: the type permits the state
+    constructed = make_frame(extracted_text="export API_KEY=sk-live-0123456789abcdefghij")
+    assert constructed.redaction is RedactionState.APPLIED
+    assert "sk-live-0123456789abcdefghij" not in serialize(constructed)["extracted_text"]
 
-    assert frame.redaction is RedactionState.NOT_APPLIED
     with pytest.raises(RedactionPolicyNotApplied):
-        serialize(frame)
+        serialize(never_constructed(make_frame()))
 
 
-def test_a_carrier_rebuilt_through_replace_is_still_checked() -> None:
-    """Every route into the serializer is checked, not just the literal constructor."""
-    applied = make_frame(redaction=RedactionState.APPLIED)
+def test_a_carrier_rebuilt_through_replace_is_redacted_again() -> None:
+    """Every route into a carrier runs the policy, not just the literal constructor.
+
+    `dataclasses.replace` re-runs `__post_init__`, so a carrier rebuilt around
+    new text is redacted on its own terms rather than inheriting the state its
+    predecessor earned. That is the route by which a redacted carrier would
+    otherwise become an unredacted one carrying an `APPLIED` label.
+    """
+    applied = make_frame()
     assert serialize(applied)["extracted_text"] == "AWS console"
 
-    reverted = dataclasses.replace(applied, redaction=RedactionState.NOT_APPLIED)
-    with pytest.raises(RedactionPolicyNotApplied):
-        serialize(reverted)
+    rebuilt = dataclasses.replace(applied, extracted_text="export API_KEY=sk-live-0123456789ab")
+    assert rebuilt.redaction is RedactionState.APPLIED
+    assert "sk-live-0123456789ab" not in serialize(rebuilt)["extracted_text"]
 
 
 def test_the_serialized_document_records_which_policy_state_produced_it() -> None:
@@ -194,13 +234,20 @@ def test_disabled_is_a_policy_state_and_not_inferred_from_the_text(  # D-020
 ) -> None:
     """Unchanged text does not mean the policy ran, and changed text does not mean it did not.
 
-    A carrier holding text with nothing secret-shaped in it is still refused
-    when the policy never ran: the state is modelled, never inferred.
+    Both directions are wrong to infer, and both are exercised here: text with
+    nothing secret-shaped in it comes out of a policy that ran completely
+    unchanged, and text a user pasted `[REDACTED]` into looks redacted under a
+    policy that was explicitly disabled. The state is modelled, never inferred.
     """
     innocuous = make_frame(extracted_text="the title slide")
+    pre_redacted = make_frame(
+        extracted_text="API_KEY=[REDACTED]",
+        redaction=RedactionState.DISABLED,
+    )
 
-    with pytest.raises(RedactionPolicyNotApplied):
-        serialize(innocuous)
+    assert serialize(innocuous)["extracted_text"] == "the title slide"
+    assert innocuous.redaction is RedactionState.APPLIED
+    assert pre_redacted.redaction is RedactionState.DISABLED
     assert RedactionState.DISABLED.policy_applied is True
     assert RedactionState.APPLIED.policy_applied is True
     assert RedactionState.NOT_APPLIED.policy_applied is False
@@ -246,7 +293,7 @@ def test_no_redact_secrets_still_produces_a_bundle(
 
 def test_extracted_text_beyond_the_cap_is_truncated_with_a_warning() -> None:
     """R-58: the cap is per field, and truncation is recorded rather than silent."""
-    oversized = "x" * (EXTRACTED_TEXT_LIMIT_BYTES + 1)
+    oversized = prose(EXTRACTED_TEXT_LIMIT_BYTES + 1)
     frame = make_frame(extracted_text=oversized, redaction=RedactionState.APPLIED)
 
     document = serialize(frame)
@@ -268,7 +315,7 @@ def test_the_cap_counts_bytes_and_never_splits_a_character() -> None:
 
 def test_a_field_exactly_at_the_cap_is_not_truncated() -> None:
     """The boundary is inclusive: 256 KiB is allowed, 256 KiB + 1 is not."""
-    exact = "x" * EXTRACTED_TEXT_LIMIT_BYTES
+    exact = prose(EXTRACTED_TEXT_LIMIT_BYTES)
     frame = make_frame(extracted_text=exact, redaction=RedactionState.APPLIED)
 
     document = serialize(frame)
@@ -281,8 +328,8 @@ def test_the_cap_reaches_extracted_text_nested_inside_an_interpretation() -> Non
     frame = make_frame(
         redaction=RedactionState.APPLIED,
         interpretation={
-            "visual_summary": "a" * (EXTRACTED_TEXT_LIMIT_BYTES + 1),
-            "detected_elements": ["b" * (EXTRACTED_TEXT_LIMIT_BYTES + 1)],
+            "visual_summary": prose(EXTRACTED_TEXT_LIMIT_BYTES + 1),
+            "detected_elements": [prose(EXTRACTED_TEXT_LIMIT_BYTES + 1)],
         },
     )
 
@@ -302,7 +349,9 @@ def test_the_cap_reaches_transcript_segment_text() -> None:
     """R-21: the transcript is extracted text on the same terms as keyframe text."""
     transcript = make_transcript(
         redaction=RedactionState.APPLIED,
-        segments=[{"start_sec": 0.0, "end_sec": 1.0, "text": "z" * (EXTRACTED_TEXT_LIMIT_BYTES + 1)}],
+        segments=[
+            {"start_sec": 0.0, "end_sec": 1.0, "text": prose(EXTRACTED_TEXT_LIMIT_BYTES + 1)}
+        ],
     )
 
     document = serialize(transcript)
@@ -320,7 +369,7 @@ def test_no_aggregate_cap_is_imposed_across_a_bundles_carriers() -> None:
     text. Every one of them serializes whole: an aggregate cap would add a
     second failure mode for no extra protection.
     """
-    at_cap = "x" * EXTRACTED_TEXT_LIMIT_BYTES
+    at_cap = prose(EXTRACTED_TEXT_LIMIT_BYTES)
     frames = [
         make_frame(index=index, extracted_text=at_cap, redaction=RedactionState.APPLIED)
         for index in range(80)

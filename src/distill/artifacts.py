@@ -1,17 +1,23 @@
 """The carriers **extracted text** travels in, and the one serializer that lets it out.
 
 This module owns the shape of a **frame artifact**, a **transcript** and a
-**stage result** in memory: their fields, the recorded state of the
-**redaction** policy that produced them, the per-field 256 KiB cap on extracted
+**stage result** in memory: their fields, *when* the **redaction** policy runs
+over them and the state that records it, the per-field 256 KiB cap on extracted
 text (R-58), the immutability of everything nested inside them, and the runtime
 refusal to serialize a carrier whose redaction policy was never applied (R-20).
 
-It does not own the redaction policy itself - that is `redact_secrets.py` - nor
-when the policy runs, nor any file write, nor the markdown **render**, nor the
-delimiting that keeps extracted text data rather than instruction. It imports
-nothing from Distill except the error and warning vocabulary, deliberately: a
-carrier is what the producing stages hand to the writers, so it must not depend
-on either side.
+When the policy runs is the answer to D-019: at construction, over every
+extracted-text region, before the carrier exists as a value anything else can
+read. That is what R-19 means by "before it can be written anywhere" - a
+**stage result** is on disk long before a **generation** is published, so a
+policy that ran later only ever cleaned up a copy (finding 4).
+
+It does not own the redaction policy itself - which values are secret-shaped and
+what replaces them is `redact_secrets.py`'s - nor any file write, nor the
+markdown **render**, nor the delimiting that keeps extracted text data rather
+than instruction. Beyond the policy it imports nothing from Distill except the
+error and warning vocabulary, deliberately: a carrier is what the producing
+stages hand to the writers, so it must not depend on either side.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar
 
 from .errors import DistillError, warning
+from .redact_secrets import redact_text
 
 # R-58 / D-045: each individual extracted-text field is capped, and no aggregate
 # bundle cap is imposed on top of it. Eighty keyframes at this cap already bounds
@@ -47,6 +54,15 @@ class RedactionState(StrEnum):
     under R-20. Inferring the state from whether the text changed would get both
     cases wrong: text with no secret in it is unchanged by a policy that ran,
     and text a user pasted `[REDACTED]` into looks redacted without one.
+
+    Passed *into* a carrier it is a choice, and the only choice is `DISABLED`:
+    every other value means "run the policy", which construction then does
+    (D-019). So `NOT_APPLIED` never survives `__post_init__`, and `APPLIED` is
+    a fact the constructor established rather than a claim a producer made.
+    A carrier bearing `NOT_APPLIED` therefore reached the serializer without
+    being constructed - a subclass that skipped `__post_init__`, or a write
+    through `object.__setattr__` past the freeze - which is why `serialize`
+    still refuses it.
     """
 
     NOT_APPLIED = "not_applied"
@@ -108,14 +124,32 @@ def _frozen_warning(payload: Mapping[str, str]) -> Mapping[str, str]:
     return MappingProxyType(dict(payload))
 
 
+def _redact(text: str, *, warnings: list[Mapping[str, str]]) -> str:
+    """Return `text` with secret-shaped values replaced, keeping the policy's warnings.
+
+    Every string in an extracted-text region goes through this, every time,
+    with no size threshold and no batching: spike A-002 measured a full
+    80-keyframe run's redaction at 10.3 ms, which is 0.034% of a 30 s run
+    against a 5% budget, so the cheapest arrangement to reason about is also
+    fast enough.
+
+    Redaction runs before the cap, because replacing a secret can lengthen the
+    text and the cap is what bounds what a carrier holds.
+    """
+    result = redact_text(text)
+    warnings.extend(_frozen_warning(item) for item in result.warnings)
+    return result.text
+
+
 def _freeze(
     value: Any,
     *,
     path: str,
     warnings: list[Mapping[str, str]],
     cap: bool,
+    redact: bool,
 ) -> Any:
-    """Copy `value` into an immutable equivalent, capping extracted text on the way.
+    """Copy `value` into an immutable equivalent, redacting and capping on the way.
 
     Copying rather than wrapping matters: a `MappingProxyType` over the
     caller's dict is a window the caller can still write through, and the
@@ -124,21 +158,28 @@ def _freeze(
 
     A type this cannot freeze is refused rather than passed through, so a
     mutable value is a defect at construction instead of a hole at the writer.
+
+    Only the *values* inside an extracted-text region are redacted, never the
+    mapping keys: a key is the schema's word for a field, chosen by Distill,
+    and is not extracted text.
     """
     if value is None or isinstance(value, bool | int | float):
         return value
     if isinstance(value, str):
-        return _cap_extracted_text(value, path=path, warnings=warnings) if cap else value
+        text = _redact(value, warnings=warnings) if redact else value
+        return _cap_extracted_text(text, path=path, warnings=warnings) if cap else text
     if isinstance(value, Mapping):
         return MappingProxyType(
             {
-                str(key): _freeze(item, path=f"{path}.{key}", warnings=warnings, cap=cap)
+                str(key): _freeze(
+                    item, path=f"{path}.{key}", warnings=warnings, cap=cap, redact=redact
+                )
                 for key, item in value.items()
             }
         )
     if isinstance(value, Sequence):
         return tuple(
-            _freeze(item, path=f"{path}[{index}]", warnings=warnings, cap=cap)
+            _freeze(item, path=f"{path}[{index}]", warnings=warnings, cap=cap, redact=redact)
             for index, item in enumerate(value)
         )
     raise TypeError(f"{path} holds {type(value).__name__}, which a carrier cannot freeze")
@@ -168,11 +209,15 @@ class Carrier(ABC):
     Two things: the recorded state of the **redaction** policy, and the
     **warnings** that qualify what it holds. Subclasses declare which of their
     fields are extracted-text regions; every string inside such a region is
-    capped individually (R-58) and everything, region or not, is frozen.
+    passed through the redaction policy (R-19) and capped individually (R-58),
+    and everything, region or not, is frozen.
 
-    What this base does not do is decide whether the text is safe. It records
-    what a producer says it did and refuses to serialize when the producer says
-    nothing at all.
+    Construction is the **redaction sink** (D-019). A carrier therefore cannot
+    hold unredacted extracted text at all, except under the one policy that
+    says so - `DISABLED`, which is the `--no-redact-secrets` opt-out and is
+    recorded as such. What this base still does not do is decide whether the
+    text is *safe*: it applies a policy of patterns, and a secret shaped like
+    nothing in `redact_secrets.SECRET_PATTERNS` passes through it untouched.
     """
 
     EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = ()
@@ -191,10 +236,24 @@ class Carrier(ABC):
             raise AssertionError(
                 f"{type(self).__name__} names extracted-text fields it does not have: {unknown}"
             )
+        # The policy runs unless it was explicitly disabled, on every route in -
+        # the literal constructor and `dataclasses.replace` alike, since replace
+        # re-runs this. A carrier rebuilt around new text is redacted again
+        # rather than inheriting the state its predecessor earned.
+        #
+        # Its predecessor's **warnings** do carry forward, because replace
+        # passes them in and nothing here can tell a warning the caller raised
+        # from one an earlier incarnation produced. A carrier rebuilt around
+        # *shorter* text therefore keeps a truncation warning that no longer
+        # describes what it holds. That is a stale record rather than a leak,
+        # and the alternative - dropping warnings a producer deliberately
+        # attached - loses a **degradation** nobody would then be told about.
+        apply_policy = self.redaction is not RedactionState.DISABLED
         collected: list[Mapping[str, str]] = []
         for field in dataclasses.fields(self):
-            if field.name == "warnings":
+            if field.name in {"warnings", "redaction"}:
                 continue
+            region = field.name in self.EXTRACTED_TEXT_FIELDS
             object.__setattr__(
                 self,
                 field.name,
@@ -202,9 +261,15 @@ class Carrier(ABC):
                     getattr(self, field.name),
                     path=field.name,
                     warnings=collected,
-                    cap=field.name in self.EXTRACTED_TEXT_FIELDS,
+                    cap=region,
+                    redact=region and apply_policy,
                 ),
             )
+        object.__setattr__(
+            self,
+            "redaction",
+            RedactionState.APPLIED if apply_policy else RedactionState.DISABLED,
+        )
         object.__setattr__(
             self,
             "warnings",
@@ -333,19 +398,28 @@ def serialize(carrier: Carrier) -> dict[str, Any]:
     D-022: Python cannot carry the guarantee in a type. The layers, and what
     each one actually catches:
 
-    - the type states the intent and holds the state, and catches nothing on
-      its own - a producer can construct a carrier whose policy never ran, and
-      must be able to, because the carrier is where the text is held while the
-      policy runs;
+    - construction runs the policy (D-019), so the text a carrier holds is
+      already redacted and there is no window in which it is not;
     - the emitter (Phase 5) is the choke point every durable write goes
       through, and catches a writer that forgets, but only a writer that uses
       it;
-    - this check catches the carrier at the last point before its text becomes
-      durable, on every route into the serializer.
+    - this check catches a carrier whose state says the policy never ran, at
+      the last point before its text becomes durable and on every route into
+      the serializer.
 
-    What none of them catch: a producer that declares `APPLIED` or `DISABLED`
-    without running the policy. The state is a claim by the producing stage,
-    and this function verifies that a claim was made, not that it was true.
+    Since construction cannot produce `NOT_APPLIED`, this check is defence in
+    depth rather than the protection: what reaches it is a carrier assembled
+    around `__post_init__`, and refusing that is worth more than trusting it.
+
+    What it does *not* catch, precisely: this reads the state, so it catches a
+    bypass that leaves the state saying the policy never ran - a write through
+    `object.__setattr__`, or a subclass that skipped construction and did not
+    set the field. A subclass that overrides `__post_init__` without calling
+    `super()` *and* declares `APPLIED` serializes raw text, and nothing here
+    can tell that from a carrier that earned it. Nor does any layer catch a
+    policy that ran and missed: `APPLIED` means the patterns in
+    `redact_secrets` were applied to every extracted-text region, not that
+    every secret in that text matched one.
     """
     if not carrier.redaction.policy_applied:
         raise RedactionPolicyNotApplied(type(carrier).__name__)

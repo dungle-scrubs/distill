@@ -442,6 +442,11 @@ def test_youtube_source_info_carries_the_lease_into_the_read(
             "label": "Skill repo",
             "source": "youtube_description",
             "reason": "code_or_reference_domain",
+            # R-21: a **related link** is **extracted text** on both halves, so
+            # it is a carrier, and its document records the policy that produced
+            # it exactly as a **frame artifact**'s does.
+            "redaction": "applied",
+            "warnings": [],
         }
     ]
     assert [event.detail for event in progress.events if event.mechanism == "youtube_download"][

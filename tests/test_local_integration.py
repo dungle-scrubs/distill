@@ -150,10 +150,17 @@ def test_cache_hit_returns_under_one_second(
     assert elapsed < 1.0
 
 
-def test_pipeline_reports_redaction_render_and_publish_progress(
+def test_pipeline_reports_render_and_publish_progress_and_no_redaction_stage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """The mechanisms a run reports are the stages it has (D-019).
+
+    Redaction was one of them, and it is not one any more: R-19 moved it into
+    carrier construction, so it belongs to the stage whose text it redacts
+    rather than being a step of its own. A mechanism nothing reports is a share
+    of the progress bar that can never fill, which is why its weight went too.
+    """
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
     reporter = ProgressReporter()
@@ -174,7 +181,7 @@ def test_pipeline_reports_redaction_render_and_publish_progress(
 
     assert response["cached"] is False
     mechanisms = [event.mechanism for event in reporter.events]
-    assert "redaction" in mechanisms
+    assert "redaction" not in mechanisms
     assert "rendering" in mechanisms
     assert "bundle_publish" in mechanisms
     assert reporter.states["bundle_publish"].status == "completed"
