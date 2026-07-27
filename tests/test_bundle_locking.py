@@ -608,3 +608,47 @@ def test_the_wait_is_not_spent_on_a_lock_that_was_never_contended(tmp_path: Path
     assert clock.now == 0.0
     assert run.waited_sec == 0.0
     run.release()
+
+
+def test_a_run_takes_the_bundle_lock_for_the_budget_its_caller_named(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """D-044 reaches a real caller: the pipeline stages under the lock, on a budget.
+
+    Until M3.6 the pipeline staged without taking the bundle lock at all, so
+    both budgets were unreachable from any command a user runs and the store's
+    own tests were the only thing asserting them. A single-source run waits five
+    minutes for the run a user is watching; one item of a batch waits five
+    seconds and lets the batch move on.
+    """
+    from distill import pipeline
+    from distill.options import DistillOptions
+    from distill.progress import ProgressReporter
+
+    budgets: list[float] = []
+
+    def record(_self: object, _key: str, *, wait_sec: float, **_rest: object) -> None:
+        budgets.append(wait_sec)
+        raise DistillError("E_STOP", "bundle", "far enough")
+
+    monkeypatch.setattr(pipeline.BundleStore, "begin", record)
+
+    class StubSource:
+        source_hash = BUNDLE_KEY
+        warnings: list[dict[str, str]] = []
+
+    root = tmp_path / "output"
+    root.mkdir()
+    for budget in (None, BATCH_ITEM_LOCK_WAIT_SEC):
+        options = DistillOptions.from_args({"output_dir": str(root), "job_id": "j"})
+        extra = {} if budget is None else {"lock_wait_sec": budget}
+        with pytest.raises(DistillError):
+            pipeline.process_resolved_source(
+                StubSource(),
+                options,
+                root,
+                progress=ProgressReporter(emitter=lambda _event: None),
+                **extra,
+            )
+
+    assert budgets == [SINGLE_SOURCE_LOCK_WAIT_SEC, BATCH_ITEM_LOCK_WAIT_SEC]

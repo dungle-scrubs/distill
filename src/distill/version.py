@@ -7,8 +7,8 @@ reason. It does not own the released package version: that is `DISTILL_VERSION`
 in `release.py`, which is bundle content and is therefore signed.
 
 It does not own cache lookup, the bundle key, or any output. Those live in
-`pipeline.py` and `bundle.py`; this module only supplies the constants they mix
-into the bundle key.
+`pipeline.py`, `bundle_store.py` and `response.py`; this module only supplies
+the constants they mix into the bundle key.
 
 Per ADR-0003 signed-ness is a property, not a list: if editing a module can
 change bundle content, it is a signed module. `tests/test_pipeline_signature.py`
@@ -36,7 +36,6 @@ PIPELINE_VERSION = 25
 # ordering mechanical rather than incidental, and test_pipeline_signature
 # enforces that too.
 SIGNED_MODULES = (
-    "bundle.py",
     "bundle_store.py",
     "capabilities.py",
     "cli.py",
@@ -52,6 +51,7 @@ SIGNED_MODULES = (
     "redact_secrets.py",
     "release.py",
     "render.py",
+    "response.py",
     "run_command.py",
     "source.py",
     "transcript.py",
@@ -65,15 +65,17 @@ SIGNED_MODULES = (
 EXEMPT_MODULES: dict[str, str] = {
     "__init__.py": (
         "Re-exports DISTILL_VERSION from the signed release.py and nothing "
-        "else. bundle.py stamps manifests from release.py directly, so this "
+        "else. response.py stamps manifests from release.py directly, so this "
         "re-export reaches no bundle and editing it cannot change bundle "
         "content."
     ),
-    "cache.py": (
-        "Prunes and deletes whole bundle generations under the cache root. It "
-        "can remove cached output but never produces or rewrites the content of "
-        "a bundle, so a change here cannot make a served bundle differ from what "
-        "the current code would produce."
+    "cache_doctor.py": (
+        "Reports on bundles under an output root and never writes, deletes or "
+        "repairs anything: it formats a BundleStore survey and an unapplied "
+        "PrunePlan. It cannot make a served bundle differ from what the current "
+        "code would produce, because it produces no bundle content and reaches "
+        "no bundle write path at all. Read-only is what this exemption rests "
+        "on; a repair mode added here would make the module signed."
     ),
     "job_store.py": (
         "Owns job records and their identifier domain, written under the cache "

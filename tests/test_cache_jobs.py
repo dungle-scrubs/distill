@@ -1,8 +1,9 @@
-"""Unit tests for the public `cleanup-cache` facade.
+"""Unit tests for the public `cleanup-cache` tool.
 
-The `cleanup-cache` tool keeps its name (D-042) and is now an adapter onto
+The `cleanup-cache` tool keeps its name (D-042) and is now a thin call onto
 **prune**: `BundleStore.plan_prune` proposes, `BundleStore.apply_prune` decides
-under the lock. These tests hold the tool's shape against **bundles** that carry
+under the lock. M3.6 deleted the `cache.py` adapter that sat between them, so
+these drive the registered tool handler directly - the surface the CLI reaches. These tests hold the tool's shape against **bundles** that carry
 a **bundle marker** - the retention tests here used to prove the tool deleted
 generations out of directories Distill never wrote, which is finding 1, and one
 of them passed `keep_generations=0`, which is finding 2's input.
@@ -22,8 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from distill.cache import cleanup_cache
 from distill.errors import DistillError
+from distill.pipeline import cleanup_distill_cache
 
 
 def _write_bundle(
@@ -63,6 +64,12 @@ def _write_bundle(
     return bundle
 
 
+def cleanup(root: Path, **args: object) -> dict:
+    """Prune under `root` through the registered tool's own handler."""
+    root.mkdir(parents=True, exist_ok=True)
+    return cleanup_distill_cache({"output_dir": str(root), **args})
+
+
 def _backdate(directory: Path, days: float) -> None:
     stamp = time.time() - days * 86400
     for path in sorted(directory.rglob("*"), reverse=True):
@@ -74,7 +81,7 @@ def test_cleanup_cache_keeps_newest_generations(tmp_path: Path) -> None:
     root = tmp_path / "cache"
     bundle = _write_bundle(root, "abc123", ("g1", "g2", "g3", "g4"), active="g4")
 
-    result = cleanup_cache(root, max_age_days=None, keep_generations=2, dry_run=False)
+    result = cleanup(root, keep_generations=2, dry_run=False)
 
     # g1 and g2 are pruned; g3 and the active g4 are retained.
     assert set(result["deleted"]) == {str(bundle / "g1"), str(bundle / "g2")}
@@ -87,7 +94,7 @@ def test_cleanup_cache_dry_run_does_not_delete(tmp_path: Path) -> None:
     root = tmp_path / "cache"
     bundle = _write_bundle(root, "abc123", ("g1", "g2", "g3", "g4"), active="g4")
 
-    result = cleanup_cache(root, max_age_days=None, keep_generations=2, dry_run=True)
+    result = cleanup(root, keep_generations=2, dry_run=True)
 
     assert result["deleted"] == []
     assert result["candidate_count"] == 2
@@ -100,7 +107,7 @@ def test_cleanup_cache_prunes_old_bundles_by_age(tmp_path: Path) -> None:
     new_bundle = _write_bundle(root, "new", ("g1",), active="g1")
     _backdate(old_bundle, days=40)
 
-    result = cleanup_cache(root, max_age_days=30, keep_generations=99, dry_run=False)
+    result = cleanup(root, max_age_days=30, keep_generations=99, dry_run=False)
 
     # Expiry takes the whole aged bundle, active generation included (D-018).
     assert result["deleted"] == [str(old_bundle)]
@@ -114,7 +121,7 @@ def test_cleanup_cache_skips_private_dirs_and_says_so(tmp_path: Path) -> None:
     (root / "_internal" / "g1").mkdir()
     (root / "_internal" / "g1" / "video.md").write_text("# x")
 
-    result = cleanup_cache(root, max_age_days=None, keep_generations=1, dry_run=False)
+    result = cleanup(root, keep_generations=1, dry_run=False)
 
     assert result["candidate_count"] == 0
     assert (root / "_internal").exists()
@@ -128,7 +135,7 @@ def test_cleanup_cache_refuses_keep_generations_below_one(tmp_path: Path) -> Non
     _write_bundle(root, "abc123", ("g1",), active="g1")
 
     with pytest.raises(DistillError) as raised:
-        cleanup_cache(root, max_age_days=None, keep_generations=0, dry_run=False)
+        cleanup(root, keep_generations=0, dry_run=False)
 
     assert raised.value.code == "E_BAD_OPTIONS"
 
@@ -138,7 +145,7 @@ def test_cleanup_cache_reports_what_it_considered(tmp_path: Path) -> None:
     root = tmp_path / "cache"
     (root / "notes").mkdir(parents=True)
 
-    result = cleanup_cache(root, max_age_days=None, keep_generations=1, dry_run=False)
+    result = cleanup(root, keep_generations=1, dry_run=False)
 
     assert result["deleted"] == []
     assert result["considered"] == 1

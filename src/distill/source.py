@@ -34,8 +34,6 @@ what a **generation** contains, or install anything.
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import hashlib
 import json
 import logging
@@ -51,6 +49,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
+from .bundle_store import BundleStore, ExclusiveLock
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, warning
 from .options import DistillOptions
@@ -156,12 +155,6 @@ def _acquisition_log(event: str, **detail: Any) -> None:
     )
 
 
-# `flock` refusing a lock somebody else holds, which is an answer rather than a
-# failure. Every other errno says this filesystem cannot give Distill the
-# exclusion it asked for, and is fatal.
-_LOCK_HELD_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
-
-
 @dataclass
 class AcquisitionLease:
     """The exclusive right to acquire and read one **source**'s media.
@@ -171,14 +164,14 @@ class AcquisitionLease:
     lease, which is exactly what stops the second from replacing media the first
     is still reading (R-36).
 
-    The lease *is* an open descriptor holding a `flock`, not a file whose
-    contents describe a holder. That is what makes it exclusive: a lock whose
-    content names its owner has to be created before it can be written, and a
-    contender reading it in between finds a lock nobody owns, calls it
-    abandoned, and takes it - two runs, one lock key. Here the lock exists for
-    exactly as long as the descriptor does, so there is nothing to publish, no
-    staleness to guess at, and no pid that could be reused. A holder killed
-    outright releases it the moment the kernel closes its descriptors.
+    The exclusion itself is `bundle_store.ExclusiveLock` - one `flock` primitive
+    for the whole package. The lease and the bundle lock stay two locks, because
+    they answer different questions on different keys ("is another run fetching
+    this source?" against "is another run producing this bundle?"), but they are
+    not two mechanisms: the argument for why an open descriptor is exclusive and
+    a lock file's *contents* are not is the argument finding 11 came from
+    getting wrong, and a second copy of it is a second chance to get it wrong
+    again.
 
     Held until `release`, which the reader calls when it is finished with the
     media - not when the download ends. `release` is idempotent, because the
@@ -191,41 +184,32 @@ class AcquisitionLease:
 
     lock_key: str
     lock_path: Path
-    fd: int
+    lock: ExclusiveLock
     warnings: list[dict[str, str]] = field(default_factory=list)
-    released: bool = False
+
+    @property
+    def released(self) -> bool:
+        return self.lock.released
 
     @classmethod
     def take(cls, lock_key: str, lock_path: Path) -> AcquisitionLease | None:
         """Take the lease, or report `None` if another run holds it.
 
-        The descriptor stays open inside the returned lease: closing it is what
-        releasing means, so nothing else may close it. `flock` is per open file
-        description rather than per process, so a second lease taken against the
-        same path is refused even inside the process that holds the first.
-
         A filesystem that cannot take the lock (`flock` reporting anything other
         than "held") is fatal: `E_LOCK_UNSUPPORTED` rather than a fallback that
-        would let two runs read one source without either of them knowing.
+        would let two runs read one source without either of them knowing. The
+        stage and message name *this* question, so a user downloading a video
+        is told which lock could not be taken.
         """
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            os.close(fd)
-            if exc.errno in _LOCK_HELD_ERRNOS:
-                return None
-            reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
-            raise DistillError(
-                "E_LOCK_UNSUPPORTED",
-                "youtube",
-                "filesystem cannot lock the YouTube source directory",
-                {"lock_path": str(lock_path), "errno": reported or str(exc.errno)},
-            ) from exc
-        except BaseException:
-            os.close(fd)
-            raise
-        return cls(lock_key=lock_key, lock_path=lock_path, fd=fd)
+        lock = ExclusiveLock.take(
+            lock_key,
+            lock_path,
+            stage="youtube",
+            message="filesystem cannot lock the YouTube source directory",
+        )
+        if lock is None:
+            return None
+        return cls(lock_key=lock_key, lock_path=lock_path, lock=lock)
 
     def release(self) -> None:
         """Give the lease up by closing the descriptor the kernel locked.
@@ -236,16 +220,11 @@ class AcquisitionLease:
         that inode while the next run creates a fresh file at the same path and
         locks that - two runs, again, one lock key. Leaving the file costs one
         empty inode per **lock key** and keeps the path itself the identity of
-        the lease. Reclaiming those files is **prune**'s business, not a
-        release's.
-
-        Closing releases only what this process was granted: a descriptor with
-        no lock behind it frees nobody, whatever the file at that path says.
+        the lease.
         """
-        if self.released:
+        if self.lock.released:
             return
-        self.released = True
-        os.close(self.fd)
+        self.lock.release()
         _acquisition_log(
             "lease_released",
             lock_key=self.lock_key,
@@ -536,8 +515,12 @@ def resolve_local_source(
     return LocalSourceProvider().resolve(SourceRequest(path_text, options, progress=progress))
 
 
-def validate_output_root(output_dir: str | None) -> Path:
+def validate_output_root(output_dir: str | None, *, create: bool = True) -> Path:
     """Accept an output root, or refuse it before anything is written under it.
+
+    `create=False` validates without creating, which is what a read-only caller
+    needs: `cache-doctor` reports on a root and must not bring one into
+    existence to say it is empty (R-57). Every writing caller takes the default.
 
     An output root is a place Distill owns: it creates bundles there and prunes
     them there. `$HOME` and the system temp directory are not such places - they
@@ -577,7 +560,8 @@ def validate_output_root(output_dir: str | None) -> Path:
             "output_dir points inside a sensitive path",
             {"output_dir": str(root), "matched": sensitive},
         )
-    root.mkdir(parents=True, exist_ok=True)
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -1172,19 +1156,25 @@ class YouTubeSourceProvider:
         request: SourceRequest,
         metadata: YouTubeMetadata | None = None,
     ) -> SourceInfo | None:
-        """Return a SourceInfo from a published manifest, or None on miss."""
+        """Describe a source from a servable bundle, or `None` if there is none.
+
+        The question is "can this download be skipped?", and the only answer
+        that justifies skipping it is a **bundle** whose **active generation**
+        is on disk (R-04). `BundleStore.load_active` is what proves that, so it
+        is asked rather than the manifest file being read directly: a manifest
+        naming a generation retention deleted is a promise, not evidence, and
+        reusing the media path it records would resolve a source for a bundle
+        nobody can serve (D-041).
+        """
         if request.output_root is None:
             raise DistillError("E_BAD_OUTPUT_DIR", "youtube", "output_root is required")
         video_id = metadata.video_id if metadata is not None else canonical_youtube_id(request.value)
         fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
         sh = source_hash(fingerprint, request.options.opts_hash("youtube"))
-        manifest_path = request.output_root / sh / "_manifest.json"
-        if not manifest_path.exists():
+        snapshot = BundleStore.open(request.output_root).load_active(sh)
+        if snapshot is None:
             return None
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return None
+        manifest = snapshot.manifest
         duration = manifest.get("duration_sec")
         resolved_path = manifest.get("source_resolved_path")
         if not isinstance(duration, (int, float)) or not isinstance(resolved_path, str):

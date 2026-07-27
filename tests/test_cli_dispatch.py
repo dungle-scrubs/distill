@@ -25,11 +25,17 @@ def _run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[object, s
 
 
 def test_list_tools_dispatch_prints_sorted_tools(capsys: pytest.CaptureFixture[str]) -> None:
+    """R-57 adds the read-only inspection command to the tool surface.
+
+    `cleanup_cache` keeps its name: D-042 renames no command, so the public
+    surface gains the surface that reports and keeps the one that deletes.
+    """
     code, out, _ = _run(["list-tools"], capsys)
     assert code is None
     payload = json.loads(out)
     assert payload == {
         "tools": [
+            "cache_doctor",
             "cleanup_cache",
             "get_job_status",
             "process_local_video",
@@ -69,6 +75,14 @@ def test_timeout_probe_dispatch_rejects_long_probe(
 
 
 def test_cleanup_cache_dispatch_dry_run(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """R-57: a preview reports what it skipped, not only what it would delete.
+
+    "Considered nothing" and "deleted nothing" are different answers, and a
+    payload carrying only `deleted` cannot tell them apart - here the root holds
+    one directory that is not a **bundle**, so the empty candidate list has to
+    come with the reason it is empty.
+    """
+    (tmp_path / "notes").mkdir()
     code, out, _ = _run(
         ["cleanup-cache", "--output-dir", str(tmp_path), "--keep-generations", "3", "--dry-run"],
         capsys,
@@ -78,6 +92,14 @@ def test_cleanup_cache_dispatch_dry_run(tmp_path: Path, capsys: pytest.CaptureFi
     assert payload["dry_run"] is True
     assert payload["candidate_count"] == 0
     assert payload["deleted"] == []
+    assert payload["considered"] == 1
+    assert payload["skipped"] == [
+        {
+            "path": str(tmp_path / "notes"),
+            "verdict": "absent",
+            "reason": "no bundle marker",
+        }
+    ]
 
 
 def test_get_job_status_dispatch_missing_job_is_error(

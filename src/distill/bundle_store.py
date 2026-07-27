@@ -161,6 +161,9 @@ makes the path itself the identity of the lock, for as long as the output root
 exists.
 """
 
+LOCK_SUFFIX = ".lock"
+"""How a run lock is named inside `_locks`, and how one is recognized there."""
+
 SINGLE_SOURCE_LOCK_WAIT_SEC = 300.0
 """How long one video's run waits for a contended **bundle key** (D-044).
 
@@ -227,6 +230,15 @@ not live.
 """
 
 PruneVerdict = Literal["deleted", "skipped"]
+
+LockState = Literal["live", "stale", "absent"]
+"""What a run lock is right now, asked of the kernel rather than of the file.
+
+`live` is a lock another run holds. `stale` is a lock file nobody holds - a
+release closes a descriptor and deliberately leaves the file, so its presence
+alone means nothing. `absent` is a **bundle key** no run has ever reached
+staging under.
+"""
 
 
 def _bundle_log(event: str, **detail: Any) -> None:
@@ -311,6 +323,16 @@ class BundleSnapshot:
     def frames(self) -> Path:
         return self.generation / FRAMES_DIR_NAME
 
+    @property
+    def manifest_path(self) -> Path:
+        """Where the **manifest** this snapshot was read from lives.
+
+        A caller that reports paths back to its own caller needs the marker's
+        path as well as its content, and deriving it from `root` outside this
+        module is how the filename escapes into a second module (D-041).
+        """
+        return self.root / MANIFEST_NAME
+
 
 @dataclass
 class ExclusiveLock:
@@ -332,10 +354,13 @@ class ExclusiveLock:
     staging ends. `release` is idempotent, because the failure paths that release
     a lock early overlap with the caller's own cleanup.
 
-    Does not own: what the subject contains, which path a subject locks on, or
-    the acquisition lease in `source.py`, which is keyed by **lock key** and
-    answers a different question - "is another run fetching this source?" rather
-    than "is another run producing this bundle?".
+    Does not own: what the subject contains, or which path a subject locks on.
+    It does not own the *meaning* of a lock either - the **acquisition lease**
+    in `source.py` is this mechanism keyed by **lock key**, answering "is
+    another run fetching this source?" where the bundle lock answers "is another
+    run producing this bundle?". Two questions, two lock paths, one primitive:
+    the exclusion argument is subtle enough that a second copy of it is a second
+    chance to get finding 11 wrong.
     """
 
     subject: str
@@ -344,7 +369,14 @@ class ExclusiveLock:
     released: bool = False
 
     @classmethod
-    def take(cls, subject: str, path: Path, *, stage: str = "bundle") -> ExclusiveLock | None:
+    def take(
+        cls,
+        subject: str,
+        path: Path,
+        *,
+        stage: str = "bundle",
+        message: str = "filesystem cannot grant an exclusive lock here",
+    ) -> ExclusiveLock | None:
         """Take the lock, or report `None` if another holder has it.
 
         The descriptor stays open inside the returned lock: closing it is what
@@ -354,7 +386,10 @@ class ExclusiveLock:
 
         A filesystem that cannot grant the lock is fatal (R-09): an errno other
         than "held" means Distill cannot tell one run from two here, and the only
-        answer that does not silently reintroduce finding 6 is to stop.
+        answer that does not silently reintroduce finding 6 is to stop. `stage`
+        and `message` name the caller's question in that error, because a
+        failure to lock a source directory and a failure to lock a bundle are
+        the same defect reported to a user doing different things.
         """
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -367,7 +402,7 @@ class ExclusiveLock:
             raise DistillError(
                 "E_LOCK_UNSUPPORTED",
                 stage,
-                "filesystem cannot grant an exclusive lock here",
+                message,
                 {
                     "subject": subject,
                     "lock_path": str(path),
@@ -463,13 +498,17 @@ class PruneTarget:
 
 
 @dataclass(frozen=True)
-class PruneSkip:
-    """One directory prune looked at and did not treat as prunable, and why.
+class DirectorySkip:
+    """One directory the walk looked at and did not treat as a **bundle**, and why.
 
-    Reported rather than silently passed over, because "prune considered nothing"
-    and "prune deleted nothing" are different answers and a caller that cannot
-    tell them apart cannot tell a healthy cache from a prune that skipped every
-    bundle it found (R-01, R-57).
+    Reported rather than silently passed over, because "considered nothing" and
+    "deleted nothing" are different answers, and a caller that cannot tell them
+    apart cannot tell a healthy cache from a prune that skipped every bundle it
+    found (R-01, R-57).
+
+    Shared by **prune** and by the survey `cache-doctor` reports, because they
+    are the same walk asking the same question: a skip a preview does not
+    mention is a skip the destructive operation will make silently.
     """
 
     path: Path
@@ -478,6 +517,81 @@ class PruneSkip:
 
     def to_dict(self) -> dict[str, str]:
         return {"path": str(self.path), "verdict": self.verdict, "reason": self.reason}
+
+
+@dataclass(frozen=True)
+class LockReport:
+    """One run lock and whether anybody holds it (R-57)."""
+
+    path: Path
+    subject: str
+    state: LockState
+
+    def to_dict(self) -> dict[str, str]:
+        return {"path": str(self.path), "subject": self.subject, "state": self.state}
+
+
+@dataclass(frozen=True)
+class BundleReport:
+    """What one directory the walk recognized as Distill's looks like right now.
+
+    Descriptive, not advisory: it says what is on disk, and says nothing about
+    what should happen to any of it. What a **prune** would remove is a
+    `PrunePlan`, derived separately from the same walk so the two answers cannot
+    drift into disagreeing about the same bundle.
+    """
+
+    path: Path
+    bundle_key: str
+    verdict: str
+    reason: str
+    active_generation: str | None
+    generations: tuple[str, ...]
+    orphan_generations: tuple[str, ...]
+    staging_directories: tuple[str, ...]
+    lock: LockReport
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "bundle_key": self.bundle_key,
+            "verdict": self.verdict,
+            "reason": self.reason,
+            "active_generation": self.active_generation,
+            "generations": list(self.generations),
+            "orphan_generations": list(self.orphan_generations),
+            "staging_directories": list(self.staging_directories),
+            "lock": self.lock.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class StoreSurvey:
+    """Every **bundle** under one output root, and everything that is not one.
+
+    The skips are half the answer, not a footnote: a survey listing only the
+    bundles it found reports the same empty result for a healthy root and for a
+    root the walk declined to descend into (R-57).
+    """
+
+    root: Path
+    root_exists: bool
+    bundles: tuple[BundleReport, ...] = ()
+    skipped: tuple[DirectorySkip, ...] = ()
+    locks: tuple[LockReport, ...] = ()
+    considered: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "root": str(self.root),
+            "root_exists": self.root_exists,
+            "considered": self.considered,
+            "bundle_count": len(self.bundles),
+            "bundles": [bundle.to_dict() for bundle in self.bundles],
+            "skipped_count": len(self.skipped),
+            "skipped": [skip.to_dict() for skip in self.skipped],
+            "locks": [lock.to_dict() for lock in self.locks],
+        }
 
 
 @dataclass(frozen=True)
@@ -492,7 +606,7 @@ class PrunePlan:
     root: Path
     policy: PrunePolicy
     targets: tuple[PruneTarget, ...] = ()
-    skipped: tuple[PruneSkip, ...] = ()
+    skipped: tuple[DirectorySkip, ...] = ()
     considered: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -526,7 +640,7 @@ class PruneOutcome:
 
     root: Path
     results: tuple[PruneResult, ...] = ()
-    skipped: tuple[PruneSkip, ...] = ()
+    skipped: tuple[DirectorySkip, ...] = ()
     considered: int = 0
 
     @property
@@ -551,11 +665,18 @@ class PruneOutcome:
 
 
 @dataclass
-class _PruneScan:
-    """Mutable accumulator for the walk, so recursion has one place to add to."""
+class _Scan:
+    """Mutable accumulator for the walk, so recursion has one place to add to.
 
-    targets: list[PruneTarget] = field(default_factory=list)
-    skipped: list[PruneSkip] = field(default_factory=list)
+    Shared by **prune** and by the survey: what each of them does when the walk
+    reaches a Distill-owned directory differs, and nothing else about the walk
+    does. Two copies of "which directories are bundles, which are skipped and
+    why, and how deep to descend" is two answers that can disagree about the
+    same root - which is the shape of finding 1.
+    """
+
+    skipped: list[DirectorySkip] = field(default_factory=list)
+    locks: list[LockReport] = field(default_factory=list)
     considered: int = 0
 
 
@@ -648,6 +769,7 @@ class BundleStore:
         *,
         wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
         resume: bool = True,
+        reuse_active: bool = True,
     ) -> BundleRun | BundleSnapshot:
         """Take the run lock for `bundle_key` and open a **staging directory**.
 
@@ -656,6 +778,12 @@ class BundleStore:
         lock to be worth anything: a waiter that decided "cache miss" before
         queueing would come out of a wait it spent behind the winner and redo
         the work the winner just published (RV-1).
+
+        `reuse_active=False` is `force_reprocess`: the caller wants the work
+        done again whatever is on disk. It suppresses the hand-back, not the
+        re-check - the lock is still taken first and the existing **active
+        generation** is left servable until this run publishes over it, so a
+        forced run that fails costs a reader nothing.
 
         Ordering is the requirement here, not just the outcome:
 
@@ -675,7 +803,7 @@ class BundleStore:
         """
         lock, waited_sec = self._take_lock(bundle_key, wait_sec)
         try:
-            snapshot = self.load_active(bundle_key)
+            snapshot = self.load_active(bundle_key) if reuse_active else None
             if snapshot is not None:
                 # A cache hit holds nothing: the question the lock was taken to
                 # answer has been answered, so the next run may have it.
@@ -822,12 +950,23 @@ class BundleStore:
         """
         if not self.root.is_dir():
             return PrunePlan(root=self.root, policy=policy)
-        scan = _PruneScan()
-        self._scan_directory(self.root, depth=0, policy=policy, now=time.time(), scan=scan)
+        scan = _Scan()
+        targets: list[PruneTarget] = []
+        now = time.time()
+
+        def propose(directory: Path, verdict: MarkerVerdict) -> None:
+            if lock_is_held(directory):
+                scan.skipped.append(
+                    DirectorySkip(directory, "locked", "another run holds this bundle key")
+                )
+                return
+            targets.extend(self._bundle_targets(directory, verdict, policy=policy, now=now))
+
+        self._walk(self.root, depth=0, scan=scan, on_bundle=propose)
         plan = PrunePlan(
             root=self.root,
             policy=policy,
-            targets=tuple(scan.targets),
+            targets=tuple(targets),
             skipped=tuple(scan.skipped),
             considered=scan.considered,
         )
@@ -937,35 +1076,94 @@ class BundleStore:
         shutil.rmtree(target.path)
         return PruneResult(target, "deleted", target.reason)
 
-    def _scan_directory(
-        self, directory: Path, *, depth: int, policy: PrunePolicy, now: float, scan: _PruneScan
+    def survey(self) -> StoreSurvey:
+        """Describe every **bundle** under the root, mutating nothing (R-57).
+
+        The read-only half of the same walk `plan_prune` uses, so what an
+        inspection reports and what a prune would consider are the same set of
+        directories by construction. It creates nothing - not the root, not a
+        `_locks` directory, not a lock file - because a command whose whole
+        purpose is to be safe to run first must be safe to run against a path
+        the user mistyped.
+
+        Liveness is asked of the kernel, never of a timestamp: a lock file
+        outlives its holder by design, so only `flock` separates a run in
+        progress from a leftover (R-06).
+        """
+        if not self.root.is_dir():
+            return StoreSurvey(root=self.root, root_exists=False)
+        scan = _Scan()
+        bundles: list[BundleReport] = []
+
+        def describe(directory: Path, verdict: MarkerVerdict) -> None:
+            bundles.append(self._bundle_report(directory, verdict))
+
+        self._walk(self.root, depth=0, scan=scan, on_bundle=describe)
+        return StoreSurvey(
+            root=self.root,
+            root_exists=True,
+            bundles=tuple(bundles),
+            skipped=tuple(scan.skipped),
+            locks=tuple(scan.locks),
+            considered=scan.considered,
+        )
+
+    def _bundle_report(self, bundle_root: Path, verdict: MarkerVerdict) -> BundleReport:
+        """Describe one bundle: its marker, its generations, its lock."""
+        active = active_generation_name(verdict)
+        generations = sorted_generations(bundle_root)
+        return BundleReport(
+            path=bundle_root,
+            bundle_key=verdict.bundle_key or bundle_root.name,
+            verdict=verdict.kind,
+            reason=verdict.reason,
+            active_generation=active,
+            generations=tuple(path.name for path in generations),
+            orphan_generations=tuple(
+                path.name for path in orphan_generations(bundle_root)
+            ),
+            staging_directories=tuple(path.name for path in staging_directories(bundle_root)),
+            lock=lock_report(bundle_root.name, prune_lock_path(bundle_root)),
+        )
+
+    def _walk(
+        self,
+        directory: Path,
+        *,
+        depth: int,
+        scan: _Scan,
+        on_bundle: Callable[[Path, MarkerVerdict], None],
     ) -> None:
-        """Walk one level, recording bundles as targets and everything else as skips."""
+        """Walk one level, handing each **bundle** to `on_bundle` and skipping the rest.
+
+        The descent is the policy R-05 and R-01 state together: descend through
+        directories that are not bundles so a bundle under a playlist root is
+        reachable, stop at every directory that is one because a **generation**
+        is not a nested bundle, and stop at every directory whose marker says
+        Distill is not free to reason about what is underneath it.
+        """
         for child in sorted(directory.iterdir()):
             if child.is_symlink():
                 scan.considered += 1
                 scan.skipped.append(
-                    PruneSkip(child, "symlink", "prune never follows a symlinked directory")
+                    DirectorySkip(child, "symlink", "a symlinked directory is never followed")
                 )
                 continue
             if not child.is_dir():
                 continue
             scan.considered += 1
             if child.name.startswith(("_", ".")):
+                if child.name == LOCK_DIR_NAME:
+                    scan.locks.extend(lock_reports(child))
                 scan.skipped.append(
-                    PruneSkip(child, "reserved", "reserved name, not a bundle directory")
+                    DirectorySkip(child, "reserved", "reserved name, not a bundle directory")
                 )
                 continue
             verdict = read_marker(child)
             if verdict.is_distill_owned:
-                if lock_is_held(child):
-                    scan.skipped.append(
-                        PruneSkip(child, "locked", "another run holds this bundle key")
-                    )
-                    continue
-                scan.targets.extend(self._bundle_targets(child, verdict, policy=policy, now=now))
+                on_bundle(child, verdict)
                 continue
-            scan.skipped.append(PruneSkip(child, verdict.kind, verdict.reason))
+            scan.skipped.append(DirectorySkip(child, verdict.kind, verdict.reason))
             if verdict.kind != "absent":
                 # A manifest that is unreadable or records another directory's
                 # identity still says Distill is not free to reason about what is
@@ -973,10 +1171,10 @@ class BundleStore:
                 continue
             if depth + 1 >= PRUNE_MAX_DEPTH:
                 scan.skipped.append(
-                    PruneSkip(child, "too-deep", f"deeper than {PRUNE_MAX_DEPTH} levels")
+                    DirectorySkip(child, "too-deep", f"deeper than {PRUNE_MAX_DEPTH} levels")
                 )
                 continue
-            self._scan_directory(child, depth=depth + 1, policy=policy, now=now, scan=scan)
+            self._walk(child, depth=depth + 1, scan=scan, on_bundle=on_bundle)
 
     def _bundle_targets(
         self,
@@ -1136,6 +1334,53 @@ class BundleRun:
             return None
         return read_stage_result(self.paths.generation, name)
 
+    @property
+    def generation_name(self) -> str:
+        """What this run's **staging directory** will be called once published.
+
+        Known before the publish because `next_generation` picked it when
+        staging opened, and answerable from here so a caller reporting progress
+        does not peel the staging prefix off a directory name itself (D-041).
+        """
+        return published_paths(self.paths).generation.name
+
+    @property
+    def scratch_dir(self) -> Path:
+        """Where a stage may put working files that are not bundle content.
+
+        The **staging directory** itself: everything in it is either published
+        as part of the **generation** or stripped, and a stage that needs a
+        scratch path gets one inside the directory this run holds the lock on
+        rather than a temporary directory nothing owns.
+        """
+        return self.paths.generation
+
+    @property
+    def frames_dir(self) -> Path:
+        """Where this run's **keyframe** images go.
+
+        Handed out rather than derived by the caller: `frames/` is layout, and
+        the stage that fills it has no business knowing the name (D-041).
+        """
+        return self.paths.frames
+
+    def write_render(self, markdown: str) -> Path:
+        """Write the **render** into the staging directory.
+
+        Checked before it is written, not after: R-16 refuses to follow a
+        symlink at the target, so a link pre-created at the render's path cannot
+        redirect the write out of the bundle (S1).
+        """
+        ensure_safe_directory(self.paths.markdown, self.paths.root, create_leaf=False)
+        self.paths.markdown.write_text(markdown)
+        return self.paths.markdown
+
+    def write_transcript(self, transcript: dict[str, Any]) -> Path:
+        """Write the **transcript** into the staging directory, on the same terms."""
+        ensure_safe_directory(self.paths.transcript, self.paths.root, create_leaf=False)
+        self.paths.transcript.write_text(json.dumps(transcript, indent=2, sort_keys=True) + "\n")
+        return self.paths.transcript
+
     def write_stage(self, name: str, result: Any) -> None:
         """Record a completed stage so an interrupted run can **resume**.
 
@@ -1200,7 +1445,7 @@ def prune_lock_path(bundle_root: Path) -> Path:
     `_locks/<name>.lock` beside the bundle - so both reach the same file, which
     is the only reason prune's lock excludes a live run at all.
     """
-    return bundle_root.parent / LOCK_DIR_NAME / f"{bundle_root.name}.lock"
+    return bundle_root.parent / LOCK_DIR_NAME / f"{bundle_root.name}{LOCK_SUFFIX}"
 
 
 def lock_is_held(bundle_root: Path) -> bool:
@@ -1223,6 +1468,40 @@ def lock_is_held(bundle_root: Path) -> bool:
         return True
     lock.release()
     return False
+
+
+def lock_report(subject: str, path: Path) -> LockReport:
+    """Whether `path` is a lock somebody holds, one nobody holds, or no lock at all.
+
+    Asking is itself read-only: a lock file that is not there is reported absent
+    rather than created, so an inspection of a root no run has ever touched
+    leaves it exactly as it was (R-57).
+    """
+    if not path.is_file():
+        return LockReport(path=path, subject=subject, state="absent")
+    lock = ExclusiveLock.take(subject, path)
+    if lock is None:
+        return LockReport(path=path, subject=subject, state="live")
+    lock.release()
+    return LockReport(path=path, subject=subject, state="stale")
+
+
+def lock_reports(lock_dir: Path) -> list[LockReport]:
+    """Every run lock in one `_locks` directory, held or leftover.
+
+    Reported alongside the per-bundle state because the two answer different
+    questions: a bundle's own lock says whether a run is live on it, while a
+    lock here whose bundle is gone is disk nothing will ever reclaim - prune
+    treats `_locks` as a reserved name and never descends into it.
+    """
+    return sorted(
+        (
+            lock_report(path.name.removesuffix(LOCK_SUFFIX), path)
+            for path in lock_dir.iterdir()
+            if path.is_file() and not path.is_symlink() and path.name.endswith(LOCK_SUFFIX)
+        ),
+        key=lambda report: report.path,
+    )
 
 
 def sorted_generations(bundle_root: Path) -> list[Path]:
@@ -1429,35 +1708,12 @@ def validate_manifest_schema(
         )
 
 
-def read_manifest(bundle_root: Path) -> dict[str, Any] | None:
-    """The published **manifest**, validated. Prefer `BundleStore.load_active`."""
-    manifest = bundle_root / MANIFEST_NAME
-    if not manifest.exists():
-        return None
-    with manifest.open() as handle:
-        data = json.load(handle)
-    validate_manifest_schema(data, require_active_generation=True)
-    return data
-
-
-def active_paths(bundle_root: Path) -> BundlePaths | None:
-    """Paths to the **active generation** without proving it exists.
-
-    Kept for callers this plan has not migrated yet; `BundleStore.load_active`
-    is the surface that answers "is there a bundle to serve?" (R-04).
-    """
-    manifest = read_manifest(bundle_root)
-    if not manifest:
-        return None
-    generation = bundle_root / str(manifest["active_generation"])
-    return BundlePaths(
-        root=bundle_root,
-        generation=generation,
-        frames=generation / FRAMES_DIR_NAME,
-        manifest=bundle_root / MANIFEST_NAME,
-        transcript=generation / TRANSCRIPT_NAME,
-        markdown=generation / RENDER_NAME,
-    )
+# `read_manifest` and `active_paths` stood here. They answered "where would the
+# active generation be?" from the manifest alone, without proving the generation
+# or its **render** is on disk - which is finding 2's cache hit, handing back
+# paths to a directory retention had deleted. `BundleStore.load_active` is the
+# only surface that answers "is there a bundle to serve?" (R-04), and D-041
+# leaves no caller needing the weaker one.
 
 
 def next_generation(bundle_root: Path) -> str:

@@ -34,6 +34,7 @@ def test_list_tools_returns_both_tools() -> None:
     )
     assert json.loads(result.stdout) == {
         "tools": [
+            "cache_doctor",
             "cleanup_cache",
             "get_job_status",
             "process_local_video",

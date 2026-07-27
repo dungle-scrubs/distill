@@ -27,7 +27,9 @@ from fake_tools import (
     fake_ffprobe_flooding_stderr,
 )
 
+from distill import bundle_store as distill_bundle_store
 from distill import source as distill_source
+from distill.bundle_store import ExclusiveLock
 from distill.errors import DistillError
 from distill.progress import ProgressReporter
 from distill.run_command import OUTPUT_CAP_BYTES, TRUNCATION_WARNING_CODE
@@ -168,7 +170,7 @@ import sys
 import time
 from pathlib import Path
 
-from distill import source as distill_source
+from distill import bundle_store, source as distill_source
 from distill.errors import DistillError
 
 url, lock_key, output_root, rendezvous_dir, token, parties = sys.argv[1:]
@@ -204,8 +206,10 @@ class RendezvousOs:
         return fd
 
 
+# The **acquisition lease** takes its lock through `bundle_store.ExclusiveLock`,
+# so that is where a lock file is opened and where the window has to be set.
 rendezvous_os = RendezvousOs(os)
-distill_source.os = rendezvous_os
+bundle_store.os = rendezvous_os
 try:
     acquired = distill_source.YoutubeDownloader(Path(output_root)).acquire(url, lock_key)
     verdict = {"acquired": True, "media": str(acquired.path)}
@@ -294,7 +298,7 @@ def test_a_filesystem_that_cannot_grant_the_lock_stops_the_run(
     def refuse(_fd: int, _operation: int) -> None:
         raise OSError(errno.ENOLCK, "no locks available")
 
-    monkeypatch.setattr(distill_source.fcntl, "flock", refuse)
+    monkeypatch.setattr(distill_bundle_store.fcntl, "flock", refuse)
 
     with pytest.raises(DistillError) as exc:
         YoutubeDownloader(tmp_path, lock_wait_sec=5.0).acquire(URL, LOCK_KEY)
@@ -419,7 +423,11 @@ def test_releasing_a_lease_this_process_does_not_hold_frees_nobody(
     stray = AcquisitionLease(
         lock_key=LOCK_KEY,
         lock_path=lock,
-        fd=os.open(lock, os.O_CREAT | os.O_RDWR, 0o600),
+        lock=ExclusiveLock(
+            subject=LOCK_KEY,
+            path=lock,
+            fd=os.open(lock, os.O_CREAT | os.O_RDWR, 0o600),
+        ),
     )
 
     stray.release()

@@ -304,7 +304,11 @@ def test_youtube_playlist_uses_playlist_output_subdirectory(
         lambda _url, _max_items: child_urls,
     )
 
-    def fake_process_youtube_video(args: dict[str, object]) -> dict[str, object]:
+    def fake_process_youtube_video(
+        args: dict[str, object], **_budget: float
+    ) -> dict[str, object]:
+        # A playlist item is handed the batch lock budget (D-044), which this
+        # double has no use for and must still accept.
         seen_child_args.append(args)
         return {
             "markdown_path": str(Path(str(args["output_dir"])) / "hash" / "g1" / "video.md"),

@@ -1,24 +1,31 @@
+"""What a run publishes, and what its caller is told about it.
+
+The seam is the pair D-041 leaves after `bundle.py` is deleted: `BundleRun`,
+which turns a **staging directory** into the **active generation**, and
+`response.py`, which produces the **manifest** content and the response payload
+from the same description of the run. These tests hold the behavior the old
+`bundle.py` tests pinned - the publish, the response keys, the frame shape - now
+stated against the surfaces that own them.
+"""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from distill.bundle import (
-    publish_generation,
-    response_from_paths,
-    write_bundle_files,
-)
 from distill.bundle_store import (
+    BundleRun,
     BundleStore,
-    active_paths,
     ensure_safe_directory,
-    read_manifest,
     stage_paths,
 )
 from distill.errors import DistillError
 from distill.options import DistillOptions
+from distill.response import manifest_document, run_response
 from distill.source import SourceInfo
 from distill.version import PIPELINE_VERSION
+
+BUNDLE_KEY = "hash"
 
 
 def source(tmp_path: Path) -> SourceInfo:
@@ -29,7 +36,7 @@ def source(tmp_path: Path) -> SourceInfo:
         resolved_path=video,
         duration_sec=1.0,
         source_fingerprint="fingerprint",
-        source_hash="hash",
+        source_hash=BUNDLE_KEY,
         warnings=[],
     )
 
@@ -42,7 +49,7 @@ def youtube_source(tmp_path: Path) -> SourceInfo:
         resolved_path=video,
         duration_sec=1.0,
         source_fingerprint="fingerprint",
-        source_hash="hash",
+        source_hash=BUNDLE_KEY,
         warnings=[],
         related_links=[
             {
@@ -55,12 +62,21 @@ def youtube_source(tmp_path: Path) -> SourceInfo:
     )
 
 
+def begin(root: Path) -> tuple[BundleStore, BundleRun]:
+    """Open a run over a fresh bundle key, the way a pipeline run does."""
+    root.mkdir(parents=True, exist_ok=True)
+    store = BundleStore.open(root)
+    run = store.begin(BUNDLE_KEY)
+    assert isinstance(run, BundleRun)
+    return store, run
+
+
 def minimal_manifest(tmp_path: Path) -> dict:
     return {
         "pipeline_version": 1,
         "distill_version": "0.1.0",
         "source_type": "local",
-        "source_hash": "hash",
+        "source_hash": BUNDLE_KEY,
         "source_resolved_path": str(tmp_path / "video.mp4"),
         "duration_sec": 1.0,
         "options": {},
@@ -73,10 +89,8 @@ def minimal_manifest(tmp_path: Path) -> dict:
 
 
 def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    frame = staged.frames / "frame_0001.png"
+    store, run = begin(tmp_path / "output")
+    frame = run.frames_dir / "frame_0001.png"
     frame.write_bytes(b"png")
     frames = [
         {
@@ -87,24 +101,25 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
             "ocr_text": "text",
         }
     ]
-    manifest = write_bundle_files(
-        staged,
-        source(tmp_path),
-        DistillOptions(),
-        {"segments": [{"start": 0, "end": 1, "text": "hi"}]},
-        "# Video\n",
-        frames,
-        [],
+    run.write_render("# Video\n")
+    run.write_transcript({"segments": [{"start": 0, "end": 1, "text": "hi"}]})
+
+    snapshot = run.commit(
+        manifest_document(
+            source(tmp_path),
+            DistillOptions(),
+            transcript_present=True,
+            frames=frames,
+            warnings=[],
+        )
     )
-    final = publish_generation(staged, manifest)
-    assert final.generation.name == "g1"
-    assert final.markdown.exists()
-    manifest_data = read_manifest(root)
-    active = active_paths(root)
-    assert manifest_data is not None
+
+    assert snapshot.generation.name == "g1"
+    assert snapshot.markdown.exists()
+    active = store.load_active(BUNDLE_KEY)
     assert active is not None
-    assert manifest_data["active_generation"] == "g1"
-    assert active.generation == final.generation
+    assert active.manifest["active_generation"] == "g1"
+    assert active.generation == snapshot.generation
 
 
 # `test_publish_rewrites_staged_paths_in_partial_files` stood here. It required
@@ -117,13 +132,13 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
 
 
 def test_response_shape(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    staged.markdown.write_text("# Video\n")
-    staged.transcript.write_text("{}")
-    final = publish_generation(staged, minimal_manifest(tmp_path))
-    response = response_from_paths(final, source(tmp_path), [], True, [], cached=False)
+    _, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+    run.write_transcript({})
+    snapshot = run.commit(minimal_manifest(tmp_path))
+
+    response = run_response(snapshot, source(tmp_path), [], True, [], cached=False)
+
     assert response["markdown_path"].endswith("video.md")
     assert response["transcript_path"].endswith("transcript.json")
     assert response["manifest_path"].endswith("_manifest.json")
@@ -132,39 +147,36 @@ def test_response_shape(tmp_path: Path) -> None:
 
 
 def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
+    store, run = begin(tmp_path / "output")
     source_info = youtube_source(tmp_path)
+    run.write_render("# Video\n")
+    run.write_transcript({"segments": [{"start": 0, "end": 1, "text": "hi"}]})
 
-    manifest = write_bundle_files(
-        staged,
-        source_info,
-        DistillOptions(),
-        {"segments": [{"start": 0, "end": 1, "text": "hi"}]},
-        "# Video\n",
-        [],
-        [],
+    snapshot = run.commit(
+        manifest_document(
+            source_info,
+            DistillOptions(),
+            transcript_present=True,
+            frames=[],
+            warnings=[],
+        )
     )
-    final = publish_generation(staged, manifest)
-    response = response_from_paths(final, source_info, [], True, [], cached=False)
+    response = run_response(snapshot, source_info, [], True, [], cached=False)
 
-    manifest_data = read_manifest(root)
-    assert manifest_data is not None
-    assert manifest_data["related_links"] == source_info.related_links
+    active = store.load_active(BUNDLE_KEY)
+    assert active is not None
+    assert active.manifest["related_links"] == source_info.related_links
     assert response["related_links"] == source_info.related_links
 
 
 def test_response_can_include_progress_summary(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    staged.markdown.write_text("# Video\n")
-    staged.transcript.write_text("{}")
-    final = publish_generation(staged, minimal_manifest(tmp_path))
+    _, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+    run.write_transcript({})
+    snapshot = run.commit(minimal_manifest(tmp_path))
 
-    response = response_from_paths(
-        final,
+    response = run_response(
+        snapshot,
         source(tmp_path),
         [],
         True,
@@ -179,15 +191,13 @@ def test_response_can_include_progress_summary(tmp_path: Path) -> None:
 def test_response_frames_keep_ocr_and_visual_interpretation_separate(
     tmp_path: Path,
 ) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    staged.markdown.write_text("# Video\n")
-    final = publish_generation(staged, minimal_manifest(tmp_path))
+    _, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+    snapshot = run.commit(minimal_manifest(tmp_path))
     frame = {
         "index": 1,
         "timestamp_sec": 0.0,
-        "path": str(staged.frames / "frame.png"),
+        "path": str(snapshot.frames / "frame.png"),
         "relative_path": "frames/frame.png",
         "ocr_text": "raw text",
         "visual_interpretation": {
@@ -201,7 +211,7 @@ def test_response_frames_keep_ocr_and_visual_interpretation_separate(
         },
     }
 
-    response = response_from_paths(final, source(tmp_path), [frame], False, [], cached=False)
+    response = run_response(snapshot, source(tmp_path), [frame], False, [], cached=False)
 
     assert response["frames"][0]["ocr_text"] == "raw text"
     assert response["frames"][0]["visual_interpretation"]["visual_summary"] == "A chart"
