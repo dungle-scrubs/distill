@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from distill.artifacts import FrameArtifact, Interpretation
 from distill.errors import DistillError
 from distill.local_vision import (
     DEFAULT_LOCAL_VISION_BASE_URL,
@@ -17,7 +18,6 @@ from distill.local_vision import (
     FrameInterpreter,
     LocalVisionConfig,
     LocalVisionProbe,
-    LocalVisionResult,
     _interpret_with_rapid_mlx,
     config_dir,
     load_local_vision_config,
@@ -31,6 +31,27 @@ from distill.options import DistillOptions
 from distill.pipeline import local_vision_diagnostics
 
 DEFAULT_MODEL = DEFAULT_LOCAL_VISION_MODEL
+
+
+def _frame(index: int, image: Path, *, extracted_text: str = "") -> FrameArtifact:
+    """One **frame artifact** as `frame_selection` would have produced it.
+
+    The interpreter takes carriers now, so a test that fed it a mapping would be
+    testing a shape nothing produces.
+    """
+    return FrameArtifact(
+        index=index,
+        timestamp_sec=float(index),
+        path=str(image),
+        relative_path=f"frames/{image.name}",
+        extracted_text=extracted_text,
+    )
+
+
+def _summary(frame: FrameArtifact) -> str:
+    reading = frame.reading
+    assert reading is not None
+    return reading.visual_summary
 
 
 def _models_body(*model_ids: str) -> dict[str, Any]:
@@ -499,11 +520,11 @@ def test_frame_interpreter_debug_info_tracks_run_state(tmp_path: Path) -> None:
         _prompt: str,
         *,
         prompt_profile: str = "technical",
-    ) -> tuple[LocalVisionResult, None]:
+    ) -> tuple[Interpretation, None]:
         return (
-            LocalVisionResult(
+            Interpretation(
                 visual_summary=f"summary for {image_path.name}",
-                detected_elements=["caption"],
+                detected_elements=("caption",),
                 interpretation="A readable caption.",
                 uncertainty="Low",
                 backend=config.backend,
@@ -517,18 +538,17 @@ def test_frame_interpreter_debug_info_tracks_run_state(tmp_path: Path) -> None:
 
     interpreter = FrameInterpreter(
         LocalVisionConfig(),
-        redact_secrets=False,
         probe=_available_probe,
         try_interpret=fake_try_interpret,
         debug=True,
     )
 
-    frames, warnings = interpreter.interpret(
-        [{"index": 1, "path": str(image), "ocr_text": "Hello"}]
-    )
+    frames, warnings = interpreter.interpret([_frame(1, image, extracted_text="Hello")])
 
     assert warnings == []
-    assert frames[0]["visual_interpretation"]["visual_summary"] == "summary for frame.png"
+    reading = frames[0].reading
+    assert reading is not None
+    assert reading.visual_summary == "summary for frame.png"
     debug_info = interpreter.debug_info()
     assert debug_info["backend"] == "rapid-mlx"
     assert debug_info["last_probe"] == {
@@ -545,7 +565,7 @@ def test_frame_interpreter_debug_info_tracks_run_state(tmp_path: Path) -> None:
         {"event": "interpret.pool", "detail": {"frames": 1, "max_parallel": 1}},
         {
             "event": "frame.start",
-            "detail": {"index": 1, "path": str(image), "has_ocr_text": True},
+            "detail": {"index": 1, "path": str(image), "has_extracted_text": True},
         },
         {
             "event": "frame.complete",
@@ -575,7 +595,7 @@ def test_frame_interpreter_caps_pool_at_configured_max_parallel(tmp_path: Path) 
         _prompt: str,
         *,
         prompt_profile: str = "technical",
-    ) -> tuple[LocalVisionResult, None]:
+    ) -> tuple[Interpretation, None]:
         nonlocal active, peak
         with lock:
             active += 1
@@ -584,9 +604,9 @@ def test_frame_interpreter_caps_pool_at_configured_max_parallel(tmp_path: Path) 
         with lock:
             active -= 1
         return (
-            LocalVisionResult(
+            Interpretation(
                 visual_summary=image_path.name,
-                detected_elements=[],
+                detected_elements=(),
                 interpretation="ok",
                 uncertainty="Low",
                 backend=config.backend,
@@ -598,16 +618,15 @@ def test_frame_interpreter_caps_pool_at_configured_max_parallel(tmp_path: Path) 
 
     interpreter = FrameInterpreter(
         LocalVisionConfig(),
-        redact_secrets=False,
         probe=_available_probe,
         try_interpret=fake_try_interpret,
         max_parallel=2,
     )
 
     frames = [
-        # OCR text grounds the interpretation so no extraneous warnings appear.
-        {"index": i + 1, "path": str(tmp_path / f"frame{i}.png"), "ocr_text": f"frame{i}"}
-        for i in range(4)
+        # Image text grounds the interpretation so no extraneous warnings appear.
+        _frame(index + 1, tmp_path / f"frame{index}.png", extracted_text=f"frame{index}")
+        for index in range(4)
     ]
     interpreted, _ = interpreter.interpret(frames)
 
@@ -616,7 +635,7 @@ def test_frame_interpreter_caps_pool_at_configured_max_parallel(tmp_path: Path) 
     assert peak <= 2
     assert peak >= 2  # and the pool did run in parallel
     # Output order is preserved despite parallel execution.
-    assert [f["visual_interpretation"]["visual_summary"] for f in interpreted] == [
+    assert [_summary(frame) for frame in interpreted] == [
         "frame0.png",
         "frame1.png",
         "frame2.png",
@@ -642,7 +661,7 @@ def test_frame_interpreter_runs_serially_when_max_parallel_is_one(tmp_path: Path
         _prompt: str,
         *,
         prompt_profile: str = "technical",
-    ) -> tuple[LocalVisionResult, None]:
+    ) -> tuple[Interpretation, None]:
         nonlocal active, peak
         with lock:
             active += 1
@@ -651,9 +670,9 @@ def test_frame_interpreter_runs_serially_when_max_parallel_is_one(tmp_path: Path
         with lock:
             active -= 1
         return (
-            LocalVisionResult(
+            Interpretation(
                 visual_summary=image_path.name,
-                detected_elements=[],
+                detected_elements=(),
                 interpretation="ok",
                 uncertainty="Low",
                 backend=config.backend,
@@ -665,13 +684,12 @@ def test_frame_interpreter_runs_serially_when_max_parallel_is_one(tmp_path: Path
 
     interpreter = FrameInterpreter(
         LocalVisionConfig(),
-        redact_secrets=False,
         probe=_available_probe,
         try_interpret=fake_try_interpret,
         max_parallel=1,
     )
 
-    frames = [{"index": i + 1, "path": str(tmp_path / f"frame{i}.png")} for i in range(3)]
+    frames = [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
     interpreted, _ = interpreter.interpret(frames)
 
     # max_parallel<=1 is the serial fallback (A-004): never overlaps.
@@ -693,14 +711,14 @@ def test_frame_interpreter_records_unavailable_probe_warning() -> None:
 
     interpreter = FrameInterpreter(
         LocalVisionConfig(),
-        redact_secrets=False,
         probe=fake_probe,
         debug=True,
     )
 
-    frames, warnings = interpreter.interpret([{"index": 1, "path": "/tmp/frame.png"}])
+    unreached = _frame(1, Path("/tmp/frame.png"))
+    frames, warnings = interpreter.interpret([unreached])
 
-    assert frames == [{"index": 1, "path": "/tmp/frame.png"}]
+    assert frames == [unreached]
     assert warnings == [
         {
             "stage": "local_vision",
@@ -716,12 +734,13 @@ def test_frame_interpreter_records_unavailable_probe_warning() -> None:
 def test_frame_interpreter_asserts_frame_path_invariant() -> None:
     interpreter = FrameInterpreter(
         LocalVisionConfig(),
-        redact_secrets=False,
         probe=_available_probe,
     )
 
+    pathless = FrameArtifact(index=1, timestamp_sec=0.0, path="", relative_path="")
+
     with pytest.raises(AssertionError, match="missing required 'path'"):
-        interpreter.interpret([{"index": 1}])
+        interpreter.interpret([pathless])
 
 
 @pytest.mark.skipif(

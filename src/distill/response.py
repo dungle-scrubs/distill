@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .artifacts import FrameArtifact, serialize
 from .bundle_store import BundleSnapshot
 from .options import DistillOptions
 from .release import DISTILL_VERSION
@@ -33,7 +34,7 @@ def manifest_document(
     options: DistillOptions,
     *,
     transcript_present: bool,
-    frames: list[dict],
+    frames: list[dict[str, Any]],
     warnings: list[dict[str, str]],
 ) -> dict[str, Any]:
     """The **manifest** content for one published **generation**.
@@ -42,6 +43,11 @@ def manifest_document(
     question, and nothing about where the bundle lives: `active_generation` is
     added by the publish, because only the publish knows which generation the
     staging directory became.
+
+    `frames` arrives as the documents `response_frames` produced, never as
+    carriers. The manifest and the response carry the same frame document, and a
+    cache hit reads it back out of the manifest rather than rebuilding it, so
+    there is one producer of that shape and no second one to disagree with it.
 
     Identity is recorded as `bundle_key` (D-008). The value hashes a **source
     fingerprint** together with an **options hash**, so it names a **bundle**
@@ -63,30 +69,48 @@ def manifest_document(
         "frame_count": len(frames),
         "transcript_present": transcript_present,
         "warning_count": len(warnings),
-        "frames": response_frames(frames),
+        "frames": frames,
         "warnings": warnings,
     }
 
 
-def response_frames(frames: list[dict]) -> list[dict[str, Any]]:
+def response_frames(frames: list[FrameArtifact]) -> list[dict[str, Any]]:
     """The frame shape both documents carry, produced once so they cannot diverge.
 
     Image text and the vision model's reading of the same frame stay separate
     fields: they are different claims about the frame, and merging them loses
     which one a reader is looking at.
+
+    This is the one adapter from a **frame artifact** to the document a caller
+    and a later cache hit read, and it is the only place besides the carrier
+    itself that names these fields. The names overlap with the carrier's without
+    being the carrier's: what a stage passes along and what a reader is served
+    are two schemas, and the second one is this module's to change (D-015).
+
+    A carrier in and a document out, never a document in, and the way out is
+    `serialize`. A **manifest** is durable and a response is what a caller
+    reads, so both are sinks R-20 is stated about: reading the fields off the
+    carrier directly would produce the same text while skipping the one check
+    that refuses a carrier whose **redaction** policy never ran.
+
+    Serializing also settles the shape. The carrier's own values are frozen -
+    `detected_elements` is a tuple inside it - and `serialize` thaws them into
+    plain JSON, so a fresh run and a cache hit reading the same document back
+    hand a caller the same types rather than a tuple one time and a list the
+    other.
     """
     response = []
     for frame in frames:
-        item = {
-            "index": int(frame["index"]),
-            "timestamp_sec": float(frame["timestamp_sec"]),
-            "path": str(frame["path"]),
-            "relative_path": str(frame["relative_path"]),
-            "ocr_text": str(frame.get("ocr_text", "")),
+        document = serialize(frame)
+        item: dict[str, Any] = {
+            "index": document["index"],
+            "timestamp_sec": document["timestamp_sec"],
+            "path": document["path"],
+            "relative_path": document["relative_path"],
+            "ocr_text": document["extracted_text"],
         }
-        visual_interpretation = frame.get("visual_interpretation")
-        if isinstance(visual_interpretation, dict):
-            item["visual_interpretation"] = visual_interpretation
+        if document["interpretation"] is not None:
+            item["visual_interpretation"] = document["interpretation"]
         response.append(item)
     return response
 
@@ -94,7 +118,7 @@ def response_frames(frames: list[dict]) -> list[dict[str, Any]]:
 def run_response(
     snapshot: BundleSnapshot,
     source: SourceInfo,
-    frames: list[dict],
+    frames: list[dict[str, Any]],
     transcript_present: bool,
     warnings: list[dict[str, str]],
     cached: bool,
@@ -106,7 +130,9 @@ def run_response(
     Stated against a `BundleSnapshot` rather than a set of paths, so a cache hit
     and a fresh publish are described by the same code from the same evidence -
     a snapshot exists only where the **active generation** was proven to be on
-    disk (R-04).
+    disk (R-04). `frames` is that same evidence for the frames: documents, which
+    a fresh run got from `response_frames` and a cache hit read out of the
+    **manifest** the previous run wrote.
     """
     visual_count = sum(
         1 for frame in frames if isinstance(frame.get("visual_interpretation"), dict)
@@ -120,7 +146,7 @@ def run_response(
         if transcript_present and snapshot.transcript.exists()
         else None,
         "manifest_path": str(snapshot.manifest_path),
-        "frames": response_frames(frames),
+        "frames": frames,
         "duration_sec": source.duration_sec,
         "frame_count": len(frames),
         "source_hash": source.source_hash,

@@ -1,10 +1,18 @@
 """The carriers **extracted text** travels in, and the one serializer that lets it out.
 
 This module owns the shape of a **frame artifact**, a **transcript** and a
-**stage result** in memory: their fields, *when* the **redaction** policy runs
-over them and the state that records it, the per-field 256 KiB cap on extracted
-text (R-58), the immutability of everything nested inside them, and the runtime
-refusal to serialize a carrier whose redaction policy was never applied (R-20).
+**stage result** in memory: their fields, the field names of the
+**interpretation** nested inside a frame artifact, *when* the **redaction**
+policy runs over them and the state that records it, the per-field 256 KiB cap
+on extracted text (R-58), the immutability of everything nested inside them, and
+the runtime refusal to serialize a carrier whose redaction policy was never
+applied (R-20).
+
+Owning those names is what makes it the *only* description of a frame: before
+M4.4, `frame_selection`, `ocr`, `local_vision`, `render` and `bundle_store` each
+restated the schema as string keys on a bare dict, which is how the redaction
+policy came to run somewhere other than where the text entered (finding 4).
+Producing stages now hand each other carriers, and a reader asks the carrier.
 
 When the policy runs is the answer to D-019: at construction, over every
 extracted-text region, before the carrier exists as a value anything else can
@@ -141,6 +149,31 @@ def _redact(text: str, *, warnings: list[Mapping[str, str]]) -> str:
     return result.text
 
 
+def is_path_field(key: str) -> bool:
+    """Whether a field name is one of Distill's names for a filesystem path.
+
+    A path Distill built is Distill's own words - an output root the user named,
+    a **bundle key** it computed, a `frame_%04d.png` it chose - so it is not
+    **extracted text** and the redaction policy has no business rewriting it.
+    Left in, it was: a bundle key is 64 hex characters, which is exactly what a
+    generic secret pattern matches, so a **stage result** recorded the frame's
+    image at a path whose middle had become `[REDACTED]`, and the **resume**
+    that read it back rejected the whole document as naming a path outside the
+    bundle root. Every stage after the transcript was silently recomputed.
+
+    Stated here rather than at each site, because "which key names a path" is
+    one rule with two readers: this one decides what the policy may rewrite, and
+    `bundle_store` decides what must stay inside the bundle root (R-23). Two
+    copies of it are two answers about the same field.
+
+    Precisely what this does not do: recognize a path recorded under a name that
+    does not say "path". Such a field is treated as extracted text - which is
+    the safe direction, since the cost is a mangled path rather than a durable
+    secret.
+    """
+    return key == "path" or key.endswith("_path")
+
+
 def _freeze(
     value: Any,
     *,
@@ -161,7 +194,9 @@ def _freeze(
 
     Only the *values* inside an extracted-text region are redacted, never the
     mapping keys: a key is the schema's word for a field, chosen by Distill,
-    and is not extracted text.
+    and is not extracted text. Nor is the value under a key that names a path -
+    see `is_path_field`, which is why a mapping's path fields are frozen like
+    everything else and passed through the policy like nothing else.
     """
     if value is None or isinstance(value, bool | int | float):
         return value
@@ -172,7 +207,11 @@ def _freeze(
         return MappingProxyType(
             {
                 str(key): _freeze(
-                    item, path=f"{path}.{key}", warnings=warnings, cap=cap, redact=redact
+                    item,
+                    path=f"{path}.{key}",
+                    warnings=warnings,
+                    cap=cap and not is_path_field(str(key)),
+                    redact=redact and not is_path_field(str(key)),
                 )
                 for key, item in value.items()
             }
@@ -276,6 +315,18 @@ class Carrier(ABC):
             (*(_frozen_warning(item) for item in self.warnings), *collected),
         )
 
+    def _raised_since(self, previous: Carrier) -> list[dict[str, str]]:
+        """The **warnings** this carrier's construction added to the inherited ones.
+
+        A carrier built from another one carries its predecessor's warnings
+        forward - `__post_init__` appends to them and never removes - so the
+        difference is what *this* construction had to say. Stages report the
+        difference, because a stage that reported the whole list would report
+        an earlier stage's truncation again every time it touched the frame,
+        and a **manifest** would count one lost field as several.
+        """
+        return [dict(item) for item in self.warnings[len(previous.warnings) :]]
+
     @abstractmethod
     def _payload(self) -> Mapping[str, Any]:
         """This carrier's document, still immutable and not yet checked.
@@ -286,6 +337,68 @@ class Carrier(ABC):
         """
 
 
+@dataclass(frozen=True)
+class Interpretation:
+    """The vision model's structured reading of one **keyframe**.
+
+    Defined here rather than beside the backend that produces it because an
+    **interpretation** is part of a **frame artifact** (CONTEXT.md: a frame
+    artifact has one keyframe, at most one interpretation, and one grounding).
+    One definition of these field names is the point: `local_vision` fills them
+    in, `render` reads them out, and neither spells them as string keys.
+
+    Read-only by the time anybody but its producer sees it. The **redaction**
+    policy runs over `document()`'s output when it enters `FrameArtifact`, so
+    an interpretation reconstructed by `from_document` holds the text the
+    policy left, not the text the model produced.
+
+    It is not a carrier: it holds no policy state and never reaches a writer on
+    its own. The frame artifact it belongs to is what makes it durable, and
+    that is where the policy runs (D-019).
+    """
+
+    visual_summary: str = ""
+    detected_elements: tuple[str, ...] = ()
+    interpretation: str = ""
+    uncertainty: str = ""
+    backend: str = ""
+    model: str = ""
+    prompt_profile: str = ""
+    frame_kind: str = ""
+    verbatim_text: str = ""
+    text_confidence: str = "none"
+
+    @property
+    def has_interpretation(self) -> bool:
+        """Whether the model said anything about the frame beyond reading it."""
+        return bool(self.interpretation.strip() or self.detected_elements)
+
+    def document(self) -> dict[str, Any]:
+        """This reading as the plain mapping a **frame artifact** carries."""
+        return {
+            **dataclasses.asdict(self),
+            "detected_elements": list(self.detected_elements),
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any] | None) -> Interpretation | None:
+        """Rebuild a reading from a frame artifact's mapping, or `None` if absent.
+
+        Tolerant on the way in, because the mapping may have been read back off
+        disk by a **resume** or out of a **manifest** written by an older
+        Distill: an unknown key is dropped and a missing one takes its default,
+        so a document that has drifted costs the fields that drifted rather
+        than the frame.
+        """
+        if document is None:
+            return None
+        fields = {field.name for field in dataclasses.fields(cls)}
+        values = {key: value for key, value in document.items() if key in fields}
+        elements = values.get("detected_elements", ())
+        values["detected_elements"] = tuple(str(item) for item in elements)
+        return cls(**values)
+
+
 @dataclass(frozen=True, kw_only=True)
 class FrameArtifact(Carrier):
     """A **keyframe** and everything Distill derived from it.
@@ -294,6 +407,19 @@ class FrameArtifact(Carrier):
     is the vision model's structured reading, which echoes the screen back and
     is therefore extracted text in every field it has. `grounding` is Distill's
     own assessment of the two, so it is frozen but not capped.
+
+    This is the only description of a frame's shape. `frame_selection` produces
+    one, `ocr` and `local_vision` add to it, and `render` reads it; none of them
+    names a field of it as a string key, which is what stops the schema from
+    being restated in five modules and the **redaction** policy from running
+    somewhere other than where the text enters (R-19, M4.4).
+
+    Adding to a frame means building the next one: the carrier is frozen, so
+    `with_extracted_text` and `with_interpretation` return a new artifact whose
+    construction re-runs the policy over what was added. The policy itself is
+    not re-chosen on the way - `redaction` travels with the frame from the
+    moment `frame_selection` creates it, so `--no-redact-secrets` survives every
+    stage without each stage being told about it separately.
     """
 
     EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = ("extracted_text", "interpretation")
@@ -307,6 +433,92 @@ class FrameArtifact(Carrier):
     extracted_text: str = ""
     interpretation: Mapping[str, Any] | None = None
     grounding: Mapping[str, Any] | None = None
+
+    @property
+    def reading(self) -> Interpretation | None:
+        """The **interpretation** as a typed value, or `None` if there is not one.
+
+        The field holds a mapping because that is what the policy caps and
+        freezes; this is how a reader gets at it without knowing what is in it.
+        """
+        return Interpretation.from_document(self.interpretation)
+
+    def with_extracted_text(self, text: str) -> tuple[FrameArtifact, list[dict[str, str]]]:
+        """The same frame carrying what the image-text reader recovered from it.
+
+        Returns the **warnings** the new frame's construction raised as well as
+        the frame, and only those - the ones it inherited are already recorded
+        against the stage that raised them. A stage that reported the whole list
+        would report R-58's truncation of the image text again for every later
+        stage that touched the frame.
+        """
+        added = dataclasses.replace(self, extracted_text=text)
+        return added, added._raised_since(self)
+
+    def with_interpretation(
+        self,
+        reading: Interpretation | None,
+        *,
+        grounding: Mapping[str, Any] | None = None,
+    ) -> tuple[FrameArtifact, list[dict[str, str]]]:
+        """The same frame carrying a vision reading and Distill's assessment of it.
+
+        Both together, because a **grounding** is an assessment *of* an
+        interpretation: recording one without the other is what lets an
+        ungrounded reading be served as though nobody had checked it. A frame
+        the model produced nothing for still takes a grounding, which is the
+        case `reading=None` covers.
+
+        Returns the warnings this construction raised, on the same terms as
+        `with_extracted_text`.
+        """
+        added = dataclasses.replace(
+            self,
+            interpretation=None if reading is None else reading.document(),
+            grounding=grounding,
+        )
+        return added, added._raised_since(self)
+
+    def relocated(self, path: str) -> FrameArtifact:
+        """The same frame, its **keyframe** image now at `path`.
+
+        A **publish** renames the **staging directory**, so the absolute path a
+        run recorded while staging is not where a reader will find the image.
+        """
+        return dataclasses.replace(self, path=path)
+
+    @classmethod
+    def from_document(
+        cls, document: Mapping[str, Any], *, redaction: RedactionState
+    ) -> FrameArtifact:
+        """Rebuild a frame artifact from a document a **stage result** recorded.
+
+        A **resume** reads its scratch back off disk as plain JSON, so the
+        carriers a stage produced have to be reconstituted before the next stage
+        can add to them.
+
+        `redaction` is the *resuming run's* policy and is required, never the
+        state the document claims. The document is something another process
+        wrote, so its claims are input (R-23's premise): a forged stage result
+        recording `disabled` would otherwise downgrade a run that asked for
+        redaction, and the text it carries would be published raw. Taking the
+        run's policy instead cannot be wrong, because `redact_secrets`
+        participates in the **options hash** and so in the **bundle key** - a
+        document under this bundle key was written by a run under this policy.
+
+        Warnings recorded on the document come back with it, and this
+        reconstruction adds none of its own in any reachable case: the text was
+        already capped and redacted before it was written, so the policy running
+        again over it changes nothing and has nothing to report.
+
+        Unknown keys are dropped rather than refused - the document is scratch,
+        and a field this Distill does not know about is one an older one wrote.
+        """
+        fields = {field.name for field in dataclasses.fields(cls)}
+        values = {key: value for key, value in document.items() if key in fields}
+        values["redaction"] = redaction
+        values["warnings"] = tuple(values.get("warnings", ()))
+        return cls(**values)
 
     def _payload(self) -> Mapping[str, Any]:
         return MappingProxyType(
@@ -340,6 +552,28 @@ class Transcript(Carrier):
     language: str
     segments: tuple[Mapping[str, Any], ...]
     language_probability: float = 0.0
+
+    @classmethod
+    def from_document(
+        cls, document: Mapping[str, Any], *, redaction: RedactionState
+    ) -> Transcript:
+        """Rebuild a transcript from a document a **stage result** recorded.
+
+        The resume route, on the same terms as `FrameArtifact.from_document`,
+        including that `redaction` is the resuming run's policy rather than the
+        one the document claims for itself.
+
+        What a segment holds is not this carrier's - `transcript.py` decides
+        that - so segments are passed through as the documents they are and
+        only frozen and capped here.
+        """
+        return cls(
+            language=str(document.get("language", "")),
+            language_probability=float(document.get("language_probability", 0.0)),
+            segments=tuple(document.get("segments", ())),
+            redaction=redaction,
+            warnings=tuple(document.get("warnings", ())),
+        )
 
     def _payload(self) -> Mapping[str, Any]:
         return MappingProxyType(
@@ -436,9 +670,11 @@ __all__ = [
     "WARNING_STAGE",
     "Carrier",
     "FrameArtifact",
+    "Interpretation",
     "RedactionPolicyNotApplied",
     "RedactionState",
     "StageResult",
     "Transcript",
+    "is_path_field",
     "serialize",
 ]

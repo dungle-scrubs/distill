@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .artifacts import FrameArtifact, RedactionState, Transcript, serialize
+from .artifacts import FrameArtifact, RedactionState, Transcript
 from .bundle_store import (
     BATCH_ITEM_LOCK_WAIT_SEC,
     DEFAULT_KEEP_GENERATIONS,
@@ -49,7 +49,7 @@ from .progress import (
     ProgressReporter,
 )
 from .render import render_markdown
-from .response import manifest_document, run_response
+from .response import manifest_document, response_frames, run_response
 from .source import (
     normalize_youtube_url,
     release_acquisition_lease,
@@ -324,17 +324,24 @@ class ProcessingRun:
         warnings.extend(list(payload.get("warnings", [])))
         return payload
 
-    def _produce_ocr(self, frames: list[dict]) -> dict[str, Any]:
+    def _produce_ocr(self, frames: list[FrameArtifact]) -> dict[str, Any]:
+        """Read every **keyframe**'s image text onto the artifact that names it.
+
+        No translation step is left here. `ocr_frames` takes the carriers
+        `select_keyframes` produced and hands back carriers, so the **redaction**
+        policy runs where the text enters (R-19) and the **stage result** this
+        payload becomes cannot hold it raw - which is finding 4, closed at the
+        seam it was hiding in rather than downstream of it.
+        """
         ocr = self.options.ocr_config()
-        ocr_frames_result, ocr_warnings = ocr_frames(
+        read, ocr_warnings = ocr_frames(
             frames,
             ocr.language,
             ocr.enabled,
             self.progress,
             ocr.preprocess,
         )
-        carried, carrier_warnings = self._carry_frames(ocr_frames_result)
-        return {"frames": carried, "warnings": [*ocr_warnings, *carrier_warnings]}
+        return {"frames": read, "warnings": ocr_warnings}
 
     @property
     def _redaction_policy(self) -> RedactionState:
@@ -349,41 +356,7 @@ class ProcessingRun:
             else RedactionState.DISABLED
         )
 
-    def _carry_frames(self, frames: list[dict]) -> tuple[list[dict], list[dict[str, str]]]:
-        """Put each frame's **extracted text** through a carrier, which redacts it (R-19).
-
-        This is the seam finding 4 was hiding in. `ocr_frames` hands back image
-        text as the reader recovered it, and the *next* thing that happens to it
-        used to be a `write_stage` - so the raw text was on disk before the
-        redaction stage ran, and that stage only ever redacted a copy. Here the
-        policy has already run before this method returns, so the **stage
-        result** the caller records cannot hold it.
-
-        The frames stay dicts on the way out because the five producing modules
-        still speak dicts; M4.4 is where they speak carriers and this
-        translation goes away. What must not move is where the policy runs.
-        """
-        policy = self._redaction_policy
-        carried: list[dict] = []
-        warnings: list[dict[str, str]] = []
-        for frame in frames:
-            artifact = FrameArtifact(
-                index=int(frame["index"]),
-                timestamp_sec=float(frame["timestamp_sec"]),
-                path=str(frame["path"]),
-                relative_path=str(frame["relative_path"]),
-                phash=str(frame.get("phash", "")),
-                source_candidate_index=int(frame.get("source_candidate_index", -1)),
-                extracted_text=str(frame.get("ocr_text", "")),
-                redaction=policy,
-            )
-            copied = dict(frame)
-            copied["ocr_text"] = artifact.extracted_text
-            carried.append(copied)
-            warnings.extend(dict(item) for item in artifact.warnings)
-        return carried, warnings
-
-    def _carry_transcript(self, transcript: Any) -> tuple[dict[str, Any] | None, list[dict]]:
+    def _carry_transcript(self, transcript: Any) -> tuple[Transcript | None, list[dict]]:
         """Put the **transcript** through a carrier on the same terms (R-21).
 
         Finding 15: no stage covered the transcript, so a secret somebody said
@@ -395,6 +368,10 @@ class ProcessingRun:
         A run with no transcript carries nothing: `None` is the absence of the
         document, not an empty one, and inventing an empty transcript here would
         publish a transcript for a video that has none.
+
+        The translation stays because `transcript.py` has not been migrated -
+        it produces the mapping faster-whisper gave it, and this is where that
+        mapping becomes a carrier. The frames need no equivalent any more.
         """
         if transcript is None:
             return None, []
@@ -404,10 +381,9 @@ class ProcessingRun:
             segments=tuple(transcript.get("segments", ())),
             redaction=self._redaction_policy,
         )
-        document = serialize(carrier)
-        return document, [dict(item) for item in carrier.warnings]
+        return carrier, [dict(item) for item in carrier.warnings]
 
-    def _produce_local_vision(self, frames: list[dict]) -> dict[str, Any]:
+    def _produce_local_vision(self, frames: list[FrameArtifact]) -> dict[str, Any]:
         vision_frames, vision_warnings = interpret_frames_with_local_vision(
             frames,
             self.options,
@@ -444,7 +420,9 @@ class ProcessingRun:
             ("transcription", "audio_extraction"),
             produce_transcript,
         )
-        transcript = transcript_payload.get("transcript")
+        transcript = _transcript_carrier(
+            transcript_payload.get("transcript"), redaction=self._redaction_policy
+        )
 
         def produce_frames() -> dict[str, Any]:
             frame_selection = self.options.frame_selection_config()
@@ -456,6 +434,7 @@ class ProcessingRun:
                 frame_selection.min_interval_sec,
                 frame_selection.max_static_window_sec,
                 self.progress,
+                redaction=self._redaction_policy,
             )
             return {"frames": frames, "warnings": frame_warnings}
 
@@ -467,7 +446,7 @@ class ProcessingRun:
             ("frame_selection",),
             produce_frames,
         )
-        frames = frames_payload["frames"]
+        frames = _frame_carriers(frames_payload["frames"], redaction=self._redaction_policy)
 
         ocr_payload = self._run_stage(
             run,
@@ -477,7 +456,7 @@ class ProcessingRun:
             ("ocr",),
             lambda: self._produce_ocr(frames),
         )
-        frames = ocr_payload["frames"]
+        frames = _frame_carriers(ocr_payload["frames"], redaction=self._redaction_policy)
 
         # No redaction stage: the policy ran inside `_produce_ocr`, where the
         # text entered its carrier (D-019). A stage here would be a stage that
@@ -494,7 +473,9 @@ class ProcessingRun:
                 ("local_vision",),
                 lambda: self._produce_local_vision(frames),
             )
-            frames = vision_payload["frames"]
+            frames = _frame_carriers(
+                vision_payload["frames"], redaction=self._redaction_policy
+            )
         else:
             self.progress.skip_cached("local_vision", detail={"reason": "disabled"})
 
@@ -516,7 +497,7 @@ class ProcessingRun:
             self.source,
             self.options,
             transcript_present=transcript is not None,
-            frames=frames,
+            frames=response_frames(frames),
             warnings=warnings,
         )
         self.progress.complete("bundle_publish", detail={"generation": run.generation_name})
@@ -524,21 +505,53 @@ class ProcessingRun:
         manifest["progress"] = progress_summary
         snapshot = run.commit(manifest)
 
-        final_frames = []
-        for frame in frames:
-            copied = dict(frame)
-            copied["path"] = str(snapshot.frames / Path(str(frame["path"])).name)
-            final_frames.append(copied)
+        # The publish renamed the **staging directory**, so the image path each
+        # artifact recorded while staging is not where a reader will find it.
+        published = [
+            frame.relocated(str(snapshot.frames / Path(frame.path).name)) for frame in frames
+        ]
         return run_response(
             snapshot,
             self.source,
-            final_frames,
+            response_frames(published),
             transcript is not None,
             warnings,
             cached=False,
             progress=progress_summary,
             job_id=self.options.job_id,
         )
+
+
+def _frame_carriers(items: Any, *, redaction: RedactionState) -> list[FrameArtifact]:
+    """The **frame artifacts** a stage payload holds, however the payload got here.
+
+    A stage that just ran hands back carriers. A stage a **resume** recovered
+    hands back the documents `bundle_store` serialized them into, because a
+    stage result is JSON on disk and nothing else. Both are the same frames, so
+    the difference is settled here rather than by every consumer downstream.
+
+    `redaction` is this run's policy, applied to a rebuilt frame whatever the
+    document says about itself: a stage result is a document another process
+    wrote, and R-23's premise is that its claims are input rather than facts.
+    """
+    return [
+        item
+        if isinstance(item, FrameArtifact)
+        else FrameArtifact.from_document(item, redaction=redaction)
+        for item in items
+    ]
+
+
+def _transcript_carrier(item: Any, *, redaction: RedactionState) -> Transcript | None:
+    """The **transcript** carrier a stage payload holds, or `None` if it has none.
+
+    The resume case again, on the same terms: a recovered payload carries the
+    document and is rebuilt under this run's policy, and a run that produced no
+    transcript carries nothing at all.
+    """
+    if item is None or isinstance(item, Transcript):
+        return item
+    return Transcript.from_document(item, redaction=redaction)
 
 
 def record_job(
@@ -884,13 +897,19 @@ def transcribe_with_imports(
 
 
 def interpret_frames_with_local_vision(
-    frames: list[dict],
+    frames: list[FrameArtifact],
     options: DistillOptions,
     progress: ProgressReporter | None = None,
-) -> tuple[list[dict], list[dict[str, str]]]:
+) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+    """Interpret every frame, under the **redaction** policy the frames carry.
+
+    The interpreter is told nothing about redaction. `--no-redact-secrets` is
+    recorded on each **frame artifact** by `select_keyframes` and travels with
+    it, so the model's words are redacted where they enter the carrier (R-19)
+    rather than by a helper the vision pass had to remember to call.
+    """
     interpreter = FrameInterpreter(
         config=options.local_vision_config(),
-        redact_secrets=options.redact_secrets,
         progress=progress,
         probe=probe_local_vision,
         try_interpret=try_interpret_image,

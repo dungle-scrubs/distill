@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from distill.artifacts import FrameArtifact, Transcript
 from distill.bundle_store import (
     BundleRun,
     BundleStore,
@@ -22,11 +23,21 @@ from distill.bundle_store import (
 from distill.errors import DistillError
 from distill.links import extract_relevant_links
 from distill.options import DistillOptions
-from distill.response import manifest_document, run_response
+from distill.response import manifest_document, response_frames, run_response
 from distill.source import SourceInfo
 from distill.version import PIPELINE_VERSION
 
 BUNDLE_KEY = "hash"
+
+
+def spoken(*segments: dict[str, object]) -> Transcript:
+    """A **transcript** carrier holding exactly these segments.
+
+    `write_transcript` takes a carrier and not a document (R-20): `serialize`
+    is the last check before **extracted text** becomes durable, so a caller
+    that could hand in a mapping would be a caller that had already skipped it.
+    """
+    return Transcript(language="en", segments=tuple(segments))
 # Secret-shaped by `redact_secrets.SECRET_PATTERNS`, placed in both halves of a
 # **related link** so the manifest is asked about the label and the destination.
 LINK_SECRET = "sk-live-0123456789abcdefghij"
@@ -97,17 +108,19 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
     store, run = begin(tmp_path / "output")
     frame = run.frames_dir / "frame_0001.png"
     frame.write_bytes(b"png")
-    frames = [
-        {
-            "index": 1,
-            "timestamp_sec": 0.0,
-            "path": str(frame),
-            "relative_path": "frames/frame_0001.png",
-            "ocr_text": "text",
-        }
-    ]
+    frames = response_frames(
+        [
+            FrameArtifact(
+                index=1,
+                timestamp_sec=0.0,
+                path=str(frame),
+                relative_path="frames/frame_0001.png",
+                extracted_text="text",
+            )
+        ]
+    )
     run.write_render("# Video\n")
-    run.write_transcript({"segments": [{"start": 0, "end": 1, "text": "hi"}]})
+    run.write_transcript(spoken({"start": 0, "end": 1, "text": "hi"}))
 
     snapshot = run.commit(
         manifest_document(
@@ -139,7 +152,7 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
 def test_response_shape(tmp_path: Path) -> None:
     _, run = begin(tmp_path / "output")
     run.write_render("# Video\n")
-    run.write_transcript({})
+    run.write_transcript(spoken())
     snapshot = run.commit(minimal_manifest(tmp_path))
 
     response = run_response(snapshot, source(tmp_path), [], True, [], cached=False)
@@ -163,7 +176,7 @@ def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> N
     store, run = begin(tmp_path / "output")
     source_info = youtube_source(tmp_path)
     run.write_render("# Video\n")
-    run.write_transcript({"segments": [{"start": 0, "end": 1, "text": "hi"}]})
+    run.write_transcript(spoken({"start": 0, "end": 1, "text": "hi"}))
 
     snapshot = run.commit(
         manifest_document(
@@ -188,7 +201,7 @@ def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> N
 def test_response_can_include_progress_summary(tmp_path: Path) -> None:
     _, run = begin(tmp_path / "output")
     run.write_render("# Video\n")
-    run.write_transcript({})
+    run.write_transcript(spoken())
     snapshot = run.commit(minimal_manifest(tmp_path))
 
     response = run_response(

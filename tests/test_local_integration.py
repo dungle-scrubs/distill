@@ -12,7 +12,8 @@ from typing import Any
 import pytest
 
 from distill import pipeline as distill_session
-from distill.local_vision import LocalVisionProbe, LocalVisionResult
+from distill.artifacts import FrameArtifact, Interpretation
+from distill.local_vision import LocalVisionProbe
 from distill.options import DistillOptions
 from distill.progress import ProgressCounter, ProgressReporter
 from distill.run_command import OUTPUT_CAP_BYTES, TRUNCATION_WARNING_CODE
@@ -263,18 +264,14 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
     monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
 
     def fake_ocr(
-        frames: list[dict],
+        frames: list[FrameArtifact],
         _language: str,
         _enabled: bool,
         _progress: object,
         _preprocess: bool = True,
-    ) -> tuple[list[dict], list[dict[str, str]]]:
-        copied = []
-        for frame in frames:
-            item = dict(frame)
-            item["ocr_text"] = "Visible OCR text"
-            copied.append(item)
-        return copied, []
+    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+        read = [frame.with_extracted_text("Visible OCR text")[0] for frame in frames]
+        return read, []
 
     def fake_probe(_config: object) -> LocalVisionProbe:
         return LocalVisionProbe(
@@ -295,12 +292,12 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
         prompt: str,
         *,
         prompt_profile: str,
-    ) -> tuple[LocalVisionResult, None]:
+    ) -> tuple[Interpretation, None]:
         seen_prompts.append(prompt)
         return (
-            LocalVisionResult(
+            Interpretation(
                 visual_summary="A settings screen",
-                detected_elements=["toggle", "button"],
+                detected_elements=("toggle", "button"),
                 interpretation="The user can save a setting.",
                 uncertainty="Low",
                 backend="rapid-mlx",
@@ -600,3 +597,68 @@ def test_the_decode_survives_in_scratch_for_a_run_that_resumes(
     staged = sorted((root).glob("*/.tmp.g1"))
     assert len(staged) == 1
     assert sorted(path.name for path in staged[0].rglob("audio.wav")) == ["audio.wav"]
+
+
+def test_a_resume_rebuilds_the_frames_it_recorded_and_publishes_from_them(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A **resume** puts the recorded frames back into carriers and finishes the run.
+
+    R-19/M4.4: the stages hand each other **frame artifacts**, but a **stage
+    result** is JSON on disk, so a run that picks one up has to reconstitute
+    them before the next stage can add to it. Nothing downstream would tolerate
+    a mapping - the vision pass, the **render** and the **manifest** all read
+    the carrier - so the rebuild is what makes a resumed run and a fresh one
+    produce the same **generation**.
+
+    The first run dies after OCR, which is what leaves an `_ocr.json` holding
+    the frames. The second run must not re-select keyframes and must publish a
+    **render** naming the image the first run extracted.
+    """
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+
+    def read_slide(
+        frames: list[FrameArtifact],
+        _language: str,
+        _enabled: bool,
+        _progress: object = None,
+        _preprocess: bool = True,
+    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+        return [frame.with_extracted_text("SLIDE TEXT")[0] for frame in frames], []
+
+    monkeypatch.setattr(distill_session, "ocr_frames", read_slide)
+    monkeypatch.setattr(
+        distill_session,
+        "render_markdown",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom after ocr")),
+    )
+    args = {
+        "path": str(video),
+        "output_dir": str(tmp_path / "cache"),
+        "ocr": True,
+        "redact_secrets": True,
+        "caption_frames": False,
+        "max_keyframes": 1,
+        "max_static_window_sec": 1,
+    }
+    with pytest.raises(RuntimeError):
+        distill_session.process_local_video(args)
+
+    def fail_select(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a resume must not select keyframes again")
+
+    monkeypatch.undo()
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    monkeypatch.setattr(distill_session, "select_keyframes", fail_select)
+    response = distill_session.process_local_video(args)
+
+    assert response["cached"] is False
+    frame = response["frames"][0]
+    assert frame["ocr_text"] == "SLIDE TEXT"
+    assert frame["relative_path"] == "frames/frame_0001.png"
+    markdown = Path(response["markdown_path"]).read_text()
+    assert "![Frame 1](frames/frame_0001.png)" in markdown
+    assert "SLIDE TEXT" in markdown

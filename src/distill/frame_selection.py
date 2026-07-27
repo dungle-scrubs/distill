@@ -2,6 +2,16 @@
 
 This module owns scene/fallback candidate timestamps, pHash dedupe, static
 window safeguards, and PNG extraction. It does not OCR or render frames.
+
+It does not own the shape of a **frame artifact** either: it produces one per
+**keyframe** it keeps and knows only the fields it can answer for - where the
+image is, when in the source it came from, and what its hash was. Everything
+later added to a frame is added by the stage that learns it, onto the carrier
+this module created (R-19).
+
+It is where a run's **redaction** policy enters the frames, once: the policy is
+recorded on the artifact at birth and travels with it through every later stage,
+so `--no-redact-secrets` is honoured without each stage being told separately.
 """
 
 from __future__ import annotations
@@ -9,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 
+from .artifacts import FrameArtifact, RedactionState
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, warning
 from .progress import ProgressCounter, ProgressReporter
@@ -159,7 +170,16 @@ def select_keyframes(
     min_interval_sec: float,
     max_static_window_sec: float,
     progress: ProgressCounter | ProgressReporter | None = None,
-) -> tuple[list[dict], list[dict[str, str]]]:
+    redaction: RedactionState = RedactionState.NOT_APPLIED,
+) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+    """Choose the **keyframes** worth interpreting and produce one artifact each.
+
+    `redaction` is the run's policy and is recorded on every artifact this
+    returns. Nothing here is **extracted text** - a timestamp and a pHash are
+    Distill's own observations - so the policy has nothing to do yet; it is set
+    here because this is where a frame begins, and a policy chosen once at the
+    source is a policy no later stage can forget to pass on (D-020).
+    """
     frames_dir.mkdir(parents=True, exist_ok=True)
     warnings: list[dict[str, str]] = []
     candidates = filtered_candidates(
@@ -173,7 +193,7 @@ def select_keyframes(
             "scene_detection",
             detail={"candidate_count": len(candidates), "duration_sec": duration_sec},
         )
-    frames: list[dict] = []
+    frames: list[FrameArtifact] = []
     last_hash: str | None = None
     for index, timestamp in enumerate(candidates):
         if len(frames) >= max_keyframes:
@@ -209,16 +229,17 @@ def select_keyframes(
             path.unlink(missing_ok=True)
             continue
         last_hash = frame_hash or last_hash
-        frames.append(
-            {
-                "index": len(frames) + 1,
-                "timestamp_sec": timestamp,
-                "path": str(path),
-                "relative_path": f"frames/{path.name}",
-                "phash": frame_hash,
-                "source_candidate_index": index,
-            }
+        artifact = FrameArtifact(
+            index=len(frames) + 1,
+            timestamp_sec=timestamp,
+            path=str(path),
+            relative_path=f"frames/{path.name}",
+            phash=frame_hash,
+            source_candidate_index=index,
+            redaction=redaction,
         )
+        warnings.extend(dict(item) for item in artifact.warnings)
+        frames.append(artifact)
     if isinstance(progress, ProgressReporter):
         progress.complete(
             "frame_extraction",

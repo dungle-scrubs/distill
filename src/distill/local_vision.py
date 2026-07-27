@@ -2,10 +2,17 @@
 
 This module owns local-only vision provider setup and the frame-interpretation
 pass: it decides whether a requested vision pass can run (or should degrade to
-OCR-only output), and when it can, ``FrameInterpreter`` reads each frame,
-requests an interpretation, redacts secrets, grounds the result against OCR
-text, and attaches ``visual_interpretation`` / ``visual_confidence`` to the
-frame.
+OCR-only output), and when it can, ``FrameInterpreter`` reads each **keyframe**,
+requests an **interpretation**, grounds it against the frame's **extracted
+text**, and hands back the **frame artifact** carrying both.
+
+It does not own what an interpretation is made of - those field names are
+``artifacts.Interpretation``'s, so that the one module reading them back
+(``render``) and the one filling them in (this one) cannot drift apart - and it
+no longer owns redaction. The policy runs where the model's words enter the
+carrier (R-19, D-019); the post-hoc ``_redact_result_fields`` helper this module
+used to apply afterwards is gone, along with the window in which an
+interpretation existed unredacted.
 
 Distill talks to a local Rapid-MLX server directly over its OpenAI-compatible
 HTTP API. The server is assumed to already be running (``rapid-mlx serve
@@ -30,10 +37,10 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .artifacts import FrameArtifact, Interpretation
 from .errors import warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
-from .redact_secrets import redact_text
 from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
 
 DEFAULT_LOCAL_VISION_BACKEND = "rapid-mlx"
@@ -89,27 +96,6 @@ class LocalVisionProbe:
         }
 
 
-@dataclass(frozen=True)
-class LocalVisionResult:
-    visual_summary: str
-    detected_elements: list[str]
-    interpretation: str
-    uncertainty: str
-    backend: str
-    model: str
-    prompt_profile: str
-    frame_kind: str = ""
-    verbatim_text: str = ""
-    text_confidence: str = "none"
-
-    @property
-    def has_interpretation(self) -> bool:
-        return bool(self.interpretation.strip() or self.detected_elements)
-
-    def public_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
 class LocalVisionFailure(Exception):
     def __init__(self, code: str, message: str, detail: dict[str, Any] | None = None):
         super().__init__(message)
@@ -126,7 +112,7 @@ class LocalVisionFailure(Exception):
 
 
 ProbeLocalVision = Callable[[LocalVisionConfig], LocalVisionProbe]
-TryInterpretImage = Callable[..., tuple["LocalVisionResult | None", "dict[str, str] | None"]]
+TryInterpretImage = Callable[..., tuple["Interpretation | None", "dict[str, str] | None"]]
 
 
 @dataclass(frozen=True)
@@ -139,11 +125,11 @@ class _FrameOutcome:
     """
 
     index: int
-    frame: dict[str, Any]
+    frame: FrameArtifact
     interpreted: bool
     warnings: list[dict[str, str]]
     path: str
-    has_ocr_text: bool
+    has_extracted_text: bool
     warning_code: str | None
 
 
@@ -362,7 +348,7 @@ def interpret_image(
     prompt: str,
     *,
     prompt_profile: str = "technical",
-) -> LocalVisionResult:
+) -> Interpretation:
     if config.backend != DEFAULT_LOCAL_VISION_BACKEND:
         raise LocalVisionFailure(
             "local_vision_backend_unsupported",
@@ -378,7 +364,7 @@ def interpret_image_after_probe(
     prompt: str,
     *,
     prompt_profile: str = "technical",
-) -> LocalVisionResult:
+) -> Interpretation:
     return _interpret_with_rapid_mlx(config, image_path, prompt, prompt_profile)
 
 
@@ -388,7 +374,7 @@ def try_interpret_image(
     prompt: str,
     *,
     prompt_profile: str = "technical",
-) -> tuple[LocalVisionResult | None, dict[str, str] | None]:
+) -> tuple[Interpretation | None, dict[str, str] | None]:
     try:
         return interpret_image(config, image_path, prompt, prompt_profile=prompt_profile), None
     except KeyboardInterrupt:
@@ -407,7 +393,7 @@ def try_interpret_image_after_probe(
     prompt: str,
     *,
     prompt_profile: str = "technical",
-) -> tuple[LocalVisionResult | None, dict[str, str] | None]:
+) -> tuple[Interpretation | None, dict[str, str] | None]:
     try:
         return (
             interpret_image_after_probe(
@@ -431,7 +417,6 @@ def try_interpret_image_after_probe(
 @dataclass
 class FrameInterpreter:
     config: LocalVisionConfig
-    redact_secrets: bool
     progress: ProgressReporter | None = None
     probe: ProbeLocalVision = probe_local_vision
     try_interpret: TryInterpretImage = try_interpret_image
@@ -444,7 +429,9 @@ class FrameInterpreter:
     _warning_counts: dict[str, int] = field(default_factory=dict)
     _trace_events: list[dict[str, Any]] = field(default_factory=list)
 
-    def interpret(self, frames: list[dict]) -> tuple[list[dict], list[dict[str, str]]]:
+    def interpret(
+        self, frames: list[FrameArtifact]
+    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
         self._reset_run(frames)
         self._log("interpret.start", {"frames": len(frames), "backend": self.config.backend})
         probe = self.probe(self.config)
@@ -509,9 +496,9 @@ class FrameInterpreter:
     def _interpret_frames(
         self,
         config: LocalVisionConfig,
-        frames: list[dict],
+        frames: list[FrameArtifact],
         warnings: list[dict[str, str]],
-    ) -> list[dict]:
+    ) -> list[FrameArtifact]:
         """Interpret every frame, capping concurrency at the admission limit.
 
         Each frame is interpreted into its own local warning list and interpreted
@@ -542,26 +529,24 @@ class FrameInterpreter:
         self,
         config: LocalVisionConfig,
         index: int,
-        frame: dict,
+        frame: FrameArtifact,
         frame_count: int,
     ) -> _FrameOutcome:
         self._ensure_frame_invariants(index, frame, frame_count)
-        path = str(frame["path"])
-        has_ocr_text = bool(str(frame.get("ocr_text", "")).strip())
         local_warnings: list[dict[str, str]] = []
         interpreted_frame, was_interpreted = self._interpret_frame(
             config, index, frame, frame_count, local_warnings
         )
         # The first frame warning (if any) is the read/transport warning surfaced
-        # by _try_interpret_frame; trailing ones are grounding/redaction warnings.
+        # by _try_interpret_frame; trailing ones are grounding and carrier warnings.
         warning_code = local_warnings[0].get("code") if local_warnings else None
         return _FrameOutcome(
             index=index,
             frame=interpreted_frame,
             interpreted=was_interpreted,
             warnings=local_warnings,
-            path=path,
-            has_ocr_text=has_ocr_text,
+            path=frame.path,
+            has_extracted_text=bool(frame.extracted_text.strip()),
             warning_code=warning_code,
         )
 
@@ -569,16 +554,16 @@ class FrameInterpreter:
         self,
         outcomes: list[_FrameOutcome],
         warnings: list[dict[str, str]],
-    ) -> list[dict]:
+    ) -> list[FrameArtifact]:
         frame_count = len(outcomes)
-        frames: list[dict] = []
+        frames: list[FrameArtifact] = []
         for outcome in outcomes:
             self._trace(
                 "frame.start",
                 {
                     "index": outcome.index + 1,
                     "path": outcome.path,
-                    "has_ocr_text": outcome.has_ocr_text,
+                    "has_extracted_text": outcome.has_extracted_text,
                 },
             )
             frames.append(outcome.frame)
@@ -630,40 +615,47 @@ class FrameInterpreter:
         self,
         config: LocalVisionConfig,
         index: int,
-        frame: dict,
+        frame: FrameArtifact,
         frame_count: int,
         warnings: list[dict[str, str]],
-    ) -> tuple[dict, bool]:
+    ) -> tuple[FrameArtifact, bool]:
         """Interpret a single frame without mutating shared interpreter state.
 
         Appends any frame warnings to the supplied (per-frame) ``warnings`` list
         and returns the interpreted frame plus whether a result was produced.
         Trace events, progress updates, and counters are emitted by the caller in
         frame order so the parallel path stays deterministic and thread-safe.
+
+        Nothing is mutated in place because nothing can be: a **frame artifact**
+        is frozen, so what comes back is the next frame in the chain and the
+        model's words went through the **redaction** policy on the way into it.
         """
         from .vision_prompts import build_technical_frame_prompt
 
         self._ensure_frame_invariants(index, frame, frame_count)
-        copied = dict(frame)
-        ocr_text = str(copied.get("ocr_text", ""))
-        prompt = build_technical_frame_prompt(ocr_text=ocr_text or None)
+        prompt = build_technical_frame_prompt(ocr_text=frame.extracted_text or None)
         result, frame_warning = self._try_interpret_frame(
             config,
-            Path(str(copied["path"])),
+            Path(frame.path),
             prompt.prompt,
             prompt_profile=prompt.profile,
         )
         if frame_warning:
             warnings.append(frame_warning)
         if result:
-            self._attach_result(copied, result, ocr_text, index, warnings)
-        elif frame_warning and frame_warning.get("code") in FRAME_READ_FAILURE_CODES:
-            copied["visual_confidence"] = GroundingAssessment(
+            return self._interpreted(frame, result, index, warnings), True
+        if frame_warning and frame_warning.get("code") in FRAME_READ_FAILURE_CODES:
+            unusable = GroundingAssessment(
                 UNGROUNDED,
                 None,
                 f"vision model produced no usable output ({frame_warning.get('code')})",
-            ).public_dict()
-        return copied, result is not None
+            )
+            carried, carrier_warnings = frame.with_interpretation(
+                None, grounding=unusable.public_dict()
+            )
+            warnings.extend(carrier_warnings)
+            return carried, False
+        return frame, False
 
     def _try_interpret_frame(
         self,
@@ -672,7 +664,7 @@ class FrameInterpreter:
         prompt: str,
         *,
         prompt_profile: str,
-    ) -> tuple[LocalVisionResult | None, dict[str, str] | None]:
+    ) -> tuple[Interpretation | None, dict[str, str] | None]:
         if self.try_interpret is try_interpret_image:
             return try_interpret_image_after_probe(
                 config,
@@ -687,35 +679,44 @@ class FrameInterpreter:
             prompt_profile=prompt_profile,
         )
 
-    def _attach_result(
+    def _interpreted(
         self,
-        frame: dict,
-        result: LocalVisionResult,
-        ocr_text: str,
+        frame: FrameArtifact,
+        reading: Interpretation,
         index: int,
         warnings: list[dict[str, str]],
-    ) -> None:
-        if self.redact_secrets:
-            result, redaction_warnings = _redact_result_fields(result)
-            warnings.extend(redaction_warnings)
-        assessment = assess_grounding(
-            ocr_text=ocr_text,
-            verbatim_text=result.verbatim_text,
-            text_confidence=result.text_confidence,
-            has_interpretation=result.has_interpretation,
-        )
-        frame["visual_interpretation"] = result.public_dict()
-        frame["visual_confidence"] = assessment.public_dict()
-        if assessment.level == UNGROUNDED:
-            warning_payload = warning(
-                "local_vision",
-                "frame_text_ungrounded",
-                f"frame {frame.get('index', index + 1)} interpretation is not grounded in "
-                f"readable text: {assessment.reason}",
-            )
-            warnings.append(warning_payload)
+    ) -> FrameArtifact:
+        """The frame carrying the model's reading and Distill's grounding of it.
 
-    def _reset_run(self, frames: list[dict]) -> None:
+        **Grounding** is assessed against the reading the model returned, and
+        the reading is then handed to the carrier, which is where the
+        **redaction** policy runs over every field of it (R-19). Assessing
+        first is deliberate: grounding compares two readers' words, and a
+        policy that replaced a secret in one of them would make the comparison
+        about what redaction did rather than about what was read.
+        """
+        assessment = assess_grounding(
+            ocr_text=frame.extracted_text,
+            verbatim_text=reading.verbatim_text,
+            text_confidence=reading.text_confidence,
+            has_interpretation=reading.has_interpretation,
+        )
+        carried, carrier_warnings = frame.with_interpretation(
+            reading, grounding=assessment.public_dict()
+        )
+        warnings.extend(carrier_warnings)
+        if assessment.level == UNGROUNDED:
+            warnings.append(
+                warning(
+                    "local_vision",
+                    "frame_text_ungrounded",
+                    f"frame {frame.index or index + 1} interpretation is not grounded in "
+                    f"readable text: {assessment.reason}",
+                )
+            )
+        return carried
+
+    def _reset_run(self, frames: list[FrameArtifact]) -> None:
         self._last_probe = None
         self._frame_count = len(frames)
         self._interpreted_count = 0
@@ -738,44 +739,13 @@ class FrameInterpreter:
         self._trace_events.append({"event": event, "detail": detail})
 
     @staticmethod
-    def _ensure_frame_invariants(index: int, frame: dict, frame_count: int) -> None:
+    def _ensure_frame_invariants(index: int, frame: FrameArtifact, frame_count: int) -> None:
         if frame_count <= 0:
             raise AssertionError("frame_count must be positive while interpreting frames")
         if not 0 <= index < frame_count:
             raise AssertionError("frame index must be within frame_count")
-        if "path" not in frame or not str(frame["path"]):
+        if not frame.path:
             raise AssertionError(f"frame at index {index} is missing required 'path'")
-
-
-def _redact_result_fields(
-    result: LocalVisionResult,
-) -> tuple[LocalVisionResult, list[dict[str, str]]]:
-    """Redact secrets from every model-produced free-text field.
-
-    The vision model echoes on-screen text into ``verbatim_text`` but also into
-    ``visual_summary``, ``interpretation``, ``uncertainty``, and
-    ``detected_elements``. All of them are persisted into the bundle via
-    ``public_dict()``/the markdown render, so redaction must cover every field,
-    not just ``verbatim_text``.
-    """
-    warnings: list[dict[str, str]] = []
-
-    def _clean(value: str) -> str:
-        if not value:
-            return value
-        redaction = redact_text(value)
-        warnings.extend(redaction.warnings)
-        return redaction.text
-
-    redacted = replace(
-        result,
-        visual_summary=_clean(result.visual_summary),
-        interpretation=_clean(result.interpretation),
-        uncertainty=_clean(result.uncertainty),
-        verbatim_text=_clean(result.verbatim_text),
-        detected_elements=[_clean(item) for item in result.detected_elements],
-    )
-    return redacted, warnings
 
 
 def _interpret_with_rapid_mlx(
@@ -785,7 +755,7 @@ def _interpret_with_rapid_mlx(
     prompt_profile: str,
     *,
     requestor: HttpRequestor | None = None,
-) -> LocalVisionResult:
+) -> Interpretation:
     try:
         image_bytes = image_path.read_bytes()
     except OSError as exc:
@@ -955,13 +925,13 @@ def _result_from_payload(
     interpreted: dict[str, Any],
     config: LocalVisionConfig,
     prompt_profile: str,
-) -> LocalVisionResult:
+) -> Interpretation:
     elements = interpreted.get("detected_elements", [])
     if not isinstance(elements, list):
         elements = []
-    return LocalVisionResult(
+    return Interpretation(
         visual_summary=str(interpreted.get("visual_summary", "")).strip(),
-        detected_elements=[str(item) for item in elements],
+        detected_elements=tuple(str(item) for item in elements),
         interpretation=str(interpreted.get("interpretation", "")).strip(),
         uncertainty=str(interpreted.get("uncertainty", "")).strip(),
         backend=config.backend,

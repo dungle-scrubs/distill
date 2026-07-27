@@ -65,6 +65,13 @@ read by other processes and are written by atomic replace, while **stage
 results** are written into a **staging directory** held under the run lock,
 which nothing else may read, and are ordinary writes.
 
+Nothing durable is written from a document a caller assembled: a **transcript**
+and a **stage result** are handed in as carriers and serialized here, because
+`artifacts.serialize` is the last point at which a carrier whose **redaction**
+policy never ran can be refused (R-20). A writer that accepted the document
+instead would accept text that had already been past that check without going
+through it.
+
 Written cheaply, read suspiciously. A **stage result** is durable scratch a
 *later* run reads back, so this module also owns what one must prove before a
 **resume** believes it: the schema version it was written under, the **bundle
@@ -111,13 +118,20 @@ import re
 import shutil
 import stat
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from .artifacts import RedactionState, StageResult, serialize
+from .artifacts import (
+    Carrier,
+    RedactionState,
+    StageResult,
+    Transcript,
+    is_path_field,
+    serialize,
+)
 from .errors import DistillError
 
 LOGGER = logging.getLogger(__name__)
@@ -1675,10 +1689,18 @@ class BundleRun:
         self.paths.markdown.write_text(markdown)
         return self.paths.markdown
 
-    def write_transcript(self, transcript: dict[str, Any]) -> Path:
-        """Write the **transcript** into the staging directory, on the same terms."""
+    def write_transcript(self, transcript: Transcript) -> Path:
+        """Write the **transcript** into the staging directory, on the same terms.
+
+        A carrier and not a document, because `serialize` is where R-20 is
+        enforced: a transcript whose **redaction** policy never ran is refused
+        here rather than written and refused later by nobody. A caller holding
+        a document has bypassed the check already, so it cannot be allowed to
+        hand one in (finding 15).
+        """
         ensure_safe_directory(self.paths.transcript, self.paths.root, create_leaf=False)
-        self.paths.transcript.write_text(json.dumps(transcript, indent=2, sort_keys=True) + "\n")
+        document = serialize(transcript)
+        self.paths.transcript.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
         return self.paths.transcript
 
     def write_stage(
@@ -2529,27 +2551,17 @@ def _with_recorded_warnings(payload: dict[str, Any], recorded: Any) -> dict[str,
     return {**payload, "warnings": [*existing, *recorded]}
 
 
-def _is_path_field(key: str) -> bool:
-    """Whether a payload key is one of Distill's names for a path.
-
-    Keys are the schema's own words, chosen by Distill and never **extracted
-    text**, so the field name is the honest signal for "this string is a path" -
-    `path` and `relative_path` on a **frame artifact** today.
-
-    Precisely what this does not do: find a path recorded under a key that is
-    not named for one. It confines the schema's path fields, not every string
-    that could be parsed as a path, and a stage that starts recording a path
-    under some other name is outside it until the name says so.
-    """
-    return key == "path" or key.endswith("_path")
-
-
 def _paths_are_confined(value: Any, root: Path) -> bool:
     """Whether every path field under `value` stays inside the bundle root.
 
-    `confined_path` decides it - the same refusal every write and every deletion
-    is put through (R-16, D-041), rather than a second rule that could disagree
-    with it. Not `ensure_safe_directory`, because that one *creates* what is
+    Which keys name a path is `artifacts.is_path_field`'s, and deliberately the
+    same answer the carrier uses to decide what the **redaction** policy may
+    rewrite: a field the policy treats as extracted text and this treats as a
+    path is a path the policy is free to mangle into one that fails here.
+
+    `confined_path` decides confinement - the same refusal every write and every
+    deletion is put through (R-16, D-041), rather than a second rule that could
+    disagree with it. Not `ensure_safe_directory`, because that one *creates* what is
     missing: validating a resumed payload must not leave directories behind, and
     a relative path field would otherwise mkdir its way into the bundle root
     just for being read.
@@ -2560,7 +2572,7 @@ def _paths_are_confined(value: Any, root: Path) -> bool:
     """
     if isinstance(value, dict):
         for key, item in value.items():
-            if _is_path_field(str(key)) and isinstance(item, str):
+            if is_path_field(str(key)) and isinstance(item, str):
                 try:
                     confined_path(Path(item), root)
                 except DistillError:
@@ -2596,11 +2608,17 @@ def write_stage_result(
     `--no-redact-secrets` reaches the scratch it reaches the **generation**
     with, and a resumed run is not handed text a first run would not have had.
 
-    The payload is turned into plain JSON before the carrier sees it, which is
-    what the write did anyway. It matters here because the carrier refuses a
-    type it cannot freeze: normalizing first means the carrier caps and redacts
-    exactly the strings that are about to be on disk, instead of `write_stage`
-    becoming a new way for a run to die on its own scratch.
+    A payload holding carriers is serialized carrier by carrier first, which is
+    what puts each of them through R-20's check: a **frame artifact** whose
+    redaction policy never ran is refused here, at the write, rather than
+    flattened into JSON by a `default=str` that would have made its text durable
+    and unreadable at once.
+
+    What is left after that is turned into plain JSON, which is what the write
+    did anyway. It matters here because the carrier refuses a type it cannot
+    freeze: normalizing first means the stage result caps and redacts exactly
+    the strings that are about to be on disk, instead of `write_stage` becoming
+    a new way for a run to die on its own scratch.
     """
     path = stage_result_path(generation, name)
     ensure_safe_directory(path, root, create_leaf=False)
@@ -2609,11 +2627,29 @@ def write_stage_result(
             schema_version=STAGE_RESULT_SCHEMA_VERSION,
             bundle_key=bundle_key,
             stage=name,
-            payload=json.loads(json.dumps(payload, default=str)),
+            payload=json.loads(json.dumps(_serialized(payload), default=str)),
             redaction=redaction,
         )
     )
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+
+
+def _serialized(value: Any) -> Any:
+    """Replace every carrier under `value` with the document `serialize` allows out.
+
+    A stage hands its result along as carriers, because that is what the stages
+    speak to each other (R-19). Turning them into documents is this module's
+    job and not theirs: `serialize` is the last check before **extracted text**
+    becomes durable (R-20), and a stage that flattened its own carriers would
+    be a stage that could skip it.
+    """
+    if isinstance(value, Carrier):
+        return serialize(value)
+    if isinstance(value, Mapping):
+        return {key: _serialized(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_serialized(item) for item in value]
+    return value
 
 
 def strip_stage_results(generation: Path) -> list[str]:

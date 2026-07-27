@@ -23,7 +23,13 @@ import pytest
 from test_local_integration import make_short_screencast
 
 from distill import pipeline as distill_session
-from distill.artifacts import FrameArtifact, RedactionState, Transcript, serialize
+from distill.artifacts import (
+    FrameArtifact,
+    Interpretation,
+    RedactionState,
+    Transcript,
+    serialize,
+)
 from distill.links import extract_relevant_links
 from distill.options import DistillOptions
 from distill.progress import DEFAULT_MECHANISM_WEIGHTS
@@ -81,18 +87,16 @@ def ocr_reading(text: str) -> Any:
     """An image-text reader double that recovers `text` from every **keyframe**."""
 
     def fake_ocr_frames(
-        frames: list[dict],
+        frames: list[FrameArtifact],
         _language: str,
         _enabled: bool,
         _progress: Any = None,
         _preprocess: bool = True,
-    ) -> tuple[list[dict], list[dict[str, str]]]:
-        updated = []
-        for frame in frames:
-            copied = dict(frame)
-            copied["ocr_text"] = text
-            updated.append(copied)
-        return updated, []
+    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+        # Through the carrier, exactly as the real `ocr_frames` does: a double
+        # that set the text some other way would be testing an arrangement in
+        # which the redaction policy never ran (R-19).
+        return [frame.with_extracted_text(text)[0] for frame in frames], []
 
     return fake_ocr_frames
 
@@ -126,12 +130,10 @@ def vision_reading(secret: str) -> Any:
         *,
         prompt_profile: str,
     ) -> tuple[Any, None]:
-        from distill.local_vision import LocalVisionResult
-
         return (
-            LocalVisionResult(
+            Interpretation(
                 visual_summary=f"a terminal showing {secret}",
-                detected_elements=[f"a shell prompt with {secret}"],
+                detected_elements=(f"a shell prompt with {secret}",),
                 interpretation=f"the presenter pasted {secret}",
                 uncertainty=f"unsure whether {secret} is real",
                 backend="rapid-mlx",
