@@ -1362,6 +1362,38 @@ def test_the_package_has_call_sites_to_check() -> None:
     }
 
 
+def test_only_run_command_imports_subprocess() -> None:
+    """R-29: one subprocess path means one module may import `subprocess`.
+
+    The call-site tests here hold every invocation that goes *through*
+    `run_command` to both timeouts and to the group contract, but they can only
+    see calls they recognize. A module importing `subprocess` itself would open
+    a second path none of them says anything about - no deadline, no group, no
+    boundary event - so ownership is asserted directly instead of being inferred
+    from the call sites that happen to be visible.
+
+    Scope is the whole package with no exemption, which is why `measure.py` was
+    migrated rather than excused: an offline harness still invokes ffmpeg.
+    """
+    def imports_subprocess(module: Path) -> bool:
+        return any(
+            (
+                isinstance(node, ast.Import)
+                and any(alias.name == "subprocess" for alias in node.names)
+            )
+            or (isinstance(node, ast.ImportFrom) and node.module == "subprocess")
+            for node in ast.walk(ast.parse(module.read_text()))
+        )
+
+    offenders = sorted(
+        module.name
+        for module in package_modules()
+        if module.name != SUBPROCESS_OWNER and imports_subprocess(module)
+    )
+
+    assert offenders == []
+
+
 def test_every_call_site_passes_both_timeouts() -> None:
     """R-30: no invocation inherits a limit by omission, not even the default."""
     missing = [
