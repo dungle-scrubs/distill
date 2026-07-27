@@ -11,7 +11,14 @@ from typing import Any
 import pytest
 
 from distill import transcript
+from distill.capabilities import EXTERNAL_TOOLS
+from distill.errors import DistillError
 from distill.progress import ProgressReporter
+from distill.run_command import (
+    OUTPUT_CAP_BYTES,
+    TRUNCATION_WARNING_CODE,
+    CommandTimeouts,
+)
 from distill.transcript import (
     extract_audio,
     parse_ffmpeg_progress_time,
@@ -269,14 +276,16 @@ def test_extract_audio_failure_reports_bounded_ffmpeg_stderr(
 ) -> None:
     fake_tool("ffmpeg", fake_ffmpeg_failing(transcript.STDERR_TAIL_LINES + 40))
 
-    result = extract_audio(
+    extracted, warnings = extract_audio(
         tmp_path / "video.mp4",
         tmp_path / "audio.wav",
         ProgressReporter(),
         duration_sec=10.0,
     )
 
-    assert result is not None
+    assert extracted is False
+    assert len(warnings) == 1
+    result = warnings[0]
     assert result["code"] == "audio_extract_failed"
     assert "Invalid data found when processing input" in result["message"]
     # Bounded: only the tail is kept, and progress keys are never diagnostic.
@@ -369,23 +378,26 @@ def test_low_confidence_segments_are_dropped_with_warning(tmp_path: Path) -> Non
     )
 
 
-def test_extract_audio_degrades_when_ffmpeg_missing(
+def test_absent_ffmpeg_ends_the_run_because_the_table_says_it_is_required(
     fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
     tmp_path: Path,
 ) -> None:
-    """ADR-0002: the run continues with a **warning** rather than raising.
+    """ADR-0002 / R-34: a missing **required capability** is a **fatal error**.
 
     Nothing is installed into the fake PATH, so ffmpeg is genuinely absent and
-    run_command's E_MISSING_TOOL is the error being degraded - not a patched
-    exception standing in for one.
+    run_command's real E_MISSING_TOOL reaches the call site. The call site hands
+    the tool to the capability table rather than deciding itself, and the table
+    classifies ffmpeg required, so the run stops here naming the tool instead of
+    degrading and failing at render under a code about missing content.
     """
-    result = extract_audio(tmp_path / "video.mp4", tmp_path / "audio.wav")
+    with pytest.raises(DistillError) as failure:
+        extract_audio(tmp_path / "video.mp4", tmp_path / "audio.wav")
 
-    assert result == {
-        "stage": "transcript",
-        "code": "audio_extract_failed",
-        "message": "ffmpeg is not installed",
-    }
+    assert failure.value.code == "E_MISSING_TOOL"
+    assert failure.value.stage == "transcript"
+    assert failure.value.message.startswith("ffmpeg is not installed or not on PATH; ")
+    assert EXTERNAL_TOOLS["ffmpeg"].absence_cost in failure.value.message
+    assert failure.value.details["requirement"] == "required"
 
 
 def test_extract_audio_emits_a_boundary_event(
@@ -413,7 +425,7 @@ def test_transcribe_video_returns_audio_warning_without_transcribing(
         "code": "audio_extract_failed",
         "message": "ffmpeg is not installed",
     }
-    monkeypatch.setattr(transcript, "extract_audio", lambda *_a, **_k: audio_warning)
+    monkeypatch.setattr(transcript, "extract_audio", lambda *_a, **_k: (False, [audio_warning]))
 
     def _should_not_run(*_a: Any, **_k: Any) -> tuple[Any, Any]:
         raise AssertionError("transcription must not run after an audio-extract failure")
@@ -426,3 +438,69 @@ def test_transcribe_video_returns_audio_warning_without_transcribing(
 
     assert result is None
     assert warnings == [audio_warning]
+
+
+# A fake ffmpeg that extracts the audio and floods stderr past the capture cap
+# while it does - the shape of a long extraction under `-progress pipe:2`.
+FAKE_FFMPEG_FLOODS_STDERR = f"""
+import sys
+
+sys.stderr.write("x" * ({OUTPUT_CAP_BYTES} + 1024))
+"""
+
+
+def test_a_truncated_extraction_still_transcribes_and_keeps_its_warning(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """R-33: extraction succeeded, so the loss it recorded is all there is to say.
+
+    A **warning** raised inside the invocation has nowhere else to live: this is
+    the only hand-off between `run_command` and the run's warnings, and a
+    successful extraction that dropped it would put a transcript in the
+    **bundle** with no record that ffmpeg's own output was cut short.
+    """
+    fake_tool("ffmpeg", FAKE_FFMPEG_FLOODS_STDERR)
+    monkeypatch.setattr(
+        transcript, "transcribe_audio", lambda *_a, **_k: ({"segments": []}, [])
+    )
+
+    result, warnings = transcribe_video(
+        tmp_path / "video.mp4", tmp_path, "small", "en", True
+    )
+
+    assert result == {"segments": []}
+    assert [item["code"] for item in warnings] == [TRUNCATION_WARNING_CODE]
+
+
+# A fake ffmpeg that is installed and then hangs: the tool is present, so this
+# is not a capability question at all.
+FAKE_FFMPEG_HANGS = """
+import time
+
+time.sleep(600)
+"""
+
+
+def test_a_wedged_but_installed_ffmpeg_still_only_costs_the_transcript(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The other half of the split: required is about installed, not about healthy.
+
+    ffmpeg is classified a **required capability**, and it is here - it just
+    stopped answering. ADR-0002's degradation still applies: the run keeps its
+    keyframes and loses its transcript, as it did before.
+    """
+    fake_tool("ffmpeg", FAKE_FFMPEG_HANGS)
+    monkeypatch.setattr(
+        transcript, "AUDIO_EXTRACT_TIMEOUTS", CommandTimeouts(total_sec=0.3, idle_sec=5.0)
+    )
+
+    extracted, warnings = extract_audio(tmp_path / "video.mp4", tmp_path / "audio.wav")
+
+    assert extracted is False
+    assert [item["code"] for item in warnings] == [transcript.AUDIO_EXTRACT_FAILED_CODE]
+    assert "exceeded its total deadline" in warnings[0]["message"]

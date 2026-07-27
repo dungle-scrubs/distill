@@ -248,7 +248,7 @@ def test_ocr_reports_frame_index_progress(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(
         ocr,
         "ocr_frame",
-        lambda _path, _language, _cmd=None, _preprocess=True: ("detected text", None),
+        lambda _path, _language, _cmd=None, _preprocess=True: ("detected text", []),
     )
     progress = ProgressReporter()
 

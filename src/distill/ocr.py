@@ -15,19 +15,23 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .capabilities import missing_tool_warning
+from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, warning
 from .progress import ProgressCounter, ProgressReporter
-from .run_command import CommandTimeouts, run
+from .run_command import run, silent_tool_timeouts
 
 # Below this mean luminance (0-255) a frame is treated as dark-background and
 # inverted before OCR, since Tesseract is tuned for dark text on light.
 _DARK_BACKGROUND_THRESHOLD = 110.0
 # Upscaling small frames gives Tesseract more pixels per glyph on slide text.
 _OCR_UPSCALE = 2
-# One frame at a time, so both limits are short: tesseract that has said nothing
-# for half a minute on a single image is stuck, not slow.
-TESSERACT_TIMEOUTS = CommandTimeouts(total_sec=120.0, idle_sec=30.0)
+# Tesseract is silent by construction: it prints its reading when it is done and
+# says nothing while it works, so the idle clock never resets - see
+# `silent_tool_timeouts`, which is why one number governs here. 120 s is the
+# budget one frame gets; a lower idle value would not catch a stall, it would
+# just cut that budget and lose the frame's **extracted text** on a loaded
+# machine, behind an `ocr_failed` warning that says nothing about the reason.
+TESSERACT_TIMEOUTS = silent_tool_timeouts(120.0)
 
 
 def preprocess_for_ocr(path: Path) -> Any:
@@ -83,7 +87,7 @@ def ensure_tesseract_available() -> dict[str, str] | None:
     """
     if find_tesseract_command():
         return None
-    return missing_tool_warning("ocr", "tesseract")
+    return missing_tool_consequence("ocr", "tesseract")
 
 
 def ocr_frame(
@@ -91,24 +95,40 @@ def ocr_frame(
     language: str,
     tesseract_cmd: str | None = None,
     preprocess: bool = True,
-) -> tuple[str, dict[str, str] | None]:
+) -> tuple[str, list[dict[str, str]]]:
+    """Read one keyframe's **extracted text**, with every **warning** it cost.
+
+    Returns the text and the warnings together rather than a single warning,
+    because an invocation can both succeed and lose output: `run_command`
+    records truncated capture as a warning (R-33), and a reading that was
+    truncated is still a reading. Dropping those here would put text in the
+    **bundle** that is quietly less than what tesseract read.
+    """
     command = tesseract_cmd or find_tesseract_command()
     if command is None:
-        return "", missing_tool_warning("ocr", "tesseract")
+        return "", [missing_tool_consequence("ocr", "tesseract")]
 
     # Preprocessing recovers low-contrast slide text. The processed frame is
     # written alongside the source - a directory we just read from, so it is
     # readable - rather than through ``$TMPDIR``, which a sandboxed tesseract
     # may not be able to open. Fall back to the original frame when
     # preprocessing is unavailable or its OCR failed.
+    #
+    # A failed first attempt's warnings are deliberately dropped on that
+    # fallback: the frame is about to be read again, and the second reading is
+    # the one that describes what the **bundle** actually holds. Reporting the
+    # discarded attempt would put an `ocr_failed` warning on a frame whose text
+    # arrived. A *successful* first attempt's warnings are kept, because that
+    # reading is the one the bundle keeps.
     if preprocess:
         processed = preprocess_for_ocr(path)
         if processed is not None:
-            text, prep_warning = _ocr_processed_image(command, processed, path, language)
-            if prep_warning is None:
-                return text, None
+            text, prep_warnings = _ocr_processed_image(command, processed, path, language)
+            if text is not None:
+                return text, prep_warnings
 
-    return _read_text(command, path, language, source=path)
+    text, warnings = _read_text(command, path, language, source=path)
+    return text or "", warnings
 
 
 def _read_text(
@@ -117,14 +137,18 @@ def _read_text(
     language: str,
     *,
     source: Path,
-) -> tuple[str, dict[str, str] | None]:
+) -> tuple[str | None, list[dict[str, str]]]:
     """Run tesseract over one image and return the text it printed.
 
     ``stdout`` as the output base is what makes tesseract print its reading
     instead of writing a sibling ``.txt``. Every failure degrades: one frame
     without **extracted text** reduces a **bundle**, it does not end the run
-    (ADR-0002), and an absent binary reports the capability table's warning
-    rather than a bespoke one.
+    (ADR-0002), and an absent binary is handed to the capability table, which
+    states that image-text extraction is optional and returns its warning.
+
+    ``None`` for the text means the attempt failed, which is what lets the
+    caller fall back to the unprocessed frame; an empty string is a successful
+    reading of a frame with no text on it.
     """
     try:
         result = run(
@@ -134,15 +158,28 @@ def _read_text(
             idle_timeout_sec=TESSERACT_TIMEOUTS.idle_sec,
         )
     except DistillError as exc:
-        if exc.code == "E_MISSING_TOOL":
-            return "", missing_tool_warning("ocr", "tesseract")
-        return "", warning("ocr", "ocr_failed", f"OCR failed for {source.name}: {exc.message}")
-    return result.stdout.strip(), None
+        if exc.code == MISSING_TOOL_CODE:
+            return None, [missing_tool_consequence("ocr", "tesseract", cause=exc)]
+        return None, [warning("ocr", "ocr_failed", _failure_reason(source, exc))]
+    return result.stdout.strip(), list(result.warnings)
+
+
+def _failure_reason(source: Path, exc: DistillError) -> str:
+    """Why this frame has no **extracted text**, in tesseract's own words.
+
+    `exc.message` alone is the generic "command failed: <path>", which tells a
+    reader of a degraded run nothing they can act on. The tool's stderr tail
+    carries the reason it actually gave - "Failed loading language 'zzz'" - so
+    it is appended when there is one.
+    """
+    reason = f"OCR failed for {source.name}: {exc.message}"
+    tail = " ".join(str(exc.details.get("stderr_tail", "")).split())
+    return f"{reason}: {tail}" if tail else reason
 
 
 def _ocr_processed_image(
     command: str, processed: Any, source: Path, language: str
-) -> tuple[str, dict[str, str] | None]:
+) -> tuple[str | None, list[dict[str, str]]]:
     """OCR a preprocessed PIL image via a temp file next to ``source``."""
     handle = tempfile.NamedTemporaryFile(  # noqa: SIM115
         suffix=".png", prefix=f".{source.stem}.ocr.", dir=str(source.parent), delete=False
@@ -153,7 +190,9 @@ def _ocr_processed_image(
         try:
             processed.save(temp_path)
         except (OSError, ValueError) as exc:
-            return "", warning("ocr", "ocr_failed", f"OCR failed for {source.name}: {exc}")
+            return None, [
+                warning("ocr", "ocr_failed", f"OCR failed for {source.name}: {exc}")
+            ]
         return _read_text(command, temp_path, language, source=source)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -190,15 +229,14 @@ def ocr_frames(
     for frame in frames:
         copied = dict(frame)
         if enabled and tesseract_cmd:
-            text, frame_warning = ocr_frame(
+            text, frame_warnings = ocr_frame(
                 Path(str(copied["path"])),
                 language,
                 tesseract_cmd,
                 preprocess,
             )
             copied["ocr_text"] = text
-            if frame_warning:
-                warnings.append(frame_warning)
+            warnings.extend(frame_warnings)
         else:
             copied["ocr_text"] = ""
         if isinstance(progress, ProgressReporter):

@@ -7,11 +7,15 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Protocol
 
+from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, warning
 from .progress import ProgressCounter, ProgressReporter
 from .run_command import CommandTimeouts, stream
 
 MIN_CONFIDENCE = -1.0
+# The one code every extraction failure reports under, named so the caller can
+# say why it skipped transcription without being handed the warning back.
+AUDIO_EXTRACT_FAILED_CODE = "audio_extract_failed"
 VAD_DROP_WARNING_RATIO = 0.50
 VAD_DROP_HIGH_RATIO = 0.90
 
@@ -107,18 +111,6 @@ def is_ffmpeg_progress_line(line: str) -> bool:
     return key in FFMPEG_PROGRESS_KEYS or (key.startswith("stream_") and key.endswith("_q"))
 
 
-def _extract_failure_reason(error: DistillError) -> str:
-    """Why extraction could not run, in the words the degradation reports.
-
-    A missing binary keeps its own wording because "not installed" is the one a
-    reader can act on; anything else carries run_command's message, which names
-    the timeout that fired.
-    """
-    if error.code == "E_MISSING_TOOL":
-        return "ffmpeg is not installed"
-    return f"ffmpeg could not extract audio: {error.message}"
-
-
 def format_stderr_tail(lines: Iterable[str]) -> str:
     tail = " | ".join(stripped for line in lines if (stripped := line.strip()))
     if len(tail) > STDERR_TAIL_CHARS:
@@ -131,7 +123,14 @@ def extract_audio(
     audio_path: Path,
     progress: ProgressReporter | None = None,
     duration_sec: float | None = None,
-) -> dict[str, str] | None:
+) -> tuple[bool, list[dict[str, str]]]:
+    """Extract the audio track, reporting whether it landed and what it cost.
+
+    Two answers rather than one warning, because they are independent: a
+    successful extraction can still record a **warning** (truncated capture,
+    R-33), and a caller that read only a warning would either lose it or read
+    it as a failure.
+    """
     if progress:
         progress.update("audio_extraction", percent=0.0)
     command = [
@@ -186,21 +185,34 @@ def extract_audio(
             check=False,
         )
     except DistillError as exc:
-        # ADR-0002: no transcript is a reduced bundle, not a dead run, so an
-        # absent or wedged ffmpeg degrades here rather than ending the run.
-        return warning("transcript", "audio_extract_failed", _extract_failure_reason(exc))
+        # An absent tool is the capability table's decision, not this call
+        # site's: ffmpeg is classified a **required capability**, so this call
+        # raises rather than returning (ADR-0002, R-34). A wedged ffmpeg that is
+        # installed is the degradation ADR-0002 does cover - the run loses its
+        # transcript and keeps its keyframes.
+        if exc.code == MISSING_TOOL_CODE:
+            return False, [missing_tool_consequence("transcript", "ffmpeg", cause=exc)]
+        return False, [
+            warning(
+                "transcript",
+                AUDIO_EXTRACT_FAILED_CODE,
+                f"ffmpeg could not extract audio: {exc.message}",
+            )
+        ]
+    warnings = list(result.warnings)
     if result.returncode != 0:
         reason = format_stderr_tail(stderr_tail)
         message = "ffmpeg could not extract audio"
         if reason:
             message = f"{message}: {reason}"
-        return warning("transcript", "audio_extract_failed", message)
+        warnings.append(warning("transcript", AUDIO_EXTRACT_FAILED_CODE, message))
+        return False, warnings
     if progress:
         progress.complete(
             "audio_extraction",
             detail={"duration_sec": duration_sec} if duration_sec is not None else None,
         )
-    return None
+    return True, warnings
 
 
 def transcribe_audio(
@@ -323,26 +335,29 @@ def transcribe_video(
     duration_sec: float | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
     audio_path = work_dir / "audio.wav"
-    audio_warning = extract_audio(
+    extracted, audio_warnings = extract_audio(
         video_path,
         audio_path,
         progress if isinstance(progress, ProgressReporter) else None,
         duration_sec,
     )
-    if audio_warning:
+    if not extracted:
         if isinstance(progress, ProgressReporter):
-            progress.complete("audio_extraction", detail={"warning": audio_warning["code"]})
-            progress.skip_cached("transcription", detail={"reason": audio_warning["code"]})
-        return None, [audio_warning]
+            progress.complete("audio_extraction", detail={"warning": AUDIO_EXTRACT_FAILED_CODE})
+            progress.skip_cached("transcription", detail={"reason": AUDIO_EXTRACT_FAILED_CODE})
+        return None, audio_warnings
     transcript, warnings = transcribe_audio(audio_path, model_name, language, vad_filter, progress)
     if isinstance(progress, ProgressReporter):
         progress.complete(
             "transcription", detail={"segments": len((transcript or {}).get("segments", []))}
         )
-    return transcript, warnings
+    # Extraction succeeded, but it may still have recorded truncated capture
+    # (R-33); those warnings belong in the bundle beside transcription's own.
+    return transcript, [*audio_warnings, *warnings]
 
 
 __all__ = [
+    "AUDIO_EXTRACT_FAILED_CODE",
     "MIN_CONFIDENCE",
     "VAD_DROP_HIGH_RATIO",
     "VAD_DROP_WARNING_RATIO",

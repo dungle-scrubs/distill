@@ -142,9 +142,9 @@ def test_ocr_frame_reads_text_tesseract_printed_to_stdout(
     frame = tmp_path / "frame.png"
     frame.write_bytes(b"not really a png")
 
-    text, frame_warning = ocr_frame(frame, "eng", str(command))
+    text, frame_warnings = ocr_frame(frame, "eng", str(command))
 
-    assert (text, frame_warning) == ("SLIDE TEXT", None)
+    assert (text, frame_warnings) == ("SLIDE TEXT", [])
     argv = literal_eval((tmp_path / "tesseract-argv.txt").read_text())
     # `stdout` as the output base is what makes tesseract print rather than
     # write a sibling .txt file, and `-l` selects the language pack.
@@ -161,12 +161,11 @@ def test_ocr_frame_degrades_when_tesseract_is_absent(tmp_path: Path) -> None:
     frame.write_bytes(b"fake")
 
     with patch("distill.ocr.find_tesseract_command", return_value=None):
-        text, frame_warning = ocr_frame(frame, "eng")
+        text, frame_warnings = ocr_frame(frame, "eng")
 
     assert text == ""
-    assert frame_warning is not None
-    assert frame_warning["code"] == "tesseract_not_found"
-    assert EXTERNAL_TOOLS["tesseract"].absence_cost in frame_warning["message"]
+    assert [w["code"] for w in frame_warnings] == ["tesseract_not_found"]
+    assert EXTERNAL_TOOLS["tesseract"].absence_cost in frame_warnings[0]["message"]
 
 
 def test_ocr_frame_reports_a_failing_tesseract_as_a_warning(
@@ -178,12 +177,14 @@ def test_ocr_frame_reports_a_failing_tesseract_as_a_warning(
     frame = tmp_path / "frame.png"
     frame.write_bytes(b"fake")
 
-    text, frame_warning = ocr_frame(frame, "eng", str(command))
+    text, frame_warnings = ocr_frame(frame, "eng", str(command))
 
     assert text == ""
-    assert frame_warning is not None
-    assert frame_warning["code"] == "ocr_failed"
-    assert "frame.png" in frame_warning["message"]
+    assert [w["code"] for w in frame_warnings] == ["ocr_failed"]
+    assert "frame.png" in frame_warnings[0]["message"]
+    # Finding 9: the generic "command failed: <path>" says nothing a reader can
+    # act on, so tesseract's own reason travels with it.
+    assert "Pix not read" in frame_warnings[0]["message"]
 
 
 def test_ocr_frame_emits_a_boundary_event(
@@ -249,9 +250,29 @@ def test_ocr_frames_processes_frames_when_tesseract_available(
     with (
         patch("distill.ocr.find_tesseract_command", return_value="/usr/bin/tesseract"),
         patch("distill.ocr.ensure_tesseract_available", return_value=None),
-        patch("distill.ocr.ocr_frame", return_value=("hello world", None)),
+        patch("distill.ocr.ocr_frame", return_value=("hello world", [])),
     ):
         updated, warnings = ocr_frames(frames, "eng", enabled=True)
 
     assert updated[0]["ocr_text"] == "hello world"
     assert warnings == []
+
+
+def test_a_tesseract_that_vanished_mid_run_still_only_degrades(tmp_path: Path) -> None:
+    """The absent-binary branch inside the invocation, not the discovery check.
+
+    Discovery found a path and the exec then failed, so run_command's real
+    E_MISSING_TOOL reaches `_read_text`. That call site does not decide what an
+    absent tool costs either - it asks the capability table, which classifies
+    image-text extraction optional, so the frame is lost and the run is not.
+    """
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"fake")
+
+    text, frame_warnings = ocr_frame(
+        frame, "eng", str(tmp_path / "tesseract-that-is-gone"), preprocess=False
+    )
+
+    assert text == ""
+    assert [item["code"] for item in frame_warnings] == ["tesseract_not_found"]
+    assert EXTERNAL_TOOLS["tesseract"].absence_cost in frame_warnings[0]["message"]

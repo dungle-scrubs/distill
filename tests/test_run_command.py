@@ -42,6 +42,7 @@ from distill.run_command import (
     FailureKind,
     run,
     run_json,
+    silent_tool_timeouts,
     stream,
 )
 
@@ -735,7 +736,7 @@ def test_run_json_reports_a_bad_document_under_the_callers_error_code() -> None:
 
 
 def test_run_json_parses_the_document_a_tool_prints() -> None:
-    payload = run_json(
+    payload, warnings = run_json(
         child("import sys; sys.stdout.write('{\"format\": {\"duration\": \"3.5\"}}')"),
         stage="source",
         total_timeout_sec=GENEROUS_TOTAL_SEC,
@@ -743,6 +744,28 @@ def test_run_json_parses_the_document_a_tool_prints() -> None:
     )
 
     assert payload["format"]["duration"] == "3.5"
+    assert warnings == ()
+
+
+def test_run_json_hands_back_the_truncation_warning_with_the_document() -> None:
+    """R-33: a document that parsed is not proof nothing was lost.
+
+    `run_json` is the only reach a caller has to the invocation, so a truncation
+    warning it does not return is a warning that cannot exist anywhere.
+    """
+    document, warnings = run_json(
+        child(
+            "import sys; sys.stdout.write('{}'); sys.stderr.write('x' * 4096)",
+        ),
+        stage="source",
+        total_timeout_sec=GENEROUS_TOTAL_SEC,
+        idle_timeout_sec=GENEROUS_IDLE_SEC,
+        output_cap_bytes=64,
+    )
+
+    assert document == {}
+    assert [item["code"] for item in warnings] == [TRUNCATION_WARNING_CODE]
+    assert "stderr" in warnings[0]["message"]
 
 
 def test_a_caller_may_override_the_command_error_code() -> None:
@@ -1287,3 +1310,32 @@ def test_a_timeout_pair_cannot_be_constructed_half_specified() -> None:
 def test_a_timeout_pair_rejects_a_limit_that_bounds_nothing(total: float, idle: float) -> None:
     with pytest.raises(ValueError):
         CommandTimeouts(total_sec=total, idle_sec=idle)
+
+
+# --- silent-by-design tools (finding 4) --------------------------------------
+
+
+def test_a_silent_tool_pair_puts_the_declared_number_in_both_places() -> None:
+    """One number governs, because with no output there is no idle clock.
+
+    A tool that says nothing until it is finished never resets the idle timer,
+    so a lower idle value is not a stall detector - it is a quieter deadline
+    that replaces the one the call site wrote down.
+    """
+    timeouts = silent_tool_timeouts(90.0)
+
+    assert timeouts == CommandTimeouts(total_sec=90.0, idle_sec=90.0)
+
+
+def test_a_silent_tool_call_site_cannot_tighten_its_idle_value_alone() -> None:
+    """The constructor takes one limit, so the two cannot drift apart."""
+    parameters = inspect.signature(silent_tool_timeouts).parameters
+
+    assert list(parameters) == ["total_sec"]
+
+
+def test_the_silent_by_design_call_sites_declare_a_single_deadline() -> None:
+    """tesseract and `ffprobe -v error` both answer only when they are done."""
+    for name in ("ocr.TESSERACT_TIMEOUTS", "source.FFPROBE_TIMEOUTS"):
+        timeouts = declared_timeouts()[name]
+        assert timeouts.idle_sec == timeouts.total_sec, name

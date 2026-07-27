@@ -6,25 +6,41 @@ invoked, and what its absence costs a **bundle**. Per ADR-0002 the two classes
 have different consequences - an absent optional capability is a **degradation**
 that records a **warning** and continues, an absent required capability is a
 **fatal error** - so the classification must be stated here rather than left to
-emerge from whichever call site happens to raise. It is also the single source
-of truth the README and AGENTS.md render, so the promise those documents make
-about degradation cannot drift from the code.
+emerge from whichever call site happens to raise.
+
+A call site that caught a missing tool therefore asks `missing_tool_consequence`
+what that absence costs instead of deciding for itself: the table is what
+answers, so no site can quietly degrade a required capability and leave the run
+to die later under an unrelated code.
+
+The README's system-dependency table is the same statement in prose. Nothing
+renders it - it is written by hand - so
+`tests/test_capabilities.py::test_the_readme_states_the_class_the_table_records`
+pins it against this table instead, and a classification changed here without
+the README changing with it fails the suite.
 
 It does not own tool discovery (each adapter finds its own binary: `ocr.py` for
 tesseract, `source.py` for ffprobe and yt-dlp), invocation or its failure
 taxonomy (`run_command.py`, whose error table raises `E_MISSING_TOOL` for a
 required tool that is not installed), or the shape of a warning record
 (`errors.py`). This module states which class a tool is in and supplies the
-degradation warning for the optional ones; it never installs anything, and
-nothing here decides whether a *particular* run needed the tool.
+consequence of its absence; it never installs anything, and nothing here decides
+whether a *particular* run needed the tool.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
-from .errors import warning
+from .errors import DistillError, warning
+from .run_command import ERROR_CODES, FailureKind
+
+# The code `run_command` raises when a tool is not installed. Named here so a
+# call site can recognize that failure and hand it to the table, rather than
+# matching the string and then hand-coding what to do about it.
+MISSING_TOOL_CODE = ERROR_CODES[FailureKind.MISSING_TOOL]
 
 
 class Requirement(StrEnum):
@@ -105,6 +121,15 @@ EXTERNAL_TOOLS: dict[str, ExternalTool] = {
 }
 
 
+def _absence_message(tool: ExternalTool) -> str:
+    """One sentence for an absent tool, whichever class it is in.
+
+    The wording is shared so a **degradation** and a **fatal error** describe the
+    same absence the same way: what is missing, and what its absence costs.
+    """
+    return f"{tool.name} is not installed or not on PATH; {tool.absence_cost}"
+
+
 def missing_tool_warning(stage: str, tool_name: str) -> dict[str, str]:
     """The degradation **warning** for an absent **optional capability**.
 
@@ -118,8 +143,49 @@ def missing_tool_warning(stage: str, tool_name: str) -> dict[str, str]:
             f"{tool.name} is a required capability; its absence is a fatal error, "
             "not a degradation"
         )
-    return warning(
-        stage,
-        tool.warning_code,
-        f"{tool.name} is not installed or not on PATH; {tool.absence_cost}",
-    )
+    return warning(stage, tool.warning_code, _absence_message(tool))
+
+
+def missing_tool_error(
+    stage: str, tool_name: str, *, cause: DistillError | None = None
+) -> DistillError:
+    """The **fatal error** for an absent **required capability** (ADR-0002, R-34).
+
+    It names the tool and states what its absence costs, so a run that cannot
+    produce a **bundle** stops here saying which tool to install - rather than
+    degrading, doing the rest of the work, and failing at render under a code
+    about missing content.
+
+    Raises `ValueError` for a tool classified optional: that is ADR-0002 read
+    backwards, and an optional absence must not be able to end a run.
+    """
+    tool = EXTERNAL_TOOLS[tool_name]
+    if tool.is_optional:
+        raise ValueError(
+            f"{tool.name} is an optional capability; its absence is a degradation, "
+            "not a fatal error"
+        )
+    details: dict[str, Any] = dict(cause.details) if cause is not None else {}
+    details["tool"] = tool.name
+    details["requirement"] = str(tool.requirement)
+    return DistillError(MISSING_TOOL_CODE, stage, _absence_message(tool), details)
+
+
+def missing_tool_consequence(
+    stage: str, tool_name: str, *, cause: DistillError | None = None
+) -> dict[str, str]:
+    """What an absent `tool_name` costs this run, decided by the table.
+
+    The single entry point for a call site that has just caught
+    `MISSING_TOOL_CODE`. An **optional capability** returns its **degradation**
+    warning for the caller to record; a **required capability** never returns -
+    it raises, because ADR-0002 makes its absence a **fatal error** and R-34
+    admits no third answer.
+
+    Call sites route through here rather than deciding per site, so which class
+    a tool is in is read off the table at the moment it matters instead of being
+    re-derived - correctly or not - at each place the tool is run.
+    """
+    if EXTERNAL_TOOLS[tool_name].is_optional:
+        return missing_tool_warning(stage, tool_name)
+    raise missing_tool_error(stage, tool_name, cause=cause) from cause

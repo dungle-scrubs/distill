@@ -146,6 +146,22 @@ payload = {"streams": streams, "format": {"duration": "12.5" if size else "0"}}
 sys.stdout.write(json.dumps(payload))
 """
 
+def fake_ffprobe_flooding_stderr(cap_bytes: int) -> str:
+    """A working ffprobe that also floods stderr past run_command's capture cap.
+
+    The invocation both answers and records truncation (R-33). `-v error` keeps
+    ffprobe quiet about a file it understands; a container it dislikes makes it
+    anything but.
+    """
+    return f"""
+import json, sys
+
+payload = {{"streams": [{{"codec_type": "video"}}], "format": {{"duration": "12.5"}}}}
+sys.stdout.write(json.dumps(payload))
+sys.stderr.write("x" * ({cap_bytes} + 1024))
+"""
+
+
 # A container ffprobe can open and read a video stream from, but whose duration
 # it cannot determine - the shape of a transfer that stopped before the index
 # was written.

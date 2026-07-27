@@ -294,12 +294,12 @@ def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
 
 
 def extract_sample_hashes(video_path: Path, work_dir: Path) -> list[str]:
-    duration = probe_duration(video_path)
+    duration, _ = probe_duration(video_path)
     hashes: list[str] = []
     for index, timestamp in enumerate(fixed_interval_candidates(duration, 1.0)):
         output_path = work_dir / f"sample-{index:04d}.png"
-        warning = extract_frame(video_path, timestamp, output_path)
-        if warning is None:
+        extracted, _ = extract_frame(video_path, timestamp, output_path)
+        if extracted:
             hashes.append(phash(output_path))
     return hashes
 
@@ -329,7 +329,7 @@ def detector_count(video_path: Path, detector_name: str) -> int | None:
 
 
 def scene_detector_comparison(video_path: Path) -> dict[str, Any]:
-    duration = probe_duration(video_path)
+    duration, _ = probe_duration(video_path)
     return {
         "content_detector_scenes": detector_count(video_path, "content"),
         "adaptive_detector_scenes": detector_count(video_path, "adaptive"),
@@ -344,11 +344,11 @@ def benchmark_whisper_models(
     models: list[str],
 ) -> list[dict[str, Any]]:
     audio_path = work_dir / f"{video_path.stem}.wav"
-    warning = extract_audio(video_path, audio_path)
-    if warning is not None:
-        return [{"error": warning["message"]}]
+    extracted, audio_warnings = extract_audio(video_path, audio_path)
+    if not extracted:
+        return [{"error": "; ".join(item["message"] for item in audio_warnings)}]
 
-    duration = probe_duration(video_path)
+    duration, _ = probe_duration(video_path)
     results: list[dict[str, Any]] = []
     for model_name in models:
         load_started = time.perf_counter()

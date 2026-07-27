@@ -7,9 +7,18 @@ from pathlib import Path
 
 import pytest
 
-from distill.capabilities import EXTERNAL_TOOLS, Requirement, missing_tool_warning
+from distill.capabilities import (
+    EXTERNAL_TOOLS,
+    Requirement,
+    missing_tool_consequence,
+    missing_tool_error,
+    missing_tool_warning,
+)
+from distill.errors import DistillError
 
-SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "distill"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src" / "distill"
+README = REPO_ROOT / "README.md"
 
 
 def test_every_external_tool_distill_invokes_is_classified() -> None:
@@ -59,3 +68,77 @@ def test_required_tool_absence_is_not_allowed_to_degrade() -> None:
 
 def test_warning_code_is_snake_case_for_a_hyphenated_tool() -> None:
     assert EXTERNAL_TOOLS["yt-dlp"].warning_code == "yt_dlp_not_found"
+
+
+def test_the_consequence_of_an_absent_optional_tool_is_its_warning() -> None:
+    """The one entry point a call site uses, answering for an optional tool."""
+    result = missing_tool_consequence("ocr", "tesseract")
+
+    assert result["code"] == "tesseract_not_found"
+    assert EXTERNAL_TOOLS["tesseract"].absence_cost in result["message"]
+
+
+def test_the_consequence_of_an_absent_required_tool_is_a_fatal_error() -> None:
+    """ADR-0002 / R-34: a required capability's absence never returns a warning.
+
+    It raises under the missing-tool code, naming the tool and stating what its
+    absence costs, so a run that cannot produce a **bundle** stops at the tool
+    rather than at the render that finds nothing to write.
+    """
+    with pytest.raises(DistillError) as failure:
+        missing_tool_consequence("frames", "ffmpeg")
+
+    assert failure.value.code == "E_MISSING_TOOL"
+    assert failure.value.stage == "frames"
+    assert "ffmpeg" in failure.value.message
+    assert EXTERNAL_TOOLS["ffmpeg"].absence_cost in failure.value.message
+    assert failure.value.details["requirement"] == "required"
+
+
+def test_the_fatal_error_carries_the_invocation_that_failed() -> None:
+    """The failing invocation's payload survives, so the run stays traceable."""
+    cause = DistillError(
+        "E_MISSING_TOOL",
+        "frames",
+        "required tool is not installed: ffmpeg",
+        {"argv": ["ffmpeg", "-y"], "tool": "ffmpeg"},
+    )
+
+    error = missing_tool_error("frames", "ffmpeg", cause=cause)
+
+    assert error.details["argv"] == ["ffmpeg", "-y"]
+    assert error.details["tool"] == "ffmpeg"
+
+
+def test_an_optional_tool_absence_is_not_allowed_to_end_a_run() -> None:
+    """ADR-0002 cuts both ways: an optional capability must not raise."""
+    with pytest.raises(ValueError, match="optional capability"):
+        missing_tool_error("ocr", "tesseract")
+
+
+def readme_dependency_rows() -> dict[str, tuple[str, str]]:
+    """Tool -> (capability, class), read off the README's four-column table."""
+    rows: dict[str, tuple[str, str]] = {}
+    for line in README.read_text(encoding="utf-8").splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) != 4 or not cells[0].startswith("`"):
+            continue
+        rows[cells[0].strip("`")] = (cells[1], cells[2])
+    return rows
+
+
+def test_the_readme_states_the_class_the_table_records() -> None:
+    """D-022: the docstring's claim about the README is backed by this test.
+
+    Nothing renders the README's system-dependency table from `EXTERNAL_TOOLS` -
+    it is prose, written by hand - so the only thing keeping the promise it
+    makes about degradation aligned with the code is this assertion. A tool
+    reclassified here without the README changing with it fails the suite.
+    """
+    rows = readme_dependency_rows()
+
+    for name, tool in EXTERNAL_TOOLS.items():
+        assert name in rows, f"{name} is classified but the README does not list it"
+        capability, requirement = rows[name]
+        assert capability == tool.capability, name
+        assert requirement == str(tool.requirement), name

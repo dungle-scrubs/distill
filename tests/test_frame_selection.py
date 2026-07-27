@@ -9,8 +9,15 @@ from typing import Any
 import pytest
 
 from distill import frame_selection
+from distill.capabilities import EXTERNAL_TOOLS
+from distill.errors import DistillError
 from distill.frame_selection import filtered_candidates, hamming_distance, select_keyframes
 from distill.progress import ProgressReporter
+from distill.run_command import (
+    OUTPUT_CAP_BYTES,
+    TRUNCATION_WARNING_CODE,
+    CommandTimeouts,
+)
 
 
 def test_filtered_candidates_respects_interval_and_static_floor() -> None:
@@ -80,38 +87,51 @@ sys.exit(1)
 """
 
 
-def test_extract_frame_degrades_when_ffmpeg_missing(
+def test_absent_ffmpeg_ends_the_run_because_the_table_says_it_is_required(
     fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
     tmp_path: Path,
 ) -> None:
-    """ADR-0002: a keyframe that cannot be grabbed is a **warning**, not a raise.
+    """ADR-0002 / R-34: a missing **required capability** is a **fatal error**.
 
     Nothing is installed into the fake PATH, so ffmpeg is genuinely absent and
-    the degradation is driven by run_command's real E_MISSING_TOOL.
+    run_command's real E_MISSING_TOOL is what reaches the call site. The call
+    site does not decide what that costs - it hands the tool to the capability
+    table, which classifies ffmpeg required, so the run ends here naming the
+    tool rather than degrading and dying later at render under E_NO_CONTENT.
     """
-    result = frame_selection.extract_frame(Path("demo.mp4"), 1.0, tmp_path / "frame.png")
+    with pytest.raises(DistillError) as failure:
+        frame_selection.extract_frame(Path("demo.mp4"), 1.0, tmp_path / "frame.png")
 
-    assert result == {
-        "stage": "frames",
-        "code": "ffmpeg_missing",
-        "message": "ffmpeg is not installed; skipping keyframe extraction",
-    }
+    assert failure.value.code == "E_MISSING_TOOL"
+    assert failure.value.stage == "frames"
+    assert failure.value.message.startswith("ffmpeg is not installed or not on PATH; ")
+    assert EXTERNAL_TOOLS["ffmpeg"].absence_cost in failure.value.message
+    assert failure.value.details["requirement"] == "required"
 
 
 def test_extract_frame_degrades_when_ffmpeg_fails(
     fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
-    """A non-zero exit reduces the bundle by one keyframe and continues."""
+    """A non-zero exit reduces the bundle by one keyframe and continues.
+
+    ffmpeg being *required* is about ffmpeg being installed. An installed
+    ffmpeg that could not decode one frame costs that keyframe, not the run.
+    """
     fake_tool("ffmpeg", FAKE_FFMPEG_FAILS)
 
-    result = frame_selection.extract_frame(Path("demo.mp4"), 1.5, tmp_path / "frame.png")
+    extracted, warnings = frame_selection.extract_frame(
+        Path("demo.mp4"), 1.5, tmp_path / "frame.png"
+    )
 
-    assert result == {
-        "stage": "frames",
-        "code": "frame_extract_failed",
-        "message": "could not extract frame at 1.500s",
-    }
+    assert extracted is False
+    assert warnings == [
+        {
+            "stage": "frames",
+            "code": "frame_extract_failed",
+            "message": "could not extract frame at 1.500s",
+        }
+    ]
 
 
 def test_extract_frame_emits_a_boundary_event(
@@ -123,7 +143,10 @@ def test_extract_frame_emits_a_boundary_event(
     fake_tool("ffmpeg", FAKE_FFMPEG_WRITES_FRAME)
 
     with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
-        assert frame_selection.extract_frame(Path("demo.mp4"), 1.0, tmp_path / "f.png") is None
+        assert frame_selection.extract_frame(Path("demo.mp4"), 1.0, tmp_path / "f.png") == (
+            True,
+            [],
+        )
 
     events = [json.loads(record.message) for record in caplog.records]
     assert [(event["detail"]["tool"], event["detail"]["stage"]) for event in events] == [
@@ -141,9 +164,11 @@ def test_frame_selection_reports_scene_and_candidate_progress(
         lambda _path, _duration: [0.0, 5.0],
     )
 
-    def fake_extract_frame(_video: Path, _timestamp: float, output: Path) -> None:
+    def fake_extract_frame(
+        _video: Path, _timestamp: float, output: Path
+    ) -> tuple[bool, list[dict[str, str]]]:
         output.write_bytes(b"png")
-        return None
+        return True, []
 
     monkeypatch.setattr(frame_selection, "extract_frame", fake_extract_frame)
     monkeypatch.setattr(frame_selection, "phash", lambda _path: "0f")
@@ -169,3 +194,75 @@ def test_frame_selection_reports_scene_and_candidate_progress(
         event.mechanism == "frame_extraction" and event.percent == 100.0
         for event in progress.events
     )
+
+
+# A fake ffmpeg that produces the frame and floods stderr past the capture cap
+# while it does. ffmpeg is genuinely chatty on stderr, so this is the shape of a
+# real invocation that both succeeds and loses part of its own record.
+FAKE_FFMPEG_FLOODS_STDERR = f"""
+import pathlib, sys
+
+pathlib.Path(sys.argv[-1]).write_bytes(b"png")
+sys.stderr.write("x" * ({OUTPUT_CAP_BYTES} + 1024))
+"""
+
+
+def test_a_truncated_frame_grab_still_yields_its_keyframe(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """R-33: the invocation's own **warning** reaches the caller, and only that.
+
+    Truncation is not failure. A caller reading one warning per grab would
+    either drop the keyframe it did produce or drop the warning; both answers
+    have to survive, which is why `extract_frame` returns them separately.
+    """
+    fake_tool("ffmpeg", FAKE_FFMPEG_FLOODS_STDERR)
+    monkeypatch.setattr(frame_selection, "scene_midpoint_candidates", lambda _p, _d: [0.0])
+    monkeypatch.setattr(frame_selection, "phash", lambda _path: "0f")
+
+    frames, warnings = select_keyframes(
+        Path("demo.mp4"),
+        tmp_path,
+        duration_sec=1.0,
+        max_keyframes=1,
+        min_interval_sec=1.0,
+        max_static_window_sec=90.0,
+    )
+
+    assert len(frames) == 1
+    assert [item["code"] for item in warnings] == [TRUNCATION_WARNING_CODE]
+
+
+# A fake ffmpeg that is installed and then hangs: the tool is present, so this
+# is not a capability question at all.
+FAKE_FFMPEG_HANGS = """
+import time
+
+time.sleep(600)
+"""
+
+
+def test_a_wedged_but_installed_ffmpeg_still_only_costs_its_keyframe(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The other half of the split: required is about installed, not about healthy.
+
+    ffmpeg is classified a **required capability**, and it is here - it just
+    cannot decode this frame in time. That reduces the **bundle** by one
+    keyframe, exactly as it did before the classification was enforced.
+    """
+    fake_tool("ffmpeg", FAKE_FFMPEG_HANGS)
+    monkeypatch.setattr(
+        frame_selection, "FRAME_EXTRACT_TIMEOUTS", CommandTimeouts(total_sec=0.3, idle_sec=0.3)
+    )
+
+    extracted, warnings = frame_selection.extract_frame(
+        Path("demo.mp4"), 1.0, tmp_path / "frame.png"
+    )
+
+    assert extracted is False
+    assert [item["code"] for item in warnings] == ["frame_extract_timeout"]

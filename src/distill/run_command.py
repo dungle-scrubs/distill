@@ -10,9 +10,11 @@ group, and the one table that maps a subprocess failure onto Distill's
 
 It does not own which tool to run, what a tool's output means, whether a
 failure is a **degradation** or a **fatal error**, or the retry policy around
-one. Callers decide those: a caller that treats its tool as an **optional
-capability** catches the error and records a **warning** (ADR-0002), and a
-caller that needs the tool lets the error end the run.
+one. For an absent tool that answer is stated once, in `capabilities.py`: a call
+site that catches `E_MISSING_TOOL` hands the tool to that table, which returns a
+**warning** for an **optional capability** and raises for a **required** one
+(ADR-0002). For every other failure the call site decides, and does so knowing
+its tool is installed.
 
 Two entry points, one core:
 
@@ -153,6 +155,23 @@ class CommandTimeouts:
         _validate_timeout("idle_sec", self.idle_sec)
 
 
+def silent_tool_timeouts(total_sec: float) -> CommandTimeouts:
+    """The pair for a tool that produces no output at all until it is finished.
+
+    An idle timeout detects a stall by watching output stop. A tool that never
+    speaks while it works - `tesseract`, `ffprobe -v error` - never resets the
+    idle clock, so a shorter idle value detects nothing: it silently *becomes*
+    the deadline and quietly replaces the total the call site declared. Such a
+    call site therefore states one number, and this constructor is what puts it
+    in both places, so the limit that governs is the limit written down.
+
+    The pair is still structurally complete under R-30 - both limits are set,
+    and neither means "no limit". What is removed is the ability to tighten one
+    of them in isolation for a tool where doing so cannot help.
+    """
+    return CommandTimeouts(total_sec=total_sec, idle_sec=total_sec)
+
+
 @dataclass(frozen=True)
 class CommandResult:
     """What one invocation produced, including how it was reduced.
@@ -264,8 +283,13 @@ def run_json(
     total_timeout_sec: float,
     idle_timeout_sec: float = DEFAULT_IDLE_TIMEOUT_SEC,
     **options: Any,
-) -> Any:
-    """Run `argv` and parse its stdout as JSON, mapping a bad document as a failure.
+) -> tuple[Any, tuple[dict[str, str], ...]]:
+    """Run `argv`, parse its stdout as JSON, and return it with any **warnings**.
+
+    The warnings are `CommandResult.warnings` - truncated capture (R-33). They
+    are returned rather than dropped because a caller of `run_json` has no other
+    way to reach them, and a truncated document that still parsed is exactly the
+    silent loss R-33 exists to prevent.
 
     A caller's `error_code` covers the whole invocation, this failure included:
     one tool reports under one code, so a caller passing `E_YTDLP` does not get
@@ -279,7 +303,7 @@ def run_json(
         **options,
     )
     try:
-        return json.loads(result.stdout)
+        return json.loads(result.stdout), result.warnings
     except json.JSONDecodeError as exc:
         raise _failure(
             FailureKind.BAD_JSON,

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,7 @@ from distill import pipeline as distill_session
 from distill.local_vision import LocalVisionProbe, LocalVisionResult
 from distill.options import DistillOptions
 from distill.progress import ProgressCounter, ProgressReporter
+from distill.run_command import OUTPUT_CAP_BYTES, TRUNCATION_WARNING_CODE
 from distill.source import probe_duration
 
 
@@ -109,7 +113,7 @@ def test_short_local_screencast_fixture_produces_transcript_and_frames(
     assert "![Frame 1](frames/" in markdown
     # The transcriber must receive the probed media duration, not None and not 0:
     # extract_audio only asks ffmpeg for "-progress pipe:2" when it has one.
-    probed_duration = probe_duration(video)
+    probed_duration, _ = probe_duration(video)
     assert probed_duration > 0
     assert len(RECORDED_DURATIONS) == 1
     assert RECORDED_DURATIONS[0] == probed_duration
@@ -430,3 +434,65 @@ def test_partial_resume_reuses_completed_transcript(
 
     assert response["cached"] is False
     assert Path(response["transcript_path"]).exists()
+
+
+# A fake tesseract that answers and floods stderr past run_command's capture cap
+# while it does. Real tesseract writes leptonica diagnostics there, and a frame
+# that produces megabytes of them is exactly what the cap exists for: the
+# reading still arrives, and what was dropped has to be said out loud (R-33).
+FAKE_TESSERACT_FLOODS_STDERR = f"""
+import sys
+
+sys.stdout.write("SLIDE TEXT\\n")
+sys.stderr.write("x" * ({OUTPUT_CAP_BYTES} + 1024))
+"""
+
+
+def test_a_truncated_ocr_invocation_records_its_warning_in_the_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """R-33: truncation is a **warning**, not a silent loss - all the way out.
+
+    The warning is created inside `run_command`, several hand-offs from the
+    manifest: `ocr_frame` -> `ocr_frames` -> the OCR stage -> the run's
+    warnings -> the published **bundle**. Asserting it at the bundle is what
+    proves the migrated OCR call site carries `CommandResult.warnings` rather
+    than reading `stdout` and dropping the rest.
+    """
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    RECORDED_DURATIONS.clear()
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    tesseract = fake_bin / "tesseract"
+    tesseract.write_text(f"#!{sys.executable}\n{FAKE_TESSERACT_FLOODS_STDERR}")
+    tesseract.chmod(0o755)
+    # Prepended rather than replacing PATH: the run still needs the machine's
+    # real ffmpeg to produce the keyframe this OCRs.
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    response = distill_session.process_local_video(
+        {
+            "path": str(video),
+            "output_dir": str(tmp_path / "cache"),
+            "ocr": True,
+            "redact_secrets": False,
+            "caption_frames": False,
+            "max_keyframes": 1,
+            "max_static_window_sec": 1,
+        }
+    )
+
+    truncations = [
+        item for item in response["warnings"] if item["code"] == TRUNCATION_WARNING_CODE
+    ]
+    assert truncations, response["warnings"]
+    assert truncations[0]["stage"] == "ocr"
+    assert "stderr" in truncations[0]["message"]
+    manifest = json.loads(Path(response["manifest_path"]).read_text())
+    assert truncations[0] in manifest["warnings"]
+    # The reading itself still arrived: truncation reduced the record of the
+    # invocation, not its result.
+    assert response["frames"][0]["ocr_text"] == "SLIDE TEXT"
