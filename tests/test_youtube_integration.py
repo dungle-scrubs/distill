@@ -13,7 +13,14 @@ from distill import pipeline as distill_session
 from distill import source as distill_source
 from distill.local_vision import LocalVisionProbe
 from distill.progress import ProgressReporter
-from distill.source import SourceInfo, YouTubeMetadata, source_hash, youtube_lock_key
+from distill.source import (
+    AcquiredSource,
+    AcquisitionLease,
+    SourceInfo,
+    YouTubeMetadata,
+    source_hash,
+    youtube_lock_key,
+)
 
 
 def test_mocked_youtube_integration_passes_through_shared_pipeline(
@@ -138,21 +145,24 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     video_id = "mock-video"
 
     class FakeDownloader:
-        last_warnings: list[dict[str, str]] = []
+        def __init__(self, output_root: Path) -> None:
+            self.lock_path = output_root / "_youtube_locks" / "mock-video.lock"
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            self.lock_path.write_text("{}")
 
-        def __init__(self, _output_root: Path) -> None:
-            pass
-
-        def download(
+        def acquire(
             self,
             _url: str,
-            _lock_key: str,
+            lock_key: str,
             progress: ProgressReporter | None = None,
-        ) -> Path:
+        ) -> AcquiredSource:
             if progress:
                 progress.update("youtube_download", percent=55.0)
                 progress.complete("youtube_download", detail={"path": str(video)})
-            return video
+            return AcquiredSource(
+                path=video,
+                lease=AcquisitionLease(lock_key=lock_key, lock_path=self.lock_path),
+            )
 
     def fake_probe(_config: object) -> LocalVisionProbe:
         return LocalVisionProbe(
@@ -180,7 +190,18 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     monkeypatch.setattr(distill_source, "check_disk_floor", lambda _path: None)
     monkeypatch.setattr(distill_source, "probe_duration", lambda _path: 1.0)
     monkeypatch.setattr(distill_session, "probe_local_vision", fake_probe)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    # R-36: transcription is the pipeline reading the acquired media, so the
+    # lease must still be held while it runs. Observing it here rather than
+    # after the run is what distinguishes "held for the read lifetime" from
+    # "released at some point".
+    lock_path = tmp_path / "cache" / "_youtube_locks" / "mock-video.lock"
+    held_during_read: list[bool] = []
+
+    def transcribe_under_the_lease(*args: Any, **kwargs: Any) -> Any:
+        held_during_read.append(lock_path.exists())
+        return fake_transcribe(*args, **kwargs)
+
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", transcribe_under_the_lease)
 
     response = distill_session.process_youtube_video(
         {
@@ -197,6 +218,9 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
 
     assert response["cached"] is False
     assert Path(response["manifest_path"]).exists()
+    assert held_during_read == [True]
+    # ... and released once the run has no further use for the media.
+    assert not lock_path.exists()
     assert any(
         warning["code"] == "local_vision_rapid_mlx_unavailable" for warning in response["warnings"]
     )

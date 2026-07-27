@@ -1,29 +1,55 @@
 """Source acquisition and fingerprinting for Distill.
 
 This module owns local path resolution, duration probing, safe output root
-validation, YouTube id lookup/download, disk checks, and source fingerprints.
-It does not write final bundle artifacts.
+validation, YouTube id lookup, the acquisition of a remote **source**, disk
+checks, and **source fingerprints**.
+
+Acquiring a remote source is staging, validation and promotion, in that order
+(R-35). The download lands in a staging directory unique to the run; the media
+file it produced is selected deterministically (R-37) and validated as the
+expected media; only then is it promoted onto the immutable path with a single
+`os.replace`. Nothing writes into the promoted path, and nothing clears it: the
+previously promoted media stays readable until a proven replacement takes its
+place atomically, so a download that dies mid-transfer costs a retry rather than
+the only good copy.
+
+The **acquisition lease** is held for the media file's whole read lifetime, not
+only for the download (R-36). Two runs of one video under different options
+share a **lock key** and not a **bundle key**, so a lease that ended with the
+download would leave the second run free to write over media the first is still
+reading. `acquire` therefore hands the lease back to its caller inside an
+`AcquiredSource`, and the caller releases it when it is finished reading - see
+`pipeline.process_resolved_source`.
+
+It does not write final bundle artifacts, own bundle-level locking (that is
+keyed by **bundle key** and belongs to the bundle store; the lease here is keyed
+by **lock key** and answers only "is another run fetching this source?"), decide
+what a **generation** contains, or install anything.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from .errors import DistillError, warning
 from .options import DistillOptions
 from .progress import ProgressReporter
 from .run_command import CommandResult, CommandTimeouts, run, run_json, stream
+
+LOGGER = logging.getLogger(__name__)
 
 CONTENT_HASH_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 FINGERPRINT_SAMPLE_BYTES = 64 * 1024
@@ -43,6 +69,22 @@ YTDLP_METADATA_TIMEOUTS = CommandTimeouts(total_sec=120.0, idle_sec=60.0)
 # progress forever without finishing.
 YTDLP_DOWNLOAD_TIMEOUTS = CommandTimeouts(total_sec=6 * 60 * 60.0, idle_sec=120.0)
 YTDLP_SOCKET_TIMEOUT_SEC = 30
+# Where a run assembles a download, and where a proven one is promoted to. They
+# are siblings under one output root so promotion is a rename on one filesystem
+# rather than a copy across two, and so the promoted directory holds nothing but
+# promoted media.
+STAGING_DIR_NAME = "_youtube_staging"
+MEDIA_DIR_NAME = "_youtube_sources"
+LOCK_DIR_NAME = "_youtube_locks"
+# The stem yt-dlp is told to write, and so the only stem a completed download
+# has. A format fragment is `source.f140.m4a`, whose stem is `source.f140`, and
+# an in-flight file is `source.mp4.part`, whose stem is `source.mp4`: matching
+# the stem exactly is what separates the merged container from both (R-37).
+PROMOTED_MEDIA_STEM = "source"
+# Preference order when a staging directory somehow holds more than one complete
+# container. Order is fixed rather than alphabetical so the choice is a stated
+# preference; anything unlisted sorts after everything listed, by suffix.
+MEDIA_CONTAINER_PREFERENCE = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
 SENSITIVE_COMPONENTS = {
     ".ssh",
     ".gnupg",
@@ -71,6 +113,75 @@ BYTE_UNITS = {
 }
 
 
+ACQUISITION_EVENT_TYPE = "distill.source"
+
+
+def _acquisition_log(event: str, **detail: Any) -> None:
+    """Emit one acquisition event: lease taken or released, verdict, promotion.
+
+    Metadata only, in the shape `run_command` uses for its boundary event, so
+    one log stream answers both "which tool ran" and "what did acquisition do
+    with what it produced". Paths are Distill's own; no **extracted text** is
+    recorded here, because none of it has passed a **redaction sink**.
+    """
+    LOGGER.debug(
+        json.dumps(
+            {
+                "type": ACQUISITION_EVENT_TYPE,
+                "event": event,
+                "detail": {"pid": os.getpid(), **detail},
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@dataclass
+class AcquisitionLease:
+    """The exclusive right to acquire and read one **source**'s media.
+
+    Keyed by **lock key**, so it identifies the source and not the combination
+    of source and options: two runs with different options contend for the same
+    lease, which is exactly what stops the second from replacing media the first
+    is still reading (R-36).
+
+    Held until `release`, which the reader calls when it is finished with the
+    media - not when the download ends. `release` is idempotent, because the
+    failure paths that release a lease early overlap with the caller's own
+    cleanup.
+    """
+
+    lock_key: str
+    lock_path: Path
+    warnings: list[dict[str, str]] = field(default_factory=list)
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self.lock_path.unlink(missing_ok=True)
+        _acquisition_log(
+            "lease_released",
+            lock_key=self.lock_key,
+            lock_path=str(self.lock_path),
+        )
+
+
+@dataclass(frozen=True)
+class AcquiredSource:
+    """A promoted media file and the lease that keeps it readable.
+
+    The lease travels with the path because the two have the same lifetime: a
+    caller holding this holds the right to read `path`, and the moment it
+    releases the lease another run may promote a replacement.
+    """
+
+    path: Path
+    lease: AcquisitionLease
+    warnings: list[dict[str, str]] = field(default_factory=list)
+
+
 @dataclass(frozen=True)
 class SourceInfo:
     source_type: str
@@ -82,6 +193,21 @@ class SourceInfo:
     youtube_video_id: str | None = None
     youtube_lock_key: str | None = None
     related_links: list[dict[str, str]] | None = None
+    # Present only for a source this run acquired. A cache hit reads no media
+    # and holds no lease; a local source has nothing to lease.
+    acquisition_lease: AcquisitionLease | None = None
+
+
+def release_acquisition_lease(source: Any) -> None:
+    """Release the lease a source carries, if it carries one.
+
+    Takes anything with the attribute rather than a `SourceInfo`, because the
+    reader that calls this handles local sources, cache hits and test doubles
+    through the same path, and none of those hold a lease.
+    """
+    lease = getattr(source, "acquisition_lease", None)
+    if isinstance(lease, AcquisitionLease):
+        lease.release()
 
 
 @dataclass(frozen=True)
@@ -107,14 +233,12 @@ class YouTubeMetadata:
 
 
 class YouTubeDownloaderProtocol(Protocol):
-    last_warnings: list[dict[str, str]]
-
-    def download(
+    def acquire(
         self,
         url: str,
         lock_key: str,
         progress: ProgressReporter | None = None,
-    ) -> Path: ...
+    ) -> AcquiredSource: ...
 
 
 def probe_duration(path: Path) -> float:
@@ -562,6 +686,166 @@ def parse_ytdlp_progress(line: str) -> dict[str, float | int] | None:
     return result or {"indeterminate": 1}
 
 
+def _container_rank(path: Path) -> tuple[int, str]:
+    suffix = path.suffix.lower()
+    if suffix in MEDIA_CONTAINER_PREFERENCE:
+        return (MEDIA_CONTAINER_PREFERENCE.index(suffix), suffix)
+    return (len(MEDIA_CONTAINER_PREFERENCE), suffix)
+
+
+def select_downloaded_media(staging_dir: Path) -> Path:
+    """Pick the completed container a download produced, deterministically (R-37).
+
+    An interrupted merge leaves the per-format fragments (`source.f140.m4a`,
+    `source.f299.mp4`) and an in-flight `source.mp4.part` beside the container
+    yt-dlp was asked for. Taking the first entry of a glob picks whichever of
+    those sorts first, which is how a run ends up transcribing an audio fragment
+    of a previous download - finding 16.
+
+    The rule instead: a completed container is a regular file whose stem is
+    exactly `source`, which every fragment and part-file fails by construction.
+    Among those, the fixed container preference decides, and the suffix breaks
+    any remaining tie, so the same staging directory always yields the same
+    choice. Selecting is not trusting: the winner is still validated before it
+    is promoted.
+    """
+    entries = sorted(staging_dir.iterdir()) if staging_dir.is_dir() else []
+    candidates = [
+        entry
+        for entry in entries
+        if entry.is_file() and not entry.is_symlink() and entry.stem == PROMOTED_MEDIA_STEM
+    ]
+    if not candidates:
+        raise DistillError(
+            "E_YTDLP",
+            "youtube",
+            "yt-dlp did not produce a source file",
+            {"staging_dir": str(staging_dir), "produced": [entry.name for entry in entries]},
+        )
+    return min(candidates, key=_container_rank)
+
+
+def _reject_media(path: Path, reason: str, message: str, **detail: Any) -> DistillError:
+    """Record a rejection verdict and build the error that carries it."""
+    _acquisition_log(
+        "media_validated", path=str(path), verdict="rejected", reason=reason, **detail
+    )
+    return DistillError("E_BAD_MEDIA", "youtube", message, {"path": str(path), **detail})
+
+
+def _probed_codec_types(probe: Any) -> list[str]:
+    streams = probe.get("streams") if isinstance(probe, dict) else None
+    if not isinstance(streams, list):
+        return []
+    return [
+        str(entry.get("codec_type"))
+        for entry in streams
+        if isinstance(entry, dict) and entry.get("codec_type")
+    ]
+
+
+def _probed_duration_sec(probe: Any) -> float:
+    container = probe.get("format") if isinstance(probe, dict) else None
+    value = container.get("duration") if isinstance(container, dict) else None
+    if not isinstance(value, (str, int, float)):
+        return 0.0
+    try:
+        return float(value)
+    except ValueError:
+        return 0.0
+
+
+def validate_media_file(path: Path) -> None:
+    """Confirm a staged file is the media Distill asked for, before promoting it.
+
+    A **fatal error**, not a **degradation** (ADR-0002): the media file is the
+    input every later stage reads, so a file that is not playable video leaves
+    no reduced-but-useful **bundle** to produce - there is no **transcript** and
+    no **keyframe** without it. That makes usable media a **required
+    capability** of the run rather than an optional one, and R-34 admits no
+    third answer. Nothing here degrades; it promotes or it raises.
+
+    Three questions, all answered by one ffprobe: does the file have content,
+    does it carry a video stream, and does it have a playable duration. An
+    audio-only format fragment fails the second and a truncated container fails
+    the third, so neither can be promoted over media that answered all three.
+    This is a separate probe from `probe_duration`, which reads the *promoted*
+    path: the point of asking here is to ask before promotion.
+    """
+    size = path.stat().st_size if path.is_file() else 0
+    if size == 0:
+        raise _reject_media(path, "empty_file", "downloaded source file is empty")
+    try:
+        probe = run_json(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type:format=duration",
+                "-of",
+                "json",
+                str(path),
+            ],
+            stage="youtube",
+            total_timeout_sec=FFPROBE_TIMEOUTS.total_sec,
+            idle_timeout_sec=FFPROBE_TIMEOUTS.idle_sec,
+        )
+    except DistillError:
+        # ffprobe could not read it at all, which is its own answer. The error it
+        # raised already names the tool and the failure, so it travels as-is.
+        _acquisition_log(
+            "media_validated", path=str(path), verdict="rejected", reason="unreadable"
+        )
+        raise
+    codec_types = _probed_codec_types(probe)
+    if "video" not in codec_types:
+        raise _reject_media(
+            path,
+            "no_video_stream",
+            "downloaded source file carries no video stream",
+            codec_types=codec_types,
+        )
+    duration_sec = _probed_duration_sec(probe)
+    if duration_sec <= 0:
+        raise _reject_media(
+            path,
+            "no_duration",
+            "downloaded source file reports no playable duration",
+            duration_sec=duration_sec,
+        )
+    _acquisition_log(
+        "media_validated",
+        path=str(path),
+        verdict="accepted",
+        size_bytes=size,
+        codec_types=codec_types,
+        duration_sec=duration_sec,
+    )
+
+
+def promote_media(produced: Path, media_dir: Path) -> Path:
+    """Move a validated file onto its immutable path in one indivisible step.
+
+    `os.replace` on one filesystem is the whole promotion: a reader either sees
+    the previous media or this one, never a half-written file, and the previous
+    media is not removed before its replacement exists. Copying, truncating or
+    clearing the directory first would each reintroduce the window RV-3
+    describes, in which the only good copy is already gone when the replacement
+    turns out not to arrive.
+    """
+    media_dir.mkdir(parents=True, exist_ok=True)
+    promoted = media_dir / produced.name
+    os.replace(produced, promoted)
+    _acquisition_log(
+        "media_promoted",
+        source=str(produced),
+        path=str(promoted),
+        size_bytes=promoted.stat().st_size,
+    )
+    return promoted
+
+
 class YoutubeDownloader:
     def __init__(
         self,
@@ -576,84 +860,145 @@ class YoutubeDownloader:
         self.lock_wait_sec = lock_wait_sec
         self.lock_poll_sec = lock_poll_sec
         self.lock_warn_after_sec = lock_warn_after_sec
-        self.last_warnings: list[dict[str, str]] = []
 
-    def download(
+    def acquire(
         self,
         url: str,
         lock_key: str,
         progress: ProgressReporter | None = None,
-    ) -> Path:
-        locks = self.output_root / "_youtube_locks"
+    ) -> AcquiredSource:
+        """Stage a download, validate what it produced, and promote it (R-35).
+
+        The lease is returned rather than released: the caller reads the media
+        under it and releases it when finished (R-36). Every path out of here
+        that does not return an `AcquiredSource` releases the lease itself, so
+        a failure never strands one.
+        """
+        lease = self._take_lease(lock_key, progress)
+        try:
+            staging_dir = self._new_staging_dir(lock_key)
+            try:
+                result = self._download(url, staging_dir, progress)
+                produced = select_downloaded_media(staging_dir)
+                validate_media_file(produced)
+                promoted = promote_media(produced, self._media_dir(lock_key))
+            finally:
+                # The staging directory is scratch: whatever survived the run -
+                # a rejected file, an unmerged fragment, a `.part` - is
+                # discarded with it. Nothing under the promoted path is touched.
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            if progress:
+                progress.complete("youtube_download", detail={"path": str(promoted)})
+        except BaseException:
+            lease.release()
+            raise
+        return AcquiredSource(
+            path=promoted,
+            lease=lease,
+            warnings=[*lease.warnings, *result.warnings],
+        )
+
+    def _media_dir(self, lock_key: str) -> Path:
+        return self.output_root / MEDIA_DIR_NAME / lock_key
+
+    def _new_staging_dir(self, lock_key: str) -> Path:
+        """A staging directory no other run can be writing into.
+
+        Named by pid and a random token, so two runs of one source - which the
+        lease already serializes - and two runs of different sources alike get
+        directories that cannot collide. Created under the lease, which is also
+        what makes discarding any staging directory left by an earlier run of
+        this source safe: no live run can own one.
+        """
+        parent = self.output_root / STAGING_DIR_NAME / lock_key
+        parent.mkdir(parents=True, exist_ok=True)
+        for stale in parent.iterdir():
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)
+        staging_dir = parent / f"{os.getpid()}-{uuid.uuid4().hex}"
+        staging_dir.mkdir()
+        return staging_dir
+
+    def _take_lease(
+        self,
+        lock_key: str,
+        progress: ProgressReporter | None,
+    ) -> AcquisitionLease:
+        locks = self.output_root / LOCK_DIR_NAME
         locks.mkdir(parents=True, exist_ok=True)
         lock = locks / f"{lock_key}.lock"
-        video_dir = self.output_root / "_youtube_sources" / lock_key
-        video_dir.mkdir(parents=True, exist_ok=True)
         if progress:
             progress.update("youtube_download", status="running", detail={"step": "lock"})
         acquired, lock_warnings = self._acquire(lock)
-        self.last_warnings = lock_warnings
         if not acquired:
-            raise DistillError("E_LOCKED", "youtube", "YouTube source is locked by another process")
-        try:
-            out_template = str(video_dir / "source.%(ext)s")
-            command = [
-                "yt-dlp",
-                "-f",
-                "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best/bv*+ba/b",
-                "--newline",
-                # The idle timeout is what bounds this download (R-30), and its
-                # heartbeat is yt-dlp's progress output. `--progress` keeps that
-                # output coming even under a user config that set `--quiet`,
-                # which would otherwise starve the idle clock and have a healthy
-                # download killed for saying nothing.
-                "--progress",
-                "--socket-timeout",
-                str(YTDLP_SOCKET_TIMEOUT_SEC),
-                "--retries",
-                "3",
-                "--fragment-retries",
-                "3",
-                "--concurrent-fragments",
-                "8",
-                "--merge-output-format",
-                "mp4",
-                "-o",
-                out_template,
-                "--",
-                url,
-            ]
-
-            def report(line: str) -> None:
-                parsed = parse_ytdlp_progress(line)
-                if not parsed or progress is None:
-                    return
-                progress.update(
-                    "youtube_download",
-                    percent=(float(parsed["percent"]) if "percent" in parsed else None),
-                    detail=parsed,
-                )
-
-            # R-32: yt-dlp writes `--newline` download progress to stdout. It is
-            # the only stream parsed here; stderr carries its diagnostics, which
-            # run_command captures for the failure payload.
-            result = stream(
-                command,
-                stage="youtube",
-                total_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.total_sec,
-                idle_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.idle_sec,
-                on_stdout_line=report,
-                error_code="E_YTDLP",
+            _acquisition_log(
+                "lease_denied", lock_key=lock_key, lock_path=str(lock), reason="held"
             )
-            self.last_warnings = [*lock_warnings, *result.warnings]
-            candidates = sorted(video_dir.glob("source.*"))
-            if not candidates:
-                raise DistillError("E_YTDLP", "youtube", "yt-dlp did not produce a source file")
-            if progress:
-                progress.complete("youtube_download", detail={"path": str(candidates[0])})
-            return candidates[0]
-        finally:
-            lock.unlink(missing_ok=True)
+            raise DistillError("E_LOCKED", "youtube", "YouTube source is locked by another process")
+        _acquisition_log("lease_acquired", lock_key=lock_key, lock_path=str(lock))
+        return AcquisitionLease(lock_key=lock_key, lock_path=lock, warnings=lock_warnings)
+
+    def _download(
+        self,
+        url: str,
+        staging_dir: Path,
+        progress: ProgressReporter | None,
+    ) -> CommandResult:
+        """Run yt-dlp with its output template pointed at the staging directory.
+
+        The template names the staging directory and never the promoted path, so
+        yt-dlp's habit of opening its destination before the transfer succeeds
+        cannot truncate media a previous run proved good (RV-3).
+        """
+        out_template = str(staging_dir / f"{PROMOTED_MEDIA_STEM}.%(ext)s")
+        command = [
+            "yt-dlp",
+            "-f",
+            "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best/bv*+ba/b",
+            "--newline",
+            # The idle timeout is what bounds this download (R-30), and its
+            # heartbeat is yt-dlp's progress output. `--progress` keeps that
+            # output coming even under a user config that set `--quiet`,
+            # which would otherwise starve the idle clock and have a healthy
+            # download killed for saying nothing.
+            "--progress",
+            "--socket-timeout",
+            str(YTDLP_SOCKET_TIMEOUT_SEC),
+            "--retries",
+            "3",
+            "--fragment-retries",
+            "3",
+            "--concurrent-fragments",
+            "8",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            out_template,
+            "--",
+            url,
+        ]
+
+        def report(line: str) -> None:
+            parsed = parse_ytdlp_progress(line)
+            if not parsed or progress is None:
+                return
+            progress.update(
+                "youtube_download",
+                percent=(float(parsed["percent"]) if "percent" in parsed else None),
+                detail=parsed,
+            )
+
+        # R-32: yt-dlp writes `--newline` download progress to stdout. It is
+        # the only stream parsed here; stderr carries its diagnostics, which
+        # run_command captures for the failure payload.
+        return stream(
+            command,
+            stage="youtube",
+            total_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.total_sec,
+            idle_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.idle_sec,
+            on_stdout_line=report,
+            error_code="E_YTDLP",
+        )
 
     def _acquire(self, lock: Path) -> tuple[bool, list[dict[str, str]]]:
         started = time.monotonic()
@@ -761,35 +1106,47 @@ class YouTubeSourceProvider:
         from .links import extract_relevant_links
 
         downloader = downloader or YoutubeDownloader(output_root)
-        downloaded = downloader.download(request.value, lock_key, progress)
-        warnings = [*metadata.warnings, *list(getattr(downloader, "last_warnings", []))]
-        if progress:
-            progress.update("duration_probe", status="running")
-        duration = probe_duration(downloaded)
-        if progress:
-            progress.complete("duration_probe", detail={"duration_sec": duration})
-        ensure_duration_allowed(duration, options.max_duration_sec)
-        if progress:
-            progress.update("youtube_download", status="running", detail={"step": "disk_postcheck"})
-        check_disk_floor(output_root)
-        if progress:
-            progress.complete(
-                "youtube_download",
-                detail={"path": str(downloaded.resolve()), "step": "complete"},
+        acquired = downloader.acquire(request.value, lock_key, progress)
+        # Everything from here reads the acquired media, so every failure has to
+        # release the lease rather than strand it until the staleness window
+        # expires. The success path deliberately does not: the caller reads the
+        # media next and releases the lease when it is finished (R-36).
+        try:
+            warnings = [*metadata.warnings, *acquired.warnings]
+            if progress:
+                progress.update("duration_probe", status="running")
+            duration = probe_duration(acquired.path)
+            if progress:
+                progress.complete("duration_probe", detail={"duration_sec": duration})
+            ensure_duration_allowed(duration, options.max_duration_sec)
+            if progress:
+                progress.update(
+                    "youtube_download", status="running", detail={"step": "disk_postcheck"}
+                )
+            check_disk_floor(output_root)
+            if progress:
+                progress.complete(
+                    "youtube_download",
+                    detail={"path": str(acquired.path.resolve()), "step": "complete"},
+                )
+            related_links = extract_relevant_links(
+                metadata.description,
+                source="youtube_description",
             )
+        except BaseException:
+            acquired.lease.release()
+            raise
         return SourceInfo(
             source_type="youtube",
-            resolved_path=downloaded.resolve(),
+            resolved_path=acquired.path.resolve(),
             duration_sec=duration,
             source_fingerprint=fingerprint,
             source_hash=source,
             warnings=warnings,
             youtube_video_id=video_id,
             youtube_lock_key=lock_key,
-            related_links=extract_relevant_links(
-                metadata.description,
-                source="youtube_description",
-            ),
+            related_links=related_links,
+            acquisition_lease=acquired.lease,
         )
 
 

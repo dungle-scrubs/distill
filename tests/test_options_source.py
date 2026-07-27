@@ -10,6 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from fake_tools import FAKE_FFPROBE, FAKE_YTDLP_DOWNLOAD, FAKE_YTDLP_FAILING
 
 from distill.errors import DistillError
 from distill.options import OPTION_DEFAULTS, DistillOptions
@@ -18,6 +19,8 @@ from distill.source import (
     CONTENT_HASH_LIMIT_BYTES,
     FINGERPRINT_INTERIOR_ANCHORS,
     FINGERPRINT_SAMPLE_BYTES,
+    AcquiredSource,
+    AcquisitionLease,
     YoutubeDownloader,
     YouTubeMetadata,
     _ytdlp_command,
@@ -317,23 +320,31 @@ def test_ytdlp_progress_handles_indeterminate_download_line() -> None:
     assert parse_ytdlp_progress("[info] unrelated") is None
 
 
-def test_youtube_source_info_emits_coarse_progress(
+def test_youtube_source_info_carries_the_lease_into_the_read(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """R-36: the resolved source hands its caller the lease, still held.
+
+    The old contract had acquisition return a bare `Path` with the lease already
+    released, after which the run probed and read the media unprotected. The
+    lease now travels with the media as far as the reader, so a resolved YouTube
+    source carries an unreleased lease and coarse progress alongside it.
+    """
     video = tmp_path / "source.mp4"
     video.write_bytes(b"video")
+    lock = tmp_path / "abc123.lock"
+    lock.write_text("{}")
+    lease = AcquisitionLease(lock_key="abc123", lock_path=lock)
     progress = ProgressReporter()
 
     class FakeDownloader:
-        last_warnings: list[dict[str, str]] = []
-
-        def download(
+        def acquire(
             self,
             url: str,
             lock_key: str,
             progress: ProgressReporter | None = None,
-        ) -> Path:
+        ) -> AcquiredSource:
             _ = (url, lock_key)
             if progress:
                 progress.update(
@@ -341,7 +352,7 @@ def test_youtube_source_info_emits_coarse_progress(
                     percent=50,
                     detail={"downloaded_bytes": 5, "total_bytes": 10},
                 )
-            return video
+            return AcquiredSource(path=video, lease=lease)
 
     monkeypatch.setattr("distill.source.check_disk_floor", lambda _path: None)
     monkeypatch.setattr(
@@ -380,6 +391,9 @@ def test_youtube_source_info_emits_coarse_progress(
         {"step": "disk_precheck"},
         {"step": "resolve_id"},
     ]
+    assert source.acquisition_lease is lease
+    assert lease.released is False
+    assert lock.exists()
     assert any(
         event.mechanism == "duration_probe" and event.status == "completed"
         for event in progress.events
@@ -442,41 +456,6 @@ def test_youtube_long_lock_wait_emits_warning(tmp_path: Path) -> None:
     assert warnings[0]["code"] == "long_lock_wait"
 
 
-# A fake yt-dlp writing realistic `--newline` download progress to **stdout**,
-# which is the stream yt-dlp actually uses (R-32). It produces the media file
-# the same way yt-dlp does, from the `-o` template, and never touches a network.
-FAKE_YTDLP_DOWNLOAD = """
-import pathlib, sys
-
-argv = sys.argv[1:]
-template = argv[argv.index("-o") + 1]
-media = pathlib.Path(template.replace("%(ext)s", "mp4"))
-media.parent.mkdir(parents=True, exist_ok=True)
-media.write_bytes(b"video")
-pathlib.Path(media.parent / "argv.json").write_text(repr(argv))
-if "--progress" not in argv:
-    # Standing in for a user config that set --quiet: without --progress the
-    # real yt-dlp goes silent, and a silent download starves the idle timer.
-    sys.exit(0)
-for line in [
-    "[download] Destination: source.mp4",
-    "[download]  10.0% of   10.00MiB at    1.00MiB/s ETA 00:09",
-    "[download]  55.0% of   10.00MiB at    1.00MiB/s ETA 00:04",
-    "[download] 100.0% of   10.00MiB in 00:00:10",
-]:
-    sys.stdout.write(line + "\\n")
-    sys.stdout.flush()
-"""
-
-FAKE_YTDLP_FAILING = """
-import sys
-
-sys.stdout.write("[download] Destination: source.mp4\\n")
-sys.stderr.write("ERROR: fatal error\\n")
-sys.exit(1)
-"""
-
-
 def test_ytdlp_download_progress_is_read_from_stdout(
     fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
@@ -489,9 +468,12 @@ def test_ytdlp_download_progress_is_read_from_stdout(
     pointed at the wrong stream sees nothing.
     """
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
     progress = ProgressReporter()
 
-    YoutubeDownloader(tmp_path).download("https://youtu.be/abc123", "abc123", progress)
+    YoutubeDownloader(tmp_path).acquire(
+        "https://youtu.be/abc123", "abc123", progress
+    ).lease.release()
 
     # The two leading Nones are the lock step and yt-dlp's indeterminate
     # "Destination:" line; every percent after them came off stdout.
@@ -504,16 +486,22 @@ def test_ytdlp_download_progress_is_read_from_stdout(
 
 def test_ytdlp_download_progress_percent_advances(
     fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Percent advances while a download runs, and the media file is returned."""
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    # The media lands in a staging directory acquisition discards, so the argv
+    # is recorded somewhere promotion does not sweep away.
+    argv_file = tmp_path / "argv.json"
+    monkeypatch.setenv("FAKE_YTDLP_ARGV_FILE", str(argv_file))
     progress = ProgressReporter()
 
-    path = YoutubeDownloader(tmp_path).download("https://youtu.be/abc123", "abc123", progress)
+    acquired = YoutubeDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123", progress)
 
-    assert path.name == "source.mp4"
-    argv = literal_eval((path.parent / "argv.json").read_text())
+    assert acquired.path.name == "source.mp4"
+    argv = literal_eval(argv_file.read_text())
     # `--newline` is what makes yt-dlp emit one progress line per update rather
     # than rewriting a single line with carriage returns.
     assert "--newline" in argv
@@ -528,6 +516,7 @@ def test_ytdlp_download_progress_percent_advances(
     assert percents == sorted(percents)
     assert percents[0] < percents[-1] == 100.0
     assert progress.events[-1].status == "completed"
+    acquired.lease.release()
 
 
 def test_ytdlp_download_emits_a_boundary_event(
@@ -537,13 +526,16 @@ def test_ytdlp_download_emits_a_boundary_event(
 ) -> None:
     """R-29: the invocation is visible at the boundary, named by its stage."""
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
 
     with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
-        YoutubeDownloader(tmp_path).download("https://youtu.be/abc123", "abc123")
+        YoutubeDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123").lease.release()
 
     events = [json.loads(record.message) for record in caplog.records]
+    # yt-dlp fetches the media; ffprobe is the validation that gates promotion.
     assert [(event["detail"]["tool"], event["detail"]["stage"]) for event in events] == [
-        ("yt-dlp", "youtube")
+        ("yt-dlp", "youtube"),
+        ("ffprobe", "youtube"),
     ]
 
 
@@ -573,7 +565,7 @@ def test_youtube_downloader_preserves_ytdlp_error(
     downloader = YoutubeDownloader(tmp_path)
 
     with pytest.raises(DistillError) as exc:
-        downloader.download("https://youtu.be/abc123", "abc123", ProgressReporter())
+        downloader.acquire("https://youtu.be/abc123", "abc123", ProgressReporter())
 
     assert exc.value.code == "E_YTDLP"
     assert exc.value.details["tool"] == "yt-dlp"
@@ -585,10 +577,15 @@ def test_youtube_downloader_releases_its_lock_when_ytdlp_fails(
     fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
-    """The lock is a `finally`, not a happy-path unlink: a failure must free it."""
+    """A failure must free the lease, even though success deliberately does not.
+
+    The lease outlives `acquire` only when there is media to read (R-36). When
+    there is not, nothing is left holding it, so every failing path releases it
+    rather than leaving the source locked until the staleness window expires.
+    """
     fake_tool("yt-dlp", FAKE_YTDLP_FAILING)
 
     with pytest.raises(DistillError):
-        YoutubeDownloader(tmp_path).download("https://youtu.be/abc123", "abc123")
+        YoutubeDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123")
 
     assert not (tmp_path / "_youtube_locks" / "abc123.lock").exists()

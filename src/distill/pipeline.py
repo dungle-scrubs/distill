@@ -48,6 +48,7 @@ from .redact_secrets import redact_text
 from .render import render_markdown
 from .source import (
     normalize_youtube_url,
+    release_acquisition_lease,
     resolve_source_for_processing,
     validate_output_root,
 )
@@ -399,9 +400,17 @@ def process_resolved_source(
     *,
     tool: str = "process_local_video",
 ) -> dict[str, Any]:
-    output_root = output_root or validate_output_root(options.output_dir)
-    progress = progress or ProgressReporter(emitter=progress_emitter(options.job_id))
-    return ProcessingRun(source, options, output_root, progress, tool).execute()
+    try:
+        output_root = output_root or validate_output_root(options.output_dir)
+        progress = progress or ProgressReporter(emitter=progress_emitter(options.job_id))
+        return ProcessingRun(source, options, output_root, progress, tool).execute()
+    finally:
+        # The end of the media file's read lifetime (R-36). Transcription and
+        # keyframe selection both read `source.resolved_path`, so the
+        # **acquisition lease** taken to fetch it is only safe to release once
+        # this returns - until then another run sharing the **lock key** but not
+        # the **bundle key** could promote a replacement underneath the read.
+        release_acquisition_lease(source)
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
