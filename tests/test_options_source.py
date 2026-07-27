@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import threading
 from ast import literal_eval
 from collections.abc import Callable
@@ -275,6 +276,55 @@ def test_output_dir_sensitive_paths_follow_platform_case_rules() -> None:
     assert sensitive_path_match(Path("/tmp/.ssh/cache"), case_sensitive=True) == ".ssh"
     assert sensitive_path_match(Path("/tmp/.SSH/cache"), case_sensitive=True) is None
     assert sensitive_path_match(Path("/tmp/.SSH/cache"), case_sensitive=False) == ".ssh"
+
+
+def test_home_itself_is_rejected_as_an_output_root() -> None:
+    """R-15, finding 1: a run rooted at `$HOME` puts every prune target in it.
+
+    `$HOME` passed the confinement check because it is trivially under itself,
+    which made the whole home directory an output root - the blast radius that
+    turned finding 1 from a bug into a critical one.
+    """
+    with pytest.raises(DistillError) as failure:
+        validate_output_root(str(Path.home()))
+
+    assert failure.value.code == "E_BAD_OUTPUT_DIR"
+
+
+def test_the_system_temp_directory_itself_is_rejected_as_an_output_root() -> None:
+    """R-15: the shared temp directory holds other programs' files."""
+    with pytest.raises(DistillError) as failure:
+        validate_output_root(tempfile.gettempdir())
+
+    assert failure.value.code == "E_BAD_OUTPUT_DIR"
+
+
+def test_a_subdirectory_of_home_or_temp_is_accepted(tmp_path: Path) -> None:
+    """R-15 rejects the roots themselves, not the tree under them."""
+    under_home = validate_output_root(str(Path.home() / "distill-output"))
+    under_temp = validate_output_root(str(tmp_path / "distill-output"))
+
+    assert under_home.is_dir()
+    assert under_temp.is_dir()
+
+
+def test_sensitive_paths_match_on_a_path_component_not_a_substring() -> None:
+    """A bare substring match rejects directories that are not sensitive at all.
+
+    `.sshfs-mounts` contains `.ssh` and `my.aws-notes` contains `.aws`, yet
+    neither is the directory the rule exists to protect. Matching whole path
+    components keeps the guard from refusing output roots a user may legitimately
+    ask for.
+    """
+    assert sensitive_path_match(Path("/tmp/.sshfs-mounts/cache")) is None
+    assert sensitive_path_match(Path("/tmp/my.aws-notes/cache")) is None
+    assert sensitive_path_match(Path("/tmp/keychains-backup/cache")) is None
+
+    assert sensitive_path_match(Path("/tmp/.ssh/cache")) == ".ssh"
+    assert sensitive_path_match(Path("/tmp/.config/1password/cache")) == ".config/1password"
+    assert sensitive_path_match(Path("/tmp/Library/Keychains/x"), case_sensitive=False) == (
+        "library/keychains"
+    )
 
 
 def test_youtube_url_parsing_and_lock_key() -> None:

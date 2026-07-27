@@ -537,11 +537,31 @@ def resolve_local_source(
 
 
 def validate_output_root(output_dir: str | None) -> Path:
+    """Accept an output root, or refuse it before anything is written under it.
+
+    An output root is a place Distill owns: it creates bundles there and prunes
+    them there. `$HOME` and the system temp directory are not such places - they
+    hold the user's own files and other programs' - so R-15 admits only a
+    subdirectory of either. Accepting `$HOME` itself is what gave finding 1 its
+    blast radius, since every directory in the home directory then sat inside an
+    output root.
+
+    The root is resolved first, so confinement is decided on the real path a
+    symlinked argument points at rather than on the name given.
+    """
     root = Path(output_dir).expanduser() if output_dir else Path.home() / ".cache" / "distill"
     root = root.resolve()
     home = Path.home().resolve()
     temp = Path(tempfile.gettempdir()).resolve()
-    if not (root in (home, temp) or root.is_relative_to(home) or root.is_relative_to(temp)):
+    if root in (home, temp):
+        raise DistillError(
+            "E_BAD_OUTPUT_DIR",
+            "bundle",
+            "output_dir must be a subdirectory of $HOME or the system temp "
+            "directory, not the directory itself",
+            {"output_dir": str(root)},
+        )
+    if not (root.is_relative_to(home) or root.is_relative_to(temp)):
         raise DistillError(
             "E_BAD_OUTPUT_DIR",
             "bundle",
@@ -558,8 +578,6 @@ def validate_output_root(output_dir: str | None) -> Path:
             {"output_dir": str(root), "matched": sensitive},
         )
     root.mkdir(parents=True, exist_ok=True)
-    if root.is_symlink():
-        raise DistillError("E_BAD_OUTPUT_DIR", "bundle", "output_dir must not be a symlink")
     return root
 
 
@@ -568,13 +586,25 @@ def sensitive_path_match(
     *,
     case_sensitive: bool | None = None,
 ) -> str | None:
+    """The sensitive location `root` sits in, or `None`.
+
+    Matching is by whole path components, not by substring: `.sshfs-mounts`
+    contains `.ssh` and `my.aws-notes` contains `.aws`, yet neither is the
+    directory the rule protects, and refusing them refuses output roots a user
+    may legitimately ask for. Multi-component entries such as
+    `.config/1password` match as a consecutive run of components.
+    """
     if case_sensitive is None:
         case_sensitive = sys.platform != "darwin"
-    root_text = str(root) if case_sensitive else str(root).lower()
-    for sensitive in SENSITIVE_COMPONENTS:
-        candidate = sensitive if case_sensitive else sensitive.lower()
-        if candidate in root_text:
-            return sensitive
+    parts = [part if case_sensitive else part.lower() for part in Path(root).parts]
+    for sensitive in sorted(SENSITIVE_COMPONENTS):
+        wanted = [
+            component if case_sensitive else component.lower()
+            for component in sensitive.split("/")
+        ]
+        for start in range(len(parts) - len(wanted) + 1):
+            if parts[start : start + len(wanted)] == wanted:
+                return sensitive
     return None
 
 

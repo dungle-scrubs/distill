@@ -19,12 +19,11 @@ from urllib.parse import parse_qs, urlparse
 
 from .bundle import (
     BundleGeneration,
-    active_paths,
-    ensure_safe_directory,
     patch_manifest_progress,
     response_from_paths,
     write_bundle_files,
 )
+from .bundle_store import active_paths, ensure_safe_directory
 from .cache import cleanup_cache
 from .errors import DistillError
 from .frame_selection import select_keyframes

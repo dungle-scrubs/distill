@@ -4,13 +4,16 @@ import json
 from pathlib import Path
 
 from distill.bundle import (
+    publish_generation,
+    response_from_paths,
+    write_bundle_files,
+)
+from distill.bundle_store import (
+    BundleStore,
     active_paths,
     ensure_safe_directory,
-    publish_generation,
     read_manifest,
-    response_from_paths,
     stage_paths,
-    write_bundle_files,
 )
 from distill.errors import DistillError
 from distill.options import DistillOptions
@@ -225,21 +228,32 @@ def test_response_frames_keep_ocr_and_visual_interpretation_separate(
     )
 
 
-def test_manifest_schema_validation_rejects_malformed_cache_manifest(
+def test_a_cache_lookup_never_fails_the_run_over_a_manifest_it_cannot_use(
     tmp_path: Path,
 ) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    (root / "_manifest.json").write_text('{"active_generation": "g1"}')
+    """R-04 (was `test_manifest_schema_validation_rejects_malformed_cache_manifest`).
 
-    try:
-        read_manifest(root)
-    except DistillError as exc:
-        assert exc.code == "E_BAD_MANIFEST"
-        assert exc.stage == "bundle"
-        assert exc.details["field"] == "pipeline_version"
-    else:
-        raise AssertionError("expected malformed manifest to fail validation")
+    Classified a *defect*: the old test pinned a fatal `E_BAD_MANIFEST` keyed on
+    the `pipeline_version` field for a manifest naming a generation that is not
+    on disk. R-04 makes that a cache miss - the lookup answers "no bundle here",
+    and the run produces one - rather than an error that ends the run.
+
+    Both shapes are misses: the original malformed fixture, and the one finding 2
+    actually produced - a well-formed manifest still naming the generation
+    retention deleted out from under it.
+    """
+    output_root = tmp_path / "output"
+    (output_root / "malformed").mkdir(parents=True)
+    (output_root / "malformed" / "_manifest.json").write_text('{"active_generation": "g1"}')
+
+    (output_root / "hash").mkdir()
+    manifest = {**minimal_manifest(tmp_path), "active_generation": "g1"}
+    (output_root / "hash" / "_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    store = BundleStore.open(output_root)
+
+    assert store.load_active("malformed") is None
+    assert store.load_active("hash") is None
 
 
 def test_precreated_symlink_component_under_output_tree_fails_closed(

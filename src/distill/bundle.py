@@ -1,33 +1,30 @@
-"""Cache layout, generation publishing, and response assembly for Distill.
+"""Generation publishing and response assembly for Distill.
 
-This module is the only final artifact writer. It owns manifest reads/writes,
-generation directories, active-generation selection, and response payloads.
+This module writes a **generation**'s files and assembles the response payload a
+caller reads. Bundle identity and layout - what a **bundle marker** is, where a
+generation lives, and whether a path may be written to - belong to
+`bundle_store`, which this module imports rather than restating. M3.3 moves
+publishing itself there; M3.6 deletes what remains.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .errors import DistillError
+from .bundle_store import (
+    BundlePaths,
+    ensure_safe_directory,
+    stage_paths,
+    validate_manifest_schema,
+)
 from .options import DistillOptions
 from .release import DISTILL_VERSION
 from .source import SourceInfo
 from .version import PIPELINE_VERSION
-
-
-@dataclass(frozen=True)
-class BundlePaths:
-    root: Path
-    generation: Path
-    frames: Path
-    manifest: Path
-    transcript: Path
-    markdown: Path
 
 
 @dataclass
@@ -78,129 +75,6 @@ class BundleGeneration:
         return publish_generation(self.paths, manifest)
 
 
-def read_manifest(bundle_root: Path) -> dict[str, Any] | None:
-    manifest = bundle_root / "_manifest.json"
-    if not manifest.exists():
-        return None
-    with manifest.open() as handle:
-        data = json.load(handle)
-    validate_manifest_schema(data, require_active_generation=True)
-    return data
-
-
-def active_paths(bundle_root: Path) -> BundlePaths | None:
-    manifest = read_manifest(bundle_root)
-    if not manifest:
-        return None
-    generation = bundle_root / str(manifest["active_generation"])
-    return BundlePaths(
-        root=bundle_root,
-        generation=generation,
-        frames=generation / "frames",
-        manifest=bundle_root / "_manifest.json",
-        transcript=generation / "transcript.json",
-        markdown=generation / "video.md",
-    )
-
-
-def validate_manifest_schema(
-    manifest: dict[str, Any],
-    *,
-    require_active_generation: bool,
-) -> None:
-    required_types: dict[str, type | tuple[type, ...]] = {
-        "pipeline_version": int,
-        "distill_version": str,
-        "source_type": str,
-        "source_hash": str,
-        "source_resolved_path": str,
-        "duration_sec": (int, float),
-        "options": dict,
-        "frame_count": int,
-        "transcript_present": bool,
-        "warning_count": int,
-        "frames": list,
-        "warnings": list,
-    }
-    if require_active_generation:
-        required_types["active_generation"] = str
-    for key, expected_type in required_types.items():
-        value = manifest.get(key)
-        if not isinstance(value, expected_type):
-            expected_name = (
-                " or ".join(item.__name__ for item in expected_type)
-                if isinstance(expected_type, tuple)
-                else expected_type.__name__
-            )
-            raise DistillError(
-                "E_BAD_MANIFEST",
-                "bundle",
-                "cache manifest schema is invalid",
-                {"field": key, "expected": expected_name},
-            )
-
-
-def next_generation(bundle_root: Path) -> str:
-    existing = [
-        int(path.name[1:])
-        for path in bundle_root.glob("g*")
-        if path.is_dir() and path.name[1:].isdigit()
-    ]
-    return f"g{max(existing, default=0) + 1}"
-
-
-def ensure_safe_directory(path: Path, root: Path) -> Path:
-    resolved_root = root.resolve()
-    target = path if path.is_absolute() else root / path
-    try:
-        target.resolve(strict=False).relative_to(resolved_root)
-    except ValueError as exc:
-        raise DistillError(
-            "E_BAD_OUTPUT_DIR",
-            "bundle",
-            "bundle path must stay under output_dir",
-            {"path": str(target), "output_root": str(resolved_root)},
-        ) from exc
-
-    current = resolved_root
-    relative_parts = target.resolve(strict=False).relative_to(resolved_root).parts
-    for part in relative_parts:
-        current = current / part
-        if current.is_symlink():
-            raise DistillError(
-                "E_BAD_OUTPUT_DIR",
-                "bundle",
-                "output tree must not contain symlink components",
-                {"path": str(current), "output_root": str(resolved_root)},
-            )
-        current.mkdir(exist_ok=True)
-    return target
-
-
-def stage_paths(bundle_root: Path, *, reset: bool = True) -> BundlePaths:
-    generation_name = next_generation(bundle_root)
-    tmp = bundle_root / f".tmp.{generation_name}"
-    if tmp.is_symlink():
-        raise DistillError(
-            "E_BAD_OUTPUT_DIR",
-            "bundle",
-            "output tree must not contain symlink components",
-            {"path": str(tmp), "output_root": str(bundle_root.resolve())},
-        )
-    if tmp.exists() and reset:
-        shutil.rmtree(tmp)
-    frames = tmp / "frames"
-    ensure_safe_directory(frames, bundle_root)
-    return BundlePaths(
-        root=bundle_root,
-        generation=tmp,
-        frames=frames,
-        manifest=bundle_root / "_manifest.json",
-        transcript=tmp / "transcript.json",
-        markdown=tmp / "video.md",
-    )
-
-
 def publish_generation(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePaths:
     generation_name = paths.generation.name.removeprefix(".tmp.")
     final_generation = paths.root / generation_name
@@ -221,6 +95,7 @@ def publish_generation(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePa
             frame["path"] = str(final_paths.frames / Path(str(frame["path"])).name)
     rewrite_published_partial_paths(paths.generation, final_generation)
     tmp_manifest = paths.root / "_manifest.json.tmp"
+    ensure_safe_directory(tmp_manifest, paths.root, create_leaf=False)
     tmp_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     tmp_manifest.replace(paths.manifest)
     return final_paths
@@ -269,8 +144,12 @@ def write_bundle_files(
     frames: list[dict],
     warnings: list[dict[str, str]],
 ) -> dict[str, Any]:
+    # R-16: a write refuses to follow a symlink at its target, so a symlink
+    # pre-created at video.md or transcript.json cannot redirect it.
+    ensure_safe_directory(paths.markdown, paths.root, create_leaf=False)
     paths.markdown.write_text(markdown)
     if transcript is not None:
+        ensure_safe_directory(paths.transcript, paths.root, create_leaf=False)
         paths.transcript.write_text(json.dumps(transcript, indent=2, sort_keys=True) + "\n")
     manifest = {
         "pipeline_version": PIPELINE_VERSION,
@@ -303,6 +182,7 @@ def read_partial(paths: BundlePaths, name: str) -> Any | None:
 
 def write_partial(paths: BundlePaths, name: str, payload: Any) -> None:
     path = partial_path(paths, name)
+    ensure_safe_directory(path, paths.root, create_leaf=False)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
 
 
