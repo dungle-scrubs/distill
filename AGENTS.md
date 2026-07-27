@@ -52,26 +52,55 @@ Land changes directly on `main`; keep the working tree green (`uv run pytest`).
 ## Pipeline signature
 
 `src/distill/version.py` carries `PIPELINE_VERSION`, `PIPELINE_SIGNATURE`
-(hash of output-affecting modules), and `SIGNED_MODULES` (the single source of
-truth for which modules are signed). Any change to `local_vision.py`,
-`options.py`, `pipeline.py`, or the other signed modules requires **both**
-recomputing `PIPELINE_SIGNATURE` **and** bumping `PIPELINE_VERSION` (then
-appending the new `signature: version` pair to
+(hash of output-affecting modules), `SIGNED_MODULES`, and `EXEMPT_MODULES` (the
+exemption table: module name -> the recorded reason it cannot change bundle
+content). Together those two tables record a disposition for **every** module
+under `src/distill/`, each keyed by its path *relative to* `src/distill/` in
+posix form (`vision/prompts.py`, not `prompts.py`).
+
+The released package version lives apart, in `src/distill/release.py`, and is
+**signed**: `DISTILL_VERSION` is stamped into every manifest, so changing it
+changes bundle content. `version.py` cannot be signed, because it holds the
+signature and cannot hash itself.
+
+Signed-ness is a property, not a list: if editing a module can change bundle
+content, it is a signed module. `test_pipeline_signature` enumerates
+`src/distill/**/*.py` from disk - recursively, so a module in a future
+subpackage is covered - and fails when a module is neither signed nor exempted,
+so a new module forces an explicit decision: sign it, or exempt it with a
+specific reason. A generic reason is not a reason, and a reason that is no
+longer true is a defect.
+
+Any change to `local_vision.py`, `options.py`, `pipeline.py`, or the other
+signed modules requires **both** recomputing `PIPELINE_SIGNATURE` **and**
+bumping `PIPELINE_VERSION` (then appending the new `signature: version` pair to
 `tests/pipeline_signature_history.json`) so `test_pipeline_signature` stays
-green. To recompute the signature:
+green. To check the tables and recompute the signature:
 
 ```bash
 uv run python -c "
 import hashlib
 from pathlib import Path
-from distill.version import SIGNED_MODULES
-scripts = Path('src/distill')
+from distill.version import EXEMPT_MODULES, SIGNED_MODULES
+package = Path('src/distill')
+classified = set(SIGNED_MODULES) | set(EXEMPT_MODULES)
+on_disk = {
+    p.relative_to(package).as_posix()
+    for p in package.rglob('*.py')
+    if '__pycache__' not in p.relative_to(package).parts
+}
+unclassified = sorted(on_disk - classified)
+assert not unclassified, f'neither signed nor exempted: {unclassified}'
 digest = hashlib.sha256()
 for name in SIGNED_MODULES:
-    digest.update((scripts / name).read_bytes())
+    digest.update((package / name).read_bytes())
 print(digest.hexdigest())
 "
 ```
+
+The mechanism detects unversioned change to Distill's own source. It does not
+detect output changes from package data, a dependency upgrade, or an external
+tool, and it is not a security control.
 
 ## Tests
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +30,7 @@ def test_list_tools_returns_both_tools() -> None:
         capture_output=True,
         text=True,
         check=True,
-        env={"PYTHONPATH": str(APP / "src")},
+        env={**os.environ, "PYTHONPATH": str(APP / "src")},
     )
     assert json.loads(result.stdout) == {
         "tools": [
@@ -130,6 +131,7 @@ def test_timeout_diagnostics_report_configured_and_effective_timeout() -> None:
         text=True,
         check=True,
         env={
+            **os.environ,
             "PYTHONPATH": str(APP / "src"),
             "DISTILL_EFFECTIVE_TIMEOUT_MS": "5400000",
         },
@@ -156,7 +158,7 @@ def test_timeout_probe_is_fast_by_default() -> None:
         capture_output=True,
         text=True,
         check=True,
-        env={"PYTHONPATH": str(APP / "src")},
+        env={**os.environ, "PYTHONPATH": str(APP / "src")},
     )
     payload = json.loads(result.stdout)
     assert payload["probe_requested_ms"] == 1
@@ -175,7 +177,7 @@ def test_long_timeout_probe_requires_explicit_opt_in() -> None:
         ],
         capture_output=True,
         text=True,
-        env={"PYTHONPATH": str(APP / "src")},
+        env={**os.environ, "PYTHONPATH": str(APP / "src")},
     )
     assert result.returncode == 2
     payload = json.loads(result.stderr)
