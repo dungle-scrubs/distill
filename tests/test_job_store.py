@@ -84,6 +84,7 @@ def stub_acquisition(monkeypatch: pytest.MonkeyPatch, source_hash: str = "abc123
         *,
         progress: Any = None,
         downloader: Any = None,
+        lock_wait_sec: float = 0.0,
     ) -> SourceResolution:
         # A stub stands in for the `SourceInfo` a real resolution returns: a run
         # touches only its **bundle key** and its warnings before the stage

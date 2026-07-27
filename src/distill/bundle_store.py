@@ -128,6 +128,25 @@ FRAMES_DIR_NAME = "frames"
 GENERATION_PREFIX = "g"
 STAGING_PREFIX = ".tmp."
 
+SCRATCH_DIR_NAME = "_scratch"
+"""Where a stage puts working files that are not bundle content.
+
+A **stage result** is scratch Distill writes and can therefore recognize by
+name; this is scratch a *stage* writes, whose names Distill does not know - the
+decoded audio track transcription keeps so an interrupted run does not decode
+the source twice, and whatever a stage added later keeps beside it. Handing a
+stage the **staging directory** itself gave it nowhere to put those that the
+rename would not publish: the decode was renamed into `g<N>` and served as
+bundle content, so every bundle carried a full decode of its source's audio for
+as long as it existed (finding 3-opus).
+
+Inside the staging directory rather than outside it, because scratch is exactly
+as valuable as a **resume** is: a temporary directory nothing owns would be
+reclaimed by the system between the crash and the resume, and one beside the
+bundle would be disk **prune** has no rule for. Removed by the publish, with the
+stage results and for the same reason (R-13).
+"""
+
 STAGE_RESULT_PREFIX = "_"
 STAGE_RESULT_SUFFIX = ".json"
 STAGE_RESULT_GLOB = f"{STAGE_RESULT_PREFIX}*{STAGE_RESULT_SUFFIX}"
@@ -210,10 +229,17 @@ concurrency mechanism to get right. Polling costs one cheap syscall per interval
 and makes the budget exact.
 """
 
-_LOCK_HELD_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
+_LOCK_HELD_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN})
 """`flock` refusing a lock somebody else holds, which is an answer rather than a
 failure. Every other errno says this filesystem cannot give Distill the
-exclusion it asked for, and is fatal (R-09)."""
+exclusion it asked for, and is fatal (R-09).
+
+`EACCES` is deliberately not here. `flock(2)` reports contention as
+`EWOULDBLOCK` - `EAGAIN` is the same number - and never as `EACCES`, so a
+filesystem answering `EACCES` is one that cannot lock. Counted as "held", it
+made a run poll out its whole budget and then report `E_LOCKED`: a user told
+another run holds the bundle does not go and look at the mount (finding
+8-opus)."""
 
 DEFAULT_KEEP_GENERATIONS = 3
 """How many **generations** of a bundle retention keeps when nobody says."""
@@ -433,12 +459,20 @@ class ExclusiveLock:
         and `message` name the caller's question in that error, because a
         failure to lock a source directory and a failure to lock a bundle are
         the same defect reported to a user doing different things.
+
+        Taking a lock is two syscalls and both are inside the guard. A read-only
+        mount, or a lock directory this process may not write, refuses the
+        `open` and never reaches `flock` - which is the same fact about the same
+        filesystem, reported as `E_INTERNAL` while only the second call was
+        guarded (finding 8-opus).
         """
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        fd: int | None = None
         try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
             if exc.errno in _LOCK_HELD_ERRNOS:
                 return None
             reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
@@ -453,9 +487,65 @@ class ExclusiveLock:
                 },
             ) from exc
         except BaseException:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
             raise
         return cls(subject=subject, path=path, fd=fd)
+
+    @staticmethod
+    def require_capability(
+        directory: Path,
+        *,
+        subject: str,
+        stage: str = "bundle",
+        message: str = "filesystem cannot grant an exclusive lock here",
+    ) -> None:
+        """Prove this filesystem grants `flock`, creating nothing (R-09).
+
+        R-09 says Distill fails `E_LOCK_UNSUPPORTED` *before mutating anything*,
+        and taking the real lock cannot answer it that way: `_locks` and an
+        empty `<subject>.lock` are both on disk by the time `flock` is asked,
+        so an unsupported filesystem was left carrying two files written for a
+        mechanism it had just refused (finding 6-codex).
+
+        The question is about the filesystem, not about this subject, so it is
+        asked of a directory that is already there - a shared lock taken on its
+        descriptor and dropped in the same breath. Shared, because two runs
+        probing at once must both get an answer; dropped at once, because
+        holding it would exclude something this is not entitled to exclude.
+
+        Contention is an answer: a refusal saying somebody holds a conflicting
+        lock proves the mechanism works. Any other errno is the fatal one.
+
+        A directory this process cannot open at all proves nothing either way
+        and is left to `take`, which reports whatever the real attempt hits.
+        The probe is a claim about `directory`'s filesystem, so a lock path on a
+        different mount below it is still guarded by `take` and only by `take`.
+        """
+        try:
+            fd = os.open(directory, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in _LOCK_HELD_ERRNOS:
+                return
+            reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
+            raise DistillError(
+                "E_LOCK_UNSUPPORTED",
+                stage,
+                message,
+                {
+                    "subject": subject,
+                    "lock_path": str(directory),
+                    "errno": reported or str(exc.errno),
+                },
+            ) from exc
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     @classmethod
     def probe(cls, path: Path) -> LockState:
@@ -498,8 +588,17 @@ class ExclusiveLock:
         The lock file itself stays on disk, deliberately: unlinking it is a
         second way to lose exclusivity, because a waiter that already opened the
         path holds a descriptor on an inode that now has no name and can lock it
-        while the next run locks a fresh file at the same path. Reclaiming those
-        empty files is **prune**'s business, not a release's.
+        while the next run locks a fresh file at the same path.
+
+        Nothing reclaims those empty files, and that is the intended end state
+        rather than a gap: the path *is* the identity of the lock, so a file
+        deleted while any run might still be about to open it reintroduces the
+        problem above. **Prune** treats `_locks` as a reserved name and never
+        descends into it - a claim that it would reclaim them stood here and was
+        never true of any prune rule (finding 7-opus). One empty inode per
+        **bundle key** is the price of the mechanism, and `cache-doctor` reports
+        every one of them so a lock whose bundle is long gone is at least
+        visible.
         """
         if self.released:
             return
@@ -915,9 +1014,32 @@ class BundleStore:
         holder's behalf.
         """
         path = self.lock_path(bundle_key)
-        # The lock directory is the one thing that has to exist before the probe
-        # can run at all. It holds no bundle content: an empty file per bundle
-        # key, outside every bundle, is not a mutation of anything R-09 protects.
+
+        def reported(exc: DistillError) -> DistillError:
+            """One report of the capability failure, whichever attempt found it.
+
+            The probe and the real take ask the same filesystem the same
+            question at two moments, and an operator needs the answer either
+            way - the lock path is logged rather than the probe's directory,
+            because the path is what the run was trying to take.
+            """
+            if exc.code == "E_LOCK_UNSUPPORTED":
+                _bundle_log(
+                    "lock_unsupported",
+                    bundle_key=bundle_key,
+                    lock_path=str(path),
+                    errno=exc.details.get("errno"),
+                )
+            return exc
+
+        # R-09 in the order it is written: the capability is proved against the
+        # output root, which is already there, before `_locks` or a lock file is
+        # created under it. A filesystem that cannot lock is then a filesystem
+        # Distill has written nothing to (finding 6-codex).
+        try:
+            ExclusiveLock.require_capability(self.root, subject=bundle_key)
+        except DistillError as exc:
+            raise reported(exc) from None
         path.parent.mkdir(parents=True, exist_ok=True)
         started = self.clock()
         contended = False
@@ -925,14 +1047,7 @@ class BundleStore:
             try:
                 lock = ExclusiveLock.take(bundle_key, path)
             except DistillError as exc:
-                if exc.code == "E_LOCK_UNSUPPORTED":
-                    _bundle_log(
-                        "lock_unsupported",
-                        bundle_key=bundle_key,
-                        lock_path=str(path),
-                        errno=exc.details.get("errno"),
-                    )
-                raise
+                raise reported(exc) from None
             waited = self.clock() - started
             if lock is not None:
                 if contended:
@@ -1246,7 +1361,7 @@ class BundleStore:
             active_generation=active,
             generations=tuple(path.name for path in generations),
             orphan_generations=tuple(
-                path.name for path in orphan_generations(bundle_root)
+                path.name for path in orphan_generations(bundle_root, verdict)
             ),
             staging_directories=tuple(path.name for path in staging_directories(bundle_root)),
             lock=lock_report(bundle_root.name, prune_lock_path(bundle_root)),
@@ -1310,7 +1425,7 @@ class BundleStore:
             if verdict.is_distill_owned:
                 on_bundle(child, verdict)
                 continue
-            scan.skipped.append(DirectorySkip(child, verdict.kind, verdict.reason))
+            scan.skipped.append(DirectorySkip(child, verdict.kind, _skip_reason(verdict)))
             if verdict.kind != "absent":
                 # A manifest that is unreadable or records another directory's
                 # identity still says Distill is not free to reason about what is
@@ -1499,12 +1614,17 @@ class BundleRun:
     def scratch_dir(self) -> Path:
         """Where a stage may put working files that are not bundle content.
 
-        The **staging directory** itself: everything in it is either published
-        as part of the **generation** or stripped, and a stage that needs a
-        scratch path gets one inside the directory this run holds the lock on
-        rather than a temporary directory nothing owns.
+        A directory *inside* the **staging directory**, created on demand: the
+        run holds the lock on it, an interrupted run finds what it left there
+        when it **resumes**, and the publish removes it rather than renaming it
+        into the **generation**.
+
+        The staging directory itself was handed out before, which made every
+        file a stage wrote bundle content unless it happened to be named like a
+        **stage result** - and the one file the transcription stage writes, a
+        decode of the whole source's audio, is not (finding 3-opus).
         """
-        return self.paths.generation
+        return ensure_safe_directory(self.paths.generation / SCRATCH_DIR_NAME, self.paths.root)
 
     @property
     def frames_dir(self) -> Path:
@@ -1585,6 +1705,34 @@ class BundleRun:
             staging_duration_sec=self.staging_duration_sec,
         )
         self.release()
+
+
+UNRECLAIMABLE_NOTE = (
+    "no rule can reclaim this directory - remove it by hand once you have "
+    "checked it is Distill's"
+)
+"""What a user has to be told about a directory prune will never propose.
+
+An `invalid` marker is a directory whose identity cannot be established, and
+nothing here reclaims one: **retention** and **expiry** both act on a bundle
+this walk recognized, and the walk does not even descend past it. That refusal
+is deliberate - a file named `_manifest.json` in a user's own directory would
+otherwise make it deletable, which is finding 1 - so the answer is not to widen
+what prune deletes but to say plainly that this one is permanent until somebody
+looks at it (finding 9-opus, R-57).
+"""
+
+
+def _skip_reason(verdict: MarkerVerdict) -> str:
+    """The reason a skip carries: what was found, and what follows from it.
+
+    Only the verdicts no rule can act on gain the consequence. `absent` is an
+    ordinary directory the walk descends through and `foreign` names the
+    identity that was recorded, which is already actionable.
+    """
+    if verdict.kind in ("invalid", "unreadable"):
+        return f"{verdict.reason}; {UNRECLAIMABLE_NOTE}"
+    return verdict.reason
 
 
 def _errno_name(exc: OSError) -> str:
@@ -2136,19 +2284,60 @@ def atomic_write_text(path: Path, text: str, *, root: Path) -> None:
     is worse than no temporary at all: a second writer truncating it while the
     first replaces it publishes a half-written file *onto the target*, which is
     exactly the torn read the replace exists to prevent. A writer that dies
-    mid-write therefore leaves its own temporary behind; that is prune's to
-    reclaim, and it is never mistaken for a marker, which is matched by name.
+    mid-write therefore leaves its own temporary behind. It is never mistaken
+    for a marker, which is matched by name, and it is reclaimed only when the
+    whole bundle is - **expiry** takes a bundle entire, while **retention** acts
+    on **generations** and never on a loose file at the bundle root (finding
+    7-opus).
+
+    Atomic against another process is not the same as atomic against power, and
+    for a **manifest** the difference is severe: a directory entry that reaches
+    the disk ahead of the bytes it names leaves a zero-length marker, which is
+    an `invalid` bundle - unservable, and a directory the walk will not descend
+    into, so the generations under it are unreclaimable too (finding 9-opus).
+    The content is therefore flushed before the replace and the directory entry
+    after it: two barriers, because they are two different things reaching the
+    disk.
     """
     ensure_safe_directory(path, root, create_leaf=False)
     unique = f"{os.getpid()}.{next(_TEMP_COUNTER)}"
     temporary = path.with_name(f"{path.name}.{unique}{ATOMIC_TEMP_SUFFIX}")
     ensure_safe_directory(temporary, root, create_leaf=False)
     try:
-        temporary.write_text(text)
+        with temporary.open("w") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         temporary.replace(path)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a rename durable, not just visible.
+
+    The replace publishes a directory entry, and an entry is as much in cache as
+    a file's bytes are. Flushed here rather than by the writer above, because
+    what has to survive is the directory's state and not the file's.
+
+    A refusal is logged and not raised: the bytes are already visible to every
+    reader by this point, so a filesystem that will not flush a directory
+    (`EINVAL` on some of them) leaves a durability gap and not a failed write,
+    and ending the run over it would cost the caller the write it just made.
+    """
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError as exc:
+        LOGGER.debug("directory not open-able for fsync: %s", _errno_name(exc))
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        LOGGER.debug("directory fsync refused: %s", _errno_name(exc))
+    finally:
+        os.close(fd)
 
 
 def write_manifest(bundle_root: Path, manifest: dict[str, Any]) -> Path:
@@ -2226,14 +2415,38 @@ def strip_stage_results(generation: Path) -> list[str]:
     return removed
 
 
+def strip_run_scratch(generation: Path) -> bool:
+    """Remove the run's scratch directory, reporting whether there was one.
+
+    The other half of R-13, and the half a name-matched strip cannot reach: a
+    **stage result** is scratch Distill named, while what a stage writes into
+    `scratch_dir` it names itself. Both are removed by the publish and neither
+    survives into a **generation**.
+
+    Removed rather than kept and ignored, because a generation is what a reader
+    is served: a decode of the source's audio published beside the **render** is
+    disk nobody asked for, and a second copy of that audio inside a bundle whose
+    purpose is to make the source unnecessary.
+    """
+    scratch = generation / SCRATCH_DIR_NAME
+    if not scratch.is_dir() or scratch.is_symlink():
+        return False
+    shutil.rmtree(scratch)
+    return True
+
+
 def publish_staging(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePaths:
     """Turn a **staging directory** into the **active generation**, in order.
 
-    Assemble (the caller's work, already done) -> strip **stage results** ->
-    rename to `g<N>` -> atomically replace the **manifest** (R-12).
+    Assemble (the caller's work, already done) -> strip **stage results** and
+    run scratch -> rename to `g<N>` -> atomically replace the **manifest**
+    (R-12).
 
     The order is the survivability argument. The strip precedes the rename, so
-    there is no instant at which a generation on disk holds scratch. The
+    there is no instant at which a generation on disk holds scratch. It has two
+    halves because scratch does: Distill names a stage result and can match it,
+    while a stage names its own working files and only the directory it was
+    given to write them in is known (finding 3-opus). The
     manifest replace comes last, so the only gap is a finished `g<N>` that no
     manifest names yet: the previous **active generation** is untouched and
     still servable, and the new directory is an **orphan generation** prune
@@ -2253,6 +2466,7 @@ def publish_staging(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePaths
     published = published_manifest(manifest, final_paths)
 
     strip_stage_results(paths.generation)
+    strip_run_scratch(paths.generation)
     ensure_safe_directory(final_paths.generation, paths.root, create_leaf=False)
     paths.generation.rename(final_paths.generation)
     write_manifest(paths.root, published)
@@ -2327,26 +2541,27 @@ def published_manifest(manifest: dict[str, Any], final_paths: BundlePaths) -> di
     return published
 
 
-def orphan_generations(bundle_root: Path) -> list[Path]:
-    """Every **generation** on disk that the **manifest** does not name.
+def orphan_generations(bundle_root: Path, verdict: MarkerVerdict) -> list[Path]:
+    """Every **generation** on disk that `verdict`'s **manifest** does not name.
 
     What a crash between the rename and the manifest replace leaves, and what a
     superseded generation becomes once a newer one is published. Naming them is
     what lets prune reclaim them (M3.4) instead of leaving unattributable disk;
     a directory with no valid marker has no **active generation**, so every
     generation under it is an orphan.
+
+    The verdict is the caller's rather than a second `read_marker` of its own.
+    Two reads are two moments, and a publish landing between them made the
+    survey describe a bundle whose **active generation** was also in its orphan
+    list - the one thing `StoreSurvey` promises cannot happen, since the survey
+    and the **prune** plan are meant to be one walk's answer (finding 6-opus).
+
+    What counts as a generation is `sorted_generations`' rule, so a symlink
+    named `g2` is neither reported here nor proposed there: a report naming a
+    cleanup prune will not perform is the same disagreement from the other side.
     """
-    verdict = read_marker(bundle_root)
-    active = None
-    if verdict.is_bundle and verdict.manifest is not None:
-        name = verdict.manifest.get("active_generation")
-        if isinstance(name, str):
-            active = name
-    return sorted(
-        path
-        for path in _listing(bundle_root)[0]
-        if _listed_kind(path) == "directory" and is_generation_name(path.name) and path.name != active
-    )
+    active = active_generation_name(verdict)
+    return [path for path in sorted_generations(bundle_root) if path.name != active]
 
 
 def stage_paths(bundle_root: Path, *, reset: bool = True) -> BundlePaths:

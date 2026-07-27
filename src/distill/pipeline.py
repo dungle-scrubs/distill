@@ -25,6 +25,7 @@ from .bundle_store import (
     BundleSnapshot,
     BundleStore,
     PrunePolicy,
+    atomic_write_text,
     ensure_safe_directory,
 )
 from .cache_doctor import inspect_cache
@@ -109,8 +110,20 @@ def acquire_and_process(
     A YouTube resolution reports the **output root** it validated and a local
     one reports none, so the caller's root stands in - the same path, validated
     before the record was opened rather than in the middle of the work.
+
+    `lock_wait_sec` is spent twice, at the two locks a run takes: the
+    **acquisition lease** on the source and the run lock on the **bundle key**.
+    Both are the same caller's decision (D-044) - a run a user is watching waits
+    for either, and a batch item gives up on either - and acquisition is the one
+    that a second run of the same video reaches first (finding 4-opus).
     """
-    resolution = resolve_source_for_processing(source_type, value, options, progress=progress)
+    resolution = resolve_source_for_processing(
+        source_type,
+        value,
+        options,
+        progress=progress,
+        lock_wait_sec=lock_wait_sec,
+    )
     return process_resolved_source(
         resolution.source,
         options,
@@ -717,7 +730,15 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
         }
         playlist_summary_path = playlist_root / "playlist.json"
         summary["playlist_summary_path"] = str(playlist_summary_path)
-        playlist_summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        # State a reader outside this process picks up, written through the one
+        # checked atomic writer (R-14, R-16). A bare `write_text` here followed a
+        # link pre-created at `playlist.json` and wrote over whatever it named,
+        # and it was the last durable write in the tree asking nothing.
+        atomic_write_text(
+            playlist_summary_path,
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            root=root,
+        )
         return summary
 
     return record_job(JobStore.open(root), options.job_id, "process_youtube_playlist", work)

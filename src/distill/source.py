@@ -49,7 +49,13 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
-from .bundle_store import BundleStore, ExclusiveLock
+from .bundle_store import (
+    SINGLE_SOURCE_LOCK_WAIT_SEC,
+    BundleStore,
+    ExclusiveLock,
+    confined_path,
+    ensure_safe_directory,
+)
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, warning
 from .options import DistillOptions
@@ -221,6 +227,13 @@ class AcquisitionLease:
         locks that - two runs, again, one lock key. Leaving the file costs one
         empty inode per **lock key** and keeps the path itself the identity of
         the lease.
+
+        Nothing ever removes it, **prune** included: `_youtube_locks` is a
+        reserved name the walk skips, so no rule proposes what is inside it
+        (finding 7-opus). That is the intended end state - a lock file deleted
+        while any run might be about to open its path is the same lost
+        exclusivity - and the cost is bounded by the number of distinct sources
+        this root has ever acquired.
         """
         if self.lock.released:
             return
@@ -280,6 +293,17 @@ class SourceRequest:
     options: DistillOptions
     output_root: Path | None = None
     progress: ProgressReporter | None = None
+    lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+    """How long this run waits for a **lock key** another run holds (D-044).
+
+    Carried on the request because the budget is the *caller's* decision and
+    acquisition is where a second run of one video meets the first: two runs of
+    the same source share a lock key long before they contend for a **bundle
+    key**, so a downloader constructed with its own idea of the budget makes
+    D-044 unreachable for the case it was written for (finding 4-opus). The
+    values are `bundle_store`'s, so the run a user is watching waits the same
+    300 s at both locks and a batch item gives up after the same 5 s at both.
+    """
 
 
 @dataclass(frozen=True)
@@ -944,7 +968,7 @@ def validate_media_file(path: Path) -> list[dict[str, str]]:
     return list(probe_warnings)
 
 
-def promote_media(produced: Path, media_dir: Path) -> Path:
+def promote_media(produced: Path, media_dir: Path, *, root: Path) -> Path:
     """Move a validated file onto its immutable path in one indivisible step.
 
     `os.replace` on one filesystem is the whole promotion: a reader either sees
@@ -953,9 +977,16 @@ def promote_media(produced: Path, media_dir: Path) -> Path:
     clearing the directory first would each reintroduce the window RV-3
     describes, in which the only good copy is already gone when the replacement
     turns out not to arrive.
+
+    Both ends of the rename are checked against `root` (R-16). A rename has two
+    of them: a symlink at the media directory sends the destination outside the
+    output root and replaces whatever it names, and a substituted staging
+    directory makes the *source* a file of the user's that promotion then moves
+    away from where they left it.
     """
-    media_dir.mkdir(parents=True, exist_ok=True)
-    promoted = media_dir / produced.name
+    ensure_safe_directory(media_dir, root)
+    produced = confined_path(produced, root)
+    promoted = confined_path(media_dir / produced.name, root)
     os.replace(produced, promoted)
     _acquisition_log(
         "media_promoted",
@@ -970,10 +1001,20 @@ class YoutubeDownloader:
     def __init__(
         self,
         output_root: Path,
-        lock_wait_sec: float = 0.0,
+        *,
+        lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
         lock_poll_sec: float = 0.25,
         lock_warn_after_sec: float = 5.0,
     ) -> None:
+        """Acquire one remote **source** under an **acquisition lease**.
+
+        `lock_wait_sec` defaults to the budget of the run a user is watching
+        rather than to zero (D-044). A zero default was one production call site
+        away from making the wait unreachable, and it was that call site: every
+        second run of a video was denied on its first attempt, which is the case
+        the budget exists for (finding 4-opus). A caller that means "do not
+        wait" now says so.
+        """
         self.output_root = output_root
         self.lock_wait_sec = lock_wait_sec
         self.lock_poll_sec = lock_poll_sec
@@ -999,12 +1040,14 @@ class YoutubeDownloader:
                 result = self._download(url, staging_dir, progress)
                 produced = select_downloaded_media(staging_dir)
                 validation_warnings = validate_media_file(produced)
-                promoted = promote_media(produced, self._media_dir(lock_key))
+                promoted = promote_media(
+                    produced, self._media_dir(lock_key), root=self.output_root
+                )
             finally:
                 # The staging directory is scratch: whatever survived the run -
                 # a rejected file, an unmerged fragment, a `.part` - is
                 # discarded with it. Nothing under the promoted path is touched.
-                shutil.rmtree(staging_dir, ignore_errors=True)
+                self._discard(staging_dir)
             if progress:
                 progress.complete("youtube_download", detail={"path": str(promoted)})
         except BaseException:
@@ -1019,6 +1062,18 @@ class YoutubeDownloader:
     def _media_dir(self, lock_key: str) -> Path:
         return self.output_root / MEDIA_DIR_NAME / lock_key
 
+    def _discard(self, staging_dir: Path) -> None:
+        """Remove a staging directory, having first proved it is one (R-16).
+
+        The check is re-run here rather than trusted from creation, and it
+        raises rather than skipping. A path that was inside the output root when
+        it was made and is not when it is deleted is a substitution in progress,
+        which is a sharper thing to report than whatever the download was doing
+        when it happened - so this is allowed to replace an in-flight error.
+        """
+        confined_path(staging_dir, self.output_root)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
     def _new_staging_dir(self, lock_key: str) -> Path:
         """A staging directory no other run can be writing into.
 
@@ -1027,13 +1082,24 @@ class YoutubeDownloader:
         directories that cannot collide. Created under the lease, which is also
         what makes discarding any staging directory left by an earlier run of
         this source safe: no live run can own one.
+
+        The lease proves who is running, not what the path is, so every entry
+        this walks is checked against the output root immediately before it is
+        removed (R-16). Both halves matter: a symlink at `<lock key>` makes
+        `iterdir` enumerate somebody else's directory, and a link planted among
+        real entries names a directory this run never staged into. Each is a
+        `rmtree` of the user's files, and neither is anything the lease can see.
         """
-        parent = self.output_root / STAGING_DIR_NAME / lock_key
-        parent.mkdir(parents=True, exist_ok=True)
-        for stale in parent.iterdir():
+        parent = ensure_safe_directory(
+            self.output_root / STAGING_DIR_NAME / lock_key, self.output_root
+        )
+        for stale in sorted(parent.iterdir()):
+            confined_path(stale, self.output_root)
             if stale.is_dir():
                 shutil.rmtree(stale, ignore_errors=True)
-        staging_dir = parent / f"{os.getpid()}-{uuid.uuid4().hex}"
+        staging_dir = confined_path(
+            parent / f"{os.getpid()}-{uuid.uuid4().hex}", self.output_root
+        )
         staging_dir.mkdir()
         return staging_dir
 
@@ -1042,8 +1108,10 @@ class YoutubeDownloader:
         lock_key: str,
         progress: ProgressReporter | None,
     ) -> AcquisitionLease:
-        locks = self.output_root / LOCK_DIR_NAME
-        locks.mkdir(parents=True, exist_ok=True)
+        locks = ensure_safe_directory(self.output_root / LOCK_DIR_NAME, self.output_root)
+        # The lock path itself is checked by `_acquire`, once per attempt, rather
+        # than here: it is created by the attempt that takes it, and a wait that
+        # can run for minutes is exactly the gap a check placed here would leave.
         lock = locks / f"{lock_key}.lock"
         if progress:
             progress.update("youtube_download", status="running", detail={"step": "lock"})
@@ -1129,10 +1197,16 @@ class YoutubeDownloader:
         The budget is the only thing that ends the wait: a lock is held until
         its holder gives it up or dies, and neither is something to time out on
         a holder's behalf.
+
+        Each attempt creates the lock file if it is not there, so each attempt
+        re-checks the path (R-16). A wait that can run for minutes and validates
+        once at the top is a check separated from its use by the whole wait,
+        which is the window the check exists to close.
         """
         started = time.monotonic()
         warnings: list[dict[str, str]] = []
         while True:
+            confined_path(lock, self.output_root)
             lease = AcquisitionLease.take(lock_key, lock)
             if lease is not None:
                 waited = time.monotonic() - started
@@ -1216,7 +1290,9 @@ class YouTubeSourceProvider:
         source = source_hash(fingerprint, options.opts_hash("youtube"))
         from .links import extract_relevant_links
 
-        downloader = downloader or YoutubeDownloader(output_root)
+        downloader = downloader or YoutubeDownloader(
+            output_root, lock_wait_sec=request.lock_wait_sec
+        )
         acquired = downloader.acquire(request.value, lock_key, progress)
         # Everything from here reads the acquired media, so every failure has to
         # release the lease rather than strand it until the staleness window
@@ -1299,9 +1375,16 @@ class SourceResolver:
         downloader: YouTubeDownloaderProtocol | None = None,
         progress: ProgressReporter | None = None,
         metadata: YouTubeMetadata | None = None,
+        lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
     ) -> SourceInfo:
         return self.youtube.resolve(
-            SourceRequest(url, options, output_root=output_root, progress=progress),
+            SourceRequest(
+                url,
+                options,
+                output_root=output_root,
+                progress=progress,
+                lock_wait_sec=lock_wait_sec,
+            ),
             downloader=downloader,
             metadata=metadata,
         )
@@ -1314,6 +1397,7 @@ class SourceResolver:
         *,
         progress: ProgressReporter | None = None,
         downloader: YouTubeDownloaderProtocol | None = None,
+        lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
     ) -> SourceResolution:
         if source_type == "local":
             return SourceResolution(
@@ -1354,6 +1438,7 @@ class SourceResolver:
                 downloader=downloader,
                 progress=progress,
                 metadata=metadata,
+                lock_wait_sec=lock_wait_sec,
             ),
             output_root=root,
             progress=progress,
@@ -1385,11 +1470,21 @@ def resolve_source_for_processing(
     *,
     progress: ProgressReporter | None = None,
     downloader: YouTubeDownloaderProtocol | None = None,
+    lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
 ) -> SourceResolution:
+    """Resolve one **source** for a run, on that run's wait budget (D-044).
+
+    `lock_wait_sec` is the caller's, and it belongs here rather than at the
+    downloader because acquisition is the *first* lock a run meets: two runs of
+    one video contend for a **lock key** before either reaches a **bundle key**,
+    so a budget that stops short of this function is a budget the case it was
+    written for never reaches (finding 4-opus).
+    """
     return SourceResolver().resolve(
         source_type,
         value,
         options,
         progress=progress,
         downloader=downloader,
+        lock_wait_sec=lock_wait_sec,
     )

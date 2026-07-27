@@ -496,3 +496,100 @@ def test_a_truncated_ocr_invocation_records_its_warning_in_the_bundle(
     # The reading itself still arrived: truncation reduced the record of the
     # invocation, not its result.
     assert response["frames"][0]["ocr_text"] == "SLIDE TEXT"
+
+
+# --- Run scratch never reaches the published bundle (finding 3-opus, R-13) ---
+
+
+def transcribe_leaving_a_decode(
+    _video_path: Path,
+    work_dir: Path,
+    _options: DistillOptions,
+    progress: ProgressCounter,
+    duration_sec: float,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """A transcriber that leaves behind what the real one leaves behind.
+
+    `transcribe_video` decodes the source's audio to `work_dir/audio.wav` and
+    keeps it, so an interrupted run does not decode it twice. That file is the
+    largest thing a run writes that is not bundle content.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "audio.wav").write_bytes(b"RIFF" + b"\0" * 4096)
+    return fake_transcribe(_video_path, work_dir, _options, progress, duration_sec)
+
+
+def test_a_published_generation_carries_no_audio_decode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 3-opus, R-13): the decode is published with the bundle.
+
+    The run handed the transcriber the **staging directory** itself as its work
+    directory, and the strip that keeps scratch out of a **generation**
+    recognizes stage results by name (`_*.json`). A 16 kHz decode of the whole
+    source is neither, so it was renamed into `g1` and published - every bundle
+    carrying a second copy of its source's audio for as long as it exists.
+    """
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", transcribe_leaving_a_decode)
+
+    response = distill_session.process_local_video(
+        {
+            "path": str(video),
+            "output_dir": str(tmp_path / "cache"),
+            "ocr": False,
+            "redact_secrets": False,
+            "caption_frames": False,
+            "max_keyframes": 1,
+            "max_static_window_sec": 1,
+        }
+    )
+
+    generation = Path(response["markdown_path"]).parent
+    assert generation.name == "g1"
+    assert sorted(path.name for path in generation.rglob("audio.wav")) == []
+
+
+def test_the_decode_survives_in_scratch_for_a_run_that_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The decode is kept, not unlinked: **resume** is what it exists for.
+
+    Deleting `audio.wav` at publish would answer finding 3-opus by throwing
+    away the reason the file is written where the run can find it again. It
+    belongs to the **staging directory**, which survives an interrupted run and
+    stops existing when the generation is published.
+    """
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+    root = tmp_path / "cache"
+    args = {
+        "path": str(video),
+        "output_dir": str(root),
+        "ocr": False,
+        "redact_secrets": False,
+        "caption_frames": False,
+        "max_keyframes": 1,
+        "max_static_window_sec": 1,
+    }
+
+    def fail_after_transcribing(
+        video_path: Path,
+        work_dir: Path,
+        options: DistillOptions,
+        progress: ProgressCounter,
+        duration_sec: float,
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        transcribe_leaving_a_decode(video_path, work_dir, options, progress, duration_sec)
+        raise RuntimeError("interrupted after the decode")
+
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fail_after_transcribing)
+    with pytest.raises(RuntimeError):
+        distill_session.process_local_video(args)
+
+    staged = sorted((root).glob("*/.tmp.g1"))
+    assert len(staged) == 1
+    assert sorted(path.name for path in staged[0].rglob("audio.wav")) == ["audio.wav"]

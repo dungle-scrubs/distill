@@ -310,3 +310,99 @@ def test_cache_doctor_is_reachable_as_a_cli_subcommand(
     assert report["bundle_count"] == 1
     assert report["bundles"][0]["active_generation"] == "g2"
     assert report["prune_preview"]["candidate_count"] == 1
+
+
+# --- One marker read per bundle, so a report cannot contradict itself --------
+
+
+def test_a_bundle_is_described_from_the_marker_the_walk_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (finding 6-opus): the survey read the marker a second time.
+
+    `StoreSurvey` says what a **prune** would consider, which only holds if both
+    are derived from one reading of one **bundle marker**. The orphan list went
+    back to disk for its own copy, so a publish landing between the two reads
+    made the report describe two different bundles at once: the generation named
+    active by the first read appears in the orphan list produced by the second.
+
+    A report that names the same generation active *and* orphaned is not a
+    stale report, it is an incoherent one - and the orphan half is the half a
+    user acts on.
+    """
+    root = tmp_path / "cache"
+    write_bundle(root, "aaa", generations=("g1", "g2"), active="g1")
+    real_read = bundle_store.read_marker
+    reads = {"count": 0}
+
+    def read_then_republish(directory: Path) -> object:
+        verdict = real_read(directory)
+        reads["count"] += 1
+        if directory.name == "aaa" and reads["count"] == 1:
+            # What a run publishing g2 does the instant after the walk looked.
+            (directory / "_manifest.json").write_text(manifest("aaa", "g2"))
+        return verdict
+
+    monkeypatch.setattr(bundle_store, "read_marker", read_then_republish)
+
+    report = inspect(root)
+
+    bundle = bundles_by_key(report)["aaa"]
+    assert bundle["active_generation"] == "g1"
+    assert bundle["orphan_generations"] == ["g2"]
+    assert bundle["active_generation"] not in bundle["orphan_generations"]
+
+
+def test_a_generation_that_is_a_symlink_is_neither_reported_nor_proposed(
+    tmp_path: Path,
+) -> None:
+    """The survey and the plan agree about what a **generation** even is.
+
+    A symlink named `g2` is not a generation: nothing published it, and prune
+    never follows one. Reported as an orphan it would name a cleanup
+    `cleanup-cache` will not perform, which is the same disagreement from the
+    other side.
+    """
+    root = tmp_path / "cache"
+    bundle = write_bundle(root, "aaa", generations=("g1",), active="g1")
+    outside = tmp_path / "not-a-generation"
+    outside.mkdir()
+    (bundle / "g2").symlink_to(outside, target_is_directory=True)
+
+    report = inspect(root)
+
+    described = bundles_by_key(report)["aaa"]
+    assert described["generations"] == ["g1"]
+    assert described["orphan_generations"] == []
+    assert [target["path"] for target in report["prune_preview"]["candidates"]] == []
+
+
+def test_a_directory_no_marker_can_identify_is_reported_as_needing_a_hand(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 9-opus, R-57): unprunable, and silent about it.
+
+    A truncated `_manifest.json` - what losing power between the entry and the
+    bytes used to leave - is an `invalid` marker. Nothing can serve the bundle
+    and nothing may reclaim it either: prune skips a directory whose identity it
+    cannot establish, deliberately, because a file of that name in a user's own
+    directory is exactly finding 1. **Expiry** does not reach it, so the disk is
+    permanent.
+
+    That is the right refusal and the wrong silence. The skip already carried
+    the fact; it now carries the consequence, because "this will never be
+    reclaimed unless you remove it" is the only part a user can act on.
+    """
+    root = tmp_path / "cache"
+    damaged = root / "aaa"
+    (damaged / "g1").mkdir(parents=True)
+    (damaged / "g1" / "video.md").write_text("# Video\n")
+    (damaged / "_manifest.json").write_text("")
+
+    report = inspect(root, max_age_days=0.000001)
+
+    skip = next(entry for entry in report["skipped"] if entry["path"] == str(damaged))
+    assert skip["verdict"] == "invalid"
+    assert "not readable JSON" in skip["reason"]
+    assert "remove it" in skip["reason"]
+    assert [target["path"] for target in report["prune_preview"]["candidates"]] == []

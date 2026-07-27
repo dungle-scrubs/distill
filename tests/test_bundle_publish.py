@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,7 @@ from distill.bundle_store import (
     atomic_write_text,
     orphan_generations,
     publish_staging,
+    read_marker,
     stage_paths,
 )
 from distill.errors import DistillError
@@ -251,7 +253,7 @@ def test_the_generation_left_by_such_a_crash_is_a_prunable_orphan(
     first = stage_paths(bundle_root)
     assemble(first, "# first\n")
     publish_staging(first, manifest_for())
-    assert orphan_generations(bundle_root) == []
+    assert orphan_generations(bundle_root, read_marker(bundle_root)) == []
 
     second = stage_paths(bundle_root)
     assemble(second, "# second\n")
@@ -264,7 +266,9 @@ def test_the_generation_left_by_such_a_crash_is_a_prunable_orphan(
         publish_staging(second, manifest_for())
 
     assert (bundle_root / "g2").is_dir()
-    assert orphan_generations(bundle_root) == [bundle_root / "g2"]
+    assert orphan_generations(bundle_root, read_marker(bundle_root)) == [
+        bundle_root / "g2"
+    ]
 
 
 def test_the_manifest_is_written_by_atomic_replace(
@@ -771,3 +775,94 @@ def test_publish_proves_the_render_inside_the_generation_it_is_renaming(
     assert active is not None
     assert active.generation.name == "g1"
     assert active.markdown.read_text() == "# published\n"
+
+
+# --- Run scratch is stripped with the stage results (finding 3-opus) --------
+
+
+def test_a_published_generation_holds_no_run_scratch(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 3-opus, R-13): scratch the strip cannot see.
+
+    `scratch_dir` handed a stage the **staging directory** itself, so anything
+    a stage wrote there that is not a **stage result** - a decoded audio track,
+    a temporary the stage forgot - was renamed into the **generation** and
+    published. The strip recognizes stage results by name because it must be
+    exhaustive rather than informed, and that same exhaustiveness has to cover
+    the scratch a stage names itself.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+
+    run = begin_run(store)
+    (run.scratch_dir / "audio.wav").write_bytes(b"RIFF-not-bundle-content")
+    assemble(run.paths)
+    snapshot = run.commit(manifest_for())
+
+    assert [path.name for path in snapshot.generation.rglob("audio.wav")] == []
+    assert sorted(path.name for path in snapshot.generation.iterdir()) == [
+        "frames",
+        "video.md",
+    ]
+
+
+def test_run_scratch_lives_inside_the_staging_directory_a_resume_reads(
+    tmp_path: Path,
+) -> None:
+    """Scratch is kept for **resume**, so it is removed by publishing, not before.
+
+    Unlinking what a stage wrote would answer finding 3-opus by discarding the
+    reason the file exists: a run that is interrupted after a 40-minute decode
+    resumes against it. Scratch therefore belongs to the **staging directory**,
+    which outlives an interrupted run and stops existing at the publish.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+
+    first = begin_run(store)
+    (first.scratch_dir / "audio.wav").write_bytes(b"RIFF-expensive-to-produce")
+    first.abandon("interrupted")
+
+    second = begin_run(store)
+    try:
+        assert (second.scratch_dir / "audio.wav").read_bytes() == b"RIFF-expensive-to-produce"
+        assert second.scratch_dir.is_relative_to(second.paths.generation)
+    finally:
+        second.release()
+
+
+# --- The replace survives losing power, not only losing a race (9-opus) -----
+
+
+def test_a_manifest_is_on_disk_before_the_replace_that_publishes_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (finding 9-opus, R-14): atomic against a reader, not against a crash.
+
+    `rename` is atomic with respect to another process and says nothing about
+    power: the directory entry can reach the platter while the bytes it names
+    are still in cache, and what comes back is a zero-length `_manifest.json`.
+    That file is the **bundle marker**, so the bundle reads `invalid` - not
+    servable, and not something the walk descends into either, which makes the
+    generations underneath it unreachable *and* unreclaimable.
+
+    Both barriers are needed and they are different: the file's own data, then
+    the directory entry the replace created.
+    """
+    bundle_root = tmp_path / BUNDLE_KEY
+    bundle_root.mkdir()
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def record(fd: int) -> None:
+        synced.append(os.fstat(fd).st_ino)
+        real_fsync(fd)
+
+    monkeypatch.setattr(bundle_store.os, "fsync", record)
+
+    atomic_write_text(bundle_root / "_manifest.json", "{}\n", root=bundle_root)
+
+    manifest = bundle_root / "_manifest.json"
+    assert manifest.stat().st_ino in synced, "the manifest's own bytes were never flushed"
+    assert bundle_root.stat().st_ino in synced, "the replace's directory entry was never flushed"

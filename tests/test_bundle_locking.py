@@ -699,3 +699,141 @@ def test_a_run_that_fails_mid_stage_abandons_its_hold_and_says_why(
     assert "E_STAGE_BOOM" in abandoned[0]["detail"]["reason"]
     assert (root / BUNDLE_KEY / ".tmp.g1").is_dir()
     assert lock_is_held(lock_path(root)) is False
+
+
+def test_the_same_budget_reaches_the_lock_a_run_takes_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (finding 4-opus, D-044): the budget stopped at the bundle key.
+
+    A run takes two locks: the **acquisition lease** on its **lock key** and the
+    run lock on its **bundle key**. Acquisition is the one it reaches first, and
+    the one two runs of *the same video* contend for - they share a lock key
+    whatever their options. A budget that reached only the second lock was
+    therefore never spent on the case D-044 was written for: the second run was
+    denied at acquisition before `begin` was called at all.
+    """
+    from distill import pipeline
+    from distill.options import DistillOptions
+    from distill.progress import ProgressReporter
+
+    budgets: list[float] = []
+
+    def record(
+        _source_type: str,
+        _value: str,
+        _options: object,
+        *,
+        progress: object = None,
+        lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
+        **_rest: object,
+    ) -> None:
+        budgets.append(lock_wait_sec)
+        raise DistillError("E_STOP", "youtube", "far enough")
+
+    monkeypatch.setattr(pipeline, "resolve_source_for_processing", record)
+
+    root = tmp_path / "output"
+    root.mkdir()
+    options = DistillOptions.from_args({"output_dir": str(root), "job_id": "j"})
+    progress = ProgressReporter(emitter=lambda _event: None)
+    for budget in (SINGLE_SOURCE_LOCK_WAIT_SEC, BATCH_ITEM_LOCK_WAIT_SEC):
+        with pytest.raises(DistillError):
+            pipeline.acquire_and_process(
+                "youtube",
+                "https://youtu.be/abc123",
+                options,
+                root,
+                progress=progress,
+                tool="process_youtube_video",
+                lock_wait_sec=budget,
+            )
+
+    assert budgets == [SINGLE_SOURCE_LOCK_WAIT_SEC, BATCH_ITEM_LOCK_WAIT_SEC]
+
+
+# --- Every way the lock can be refused is R-09's answer (finding 8-opus) ----
+
+
+def test_a_lock_file_that_cannot_be_opened_is_a_capability_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (finding 8-opus, R-09): the refusal escaped as a raw `OSError`.
+
+    Taking the lock is two syscalls, and only the second was inside the guard:
+    a read-only mount or a directory this process may not write refuses the
+    `open`, never reaching `flock` at all. That is the same fact R-09 is about -
+    this filesystem cannot give Distill the exclusion it asked for - and a
+    caller told `E_INTERNAL` learns nothing it can act on, where
+    `E_LOCK_UNSUPPORTED` names the mount and the errno.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+    real_open = os.open
+
+    def refuse_lock_files(path: Any, flags: int, *rest: Any, **kwargs: Any) -> int:
+        if str(path).endswith(".lock"):
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS))
+        return real_open(path, flags, *rest, **kwargs)
+
+    monkeypatch.setattr(bundle_store.os, "open", refuse_lock_files)
+
+    with pytest.raises(DistillError) as exc:
+        store.begin(BUNDLE_KEY)
+
+    assert exc.value.code == "E_LOCK_UNSUPPORTED"
+    assert exc.value.details["errno"] == "EROFS"
+    assert (root / BUNDLE_KEY).exists() is False
+
+
+def test_a_filesystem_answering_eacces_is_not_read_as_a_lock_somebody_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FAILS FIRST (finding 8-opus, R-09): a fatal answer was read as contention.
+
+    `flock(2)` reports a lock somebody else holds as `EWOULDBLOCK`/`EAGAIN` and
+    never as `EACCES`. Counting `EACCES` as "held" therefore misreads a
+    filesystem that cannot lock as a busy one: the run spends its whole budget
+    polling a lock nobody holds and is then told another run has the bundle,
+    which is the one report that stops a user looking at the mount.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    clock = FakeClock()
+    store = BundleStore.open(root, clock=clock.monotonic, sleep=clock.sleep)
+    refuse_flock(monkeypatch, code=errno.EACCES)
+
+    with pytest.raises(DistillError) as exc:
+        store.begin(BUNDLE_KEY)
+
+    assert exc.value.code == "E_LOCK_UNSUPPORTED"
+    assert exc.value.details["errno"] == "EACCES"
+    assert clock.now == 0.0, "a capability failure is not something to wait out"
+
+
+def test_a_filesystem_that_cannot_lock_leaves_no_lock_directory_behind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (finding 6-codex, R-09): "before mutating anything" was not.
+
+    The refusal was raised by the `flock` at the end of a sequence that had
+    already created `_locks` and an empty `<bundle key>.lock` inside it. Both
+    are Distill's files in a user's output root, written on a filesystem that
+    just said it cannot support what they are for - and the existing test only
+    watched the bundle directory, so it could not see them.
+
+    The capability is therefore asked of a directory that already exists, with
+    a shared lock taken and dropped at once: the question is whether this
+    filesystem grants `flock` at all, and asking it creates nothing.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+    refuse_flock(monkeypatch)
+
+    with pytest.raises(DistillError) as exc:
+        store.begin(BUNDLE_KEY)
+
+    assert exc.value.code == "E_LOCK_UNSUPPORTED"
+    assert sorted(entry.name for entry in root.iterdir()) == []

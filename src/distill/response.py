@@ -42,12 +42,20 @@ def manifest_document(
     question, and nothing about where the bundle lives: `active_generation` is
     added by the publish, because only the publish knows which generation the
     staging directory became.
+
+    Identity is recorded as `bundle_key` (D-008). The value hashes a **source
+    fingerprint** together with an **options hash**, so it names a **bundle**
+    rather than a source, and `bundle_store.IDENTITY_FIELDS` already said only
+    this name is written from here on - while the writer went on producing the
+    legacy `source_hash` for every new manifest (finding 5-opus). Reading still
+    accepts both, because a bundle published before the rename records the old
+    name and nothing will rewrite it (D-017).
     """
     return {
         "pipeline_version": PIPELINE_VERSION,
         "distill_version": DISTILL_VERSION,
         "source_type": source.source_type,
-        "source_hash": source.source_hash,
+        "bundle_key": source.source_hash,
         "source_resolved_path": str(source.resolved_path),
         "related_links": list(source.related_links or []),
         "duration_sec": source.duration_sec,

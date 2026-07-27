@@ -280,3 +280,58 @@ def test_precreated_tmp_symlink_fails_before_cleanup(tmp_path: Path) -> None:
         assert exc.stage == "bundle"
     else:
         raise AssertionError("expected symlinked staging path to fail closed")
+
+
+# --- A new manifest records its bundle key by that name (finding 5-opus) ----
+
+
+def test_a_new_manifest_records_the_bundle_key_under_the_current_name(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 5-opus, D-008): every new manifest used the old name.
+
+    The value hashes a **source fingerprint** together with an **options hash**,
+    so it identifies a **bundle** and not a source - which is why D-008 renamed
+    it. `IDENTITY_FIELDS` says only `bundle_key` is written from here on and
+    accepts `source_hash` for what is already on disk; the writer never caught
+    up, so the legacy name was still the only one Distill produced and the
+    vocabulary's `_Avoid_` entry described current behavior.
+    """
+    store, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+
+    run.commit(
+        manifest_document(
+            source(tmp_path),
+            DistillOptions(),
+            transcript_present=False,
+            frames=[],
+            warnings=[],
+        )
+    )
+
+    active = store.load_active(BUNDLE_KEY)
+    assert active is not None
+    assert active.manifest["bundle_key"] == BUNDLE_KEY
+    assert "source_hash" not in active.manifest
+
+
+def test_a_manifest_written_before_the_rename_is_still_a_bundle(tmp_path: Path) -> None:
+    """D-017: the legacy name stays readable, so old bundles stay prunable.
+
+    Writing the current name is not the same as refusing the old one. A bundle
+    published before this rename records `source_hash` and nothing will ever
+    rewrite it, so recognition has to keep accepting it - the alternative is
+    disk no **prune** can reclaim because nothing recognizes it as Distill's.
+    """
+    store, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+    legacy = {**minimal_manifest(tmp_path)}
+    assert legacy["source_hash"] == BUNDLE_KEY
+
+    run.commit(legacy)
+
+    active = store.load_active(BUNDLE_KEY)
+    assert active is not None
+    assert active.bundle_key == BUNDLE_KEY
+    assert active.manifest["source_hash"] == BUNDLE_KEY

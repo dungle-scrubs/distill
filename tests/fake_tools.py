@@ -118,6 +118,20 @@ media.parent.mkdir(parents=True, exist_ok=True)
 media.write_bytes(b"")
 """
 
+# yt-dlp exits 0 having produced a link rather than a file. The download is the
+# one step that runs a tool Distill does not control inside a directory Distill
+# writes, so what comes back out of staging is as untrusted as what comes back
+# on stdout. The link's target is named by FAKE_YTDLP_LINK_TARGET.
+FAKE_YTDLP_PRODUCES_A_SYMLINK = """
+import os, pathlib, sys
+
+argv = sys.argv[1:]
+template = argv[argv.index("-o") + 1]
+media = pathlib.Path(template.replace("%(ext)s", "mp4"))
+media.parent.mkdir(parents=True, exist_ok=True)
+media.symlink_to(os.environ["FAKE_YTDLP_LINK_TARGET"])
+"""
+
 # yt-dlp exits 0 having produced an audio-only file: the format selector fell
 # through to an audio format, or the merge step silently dropped the video.
 FAKE_YTDLP_PRODUCES_AUDIO_ONLY = """

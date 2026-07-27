@@ -12,6 +12,7 @@ from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import pipeline as distill_session
 from distill import source as distill_source
+from distill.errors import DistillError
 from distill.local_vision import LocalVisionProbe
 from distill.progress import ProgressReporter
 from distill.source import (
@@ -146,7 +147,11 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     video_id = "mock-video"
 
     class FakeDownloader:
-        def __init__(self, output_root: Path) -> None:
+        def __init__(self, output_root: Path, *, lock_wait_sec: float = 0.0) -> None:
+            # The budget the run named reaches the downloader (D-044), so a
+            # stand-in for one takes it too - taking a different shape here is
+            # how the suite stopped noticing that production passed none.
+            self.lock_wait_sec = lock_wait_sec
             self.lock_path = output_root / "_youtube_locks" / "mock-video.lock"
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -348,6 +353,36 @@ def test_youtube_playlist_uses_playlist_output_subdirectory(
         expected_playlist_root,
     ]
     assert [args["job_id"] for args in seen_child_args] == ["playlist-job-1", "playlist-job-2"]
+
+
+def test_the_playlist_summary_does_not_write_through_a_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 2-codex, R-16): the last unchecked write in the tree.
+
+    The playlist summary was the one durable write left on a bare `write_text`.
+    A link pre-created at `playlist.json` is followed, so the summary is written
+    over whatever the link names - and R-16 says there is one symlink refusal in
+    Distill, which a write that never asks for it does not have.
+    """
+    url = "https://www.youtube.com/playlist?list=PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH"
+    monkeypatch.setattr(distill_session, "youtube_playlist_urls", lambda _url, _max: [])
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = tmp_path / "user-notes.md"
+    victim.write_text("notes the user wrote\n")
+    playlist_root = output_root / "playlists" / "PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH"
+    playlist_root.mkdir(parents=True)
+    (playlist_root / "playlist.json").symlink_to(victim)
+
+    with pytest.raises(DistillError) as exc:
+        distill_session.process_youtube_playlist(
+            {"url": url, "output_dir": str(output_root), "job_id": "playlist-job"}
+        )
+
+    assert exc.value.code == "E_BAD_OUTPUT_DIR"
+    assert victim.read_text() == "notes the user wrote\n"
 
 
 @pytest.mark.network

@@ -6,6 +6,7 @@ import errno
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +21,7 @@ from fake_tools import (
     FAKE_YTDLP_CLOBBERING,
     FAKE_YTDLP_DOWNLOAD,
     FAKE_YTDLP_LEAVES_FORMAT_FRAGMENTS,
+    FAKE_YTDLP_PRODUCES_A_SYMLINK,
     FAKE_YTDLP_PRODUCES_AUDIO_ONLY,
     FAKE_YTDLP_PRODUCES_EMPTY_FILE,
     FAKE_YTDLP_RECORDS_STAGING_DIR,
@@ -143,7 +145,7 @@ def test_second_run_with_different_options_cannot_disturb_media_being_read(
 
     fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
     with pytest.raises(DistillError) as exc:
-        YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+        YoutubeDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_LOCKED"
     assert first.path.read_bytes() == b"video"
@@ -211,7 +213,9 @@ class RendezvousOs:
 rendezvous_os = RendezvousOs(os)
 bundle_store.os = rendezvous_os
 try:
-    acquired = distill_source.YoutubeDownloader(Path(output_root)).acquire(url, lock_key)
+    acquired = distill_source.YoutubeDownloader(
+        Path(output_root), lock_wait_sec=0.0
+    ).acquire(url, lock_key)
     verdict = {"acquired": True, "media": str(acquired.path)}
 except DistillError as exc:
     verdict = {"acquired": False, "code": exc.code}
@@ -331,7 +335,7 @@ def test_a_lease_a_live_run_holds_is_not_stealable_however_old_it_is(
 
     fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
     with pytest.raises(DistillError) as exc:
-        YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+        YoutubeDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_LOCKED"
     assert first.path.read_bytes() == b"video"
@@ -434,7 +438,7 @@ def test_releasing_a_lease_this_process_does_not_hold_frees_nobody(
 
     fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
     with pytest.raises(DistillError) as exc:
-        YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+        YoutubeDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
     assert exc.value.code == "E_LOCKED"
     assert promoted_names(tmp_path) == ["source.mp4"]
     holder.kill()
@@ -631,7 +635,7 @@ def test_acquisition_emits_lease_validation_and_promotion_events(
     with caplog.at_level(logging.DEBUG, logger="distill.source"):
         acquired = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
         with pytest.raises(DistillError):
-            YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+            YoutubeDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
         acquired.lease.release()
 
     events = [
@@ -725,3 +729,442 @@ def test_a_truncated_validation_probe_travels_with_the_acquired_source(
         ] == [TRUNCATION_WARNING_CODE]
     finally:
         acquired.lease.release()
+
+
+# --- Acquisition writes and deletions stay inside the output root (R-16) -----
+#
+# The **acquisition lease** proves who is running, not what a path is. Every
+# directory acquisition touches - staging, media, locks - is derived by joining
+# a name onto the output root, and a symlink pre-created at any of those names
+# redirects the operation that follows it out of the tree. Staging is the worst
+# of the three, because what follows is a recursive delete.
+
+
+def user_data_outside(root: Path) -> Path:
+    """A directory of the user's own files that acquisition has no claim on."""
+    victim = root / "user-data" / "photos"
+    victim.mkdir(parents=True)
+    (victim / "holiday.jpg").write_bytes(b"irreplaceable")
+    return victim
+
+
+def test_staging_cleanup_cannot_delete_through_a_symlinked_staging_directory(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 2-codex, R-16): a recursive delete outside the root.
+
+    `_new_staging_dir` created its parent with `mkdir(exist_ok=True)`, which is
+    satisfied by a symlink to a directory, then iterated the parent and
+    recursively removed every child directory it found. Pointed at a directory
+    of the user's files, that walk is a `rmtree` of their subdirectories.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = user_data_outside(tmp_path)
+    staging_root(output_root).parent.mkdir(parents=True)
+    staging_root(output_root).symlink_to(victim.parent, target_is_directory=True)
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_BAD_OUTPUT_DIR"
+    # The link names the *parent*, so what the walk would have removed is every
+    # directory inside it - `photos` and everything under it.
+    container = victim.parent
+    survivors = sorted(str(entry.relative_to(container)) for entry in container.rglob("*"))
+    assert survivors == ["photos", "photos/holiday.jpg"]
+
+
+@pytest.mark.parametrize("derived", ["_youtube_staging", "_youtube_sources"])
+def test_acquisition_creates_nothing_through_a_symlinked_directory(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+    derived: str,
+) -> None:
+    """FAILS FIRST (finding 2-codex, R-16): the check has to precede the mkdir.
+
+    Both of these paths are two components deep, and `mkdir(parents=True)`
+    builds every missing one before anything reads the path - so a link at the
+    first component is already followed by the time a check on the second fires.
+    Refusing afterwards still leaves a directory in the user's tree.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = user_data_outside(tmp_path)
+    output_root.joinpath(derived).symlink_to(victim, target_is_directory=True)
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_BAD_OUTPUT_DIR"
+    assert sorted(entry.name for entry in victim.iterdir()) == ["holiday.jpg"]
+
+
+def test_a_symlink_planted_inside_staging_is_refused_rather_than_walked(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 2-codex, R-16): the deletion target itself is a link.
+
+    Validating the staging parent once is not enough. Each stale entry is its
+    own deletion target, and a link planted beside the real ones names a
+    directory the run never staged into.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = user_data_outside(tmp_path)
+    staging_root(output_root).mkdir(parents=True)
+    (staging_root(output_root) / "abandoned-run").symlink_to(
+        victim, target_is_directory=True
+    )
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_BAD_OUTPUT_DIR"
+    assert sorted(entry.name for entry in victim.iterdir()) == ["holiday.jpg"]
+
+
+def test_promotion_cannot_write_through_a_symlinked_media_directory(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 2-codex, R-16): `os.replace` onto a redirected path.
+
+    `promote_media` created its directory with `mkdir(parents=True,
+    exist_ok=True)`, which a symlink to a directory satisfies, and then renamed
+    the staged media onto `<media_dir>/source.mp4`. A user file of that name
+    under the link's target is replaced outright.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = user_data_outside(tmp_path)
+    (victim / "source.mp4").write_bytes(b"the user's only copy")
+    media_root(output_root).parent.mkdir(parents=True)
+    media_root(output_root).symlink_to(victim, target_is_directory=True)
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_BAD_OUTPUT_DIR"
+    assert (victim / "source.mp4").read_bytes() == b"the user's only copy"
+
+
+def test_the_lease_is_not_taken_through_a_symlinked_lock_directory(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 2-codex, R-16): the lock file lands outside the root.
+
+    A lease taken at a path outside the output root excludes nothing that
+    matters and creates a file where Distill was never asked to write. The lock
+    directory is derived the same way staging and media are, so it fails the
+    same way.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = user_data_outside(tmp_path)
+    output_root.joinpath("_youtube_locks").symlink_to(victim, target_is_directory=True)
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_BAD_OUTPUT_DIR"
+    assert sorted(entry.name for entry in victim.iterdir()) == ["holiday.jpg"]
+
+
+def test_a_download_that_produces_a_link_is_never_selected(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """R-37, R-16: what a download leaves behind is as untrusted as its stdout.
+
+    yt-dlp writes into the staging directory, so staging afterwards holds
+    whatever a tool Distill does not control put there. A link is not a
+    completed container, and selecting one would promote it onto the media path
+    for every later read - the probe, the frames, the transcript - to follow
+    wherever it points.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_PRODUCES_A_SYMLINK)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = user_data_outside(tmp_path) / "holiday.jpg"
+    monkeypatch.setenv("FAKE_YTDLP_LINK_TARGET", str(victim))
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_YTDLP"
+    assert exc.value.details["produced"] == ["source.mp4"]
+    assert promoted_names(output_root) == []
+    assert victim.read_bytes() == b"irreplaceable"
+
+
+def test_staging_substituted_mid_run_does_not_promote_the_users_file(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 2-codex, R-16): validating once is validating too early.
+
+    A rename has two ends, and staging was checked when it was created rather
+    than when it is read from. Substituting it between those two moments makes
+    the *source* of the promotion a file of the user's, which `os.replace` then
+    moves out of their directory - the file is not copied away, it is gone from
+    where they left it. Validation therefore belongs immediately before the
+    operation, which is the only placement this substitution cannot get past.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = user_data_outside(tmp_path)
+    (victim / "source.mp4").write_bytes(b"the user's only copy")
+
+    def substitute_staging(produced: Path) -> list[dict[str, str]]:
+        # Stands in for the window between the check and the use: validation is
+        # the last thing to run before promotion, so the swap lands there.
+        staging = produced.parent
+        shutil.rmtree(staging)
+        staging.symlink_to(victim, target_is_directory=True)
+        return []
+
+    monkeypatch.setattr(distill_source, "validate_media_file", substitute_staging)
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_BAD_OUTPUT_DIR"
+    assert sorted(entry.name for entry in victim.iterdir()) == ["holiday.jpg", "source.mp4"]
+    assert (victim / "source.mp4").read_bytes() == b"the user's only copy"
+    assert promoted_names(output_root) == []
+
+
+def test_discarding_staging_never_deletes_through_a_substituted_path(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 2-codex, R-16): the cleanup is a deletion too.
+
+    Discarding staging is the last thing a run does with the directory and the
+    furthest point from where it was created, so it is where a check made once
+    at the start has aged the most. What runs there is a recursive delete, which
+    is the operation with the least to gain from being trusting.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = user_data_outside(tmp_path).parent
+    real_promote = distill_source.promote_media
+
+    def promote_then_substitute(produced: Path, media_dir: Path, *, root: Path) -> Path:
+        # Promotion is the last step before the discard, so the swap lands here.
+        # The link goes one level above the staging directory: `rmtree` refuses a
+        # link handed to it directly, and follows one in a component every time.
+        promoted = real_promote(produced, media_dir, root=root)
+        staging = produced.parent
+        (victim / staging.name).mkdir()
+        (victim / staging.name / "tax-return.pdf").write_bytes(b"irreplaceable")
+        shutil.rmtree(staging.parent)
+        staging.parent.symlink_to(victim, target_is_directory=True)
+        return promoted
+
+    monkeypatch.setattr(distill_source, "promote_media", promote_then_substitute)
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_BAD_OUTPUT_DIR"
+    survivors = sorted(str(entry.relative_to(victim)) for entry in victim.rglob("*"))
+    assert "photos/holiday.jpg" in survivors
+    assert [name for name in survivors if name.endswith("tax-return.pdf")] != []
+
+
+def test_a_link_pre_created_at_the_promoted_media_path_is_refused(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 2-codex, R-16): the destination is checked too.
+
+    The media directory being sound when it was created is not the media path
+    being sound when the rename runs - that is a check separated from its use.
+    Re-walking the destination immediately before `os.replace` is what closes
+    the gap, and it is the only thing that sees a link at the leaf.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    output_root = tmp_path / "out"
+    output_root.mkdir()
+    victim = user_data_outside(tmp_path) / "holiday.jpg"
+    media_root(output_root).mkdir(parents=True)
+    (media_root(output_root) / "source.mp4").symlink_to(victim)
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_BAD_OUTPUT_DIR"
+    assert victim.read_bytes() == b"irreplaceable"
+
+
+# --- The caller's wait budget reaches the lease (finding 4-opus, D-044) -----
+#
+# Two runs of *the same video* share a **lock key**, which is the case D-044's
+# 300 s budget was written for: the likely holder is a run that is nearly done,
+# and waiting for it costs less than failing. The budget is spent here, at the
+# **acquisition lease**, because acquisition is what a second run of one video
+# reaches first - long before any **bundle key** is contended.
+
+
+class BudgetClock:
+    """A clock that moves only when the waiter polls, so a budget is exact.
+
+    A wait budget is a promise about how long a run waits, not about how long
+    the suite takes: `sleep` advances the reading and returns at once, and
+    `on_sleep` is where a test lets the world change - a holder giving the lease
+    up between two polls, which is the whole reason a run waits at all.
+    """
+
+    def __init__(self, on_sleep: Callable[[int], None] | None = None) -> None:
+        self.now = 0.0
+        self.sleeps = 0
+        self._on_sleep = on_sleep
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(time, name)
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps += 1
+        self.now += seconds
+        if self._on_sleep is not None:
+            self._on_sleep(self.sleeps)
+
+
+def youtube_options(root: Path) -> Any:
+    from distill.options import DistillOptions
+
+    return DistillOptions.from_args(
+        {
+            "url": URL,
+            "output_dir": str(root),
+            "ocr": False,
+            "redact_secrets": False,
+            "caption_frames": False,
+            "cache_mode": "fingerprint",
+        }
+    )
+
+
+def hold_the_lease(root: Path, lock_key: str) -> AcquisitionLease:
+    """Take the **acquisition lease** the way another run of the video holds it."""
+    from distill.source import LOCK_DIR_NAME
+
+    lock = root / LOCK_DIR_NAME / f"{lock_key}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lease = AcquisitionLease.take(lock_key, lock)
+    assert lease is not None
+    return lease
+
+
+def resolving_youtube(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    lock_wait_sec: float,
+) -> Any:
+    """Resolve a YouTube source the way a tool call does, metadata faked."""
+    from distill.source import YouTubeMetadata
+
+    monkeypatch.setattr(
+        distill_source,
+        "youtube_metadata",
+        lambda _url: YouTubeMetadata("abc123", "", []),
+    )
+    return distill_source.resolve_source_for_processing(
+        "youtube",
+        URL,
+        youtube_options(root),
+        lock_wait_sec=lock_wait_sec,
+    )
+
+
+def test_a_single_source_run_waits_for_the_lock_key_another_run_holds(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 4-opus, D-044): the budget never reached the downloader.
+
+    `YoutubeDownloader` defaulted to a wait of zero and production constructed
+    it with that default, so a second run of the same video was denied by the
+    lease on its first attempt and never reached the wait D-044 describes. The
+    300 s budget and the coalescing it exists to deliver were only reachable
+    when two runs had *different* lock keys - which is never two runs of one
+    video, the exact case the budget was written for.
+    """
+    from distill.bundle_store import SINGLE_SOURCE_LOCK_WAIT_SEC
+    from distill.source import youtube_lock_key
+
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    root = tmp_path / "out"
+    root.mkdir()
+    held = hold_the_lease(root, youtube_lock_key("abc123"))
+    clock = BudgetClock(on_sleep=lambda count: held.release() if count == 2 else None)
+    monkeypatch.setattr(distill_source, "time", clock)
+
+    resolution = resolving_youtube(monkeypatch, root, SINGLE_SOURCE_LOCK_WAIT_SEC)
+
+    assert clock.sleeps == 2, "the run must poll rather than be denied on its first attempt"
+    assert clock.now < SINGLE_SOURCE_LOCK_WAIT_SEC
+    assert resolution.source.resolved_path.read_bytes() == b"video"
+    distill_source.release_acquisition_lease(resolution.source)
+
+
+def test_a_batch_item_gives_up_on_the_lock_key_after_its_own_budget(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 4-opus, D-044): both budgets were unreachable, not one.
+
+    A playlist item behind another run's 40-minute video must fail fast and let
+    the batch move on, which is a different number and the same mechanism. Held
+    for the whole wait, the lease is denied - waiting on a lease never makes it
+    stealable.
+    """
+    from distill.bundle_store import BATCH_ITEM_LOCK_WAIT_SEC
+    from distill.source import youtube_lock_key
+
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    root = tmp_path / "out"
+    root.mkdir()
+    held = hold_the_lease(root, youtube_lock_key("abc123"))
+    clock = BudgetClock()
+    monkeypatch.setattr(distill_source, "time", clock)
+
+    with pytest.raises(DistillError) as exc:
+        resolving_youtube(monkeypatch, root, BATCH_ITEM_LOCK_WAIT_SEC)
+
+    assert exc.value.code == "E_LOCKED"
+    assert BATCH_ITEM_LOCK_WAIT_SEC == 5.0
+    assert clock.now == pytest.approx(BATCH_ITEM_LOCK_WAIT_SEC)
+    assert promoted_names(root) == []
+    held.release()
