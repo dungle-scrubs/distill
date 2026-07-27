@@ -13,12 +13,18 @@ loaded machine makes a test slower rather than red.
 
 from __future__ import annotations
 
+import ast
+import importlib
 import inspect
+import json
+import logging
+import math
 import os
 import signal
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -29,6 +35,7 @@ from distill.run_command import (
     ERROR_CODES,
     OUTPUT_CAP_BYTES,
     TRUNCATION_WARNING_CODE,
+    CommandTimeouts,
     FailureKind,
     run,
     run_json,
@@ -680,3 +687,285 @@ def test_stream_consumes_progress_while_the_other_stream_overflows() -> None:
 
     assert progress == [f"[download] {index}%" for index in range(32)]
     assert len(result.stderr) == 32 * 8192
+
+
+# --- the boundary event (R-29 observability) ---------------------------------
+
+
+def boundary_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    return [json.loads(record.message) for record in caplog.records]
+
+
+def test_every_invocation_emits_one_boundary_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One event per invocation, carrying what ties it to the run that made it."""
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        run(
+            child("import sys; sys.stdout.write('hi')"),
+            stage="source",
+            total_timeout_sec=GENEROUS_TOTAL_SEC,
+            idle_timeout_sec=GENEROUS_IDLE_SEC,
+        )
+
+    events = boundary_events(caplog)
+    assert len(events) == 1
+    assert events[0]["type"] == "distill.run_command"
+    detail = events[0]["detail"]
+    assert detail["stage"] == "source"
+    assert detail["tool"] == PYTHON
+    assert detail["outcome"] == "ok"
+    assert detail["exit_status"] == 0
+    assert detail["timeout_fired"] is None
+    # The run is one process, so pid plus ordinal is what correlates this
+    # invocation to the run that made it and orders it among the others.
+    assert detail["pid"] == os.getpid()
+    assert isinstance(detail["sequence"], int)
+    assert detail["duration_sec"] >= 0
+
+
+def test_the_boundary_event_carries_no_captured_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Captured output is **extracted text** and a debug log is not a redaction sink.
+
+    The child assembles the secret at runtime, so the string never appears in
+    the argv the event does record: what is asserted here is that the tool's
+    *output* stayed out, not that nothing recognizable was ever logged.
+    """
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        run(
+            child("import sys; s = 'sk' + '-secret'; sys.stdout.write(s); sys.stderr.write(s)"),
+            stage="ocr",
+            total_timeout_sec=GENEROUS_TOTAL_SEC,
+            idle_timeout_sec=GENEROUS_IDLE_SEC,
+        )
+
+    assert "sk-secret" not in caplog.text
+
+
+def test_a_failed_invocation_still_emits_its_boundary_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The events an operator needs most are the ones that ended badly."""
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        with pytest.raises(DistillError):
+            run(
+                child("import sys; sys.exit(3)"),
+                stage="frames",
+                total_timeout_sec=GENEROUS_TOTAL_SEC,
+                idle_timeout_sec=GENEROUS_IDLE_SEC,
+            )
+        with pytest.raises(DistillError):
+            run(
+                ["distill-no-such-tool"],
+                stage="frames",
+                total_timeout_sec=GENEROUS_TOTAL_SEC,
+                idle_timeout_sec=GENEROUS_IDLE_SEC,
+            )
+        with pytest.raises(DistillError):
+            run(
+                child("import time; time.sleep(30)"),
+                stage="frames",
+                total_timeout_sec=GENEROUS_TOTAL_SEC,
+                idle_timeout_sec=0.2,
+            )
+
+    outcomes = [event["detail"]["outcome"] for event in boundary_events(caplog)]
+    assert outcomes == ["exit_status", "missing_tool", "idle_timeout"]
+
+
+def test_a_callback_that_raises_still_emits_its_boundary_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A progress reporter can raise, and a tool that ran must leave a trace.
+
+    `ProgressReporter.update` raises once its counter is stopped, so this is a
+    production path, not a hypothetical one.
+    """
+
+    def explode(_line: str) -> None:
+        raise RuntimeError("progress reporter is stopped")
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="distill.run_command"),
+        pytest.raises(RuntimeError),
+    ):
+        stream(
+            child(CHATTY_FOREVER),
+            stage="youtube",
+            total_timeout_sec=GENEROUS_TOTAL_SEC,
+            idle_timeout_sec=GENEROUS_IDLE_SEC,
+            terminate_grace_sec=0.2,
+            on_stdout_line=explode,
+        )
+
+    assert [event["detail"]["outcome"] for event in boundary_events(caplog)] == [
+        "callback_error"
+    ]
+
+
+def test_an_unchecked_non_zero_exit_is_not_reported_as_ok(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A **degradation** is exactly what an operator comes to this event for."""
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        run(
+            child("import sys; sys.exit(1)"),
+            stage="youtube",
+            total_timeout_sec=GENEROUS_TOTAL_SEC,
+            idle_timeout_sec=GENEROUS_IDLE_SEC,
+            check=False,
+        )
+
+    assert boundary_events(caplog)[0]["detail"]["outcome"] == "nonzero_exit_unchecked"
+
+
+# --- the migrated call sites (M2.2) ------------------------------------------
+
+PACKAGE_ROOT = Path(run_command.__file__).parent
+# The one module allowed to import `subprocess`. Scope is the whole package,
+# with no exemption: `measure.py` is an offline harness rather than runtime
+# pipeline code, but it still invokes ffmpeg, and R-29 admits no second path.
+SUBPROCESS_OWNER = "run_command.py"
+
+# The names `run_command` exports for invoking a tool. A call to one of these
+# is a call site, and every call site is held to R-30 below.
+HELPER_NAMES = frozenset({"run", "stream", "run_json"})
+
+
+def package_modules() -> list[Path]:
+    return sorted(
+        module
+        for module in PACKAGE_ROOT.rglob("*.py")
+        if "__pycache__" not in module.parts
+    )
+
+
+def call_sites() -> list[tuple[str, int, dict[str, ast.expr]]]:
+    """Every invocation of a `run_command` helper outside `run_command` itself.
+
+    Read off the source rather than a maintained list, so a call site added
+    later is covered without anyone remembering to enumerate it. Only calls to
+    names the module imported from `run_command` count - an unrelated
+    `runner.run(...)` is not a tool invocation.
+    """
+    found: list[tuple[str, int, dict[str, ast.expr]]] = []
+    for module in package_modules():
+        if module.name == SUBPROCESS_OWNER:
+            continue
+        tree = ast.parse(module.read_text())
+        imported = {
+            alias.asname or alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("run_command")
+            for alias in node.names
+            if alias.name in HELPER_NAMES
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in imported
+            ):
+                found.append(
+                    (
+                        module.name,
+                        node.lineno,
+                        {
+                            keyword.arg: keyword.value
+                            for keyword in node.keywords
+                            if keyword.arg
+                        },
+                    )
+                )
+    return found
+
+
+def declared_timeouts() -> dict[str, CommandTimeouts]:
+    """Every `CommandTimeouts` pair the package declares, discovered by import."""
+    found: dict[str, CommandTimeouts] = {}
+    for module in package_modules():
+        if module.name == "__init__.py":
+            continue
+        imported = importlib.import_module(f"distill.{module.stem}")
+        for name, value in vars(imported).items():
+            if isinstance(value, CommandTimeouts):
+                found[f"{module.stem}.{name}"] = value
+    return found
+
+
+def test_the_package_has_call_sites_to_check() -> None:
+    """Guards the two tests below against silently checking an empty set."""
+    assert {module for module, _line, _kwargs in call_sites()} == {
+        "frame_selection.py",
+        "measure.py",
+        "ocr.py",
+        "source.py",
+        "transcript.py",
+    }
+
+
+def test_every_call_site_passes_both_timeouts() -> None:
+    """R-30: no invocation inherits a limit by omission, not even the default."""
+    missing = [
+        f"{module}:{line}"
+        for module, line, kwargs in call_sites()
+        if not {"total_timeout_sec", "idle_timeout_sec"} <= set(kwargs)
+    ]
+
+    assert missing == []
+
+
+# What a timeout argument must look like: `SOME_TIMEOUTS.total_sec`, reading
+# off a declared `CommandTimeouts` pair.
+TIMEOUT_FIELDS = {"total_timeout_sec": "total_sec", "idle_timeout_sec": "idle_sec"}
+
+
+def test_no_call_site_inlines_a_timeout_value() -> None:
+    """A literal at a call site is a limit nobody can find, review, or raise."""
+    def reads_the_named_field(value: ast.expr, field: str) -> bool:
+        return isinstance(value, ast.Attribute) and value.attr == field
+
+    inlined = [
+        f"{module}:{line} {argument}"
+        for module, line, kwargs in call_sites()
+        for argument, field in TIMEOUT_FIELDS.items()
+        if argument in kwargs and not reads_the_named_field(kwargs[argument], field)
+    ]
+
+    assert inlined == []
+
+
+def test_every_declared_timeout_pair_bounds_something() -> None:
+    pairs = declared_timeouts()
+
+    assert pairs
+    for name, timeouts in pairs.items():
+        assert timeouts.total_sec > 0 and math.isfinite(timeouts.total_sec), name
+        assert timeouts.idle_sec > 0 and math.isfinite(timeouts.idle_sec), name
+
+
+def test_every_module_with_a_call_site_declares_a_named_timeout_pair() -> None:
+    """The pair each call site reads from is declared in the module that runs it."""
+    invoking = {module.removesuffix(".py") for module, _line, _kwargs in call_sites()}
+    declaring = {name.split(".", 1)[0] for name in declared_timeouts()}
+
+    assert invoking <= declaring
+
+
+def test_a_timeout_pair_cannot_be_constructed_half_specified() -> None:
+    """R-30: there is no constructor that omits one of the two limits."""
+    with pytest.raises(TypeError):
+        CommandTimeouts(total_sec=60.0)  # ty: ignore[missing-argument]
+    with pytest.raises(TypeError):
+        CommandTimeouts(idle_sec=60.0)  # ty: ignore[missing-argument]
+
+
+@pytest.mark.parametrize(
+    ("total", "idle"),
+    [(0.0, 60.0), (-1.0, 60.0), (float("inf"), 60.0), (60.0, 0.0), (60.0, float("nan"))],
+)
+def test_a_timeout_pair_rejects_a_limit_that_bounds_nothing(total: float, idle: float) -> None:
+    with pytest.raises(ValueError):
+        CommandTimeouts(total_sec=total, idle_sec=idle)

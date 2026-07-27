@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -60,14 +63,32 @@ def test_scene_midpoint_candidates_falls_back_to_adaptive_detector(
     assert frame_selection.scene_midpoint_candidates(Path("demo.mp4"), 10.0) == [2.0]
 
 
+# A fake ffmpeg that writes the single frame it was asked for, and one that
+# fails the way a bad seek does. Both are real executables: run_command spawns a
+# real child in its own process group, which no patched call can stand in for.
+FAKE_FFMPEG_WRITES_FRAME = """
+import pathlib, sys
+
+pathlib.Path(sys.argv[-1]).write_bytes(b"png")
+"""
+
+FAKE_FFMPEG_FAILS = """
+import sys
+
+sys.stderr.write("Output file #0 does not contain any stream\\n")
+sys.exit(1)
+"""
+
+
 def test_extract_frame_degrades_when_ffmpeg_missing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    tmp_path: Path,
 ) -> None:
-    def _missing(*_args: Any, **_kwargs: Any) -> object:
-        raise FileNotFoundError("ffmpeg")
+    """ADR-0002: a keyframe that cannot be grabbed is a **warning**, not a raise.
 
-    monkeypatch.setattr(frame_selection.subprocess, "run", _missing)
-
+    Nothing is installed into the fake PATH, so ffmpeg is genuinely absent and
+    the degradation is driven by run_command's real E_MISSING_TOOL.
+    """
     result = frame_selection.extract_frame(Path("demo.mp4"), 1.0, tmp_path / "frame.png")
 
     assert result == {
@@ -75,6 +96,39 @@ def test_extract_frame_degrades_when_ffmpeg_missing(
         "code": "ffmpeg_missing",
         "message": "ffmpeg is not installed; skipping keyframe extraction",
     }
+
+
+def test_extract_frame_degrades_when_ffmpeg_fails(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """A non-zero exit reduces the bundle by one keyframe and continues."""
+    fake_tool("ffmpeg", FAKE_FFMPEG_FAILS)
+
+    result = frame_selection.extract_frame(Path("demo.mp4"), 1.5, tmp_path / "frame.png")
+
+    assert result == {
+        "stage": "frames",
+        "code": "frame_extract_failed",
+        "message": "could not extract frame at 1.500s",
+    }
+
+
+def test_extract_frame_emits_a_boundary_event(
+    fake_tool: Callable[[str, str], Path],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """R-29: the invocation is visible at the boundary, named by its stage."""
+    fake_tool("ffmpeg", FAKE_FFMPEG_WRITES_FRAME)
+
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        assert frame_selection.extract_frame(Path("demo.mp4"), 1.0, tmp_path / "f.png") is None
+
+    events = [json.loads(record.message) for record in caplog.records]
+    assert [(event["detail"]["tool"], event["detail"]["stage"]) for event in events] == [
+        ("ffmpeg", "frames")
+    ]
 
 
 def test_frame_selection_reports_scene_and_candidate_progress(

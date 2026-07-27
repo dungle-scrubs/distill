@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -39,6 +38,7 @@ try:
     )
     from .pipeline import run_timeout_probe, timeout_diagnostics
     from .redact_secrets import redact_text
+    from .run_command import CommandTimeouts, run
     from .source import probe_duration
     from .transcript import FasterWhisperAdapter, extract_audio
 except ImportError:
@@ -54,11 +54,20 @@ except ImportError:
         timeout_diagnostics,
     )
     from distill.redact_secrets import redact_text  # type: ignore[no-redef]
+    from distill.run_command import (  # type: ignore[no-redef]
+        CommandTimeouts,
+        run,
+    )
     from distill.source import probe_duration  # type: ignore[no-redef]
     from distill.transcript import (  # type: ignore[no-redef]
         FasterWhisperAdapter,
         extract_audio,
     )
+
+# Corpus generation encodes a few seconds of synthetic video; generous, because
+# a slow machine is not a wedged one, and bounded, because nothing here should
+# outlive a coffee break.
+CORPUS_TIMEOUTS = CommandTimeouts(total_sec=600.0, idle_sec=120.0)
 
 SCHEMA_VERSION = 1
 MIN_CORPUS_ITEMS = 3
@@ -157,12 +166,20 @@ def require_ffmpeg() -> None:
         raise RuntimeError("ffprobe is required to measure synthetic corpus")
 
 
-def run_command(command: list[str]) -> None:
-    proc = subprocess.run(command, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"command failed: {command[0]}\nstdout={proc.stdout}\nstderr={proc.stderr}"
-        )
+def generate_corpus_media(command: list[str]) -> None:
+    """Run one corpus-generating ffmpeg invocation.
+
+    Offline harness or not, this is an external tool invocation and goes
+    through the one subprocess path (R-29), so it inherits both timeouts, its
+    own process group, concurrent draining and the shared failure taxonomy
+    instead of being the last place a wedged ffmpeg can hang forever.
+    """
+    run(
+        command,
+        stage="measure",
+        total_timeout_sec=CORPUS_TIMEOUTS.total_sec,
+        idle_timeout_sec=CORPUS_TIMEOUTS.idle_sec,
+    )
 
 
 def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
@@ -174,7 +191,7 @@ def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
     scene_cuts = output_dir / "distill-scene-cuts.mp4"
     quiet = output_dir / "distill-quiet-demo.mp4"
 
-    run_command(
+    generate_corpus_media(
         [
             "ffmpeg",
             "-y",
@@ -196,7 +213,7 @@ def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
             str(static),
         ]
     )
-    run_command(
+    generate_corpus_media(
         [
             "ffmpeg",
             "-y",
@@ -232,7 +249,7 @@ def generate_synthetic_corpus(output_dir: Path) -> list[CorpusItem]:
             str(scene_cuts),
         ]
     )
-    run_command(
+    generate_corpus_media(
         [
             "ffmpeg",
             "-y",

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import logging
+from ast import literal_eval
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -134,23 +138,58 @@ def test_ffmpeg_progress_time_parses_supported_formats() -> None:
     assert parse_ffmpeg_progress_time("progress=continue") is None
 
 
+# ffmpeg is told to write its `-progress` blocks to stderr ("-progress pipe:2"),
+# so unlike yt-dlp, stderr is the stream this call site must read (R-32). The
+# fakes below are real executables, because run_command spawns a real child.
+FAKE_FFMPEG_ONE_BLOCK = """
+import pathlib, sys
+
+argv = sys.argv[1:]
+output = pathlib.Path(argv[-1])
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_bytes(b"audio")
+(output.parent / "ffmpeg-argv.txt").write_text(repr(argv))
+if "-progress" in argv:
+    # One real -progress block: the same instant reported under several keys.
+    for line in [
+        "frame=125",
+        "fps=25.00",
+        "stream_0_0_q=-0.0",
+        "bitrate=  32.0kbits/s",
+        "total_size=20480",
+        "out_time_us=5000000",
+        "out_time_ms=5000000",
+        "out_time=00:00:05.000000",
+        "dup_frames=0",
+        "drop_frames=0",
+        "speed=  50x",
+        "progress=continue",
+    ]:
+        sys.stderr.write(line + "\\n")
+    sys.stderr.flush()
+"""
+
+
+def fake_ffmpeg_failing(noise_lines: int) -> str:
+    """A fake ffmpeg that emits one progress block, then noise, then dies."""
+    return f"""
+import sys
+
+sys.stderr.write("out_time=00:00:05.000000\\n")
+sys.stderr.write("progress=continue\\n")
+for index in range({noise_lines}):
+    sys.stderr.write("noise line " + str(index) + "\\n")
+sys.stderr.write("video.mp4: Invalid data found when processing input\\n")
+sys.exit(1)
+"""
+
+
 def test_transcribe_video_enables_audio_extraction_progress(
+    fake_tool: Callable[[str, str], Path],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    captured_command: list[str] = []
-
-    class FakePopen:
-        returncode = 0
-
-        def __init__(self, command: list[str], **_kwargs: object) -> None:
-            captured_command.extend(command)
-            self.stderr = iter(())
-
-        def communicate(self) -> tuple[str, str]:
-            return "", ""
-
-    monkeypatch.setattr("distill.transcript.subprocess.Popen", FakePopen)
+    fake_tool("ffmpeg", FAKE_FFMPEG_ONE_BLOCK)
     monkeypatch.setattr(transcript, "transcribe_audio", lambda *_a, **_k: (None, []))
 
     transcribe_video(
@@ -163,24 +202,17 @@ def test_transcribe_video_enables_audio_extraction_progress(
         duration_sec=10.0,
     )
 
-    progress_index = captured_command.index("-progress")
-    assert captured_command[progress_index : progress_index + 2] == ["-progress", "pipe:2"]
+    command = literal_eval((tmp_path / "ffmpeg-argv.txt").read_text())
+    progress_index = command.index("-progress")
+    assert command[progress_index : progress_index + 2] == ["-progress", "pipe:2"]
 
 
 def test_extract_audio_reports_media_time_progress(
+    fake_tool: Callable[[str, str], Path],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    class FakePopen:
-        returncode = 0
-
-        def __init__(self, _command: list[str], **_kwargs: object) -> None:
-            self.stderr = iter(["out_time=00:00:05.00\n"])
-
-        def communicate(self) -> tuple[str, str]:
-            return "", ""
-
-    monkeypatch.setattr("distill.transcript.subprocess.Popen", FakePopen)
+    fake_tool("ffmpeg", FAKE_FFMPEG_ONE_BLOCK)
     monkeypatch.setattr(transcript, "transcribe_audio", lambda *_a, **_k: (None, []))
     progress = ProgressReporter()
 
@@ -209,35 +241,10 @@ def test_extract_audio_reports_media_time_progress(
 
 
 def test_extract_audio_emits_one_event_per_ffmpeg_progress_block(
-    monkeypatch: pytest.MonkeyPatch,
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
-    # A real ffmpeg -progress block reports the same instant under several keys.
-    block = [
-        "frame=125\n",
-        "fps=25.00\n",
-        "stream_0_0_q=-0.0\n",
-        "bitrate=  32.0kbits/s\n",
-        "total_size=20480\n",
-        "out_time_us=5000000\n",
-        "out_time_ms=5000000\n",
-        "out_time=00:00:05.000000\n",
-        "dup_frames=0\n",
-        "drop_frames=0\n",
-        "speed=  50x\n",
-        "progress=continue\n",
-    ]
-
-    class FakePopen:
-        returncode = 0
-
-        def __init__(self, _command: list[str], **_kwargs: object) -> None:
-            self.stderr = iter(block)
-
-        def communicate(self) -> tuple[str, str]:
-            return "", ""
-
-    monkeypatch.setattr("distill.transcript.subprocess.Popen", FakePopen)
+    fake_tool("ffmpeg", FAKE_FFMPEG_ONE_BLOCK)
     progress = ProgressReporter()
 
     extract_audio(
@@ -257,28 +264,10 @@ def test_extract_audio_emits_one_event_per_ffmpeg_progress_block(
 
 
 def test_extract_audio_failure_reports_bounded_ffmpeg_stderr(
-    monkeypatch: pytest.MonkeyPatch,
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
-    noise = [f"noise line {index}\n" for index in range(transcript.STDERR_TAIL_LINES + 40)]
-
-    class FakePopen:
-        returncode = 1
-
-        def __init__(self, _command: list[str], **_kwargs: object) -> None:
-            self.stderr = iter(
-                [
-                    "out_time=00:00:05.000000\n",
-                    "progress=continue\n",
-                    *noise,
-                    "video.mp4: Invalid data found when processing input\n",
-                ]
-            )
-
-        def communicate(self) -> tuple[str, str]:
-            return "", ""
-
-    monkeypatch.setattr("distill.transcript.subprocess.Popen", FakePopen)
+    fake_tool("ffmpeg", fake_ffmpeg_failing(transcript.STDERR_TAIL_LINES + 40))
 
     result = extract_audio(
         tmp_path / "video.mp4",
@@ -381,13 +370,15 @@ def test_low_confidence_segments_are_dropped_with_warning(tmp_path: Path) -> Non
 
 
 def test_extract_audio_degrades_when_ffmpeg_missing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    tmp_path: Path,
 ) -> None:
-    def _missing(*_args: Any, **_kwargs: Any) -> object:
-        raise FileNotFoundError("ffmpeg")
+    """ADR-0002: the run continues with a **warning** rather than raising.
 
-    monkeypatch.setattr("distill.transcript.subprocess.Popen", _missing)
-
+    Nothing is installed into the fake PATH, so ffmpeg is genuinely absent and
+    run_command's E_MISSING_TOOL is the error being degraded - not a patched
+    exception standing in for one.
+    """
     result = extract_audio(tmp_path / "video.mp4", tmp_path / "audio.wav")
 
     assert result == {
@@ -395,6 +386,23 @@ def test_extract_audio_degrades_when_ffmpeg_missing(
         "code": "audio_extract_failed",
         "message": "ffmpeg is not installed",
     }
+
+
+def test_extract_audio_emits_a_boundary_event(
+    fake_tool: Callable[[str, str], Path],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """R-29: the invocation is visible at the boundary, named by its stage."""
+    fake_tool("ffmpeg", FAKE_FFMPEG_ONE_BLOCK)
+
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        extract_audio(tmp_path / "video.mp4", tmp_path / "audio.wav")
+
+    events = [json.loads(record.message) for record in caplog.records]
+    assert [(event["detail"]["tool"], event["detail"]["stage"]) for event in events] == [
+        ("ffmpeg", "transcript")
+    ]
 
 
 def test_transcribe_video_returns_audio_warning_without_transcribing(

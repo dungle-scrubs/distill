@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import subprocess
 from collections import deque
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Protocol
 
-from .errors import warning
+from .errors import DistillError, warning
 from .progress import ProgressCounter, ProgressReporter
+from .run_command import CommandTimeouts, stream
 
 MIN_CONFIDENCE = -1.0
 VAD_DROP_WARNING_RATIO = 0.50
@@ -40,6 +40,11 @@ FFMPEG_PROGRESS_KEYS = frozenset(
 # is kept - but bounded, since -progress makes stderr unbounded in the happy case.
 STDERR_TAIL_LINES = 20
 STDERR_TAIL_CHARS = 600
+
+# Extraction is bounded by silence rather than by length (R-30): decoding a long
+# recording is legitimately slow, but ffmpeg emits either a -progress block or a
+# stats line while it works, so two minutes without a byte means it is wedged.
+AUDIO_EXTRACT_TIMEOUTS = CommandTimeouts(total_sec=3 * 60 * 60.0, idle_sec=120.0)
 
 
 class WhisperAdapter(Protocol):
@@ -102,6 +107,18 @@ def is_ffmpeg_progress_line(line: str) -> bool:
     return key in FFMPEG_PROGRESS_KEYS or (key.startswith("stream_") and key.endswith("_q"))
 
 
+def _extract_failure_reason(error: DistillError) -> str:
+    """Why extraction could not run, in the words the degradation reports.
+
+    A missing binary keeps its own wording because "not installed" is the one a
+    reader can act on; anything else carries run_command's message, which names
+    the timeout that fired.
+    """
+    if error.code == "E_MISSING_TOOL":
+        return "ffmpeg is not installed"
+    return f"ffmpeg could not extract audio: {error.message}"
+
+
 def format_stderr_tail(lines: Iterable[str]) -> str:
     tail = " | ".join(stripped for line in lines if (stripped := line.strip()))
     if len(tail) > STDERR_TAIL_CHARS:
@@ -132,39 +149,47 @@ def extract_audio(
         command.extend(["-progress", "pipe:2"])
     command.append(str(audio_path))
 
-    try:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except FileNotFoundError:
-        # ffmpeg not installed: degrade to no-transcript rather than crashing.
-        return warning("transcript", "audio_extract_failed", "ffmpeg is not installed")
     stderr_tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
-    if proc.stderr:
-        for line in proc.stderr:
-            if is_ffmpeg_progress_line(line):
-                if not line.startswith(FFMPEG_PROGRESS_TIME_KEY):
-                    continue
-                progress_sec = parse_ffmpeg_progress_time(line)
-                if progress_sec is not None and progress and duration_sec and duration_sec > 0:
-                    progress.update(
-                        "audio_extraction",
-                        percent=(progress_sec / duration_sec) * 100,
-                        detail={
-                            "processed_sec": progress_sec,
-                            "duration_sec": duration_sec,
-                        },
-                    )
-                continue
-            stderr_tail.append(line)
-    _stdout, remaining_stderr = proc.communicate()
-    for line in (remaining_stderr or "").splitlines():
-        if not is_ffmpeg_progress_line(line):
-            stderr_tail.append(line)
-    if proc.returncode != 0:
+
+    def read_stderr(line: str) -> None:
+        """Consume one ffmpeg stderr line: a -progress field, or diagnostics.
+
+        ffmpeg is told to write its -progress blocks to stderr ("-progress
+        pipe:2"), so this is the stream to parse here - unlike yt-dlp, whose
+        progress is on stdout (R-32).
+        """
+        if is_ffmpeg_progress_line(line):
+            # A block reports one instant under several keys; only the
+            # out_time= field drives an event, so a block emits exactly one.
+            if not line.startswith(FFMPEG_PROGRESS_TIME_KEY):
+                return
+            progress_sec = parse_ffmpeg_progress_time(line)
+            if progress_sec is not None and progress and duration_sec and duration_sec > 0:
+                progress.update(
+                    "audio_extraction",
+                    percent=(progress_sec / duration_sec) * 100,
+                    detail={
+                        "processed_sec": progress_sec,
+                        "duration_sec": duration_sec,
+                    },
+                )
+            return
+        stderr_tail.append(line)
+
+    try:
+        result = stream(
+            command,
+            stage="transcript",
+            total_timeout_sec=AUDIO_EXTRACT_TIMEOUTS.total_sec,
+            idle_timeout_sec=AUDIO_EXTRACT_TIMEOUTS.idle_sec,
+            on_stderr_line=read_stderr,
+            check=False,
+        )
+    except DistillError as exc:
+        # ADR-0002: no transcript is a reduced bundle, not a dead run, so an
+        # absent or wedged ffmpeg degrades here rather than ending the run.
+        return warning("transcript", "audio_extract_failed", _extract_failure_reason(exc))
+    if result.returncode != 0:
         reason = format_stderr_tail(stderr_tail)
         message = "ffmpeg could not extract audio"
         if reason:

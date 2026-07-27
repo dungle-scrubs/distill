@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -44,6 +44,35 @@ def neutralize_distill_environment(
     environment.setenv("HOME", str(home))
     environment.setenv("USERPROFILE", str(home))
     environment.setenv("DISTILL_CONFIG_DIR", str(config_dir))
+
+
+@pytest.fixture
+def fake_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[str, str], Path]:
+    """Install a fake external tool on `PATH` and return the installer.
+
+    Every external tool now runs through `run_command`, which spawns a real
+    child in its own process group and drains real pipes. A patched `Popen` can
+    no longer stand in for a tool, so a fake is a real executable: a Python
+    script with the test interpreter in its shebang, needing no shell.
+
+    `PATH` is replaced by the fake directory alone, so a tool a test does not
+    install is genuinely absent - a degradation test cannot pass merely because
+    the machine running it happens to lack ffmpeg, nor fail because it has it.
+    """
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    def install(name: str, script: str) -> Path:
+        path = bin_dir / name
+        path.write_text(f"#!{sys.executable}\n{script}")
+        path.chmod(0o755)
+        return path
+
+    return install
 
 
 @pytest.fixture(autouse=True)

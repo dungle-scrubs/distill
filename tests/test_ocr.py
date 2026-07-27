@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import platform
 import subprocess
+from ast import literal_eval
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -109,18 +113,95 @@ def test_find_tesseract_command_returns_none_when_missing() -> None:
     assert result is None
 
 
-def test_ocr_frame_returns_empty_and_warning_when_pytesseract_missing(
+# A fake tesseract, invoked the way the CLI really is: `tesseract IMAGE stdout
+# -l LANG`, with the recognized text on stdout. It records its argv so a test
+# can assert on the invocation that happened rather than on a patched call.
+FAKE_TESSERACT = """
+import pathlib, sys
+
+argv = sys.argv[1:]
+image = pathlib.Path(argv[0])
+(image.parent / "tesseract-argv.txt").write_text(repr(argv))
+sys.stdout.write("SLIDE TEXT\\n\\n")
+"""
+
+FAKE_TESSERACT_FAILING = """
+import sys
+
+sys.stderr.write("Error in pixReadStream: Pix not read\\n")
+sys.exit(1)
+"""
+
+
+def test_ocr_frame_reads_text_tesseract_printed_to_stdout(
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
+    """The adapter runs the tesseract binary itself and keeps what it read."""
+    command = fake_tool("tesseract", FAKE_TESSERACT)
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"not really a png")
+
+    text, frame_warning = ocr_frame(frame, "eng", str(command))
+
+    assert (text, frame_warning) == ("SLIDE TEXT", None)
+    argv = literal_eval((tmp_path / "tesseract-argv.txt").read_text())
+    # `stdout` as the output base is what makes tesseract print rather than
+    # write a sibling .txt file, and `-l` selects the language pack.
+    assert argv[1:] == ["stdout", "-l", "eng"]
+
+
+def test_ocr_frame_degrades_when_tesseract_is_absent(tmp_path: Path) -> None:
+    """ADR-0002: image-text extraction is an **optional capability**.
+
+    Its absence yields the one warning the capability table defines, stating the
+    cost, rather than a bespoke message or a raise.
+    """
     frame = tmp_path / "frame.png"
     frame.write_bytes(b"fake")
 
-    with patch.dict("sys.modules", {"pytesseract": None}):
-        text, warning_result = ocr_frame(frame, "eng")
+    with patch("distill.ocr.find_tesseract_command", return_value=None):
+        text, frame_warning = ocr_frame(frame, "eng")
 
     assert text == ""
-    assert warning_result is not None
-    assert warning_result["code"] == "tesseract_python_missing"
+    assert frame_warning is not None
+    assert frame_warning["code"] == "tesseract_not_found"
+    assert EXTERNAL_TOOLS["tesseract"].absence_cost in frame_warning["message"]
+
+
+def test_ocr_frame_reports_a_failing_tesseract_as_a_warning(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """One unreadable frame costs its extracted text, not the run."""
+    command = fake_tool("tesseract", FAKE_TESSERACT_FAILING)
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"fake")
+
+    text, frame_warning = ocr_frame(frame, "eng", str(command))
+
+    assert text == ""
+    assert frame_warning is not None
+    assert frame_warning["code"] == "ocr_failed"
+    assert "frame.png" in frame_warning["message"]
+
+
+def test_ocr_frame_emits_a_boundary_event(
+    fake_tool: Callable[[str, str], Path],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """R-29: the invocation is visible at the boundary, named by its stage."""
+    command = fake_tool("tesseract", FAKE_TESSERACT)
+    frame = tmp_path / "frame.png"
+    frame.write_bytes(b"fake")
+
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        ocr_frame(frame, "eng", str(command))
+
+    events = [json.loads(record.message) for record in caplog.records]
+    assert [event["detail"]["stage"] for event in events] == ["ocr"]
+    assert events[0]["detail"]["tool"] == str(command)
 
 
 def test_ocr_frames_sets_empty_ocr_text_when_disabled(tmp_path: Path) -> None:

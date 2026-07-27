@@ -34,6 +34,12 @@ session, and a timeout signals the group: SIGTERM, a grace period, then
 SIGKILL. Signals are sent while the direct child is still unreaped, so the
 group id cannot have been recycled onto an unrelated process.
 
+Why a boundary event (R-29 observability). Because this is the only path an
+external tool is invoked on, one event emitted here covers every invocation in
+the pipeline without a call site remembering to log. Every invocation emits
+exactly one, at the end, whether it succeeded, failed, or never started; see
+`_boundary_log`.
+
 Known limits. A grandchild that inherits the pipes and outlives its parent is
 not killed when the parent exits on its own - only a timeout terminates the
 group - and draining is bounded rather than waiting for such a grandchild to
@@ -44,7 +50,9 @@ run. Process control here is POSIX-only.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
+import logging
 import math
 import os
 import queue
@@ -59,6 +67,8 @@ from pathlib import Path
 from typing import Any
 
 from .errors import DistillError, warning
+
+LOGGER = logging.getLogger(__name__)
 
 # R-30: an invocation with no output for this long is treated as stalled. Named
 # rather than repeated at call sites so raising it is one edit.
@@ -112,6 +122,29 @@ _TIMEOUT_KINDS: dict[str, FailureKind] = {
     "total": FailureKind.TOTAL_TIMEOUT,
     "idle": FailureKind.IDLE_TIMEOUT,
 }
+
+
+@dataclass(frozen=True)
+class CommandTimeouts:
+    """The pair of limits one call site invokes its tool under (R-30).
+
+    Both are required: there is no constructor that produces a half-specified
+    pair, so a call site cannot express "bound the total but not the stall" by
+    omission. Each is validated the moment it is written down rather than when
+    the tool is finally run, which is what makes a wrong limit a startup error
+    instead of a surprise an hour into a download.
+
+    A long download is bounded by `idle_sec` rather than `total_sec`: the total
+    for such a call site is deliberately generous, because the limit that
+    detects a wedged transfer is the absence of output, not the elapsed time.
+    """
+
+    total_sec: float
+    idle_sec: float
+
+    def __post_init__(self) -> None:
+        _validate_timeout("total_sec", self.total_sec)
+        _validate_timeout("idle_sec", self.idle_sec)
 
 
 @dataclass(frozen=True)
@@ -315,6 +348,61 @@ def _failure(
     )
 
 
+# --- the boundary event ------------------------------------------------------
+
+BOUNDARY_EVENT_TYPE = "distill.run_command"
+BOUNDARY_EVENT_NAME = "tool_invocation"
+
+# Ordinal of the invocation within this process. A run is one process, so the
+# pid plus this ordinal orders every tool Distill spawned and ties each event to
+# the run that spawned it without a run id having to be threaded through.
+_invocation_sequence = itertools.count(1)
+
+
+def _boundary_log(
+    *,
+    outcome: str,
+    stage: str,
+    argv: Sequence[str],
+    sequence: int,
+    exit_status: int | None,
+    timeout_fired: str | None,
+    duration_sec: float,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> None:
+    """Emit the one event this invocation produces (R-29 observability).
+
+    Metadata only. The tool's captured output is deliberately absent: it is
+    **extracted text**, it has not passed a **redaction sink**, and a debug log
+    is not one. What is here answers which tool ran, under which stage, in what
+    order within the run, how it ended, and how long it took - enough to trace a
+    hang or a degradation back to the invocation that caused it.
+    """
+    LOGGER.debug(
+        json.dumps(
+            {
+                "type": BOUNDARY_EVENT_TYPE,
+                "event": BOUNDARY_EVENT_NAME,
+                "detail": {
+                    "pid": os.getpid(),
+                    "sequence": sequence,
+                    "stage": stage,
+                    "tool": _tool_of(argv),
+                    "argv": list(argv),
+                    "outcome": outcome,
+                    "exit_status": exit_status,
+                    "timeout_fired": timeout_fired,
+                    "duration_sec": round(duration_sec, 6),
+                    "stdout_truncated": stdout_truncated,
+                    "stderr_truncated": stderr_truncated,
+                },
+            },
+            sort_keys=True,
+        )
+    )
+
+
 # --- capture and draining ----------------------------------------------------
 
 
@@ -513,6 +601,21 @@ def _drain_queue(
         _deliver(name, text, on_stdout_line, on_stderr_line)
 
 
+def _outcome_of(timeout_fired: str | None, exit_status: int | None, *, check: bool) -> str:
+    """How the invocation ended, for the boundary event.
+
+    A non-zero exit under `check=False` is reported as it happened rather than
+    as success: the caller chose to handle it, which does not make it a clean
+    run, and a **degradation** is exactly what an operator comes to this event
+    looking for.
+    """
+    if timeout_fired is not None:
+        return _TIMEOUT_KINDS[timeout_fired].value
+    if exit_status != 0:
+        return FailureKind.EXIT_STATUS.value if check else "nonzero_exit_unchecked"
+    return "ok"
+
+
 def _execute(
     argv: Sequence[str],
     *,
@@ -538,6 +641,7 @@ def _execute(
         raise ValueError(f"output_cap_bytes must be positive, got {output_cap_bytes!r}")
 
     started = time.monotonic()
+    sequence = next(_invocation_sequence)
     try:
         # An argument list, always. There is no code path here that hands a
         # command line to a shell, so no argument can become syntax.
@@ -553,6 +657,18 @@ def _execute(
             start_new_session=True,
         )
     except (FileNotFoundError, NotADirectoryError, PermissionError, IsADirectoryError) as exc:
+        duration_sec = time.monotonic() - started
+        _boundary_log(
+            outcome=FailureKind.MISSING_TOOL.value,
+            stage=stage,
+            argv=command,
+            sequence=sequence,
+            exit_status=None,
+            timeout_fired=None,
+            duration_sec=duration_sec,
+            stdout_truncated=False,
+            stderr_truncated=False,
+        )
         raise _failure(
             FailureKind.MISSING_TOOL,
             command,
@@ -563,7 +679,7 @@ def _execute(
                 timeout_fired=None,
                 stdout_truncated=False,
                 stderr_truncated=False,
-                duration_sec=time.monotonic() - started,
+                duration_sec=duration_sec,
             ),
         ) from exc
 
@@ -608,8 +724,22 @@ def _execute(
             _dispatch(lines, max(wait_for, 0.0), on_stdout_line, on_stderr_line)
     except BaseException:
         # A callback raised, or the caller was interrupted: the child is still
-        # ours to clean up.
-        _terminate_group(proc, grace)
+        # ours to clean up. This path is reachable in production - a progress
+        # reporter whose counter has been stopped raises - so it emits the
+        # invocation's boundary event too, rather than being the one way a tool
+        # can run and leave no trace.
+        exit_status = _terminate_group(proc, grace)
+        _boundary_log(
+            outcome="callback_error",
+            stage=stage,
+            argv=command,
+            sequence=sequence,
+            exit_status=exit_status,
+            timeout_fired=None,
+            duration_sec=time.monotonic() - started,
+            stdout_truncated=sinks[_STDOUT].truncated,
+            stderr_truncated=sinks[_STDERR].truncated,
+        )
         raise
 
     exit_status = (
@@ -648,6 +778,18 @@ def _execute(
         stderr_truncated=stderr_sink.truncated,
         stderr=stderr_sink.text(),
         duration_sec=duration_sec,
+    )
+
+    _boundary_log(
+        outcome=_outcome_of(timeout_fired, exit_status, check=check),
+        stage=stage,
+        argv=command,
+        sequence=sequence,
+        exit_status=exit_status,
+        timeout_fired=timeout_fired,
+        duration_sec=duration_sec,
+        stdout_truncated=stdout_sink.truncated,
+        stderr_truncated=stderr_sink.truncated,
     )
 
     if timeout_fired is not None:

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
+from ast import literal_eval
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -23,6 +26,7 @@ from distill.source import (
     parse_byte_amount,
     parse_youtube_url,
     parse_ytdlp_progress,
+    probe_duration,
     sensitive_path_match,
     source_hash,
     validate_output_root,
@@ -56,26 +60,33 @@ def test_ensure_youtube_host_rejects_injection_and_foreign_hosts() -> None:
     ensure_youtube_host("https://www.youtube.com/playlist?list=PLabc")
 
 
-def test_playlist_listing_uses_guarded_ytdlp_command(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import subprocess
+# A fake yt-dlp that records the argv it was handed, so a test can assert on the
+# invocation that really happened rather than on a patched call. The recording
+# path is passed out of band, in an environment variable Distill never reads.
+FAKE_YTDLP_RECORDING_ARGV = """
+import os, pathlib, sys
 
-    from distill import source
+pathlib.Path(os.environ["FAKE_YTDLP_ARGV_FILE"]).write_text(repr(sys.argv[1:]))
+sys.stdout.write("https://youtu.be/aaa\\n")
+"""
+
+
+def test_playlist_listing_uses_guarded_ytdlp_command(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The guard is on the argv yt-dlp actually receives, not on a patched call."""
     from distill.pipeline import youtube_playlist_urls
 
-    captured: dict[str, list[str]] = {}
-
-    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        captured["command"] = command
-        return subprocess.CompletedProcess(command, 0, "https://youtu.be/aaa\n", "")
-
-    monkeypatch.setattr(source.subprocess, "run", fake_run)
+    fake_tool("yt-dlp", FAKE_YTDLP_RECORDING_ARGV)
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_YTDLP_ARGV_FILE", str(argv_file))
 
     urls = youtube_playlist_urls("https://www.youtube.com/playlist?list=PLabc", 10)
 
     assert urls == ["https://youtu.be/aaa"]
-    command = captured["command"]
+    command = literal_eval(argv_file.read_text())
     # URL sits after a literal `--`, and yt-dlp gets a socket timeout.
     assert command[-2:] == ["--", "https://www.youtube.com/playlist?list=PLabc"]
     assert "--socket-timeout" in command
@@ -431,62 +442,153 @@ def test_youtube_long_lock_wait_emits_warning(tmp_path: Path) -> None:
     assert warnings[0]["code"] == "long_lock_wait"
 
 
-def test_youtube_downloader_parses_progress_and_preserves_success(
-    monkeypatch: pytest.MonkeyPatch,
+# A fake yt-dlp writing realistic `--newline` download progress to **stdout**,
+# which is the stream yt-dlp actually uses (R-32). It produces the media file
+# the same way yt-dlp does, from the `-o` template, and never touches a network.
+FAKE_YTDLP_DOWNLOAD = """
+import pathlib, sys
+
+argv = sys.argv[1:]
+template = argv[argv.index("-o") + 1]
+media = pathlib.Path(template.replace("%(ext)s", "mp4"))
+media.parent.mkdir(parents=True, exist_ok=True)
+media.write_bytes(b"video")
+pathlib.Path(media.parent / "argv.json").write_text(repr(argv))
+if "--progress" not in argv:
+    # Standing in for a user config that set --quiet: without --progress the
+    # real yt-dlp goes silent, and a silent download starves the idle timer.
+    sys.exit(0)
+for line in [
+    "[download] Destination: source.mp4",
+    "[download]  10.0% of   10.00MiB at    1.00MiB/s ETA 00:09",
+    "[download]  55.0% of   10.00MiB at    1.00MiB/s ETA 00:04",
+    "[download] 100.0% of   10.00MiB in 00:00:10",
+]:
+    sys.stdout.write(line + "\\n")
+    sys.stdout.flush()
+"""
+
+FAKE_YTDLP_FAILING = """
+import sys
+
+sys.stdout.write("[download] Destination: source.mp4\\n")
+sys.stderr.write("ERROR: fatal error\\n")
+sys.exit(1)
+"""
+
+
+def test_ytdlp_download_progress_is_read_from_stdout(
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
-    commands: list[list[str]] = []
+    """FAILS FIRST (finding 3, R-32): progress lives on stdout, not stderr.
 
-    class FakePopen:
-        returncode = 0
-
-        def __init__(self, command: list[str], **_kwargs: object) -> None:
-            commands.append(command)
-            out_template = Path(command[command.index("-o") + 1])
-            (out_template.parent / "source.mp4").write_bytes(b"video")
-            self.stderr = iter(
-                [
-                    "[download] Destination: source.mp4\n",
-                    "[download] 50.0% of 10.00MiB at 1.00MiB/s ETA 00:05\n",
-                ]
-            )
-
-        def communicate(self) -> tuple[str, str]:
-            return "", ""
-
-    monkeypatch.setattr("distill.source.subprocess.Popen", FakePopen)
+    yt-dlp writes `--newline` progress to stdout. Reading stderr for it reports
+    no progress at all, and - with both pipes not drained concurrently - is the
+    deadlock finding 3 describes. The fake writes only to stdout, so a reader
+    pointed at the wrong stream sees nothing.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
     progress = ProgressReporter()
-    downloader = YoutubeDownloader(tmp_path)
 
-    path = downloader.download("https://youtu.be/abc123", "abc123", progress)
+    YoutubeDownloader(tmp_path).download("https://youtu.be/abc123", "abc123", progress)
+
+    # The two leading Nones are the lock step and yt-dlp's indeterminate
+    # "Destination:" line; every percent after them came off stdout.
+    assert [
+        event.percent
+        for event in progress.events
+        if event.mechanism == "youtube_download" and event.status == "running"
+    ] == [None, None, 10.0, 55.0, 100.0]
+
+
+def test_ytdlp_download_progress_percent_advances(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """Percent advances while a download runs, and the media file is returned."""
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    progress = ProgressReporter()
+
+    path = YoutubeDownloader(tmp_path).download("https://youtu.be/abc123", "abc123", progress)
 
     assert path.name == "source.mp4"
-    assert "--newline" in commands[0]
-    assert any(
-        event.mechanism == "youtube_download" and event.percent == 50.0 for event in progress.events
-    )
+    argv = literal_eval((path.parent / "argv.json").read_text())
+    # `--newline` is what makes yt-dlp emit one progress line per update rather
+    # than rewriting a single line with carriage returns.
+    assert "--newline" in argv
+    assert argv[-2:] == ["--", "https://youtu.be/abc123"]
+    percents = [
+        event.percent
+        for event in progress.events
+        if event.mechanism == "youtube_download"
+        and event.status == "running"
+        and event.percent is not None
+    ]
+    assert percents == sorted(percents)
+    assert percents[0] < percents[-1] == 100.0
     assert progress.events[-1].status == "completed"
 
 
-def test_youtube_downloader_preserves_ytdlp_error(
-    monkeypatch: pytest.MonkeyPatch,
+def test_ytdlp_download_emits_a_boundary_event(
+    fake_tool: Callable[[str, str], Path],
+    caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
 ) -> None:
-    class FakePopen:
-        returncode = 1
+    """R-29: the invocation is visible at the boundary, named by its stage."""
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
 
-        def __init__(self, _command: list[str], **_kwargs: object) -> None:
-            self.stderr = iter(["fatal error\n"])
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        YoutubeDownloader(tmp_path).download("https://youtu.be/abc123", "abc123")
 
-        def communicate(self) -> tuple[str, str]:
-            return "stdout text", ""
+    events = [json.loads(record.message) for record in caplog.records]
+    assert [(event["detail"]["tool"], event["detail"]["stage"]) for event in events] == [
+        ("yt-dlp", "youtube")
+    ]
 
-    monkeypatch.setattr("distill.source.subprocess.Popen", FakePopen)
+
+def test_probe_duration_emits_a_boundary_event(
+    fake_tool: Callable[[str, str], Path],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """The ffprobe call site goes through the same path as every other tool."""
+    fake_tool("ffprobe", 'import sys\n\nsys.stdout.write(\'{"format": {"duration": "12.5"}}\')\n')
+
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        assert probe_duration(tmp_path / "video.mp4") == 12.5
+
+    events = [json.loads(record.message) for record in caplog.records]
+    assert [(event["detail"]["tool"], event["detail"]["stage"]) for event in events] == [
+        ("ffprobe", "source")
+    ]
+
+
+def test_youtube_downloader_preserves_ytdlp_error(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """A failed download raises E_YTDLP carrying run_command's failure payload."""
+    fake_tool("yt-dlp", FAKE_YTDLP_FAILING)
     downloader = YoutubeDownloader(tmp_path)
 
     with pytest.raises(DistillError) as exc:
         downloader.download("https://youtu.be/abc123", "abc123", ProgressReporter())
 
     assert exc.value.code == "E_YTDLP"
-    assert exc.value.details["stderr"] == "fatal error"
-    assert exc.value.details["stdout"] == "stdout text"
+    assert exc.value.details["tool"] == "yt-dlp"
+    assert exc.value.details["exit_status"] == 1
+    assert "fatal error" in exc.value.details["stderr_tail"]
+
+
+def test_youtube_downloader_releases_its_lock_when_ytdlp_fails(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """The lock is a `finally`, not a happy-path unlink: a failure must free it."""
+    fake_tool("yt-dlp", FAKE_YTDLP_FAILING)
+
+    with pytest.raises(DistillError):
+        YoutubeDownloader(tmp_path).download("https://youtu.be/abc123", "abc123")
+
+    assert not (tmp_path / "_youtube_locks" / "abc123.lock").exists()

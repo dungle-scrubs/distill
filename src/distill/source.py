@@ -12,7 +12,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -24,6 +23,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 from .errors import DistillError, warning
 from .options import DistillOptions
 from .progress import ProgressReporter
+from .run_command import CommandResult, CommandTimeouts, run, run_json, stream
 
 CONTENT_HASH_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 FINGERPRINT_SAMPLE_BYTES = 64 * 1024
@@ -35,8 +35,13 @@ YOUTUBE_DISK_FLOOR_BYTES = 1024 * 1024 * 1024
 # Wall-clock ceilings so a wedged tool or a stalled network call cannot hang the
 # whole run. yt-dlp additionally gets `--socket-timeout` so it aborts a stalled
 # connection on its own rather than blocking until the outer timeout fires.
-FFPROBE_TIMEOUT_SEC = 60.0
-YTDLP_METADATA_TIMEOUT_SEC = 120.0
+FFPROBE_TIMEOUTS = CommandTimeouts(total_sec=60.0, idle_sec=30.0)
+YTDLP_METADATA_TIMEOUTS = CommandTimeouts(total_sec=120.0, idle_sec=60.0)
+# A download is bounded by silence, not by length (R-30): a legitimate multi-GB
+# fetch on a slow link may run for hours, while a wedged one stops emitting
+# progress within seconds. The total is a backstop against a tool that reports
+# progress forever without finishing.
+YTDLP_DOWNLOAD_TIMEOUTS = CommandTimeouts(total_sec=6 * 60 * 60.0, idle_sec=120.0)
 YTDLP_SOCKET_TIMEOUT_SEC = 30
 SENSITIVE_COMPONENTS = {
     ".ssh",
@@ -112,45 +117,8 @@ class YouTubeDownloaderProtocol(Protocol):
     ) -> Path: ...
 
 
-def run_json_command(command: list[str], *, timeout: float = FFPROBE_TIMEOUT_SEC) -> dict:
-    try:
-        proc = subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=timeout
-        )
-    except FileNotFoundError as exc:
-        raise DistillError(
-            "E_MISSING_TOOL",
-            "source",
-            f"required tool is not installed: {command[0]}",
-            {"tool": command[0]},
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise DistillError(
-            "E_COMMAND",
-            "source",
-            f"command timed out: {command[0]}",
-            {"timeout_sec": timeout, "command": command},
-        ) from exc
-    if proc.returncode != 0:
-        raise DistillError(
-            "E_COMMAND",
-            "source",
-            f"command failed: {command[0]}",
-            {"stderr": proc.stderr.strip(), "command": command},
-        )
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise DistillError(
-            "E_COMMAND",
-            "source",
-            f"command returned invalid JSON: {command[0]}",
-            {"stdout": proc.stdout[:500]},
-        ) from exc
-
-
 def probe_duration(path: Path) -> float:
-    data = run_json_command(
+    data = run_json(
         [
             "ffprobe",
             "-v",
@@ -160,7 +128,10 @@ def probe_duration(path: Path) -> float:
             "-of",
             "json",
             str(path),
-        ]
+        ],
+        stage="source",
+        total_timeout_sec=FFPROBE_TIMEOUTS.total_sec,
+        idle_timeout_sec=FFPROBE_TIMEOUTS.idle_sec,
     )
     try:
         duration = float(data["format"]["duration"])
@@ -462,33 +433,29 @@ def _run_ytdlp(
     extra_args: list[str],
     url: str,
     *,
-    timeout: float = YTDLP_METADATA_TIMEOUT_SEC,
-) -> subprocess.CompletedProcess[str]:
-    command = _ytdlp_command(extra_args, url)
-    try:
-        return subprocess.run(
-            command, capture_output=True, text=True, check=False, timeout=timeout
-        )
-    except FileNotFoundError as exc:
-        raise DistillError(
-            "E_MISSING_TOOL", "youtube", "yt-dlp is not installed", {"tool": "yt-dlp"}
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        raise DistillError(
-            "E_YTDLP", "youtube", "yt-dlp timed out", {"timeout_sec": timeout}
-        ) from exc
+    timeouts: CommandTimeouts = YTDLP_METADATA_TIMEOUTS,
+) -> CommandResult:
+    """Run a non-downloading yt-dlp invocation and hand back what it produced.
+
+    `check=False`: every caller inspects `returncode` itself, because "yt-dlp
+    ran and said no" means something different at each one - an unresolvable id
+    is fatal, an unreadable description is a **degradation**. A yt-dlp that is
+    absent or wedged still raises, since there is no answer to inspect.
+    """
+    return run(
+        _ytdlp_command(extra_args, url),
+        stage="youtube",
+        total_timeout_sec=timeouts.total_sec,
+        idle_timeout_sec=timeouts.idle_sec,
+        check=False,
+        error_code="E_YTDLP",
+    )
 
 
 def youtube_description(url: str) -> tuple[str, list[dict[str, str]]]:
     try:
-        proc = subprocess.run(
-            _ytdlp_command(["--skip-download", "--print", "%(description)s"], url),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=YTDLP_METADATA_TIMEOUT_SEC,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        proc = _run_ytdlp(["--skip-download", "--print", "%(description)s"], url)
+    except DistillError:
         # Description is best-effort metadata; degrade rather than fail the run.
         return "", [
             warning(
@@ -635,8 +602,14 @@ class YoutubeDownloader:
                 "-f",
                 "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best/bv*+ba/b",
                 "--newline",
+                # The idle timeout is what bounds this download (R-30), and its
+                # heartbeat is yt-dlp's progress output. `--progress` keeps that
+                # output coming even under a user config that set `--quiet`,
+                # which would otherwise starve the idle clock and have a healthy
+                # download killed for saying nothing.
+                "--progress",
                 "--socket-timeout",
-                "30",
+                str(YTDLP_SOCKET_TIMEOUT_SEC),
                 "--retries",
                 "3",
                 "--fragment-retries",
@@ -650,33 +623,29 @@ class YoutubeDownloader:
                 "--",
                 url,
             ]
-            proc = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            stderr_lines: list[str] = []
-            if proc.stderr:
-                for line in proc.stderr:
-                    stderr_lines.append(line)
-                    parsed = parse_ytdlp_progress(line)
-                    if parsed and progress:
-                        progress.update(
-                            "youtube_download",
-                            percent=(float(parsed["percent"]) if "percent" in parsed else None),
-                            detail=parsed,
-                        )
-            stdout, stderr_tail = proc.communicate()
-            if stderr_tail:
-                stderr_lines.append(stderr_tail)
-            if proc.returncode != 0:
-                raise DistillError(
-                    "E_YTDLP",
-                    "youtube",
-                    "yt-dlp download failed",
-                    {"stderr": "".join(stderr_lines).strip(), "stdout": stdout.strip()},
+
+            def report(line: str) -> None:
+                parsed = parse_ytdlp_progress(line)
+                if not parsed or progress is None:
+                    return
+                progress.update(
+                    "youtube_download",
+                    percent=(float(parsed["percent"]) if "percent" in parsed else None),
+                    detail=parsed,
                 )
+
+            # R-32: yt-dlp writes `--newline` download progress to stdout. It is
+            # the only stream parsed here; stderr carries its diagnostics, which
+            # run_command captures for the failure payload.
+            result = stream(
+                command,
+                stage="youtube",
+                total_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.total_sec,
+                idle_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.idle_sec,
+                on_stdout_line=report,
+                error_code="E_YTDLP",
+            )
+            self.last_warnings = [*lock_warnings, *result.warnings]
             candidates = sorted(video_dir.glob("source.*"))
             if not candidates:
                 raise DistillError("E_YTDLP", "youtube", "yt-dlp did not produce a source file")

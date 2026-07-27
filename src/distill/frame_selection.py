@@ -6,17 +6,19 @@ window safeguards, and PNG extraction. It does not OCR or render frames.
 
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 
-from .errors import warning
+from .errors import DistillError, warning
 from .progress import ProgressCounter, ProgressReporter
+from .run_command import CommandTimeouts, run
 
 PHASH_DISTANCE_THRESHOLD = 10
 # Wall-clock ceiling for a single ffmpeg frame grab so a wedged decode cannot
-# hang the whole run.
-FRAME_EXTRACT_TIMEOUT_SEC = 120.0
+# hang the whole run. Grabbing one frame is short even on a long source - the
+# seek is not a scan - so here the total deadline is the meaningful limit and
+# the idle timeout only catches a decode that stops talking sooner.
+FRAME_EXTRACT_TIMEOUTS = CommandTimeouts(total_sec=120.0, idle_sec=60.0)
 
 
 def scene_midpoint_candidates(video_path: Path, duration_sec: float) -> list[float]:
@@ -83,7 +85,7 @@ def extract_frame(
     video_path: Path, timestamp_sec: float, output_path: Path
 ) -> dict[str, str] | None:
     try:
-        proc = subprocess.run(
+        result = run(
             [
                 "ffmpeg",
                 "-y",
@@ -95,25 +97,26 @@ def extract_frame(
                 "1",
                 str(output_path),
             ],
-            capture_output=True,
-            text=True,
+            stage="frames",
+            total_timeout_sec=FRAME_EXTRACT_TIMEOUTS.total_sec,
+            idle_timeout_sec=FRAME_EXTRACT_TIMEOUTS.idle_sec,
             check=False,
-            timeout=FRAME_EXTRACT_TIMEOUT_SEC,
         )
-    except FileNotFoundError:
-        # ffmpeg not installed: degrade to no-frame rather than crashing the run.
-        return warning(
-            "frames",
-            "ffmpeg_missing",
-            "ffmpeg is not installed; skipping keyframe extraction",
-        )
-    except subprocess.TimeoutExpired:
+    except DistillError as exc:
+        # ADR-0002: a keyframe that cannot be grabbed reduces the bundle; it
+        # does not end the run, so every failure here becomes a **warning**.
+        if exc.code == "E_MISSING_TOOL":
+            return warning(
+                "frames",
+                "ffmpeg_missing",
+                "ffmpeg is not installed; skipping keyframe extraction",
+            )
         return warning(
             "frames",
             "frame_extract_timeout",
             f"ffmpeg timed out extracting frame at {timestamp_sec:.3f}s",
         )
-    if proc.returncode != 0:
+    if result.returncode != 0:
         return warning(
             "frames",
             "frame_extract_failed",

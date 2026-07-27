@@ -3,7 +3,9 @@
 This module owns OCR invocation, tesseract discovery, and per-frame OCR
 warnings. It does not own redaction policy, frame selection, or the decision
 that image-text extraction is an **optional capability** - that classification
-is stated once in `capabilities.py`. It never installs tesseract (R-34).
+is stated once in `capabilities.py`. It never installs tesseract (R-34), and it
+does not own how a subprocess is run: tesseract is invoked through
+`run_command`, like every other external tool (R-29).
 """
 
 from __future__ import annotations
@@ -14,14 +16,18 @@ from pathlib import Path
 from typing import Any
 
 from .capabilities import missing_tool_warning
-from .errors import warning
+from .errors import DistillError, warning
 from .progress import ProgressCounter, ProgressReporter
+from .run_command import CommandTimeouts, run
 
 # Below this mean luminance (0-255) a frame is treated as dark-background and
 # inverted before OCR, since Tesseract is tuned for dark text on light.
 _DARK_BACKGROUND_THRESHOLD = 110.0
 # Upscaling small frames gives Tesseract more pixels per glyph on slide text.
 _OCR_UPSCALE = 2
+# One frame at a time, so both limits are short: tesseract that has said nothing
+# for half a minute on a single image is stuck, not slow.
+TESSERACT_TIMEOUTS = CommandTimeouts(total_sec=120.0, idle_sec=30.0)
 
 
 def preprocess_for_ocr(path: Path) -> Any:
@@ -86,36 +92,56 @@ def ocr_frame(
     tesseract_cmd: str | None = None,
     preprocess: bool = True,
 ) -> tuple[str, dict[str, str] | None]:
-    try:
-        import pytesseract
-    except ImportError:
-        return "", warning("ocr", "tesseract_python_missing", "pytesseract is not installed")
+    command = tesseract_cmd or find_tesseract_command()
+    if command is None:
+        return "", missing_tool_warning("ocr", "tesseract")
 
-    if tesseract_cmd:
-        setattr(pytesseract.pytesseract, "tesseract_cmd", tesseract_cmd)  # noqa: B010
-
-    # Preprocessing recovers low-contrast slide text, but pytesseract spools a
-    # PIL image through ``$TMPDIR``; in sandboxed/restricted environments the
-    # tesseract subprocess cannot read that temp path and OCR silently fails.
-    # Write the processed frame alongside the source (a directory we just read
-    # from, so it is readable) and OCR by path instead of handing over a PIL
-    # object. Fall back to the original frame if preprocessing is unavailable.
+    # Preprocessing recovers low-contrast slide text. The processed frame is
+    # written alongside the source - a directory we just read from, so it is
+    # readable - rather than through ``$TMPDIR``, which a sandboxed tesseract
+    # may not be able to open. Fall back to the original frame when
+    # preprocessing is unavailable or its OCR failed.
     if preprocess:
         processed = preprocess_for_ocr(path)
         if processed is not None:
-            text, prep_warning = _ocr_processed_image(pytesseract, processed, path, language)
+            text, prep_warning = _ocr_processed_image(command, processed, path, language)
             if prep_warning is None:
                 return text, None
-            # Preprocessed OCR failed; recover what we can from the raw frame.
 
+    return _read_text(command, path, language, source=path)
+
+
+def _read_text(
+    command: str,
+    image: Path,
+    language: str,
+    *,
+    source: Path,
+) -> tuple[str, dict[str, str] | None]:
+    """Run tesseract over one image and return the text it printed.
+
+    ``stdout`` as the output base is what makes tesseract print its reading
+    instead of writing a sibling ``.txt``. Every failure degrades: one frame
+    without **extracted text** reduces a **bundle**, it does not end the run
+    (ADR-0002), and an absent binary reports the capability table's warning
+    rather than a bespoke one.
+    """
     try:
-        return pytesseract.image_to_string(str(path), lang=language).strip(), None
-    except Exception as exc:
-        return "", warning("ocr", "ocr_failed", f"OCR failed for {path.name}: {exc}")
+        result = run(
+            [command, str(image), "stdout", "-l", language],
+            stage="ocr",
+            total_timeout_sec=TESSERACT_TIMEOUTS.total_sec,
+            idle_timeout_sec=TESSERACT_TIMEOUTS.idle_sec,
+        )
+    except DistillError as exc:
+        if exc.code == "E_MISSING_TOOL":
+            return "", missing_tool_warning("ocr", "tesseract")
+        return "", warning("ocr", "ocr_failed", f"OCR failed for {source.name}: {exc.message}")
+    return result.stdout.strip(), None
 
 
 def _ocr_processed_image(
-    pytesseract: Any, processed: Any, source: Path, language: str
+    command: str, processed: Any, source: Path, language: str
 ) -> tuple[str, dict[str, str] | None]:
     """OCR a preprocessed PIL image via a temp file next to ``source``."""
     handle = tempfile.NamedTemporaryFile(  # noqa: SIM115
@@ -124,10 +150,11 @@ def _ocr_processed_image(
     temp_path = Path(handle.name)
     handle.close()
     try:
-        processed.save(temp_path)
-        return pytesseract.image_to_string(str(temp_path), lang=language).strip(), None
-    except Exception as exc:
-        return "", warning("ocr", "ocr_failed", f"OCR failed for {source.name}: {exc}")
+        try:
+            processed.save(temp_path)
+        except (OSError, ValueError) as exc:
+            return "", warning("ocr", "ocr_failed", f"OCR failed for {source.name}: {exc}")
+        return _read_text(command, temp_path, language, source=source)
     finally:
         temp_path.unlink(missing_ok=True)
 
