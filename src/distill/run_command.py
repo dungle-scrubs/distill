@@ -43,8 +43,10 @@ exactly one, at the end, whether it succeeded, failed, or never started; see
 Known limits. A grandchild that inherits the pipes and outlives its parent is
 not killed when the parent exits on its own - only a timeout terminates the
 group - and draining is bounded rather than waiting for such a grandchild to
-close the pipes, so the tail of that output is dropped instead of hanging the
-run. Process control here is POSIX-only.
+close the pipes. Past that bound the readers are stopped and the pipes closed
+regardless, so the tail is dropped instead of hanging the run or leaking a
+thread and two descriptors per invocation; the drop is recorded as truncation
+(R-33) rather than lost in silence. Process control here is POSIX-only.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ import logging
 import math
 import os
 import queue
+import select
 import signal
 import subprocess
 import threading
@@ -83,6 +86,9 @@ TRUNCATION_WARNING_CODE = "command_output_truncated"
 # How long the readers get to finish once the child is gone. Bounded because a
 # grandchild may hold the pipes open indefinitely.
 _DRAIN_GRACE_SEC = 1.0
+# Slack for a stopped reader to notice and exit. It checks between polls, so
+# this is headroom on a loaded machine rather than a wait anyone pays for.
+_READER_STOP_GRACE_SEC = 0.5
 _POLL_INTERVAL_SEC = 0.01
 _READ_CHUNK_BYTES = 64 * 1024
 # A "line" this long without a terminator is delivered as-is, so a tool that
@@ -226,8 +232,14 @@ def stream(
     Callbacks run on the calling thread, not on the reader threads, so a
     caller's progress emitter needs no locking. Lines are delivered without
     their terminator; both `\\n` and `\\r` end a line, because progress-writing
-    tools use either. Empty lines are not delivered. The full output is still
-    captured and returned.
+    tools use either, and a `\\r` ends one the moment it arrives rather than at
+    EOF. Empty lines are not delivered.
+
+    Delivery is bounded by the same cap as capture: once a stream passes
+    `output_cap_bytes` its lines stop being handed over, because they are no
+    longer being kept either. The drop is the truncation already recorded as a
+    **warning**, and it is what bounds the queue of lines waiting for the
+    caller - at most one cap's worth per stream.
     """
     return _execute(
         argv,
@@ -253,7 +265,12 @@ def run_json(
     idle_timeout_sec: float = DEFAULT_IDLE_TIMEOUT_SEC,
     **options: Any,
 ) -> Any:
-    """Run `argv` and parse its stdout as JSON, mapping a bad document as a failure."""
+    """Run `argv` and parse its stdout as JSON, mapping a bad document as a failure.
+
+    A caller's `error_code` covers the whole invocation, this failure included:
+    one tool reports under one code, so a caller passing `E_YTDLP` does not get
+    `E_COMMAND` for the single case where the tool ran and answered badly.
+    """
     result = run(
         argv,
         stage=stage,
@@ -268,6 +285,7 @@ def run_json(
             FailureKind.BAD_JSON,
             argv,
             stage=stage,
+            error_code=options.get("error_code"),
             details=_failure_details(
                 argv,
                 exit_status=result.returncode,
@@ -407,13 +425,24 @@ def _boundary_log(
 
 
 class _CappedSink:
-    """Accumulates bytes up to a cap, counting the rest as truncated."""
+    """Accumulates bytes up to a cap, counting the rest as truncated.
+
+    Two ways a stream loses bytes, kept apart because they need different
+    **warning** messages: the cap was reached, or the reader was stopped before
+    the pipe reached EOF because something outlived the child holding it open.
+    `truncated` is the caller-facing answer to "is this the whole output".
+    """
 
     def __init__(self, cap_bytes: int) -> None:
         self._cap = cap_bytes
         self._parts: list[bytes] = []
         self._size = 0
-        self.truncated = False
+        self.over_cap = False
+        self.tail_dropped = False
+
+    @property
+    def truncated(self) -> bool:
+        return self.over_cap or self.tail_dropped
 
     def add(self, chunk: bytes) -> None:
         room = self._cap - self._size
@@ -422,7 +451,7 @@ class _CappedSink:
             self._parts.append(kept)
             self._size += len(kept)
         if len(chunk) > room:
-            self.truncated = True
+            self.over_cap = True
 
     def text(self) -> str:
         return b"".join(self._parts).decode("utf-8", errors="replace")
@@ -446,35 +475,62 @@ class _ActivityClock:
 
 
 class _StreamReader(threading.Thread):
-    """Drains one pipe. One per stream, so neither can starve the other."""
+    """Drains one pipe. One per stream, so neither can starve the other.
+
+    Reads are preceded by a bounded `poll`, so the thread never parks in a read
+    that only a grandchild's exit could end: `stop` is noticed within one poll
+    interval, which is what makes shutdown bounded rather than a leaked thread
+    and descriptor per invocation. `poll` rather than `select`, because
+    `select` cannot watch a descriptor number past `FD_SETSIZE`.
+    """
 
     def __init__(
         self,
-        name: str,
+        stream: str,
         source: Any,
         *,
         sink: _CappedSink,
         clock: _ActivityClock,
         lines: queue.SimpleQueue[tuple[str, str]] | None,
     ) -> None:
-        super().__init__(name=f"run_command-{name}", daemon=True)
-        self._name = name
+        super().__init__(name=f"run_command-{stream}", daemon=True)
+        # Not `_name`: that is `threading.Thread`'s own backing field, and
+        # writing it would rename the thread out of a stack dump.
+        self._stream = stream
         self._source = source
         self._sink = sink
         self._clock = clock
         self._lines = lines
         self._pending = b""
+        self._stopped = threading.Event()
+        self.reached_eof = False
+
+    def stop(self) -> None:
+        """Stop reading, recording anything left unread as truncation.
+
+        Called once draining is out of time. A grandchild can hold the write
+        end open long after the child is gone, so the bytes this reader never
+        got are a loss the caller is told about (R-33) rather than a silent
+        gap.
+        """
+        self._stopped.set()
+        if not self.reached_eof:
+            self._sink.tail_dropped = True
 
     def run(self) -> None:
         try:
-            while True:
+            poller = select.poll()
+            poller.register(self._source, select.POLLIN)
+            while not self._stopped.is_set():
+                if not poller.poll(_POLL_INTERVAL_SEC * 1000):
+                    continue
                 chunk = self._source.read(_READ_CHUNK_BYTES)
                 if not chunk:
+                    self.reached_eof = True
                     break
                 self._clock.mark()
                 self._sink.add(chunk)
-                if self._lines is not None:
-                    self._split(chunk)
+                self._split(chunk)
         except (OSError, ValueError):
             # The pipe was closed underneath us during termination.
             pass
@@ -486,21 +542,31 @@ class _StreamReader(threading.Thread):
                 self._lines.put((_EOF, ""))
 
     def _split(self, chunk: bytes) -> None:
-        parts = (self._pending + chunk).split(b"\n")
+        """Cut the buffer into lines on either terminator.
+
+        Both `\\n` and `\\r` end a line, and a lone `\\r` ends one as soon as it
+        arrives rather than waiting for a newline that a progress writer never
+        sends: ffmpeg's stats are CR-delimited, and holding them in the pending
+        buffer would deliver a whole download as one blob at EOF.
+        """
+        if self._lines is None:
+            return
+        parts = (self._pending + chunk).replace(b"\r", b"\n").split(b"\n")
         self._pending = parts.pop()
         for part in parts:
-            if part.endswith(b"\r"):
-                part = part[:-1]
-            for piece in part.split(b"\r"):
-                self._emit(piece)
+            self._emit(part)
         if len(self._pending) >= _MAX_LINE_BYTES:
             self._emit(self._pending)
             self._pending = b""
 
     def _emit(self, raw: bytes) -> None:
-        if not raw or self._lines is None:
+        # Past the capture cap the line was not kept, so it is not delivered
+        # either. The cap is checked before the split, so every queued line came
+        # out of bytes that fit under it: the queue holds at most one cap's
+        # worth of output per stream, which is what bounds it.
+        if not raw or self._lines is None or self._sink.over_cap:
             return
-        self._lines.put((self._name, raw.decode("utf-8", errors="replace")))
+        self._lines.put((self._stream, raw.decode("utf-8", errors="replace")))
 
 
 _EOF = "__eof__"
@@ -516,34 +582,71 @@ def _validate_timeout(name: str, value: float) -> float:
     return number
 
 
-def _terminate_group(proc: subprocess.Popen[bytes], grace_sec: float) -> int | None:
-    """SIGTERM the child's group, then SIGKILL it if the group is still there.
-
-    Signalling happens before the direct child is reaped, so the group id is
-    still reserved and cannot have been recycled onto an unrelated process.
-    """
-    pgid: int | None
+def _group_id(proc: subprocess.Popen[bytes]) -> int | None:
+    """The group to signal, or `None` if signalling one would be wrong."""
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
-        pgid = None
-    if pgid is not None and pgid == os.getpgrp():
+        return None
+    if pgid == os.getpgrp():
         # start_new_session did not take effect; signalling this group would
         # signal Distill itself.
-        pgid = None
+        return None
+    return pgid
 
-    for signal_number in (signal.SIGTERM, signal.SIGKILL):
+
+def _signal_group(
+    proc: subprocess.Popen[bytes], pgid: int | None, signal_number: int
+) -> None:
+    """Signal the whole group, falling back to the child when there is no group."""
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal_number)
+        else:
+            proc.send_signal(signal_number)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _await_exit_without_reaping(proc: subprocess.Popen[bytes], grace_sec: float) -> None:
+    """Give the child `grace_sec` to exit, leaving it unreaped either way.
+
+    Reaping would release the child's pid, and that pid is the group id. The
+    kernel keeps the id reserved while the leader is unreaped or the group still
+    has members, so not reaping here is what lets the SIGKILL that follows name
+    a group that is provably still this child's.
+    """
+    if proc.returncode is not None:
+        return
+    deadline = time.monotonic() + grace_sec
+    while True:
         try:
-            if pgid is not None:
-                os.killpg(pgid, signal_number)
-            else:
-                proc.send_signal(signal_number)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            return proc.wait(timeout=grace_sec)
-        except subprocess.TimeoutExpired:
-            continue
+            exited = os.waitid(
+                os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+            )
+        except OSError:  # already reaped, or never ours
+            return
+        if exited is not None or time.monotonic() >= deadline:
+            return
+        time.sleep(_POLL_INTERVAL_SEC)
+
+
+def _terminate_group(proc: subprocess.Popen[bytes], grace_sec: float) -> int | None:
+    """SIGTERM the child's group, then SIGKILL the group whatever the child did.
+
+    The forced kill is not an escalation reserved for a child that ignored
+    SIGTERM. yt-dlp exits cleanly on SIGTERM while the ffmpeg it spawned for the
+    merge - holding the network and the disk - does not, so returning as soon as
+    the direct child is gone orphans exactly the process that matters (R-31,
+    finding 8). The group SIGKILL therefore always runs.
+
+    Both signals are sent while the direct child is still unreaped, so the group
+    id cannot have been recycled onto an unrelated process.
+    """
+    pgid = _group_id(proc)
+    _signal_group(proc, pgid, signal.SIGTERM)
+    _await_exit_without_reaping(proc, grace_sec)
+    _signal_group(proc, pgid, signal.SIGKILL)
     try:
         return proc.wait(timeout=grace_sec)
     except subprocess.TimeoutExpired:  # pragma: no cover - unkillable child
@@ -572,8 +675,10 @@ def _dispatch(
 
     Doubles as the wait in the supervision loop: with no callbacks registered
     nothing is ever queued and this is simply a bounded sleep. A batch rather
-    than a single line per turn, so a chatty tool cannot make the queue grow
-    faster than the loop empties it.
+    than a single line per turn, so a burst is handed over promptly instead of
+    one line per poll interval - a chatty tool can still queue faster than this
+    drains it, and what bounds the queue is the capture cap, not this batch:
+    `_StreamReader._emit` stops queueing once its sink is full.
     """
     try:
         name, text = lines.get(timeout=timeout_sec)
@@ -599,6 +704,49 @@ def _drain_queue(
         except queue.Empty:
             return
         _deliver(name, text, on_stdout_line, on_stderr_line)
+
+
+def _shutdown_readers(readers: Sequence[_StreamReader], proc: subprocess.Popen[bytes]) -> None:
+    """End draining and release what the invocation held, on every exit path.
+
+    Bounded on purpose: a grandchild that inherited the pipes can hold them open
+    long after the child is gone, so the readers get a grace period, are then
+    stopped, and their pipes are closed whatever they were doing. Abandoning a
+    blocked reader instead leaks a thread and two descriptors per invocation,
+    and drops its tail in silence; `stop` records that tail as truncation
+    (R-33).
+    """
+    deadline = time.monotonic() + _DRAIN_GRACE_SEC
+    for reader in readers:
+        reader.join(timeout=max(deadline - time.monotonic(), 0.0))
+    for reader in readers:
+        reader.stop()
+    for reader in readers:
+        reader.join(timeout=_READER_STOP_GRACE_SEC)
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            with contextlib.suppress(OSError):  # already closed
+                pipe.close()
+
+
+def _truncation_messages(
+    tool: str, stream: str, sink: _CappedSink, cap_bytes: int
+) -> list[str]:
+    """Every way this stream lost bytes, one **warning** message each (R-33).
+
+    A tail left unread because a helper held the pipe open past the drain
+    deadline is the same loss to the caller as output past the cap, and is
+    reported the same way: R-33 makes truncation a warning, not a silent gap.
+    """
+    messages = []
+    if sink.over_cap:
+        messages.append(f"{tool} {stream} exceeded {cap_bytes} bytes and was truncated")
+    if sink.tail_dropped:
+        messages.append(
+            f"{tool} {stream} was still held open when draining ended, "
+            "so its remaining output was truncated"
+        )
+    return messages
 
 
 def _outcome_of(timeout_fired: str | None, exit_status: int | None, *, check: bool) -> str:
@@ -729,6 +877,7 @@ def _execute(
         # invocation's boundary event too, rather than being the one way a tool
         # can run and leave no trace.
         exit_status = _terminate_group(proc, grace)
+        _shutdown_readers(readers, proc)
         _boundary_log(
             outcome="callback_error",
             stage=stage,
@@ -746,29 +895,15 @@ def _execute(
         _terminate_group(proc, grace) if timeout_fired is not None else proc.returncode
     )
 
-    deadline = time.monotonic() + _DRAIN_GRACE_SEC
-    for reader in readers:
-        reader.join(timeout=max(deadline - time.monotonic(), 0.0))
+    _shutdown_readers(readers, proc)
     _drain_queue(lines, on_stdout_line, on_stderr_line)
-    # Only close the pipes when no reader is still blocked on one: closing
-    # underneath a reader would free an fd number another thread could reopen.
-    if all(not reader.is_alive() for reader in readers):
-        for pipe in (proc.stdout, proc.stderr):
-            if pipe is not None:
-                with contextlib.suppress(OSError):  # already closed
-                    pipe.close()
 
     stdout_sink, stderr_sink = sinks[_STDOUT], sinks[_STDERR]
     duration_sec = time.monotonic() - started
     warnings = tuple(
-        warning(
-            stage,
-            TRUNCATION_WARNING_CODE,
-            f"{_tool_of(command)} {name} exceeded {output_cap_bytes} bytes "
-            "and was truncated",
-        )
+        warning(stage, TRUNCATION_WARNING_CODE, message)
         for name, sink in ((_STDOUT, stdout_sink), (_STDERR, stderr_sink))
-        if sink.truncated
+        for message in _truncation_messages(_tool_of(command), name, sink, output_cap_bytes)
     )
     details = _failure_details(
         command,

@@ -14,6 +14,7 @@ loaded machine makes a test slower rather than red.
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib
 import inspect
 import json
@@ -22,7 +23,9 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +69,28 @@ def wait_until_gone(pid: int, timeout_sec: float = 15.0) -> bool:
             return False
         time.sleep(0.02)
     return False
+
+
+def wait_for(condition: Callable[[], bool], timeout_sec: float = 5.0) -> bool:
+    """Poll until `condition` holds. Bounded, and asserts on state, not on time."""
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return condition()
+
+
+def open_descriptors() -> int:
+    """How many descriptors this process holds. POSIX-only, like the module."""
+    return len(os.listdir("/dev/fd"))
+
+
+def kill_all(pid_file: Path) -> None:
+    """Kill every pid a child recorded, so a failing test leaves nothing behind."""
+    for value in pid_file.read_text().split():
+        with contextlib.suppress(ProcessLookupError, ValueError):
+            os.kill(int(value), signal.SIGKILL)
 
 
 # --- concurrent draining (finding 3) ----------------------------------------
@@ -348,6 +373,63 @@ def test_a_sigterm_ignoring_child_leaves_no_grandchild_after_the_deadline(
     assert failure.value.details["exit_status"] == -signal.SIGKILL
 
 
+def sigterm_obeying_parent_script(pid_file: Path) -> str:
+    """A child that dies on SIGTERM but leaves behind a helper that does not.
+
+    The yt-dlp shape: the tool exits cleanly on the first signal while the
+    ffmpeg it spawned for the merge - holding the network and the disk - ignores
+    it. The helper's output goes to /dev/null for the same reason as above.
+    """
+    return f"""
+import os, signal, subprocess, sys, time
+grandchild = subprocess.Popen(
+    [
+        {PYTHON!r},
+        "-c",
+        "import signal, time;"
+        " signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)",
+    ],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+open({str(pid_file)!r}, "w").write("%d %d" % (os.getpid(), grandchild.pid))
+sys.stdout.write("spawned\\n")
+sys.stdout.flush()
+time.sleep(600)
+"""
+
+
+def test_a_grandchild_that_ignores_sigterm_dies_even_when_the_child_obeys_it(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 2): the child honouring SIGTERM ended termination early.
+
+    Reaping the direct child says nothing about the rest of its group. The
+    inverse case - a child that ignores SIGTERM - is covered above and does not
+    catch this one, because there the escalation to SIGKILL still ran.
+    """
+    pid_file = tmp_path / "pids"
+
+    with pytest.raises(DistillError) as failure:
+        run(
+            child(sigterm_obeying_parent_script(pid_file)),
+            stage="youtube",
+            total_timeout_sec=1.0,
+            idle_timeout_sec=GENEROUS_IDLE_SEC,
+            terminate_grace_sec=0.2,
+        )
+
+    child_pid, grandchild_pid = (int(value) for value in pid_file.read_text().split())
+    try:
+        # The child died on SIGTERM: this is the path where the old escalation
+        # to a group SIGKILL never ran.
+        assert failure.value.details["exit_status"] == -signal.SIGTERM
+        assert wait_until_gone(child_pid), "the child outlived its deadline"
+        assert wait_until_gone(grandchild_pid), "the grandchild was orphaned"
+    finally:
+        kill_all(pid_file)
+
+
 def test_the_group_is_asked_to_terminate_before_it_is_forced(tmp_path: Path) -> None:
     """SIGTERM reaches the group first; SIGKILL is the escalation, not the opener."""
     handled = tmp_path / "sigterm-seen"
@@ -396,6 +478,77 @@ sys.stdout.flush()
     assert result.returncode == 0
     assert "bye" in result.stdout
     os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+
+PIPE_HOLDING_GRANDCHILD = f"""
+import subprocess, sys
+grandchild = subprocess.Popen([{PYTHON!r}, "-c", "import time; time.sleep(60)"])
+open(sys.argv[1], "a").write("%d\\n" % grandchild.pid)
+sys.stdout.write("bye\\n")
+sys.stdout.flush()
+"""
+
+_INVOCATIONS = 3
+
+
+def test_a_pipe_holding_grandchild_leaks_no_thread_or_descriptor(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 3): the blocked reader and its pipes were abandoned.
+
+    The grandchild inherits both pipes and outlives the child, so neither reader
+    ever reaches EOF. Abandoning them leaked a thread and two descriptors per
+    invocation - a pipeline that runs one such tool per stage runs out of both.
+    """
+    pid_file = tmp_path / "grandchild-pids"
+    pid_file.write_text("")
+    argv = child(PIPE_HOLDING_GRANDCHILD, str(pid_file))
+
+    try:
+        threads_before = threading.active_count()
+        descriptors_before = open_descriptors()
+        for _ in range(_INVOCATIONS):
+            result = run(
+                argv,
+                stage="source",
+                total_timeout_sec=GENEROUS_TOTAL_SEC,
+                idle_timeout_sec=GENEROUS_IDLE_SEC,
+            )
+            assert "bye" in result.stdout
+
+        assert wait_for(lambda: threading.active_count() == threads_before), (
+            f"{threading.active_count() - threads_before} reader threads were abandoned"
+        )
+        assert open_descriptors() <= descriptors_before
+    finally:
+        kill_all(pid_file)
+
+
+def test_a_dropped_tail_is_recorded_as_a_warning(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 3): what the readers never got was lost in silence.
+
+    R-33 makes truncation a **warning**; a tail dropped because a helper held
+    the pipe open past the drain deadline is the same loss to the caller as
+    output past the cap, so it is reported the same way.
+    """
+    pid_file = tmp_path / "grandchild-pids"
+    pid_file.write_text("")
+
+    try:
+        result = run(
+            child(PIPE_HOLDING_GRANDCHILD, str(pid_file)),
+            stage="youtube",
+            total_timeout_sec=GENEROUS_TOTAL_SEC,
+            idle_timeout_sec=GENEROUS_IDLE_SEC,
+        )
+
+        assert result.stdout_truncated is True
+        assert result.stderr_truncated is True
+        assert {entry["code"] for entry in result.warnings} == {TRUNCATION_WARNING_CODE}
+        assert {entry["stage"] for entry in result.warnings} == {"youtube"}
+        messages = " ".join(entry["message"] for entry in result.warnings)
+        assert "stdout" in messages
+        assert "stderr" in messages
+    finally:
+        kill_all(pid_file)
 
 
 # --- output caps -------------------------------------------------------------
@@ -461,6 +614,35 @@ def test_truncation_is_recorded_as_a_warning() -> None:
     assert "stdout" in messages
     assert "stderr" in messages
     assert len(result.warnings) == 2
+
+
+EXACT_CAP_BYTES = 1000
+
+
+@pytest.mark.parametrize(
+    ("written", "truncated"),
+    [(EXACT_CAP_BYTES - 1, False), (EXACT_CAP_BYTES, False), (EXACT_CAP_BYTES + 1, True)],
+)
+def test_the_cap_is_the_last_byte_kept_not_the_first_dropped(
+    written: int, truncated: bool
+) -> None:
+    """The boundary itself, so the one arithmetic line R-33 rests on is pinned.
+
+    Output of exactly the cap fits; one byte more does not. Without this, `>`
+    and `>=` in the sink are indistinguishable and the cap silently loses a
+    byte's worth of every stream.
+    """
+    result = run(
+        child(f"import sys; sys.stdout.write('a' * {written})"),
+        stage="source",
+        total_timeout_sec=GENEROUS_TOTAL_SEC,
+        idle_timeout_sec=GENEROUS_IDLE_SEC,
+        output_cap_bytes=EXACT_CAP_BYTES,
+    )
+
+    assert result.stdout == "a" * min(written, EXACT_CAP_BYTES)
+    assert result.stdout_truncated is truncated
+    assert (result.warnings != ()) is truncated
 
 
 def test_output_within_the_cap_records_no_warning() -> None:
@@ -530,6 +712,26 @@ def test_invalid_json_maps_to_e_command() -> None:
         )
 
     assert failure.value.code == ERROR_CODES[FailureKind.BAD_JSON] == "E_COMMAND"
+
+
+def test_run_json_reports_a_bad_document_under_the_callers_error_code() -> None:
+    """FAILS FIRST (finding 8): the caller's code was dropped for this one failure.
+
+    One tool reports under one code. Passing `E_YTDLP` and getting `E_COMMAND`
+    only when the tool answered with garbage splits one tool's failures across
+    two codes, which is exactly the case an operator greps for.
+    """
+    with pytest.raises(DistillError) as failure:
+        run_json(
+            child("import sys; sys.stdout.write('not json')"),
+            stage="youtube",
+            total_timeout_sec=GENEROUS_TOTAL_SEC,
+            idle_timeout_sec=GENEROUS_IDLE_SEC,
+            error_code="E_YTDLP",
+        )
+
+    assert failure.value.code == "E_YTDLP"
+    assert failure.value.stage == "youtube"
 
 
 def test_run_json_parses_the_document_a_tool_prints() -> None:
@@ -687,6 +889,122 @@ def test_stream_consumes_progress_while_the_other_stream_overflows() -> None:
 
     assert progress == [f"[download] {index}%" for index in range(32)]
     assert len(result.stderr) == 32 * 8192
+
+
+def carriage_return_progress_script(acknowledgement: Path) -> str:
+    """A tool whose progress is CR-delimited, like ffmpeg without `-progress`.
+
+    Nothing further is written until the first line has been delivered, so a
+    helper that holds a CR-terminated line in its pending buffer produces
+    `unacked` instead of the rest of the progress.
+    """
+    return f"""
+import os, sys, time
+sys.stdout.write("frame=1\\r")
+sys.stdout.flush()
+deadline = time.monotonic() + 5
+while not os.path.exists({str(acknowledgement)!r}) and time.monotonic() < deadline:
+    time.sleep(0.01)
+if os.path.exists({str(acknowledgement)!r}):
+    sys.stdout.write("frame=2\\rdone\\n")
+else:
+    sys.stdout.write("unacked\\n")
+sys.stdout.flush()
+"""
+
+
+def test_stream_delivers_a_carriage_return_line_as_it_arrives(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 7): a CR-terminated line sat in the pending buffer.
+
+    `stream` documents `\\r` as a line terminator, and ffmpeg's stats use it
+    when `-progress pipe:2` is absent. Splitting on newline first delivers a
+    whole run of progress as one blob at EOF, which then crowds the real error
+    out of the stderr tail.
+    """
+    acknowledgement = tmp_path / "ack"
+    seen: list[str] = []
+
+    def acknowledge(line: str) -> None:
+        seen.append(line)
+        if line == "frame=1":
+            acknowledgement.write_text("ok")
+
+    result = stream(
+        child(carriage_return_progress_script(acknowledgement)),
+        stage="youtube",
+        total_timeout_sec=GENEROUS_TOTAL_SEC,
+        idle_timeout_sec=GENEROUS_IDLE_SEC,
+        on_stdout_line=acknowledge,
+    )
+
+    assert seen == ["frame=1", "frame=2", "done"]
+    assert result.stdout == "frame=1\rframe=2\rdone\n"
+
+
+CHATTIER_THAN_THE_CAP = """
+import sys
+for index in range(20000):
+    sys.stdout.write("line %05d\\n" % index)
+sys.stdout.flush()
+"""
+
+
+def test_line_delivery_stops_at_the_capture_cap() -> None:
+    """FAILS FIRST (finding 11): the cap bounded capture but not the line queue.
+
+    Every line was queued whatever the cap said, so a chatty tool grew the queue
+    without bound - the one thing the cap exists to prevent. Delivery now stops
+    where capture does, and the drop is the truncation already warned about.
+    """
+    cap_bytes = 1000
+    seen: list[str] = []
+
+    result = stream(
+        child(CHATTIER_THAN_THE_CAP),
+        stage="youtube",
+        total_timeout_sec=GENEROUS_TOTAL_SEC,
+        idle_timeout_sec=GENEROUS_IDLE_SEC,
+        output_cap_bytes=cap_bytes,
+        on_stdout_line=seen.append,
+    )
+
+    assert result.stdout_truncated is True
+    assert sum(len(line) + 1 for line in seen) <= cap_bytes
+    # What is delivered is still the head of the output, in order.
+    assert seen == [f"line {index:05d}" for index in range(len(seen))]
+
+
+def test_the_reader_threads_are_named_for_the_stream_they_drain(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 10): the intended names never reached the threads.
+
+    A hung run is diagnosed from a stack dump, and "stdout" alone does not say
+    which subsystem is blocked. The child is still running when the names are
+    read, so both readers are certainly alive.
+    """
+    acknowledgement = tmp_path / "ack"
+    script = f"""
+import os, sys, time
+sys.stdout.write("go\\n")
+sys.stdout.flush()
+deadline = time.monotonic() + 5
+while not os.path.exists({str(acknowledgement)!r}) and time.monotonic() < deadline:
+    time.sleep(0.01)
+"""
+    named: set[str] = set()
+
+    def record(_line: str) -> None:
+        named.update(thread.name for thread in threading.enumerate())
+        acknowledgement.write_text("ok")
+
+    stream(
+        child(script),
+        stage="youtube",
+        total_timeout_sec=GENEROUS_TOTAL_SEC,
+        idle_timeout_sec=GENEROUS_IDLE_SEC,
+        on_stdout_line=record,
+    )
+
+    assert {"run_command-stdout", "run_command-stderr"} <= named
 
 
 # --- the boundary event (R-29 observability) ---------------------------------
