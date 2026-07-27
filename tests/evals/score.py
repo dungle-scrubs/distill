@@ -112,7 +112,13 @@ def _truth(case_id: str) -> str | None:
 def evaluate(
     with_vision: bool, model: str | None = None, backend: str | None = None
 ) -> list[CaseResult]:
-    if not find_tesseract_command():
+    # The same lookup that gates this function must also drive the OCR call.
+    # find_tesseract_command() falls back to well-known install paths that are
+    # not necessarily on PATH; if the guard used it but ocr_frame resolved
+    # "tesseract" from PATH on its own, OCR would silently return nothing and
+    # the eval would hard-fail at WER 1.00 instead of skipping.
+    tesseract_cmd = find_tesseract_command()
+    if not tesseract_cmd:
         raise SystemExit("tesseract not found; install it before scoring OCR")
     interpret = _vision_interpreter(model, backend) if with_vision else None
     results: list[CaseResult] = []
@@ -124,7 +130,7 @@ def evaluate(
         if truth is None:
             continue
         image = FRAMES_DIR / f"{case_id}.png"
-        ocr_text, _ = ocr_frame(image, "eng")
+        ocr_text, _ = ocr_frame(image, "eng", tesseract_cmd=tesseract_cmd)
         has_text = bool(case.get("has_text", True))
         ocr_wer = word_error_rate(truth, ocr_text) if has_text else None
 

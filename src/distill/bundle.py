@@ -15,8 +15,9 @@ from typing import Any
 
 from .errors import DistillError
 from .options import DistillOptions
+from .release import DISTILL_VERSION
 from .source import SourceInfo
-from .version import DISTILL_VERSION, PIPELINE_VERSION
+from .version import PIPELINE_VERSION
 
 
 @dataclass(frozen=True)

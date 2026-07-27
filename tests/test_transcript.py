@@ -134,16 +134,105 @@ def test_ffmpeg_progress_time_parses_supported_formats() -> None:
     assert parse_ffmpeg_progress_time("progress=continue") is None
 
 
+def test_transcribe_video_enables_audio_extraction_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_command: list[str] = []
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, command: list[str], **_kwargs: object) -> None:
+            captured_command.extend(command)
+            self.stderr = iter(())
+
+        def communicate(self) -> tuple[str, str]:
+            return "", ""
+
+    monkeypatch.setattr("distill.transcript.subprocess.Popen", FakePopen)
+    monkeypatch.setattr(transcript, "transcribe_audio", lambda *_a, **_k: (None, []))
+
+    transcribe_video(
+        tmp_path / "video.mp4",
+        tmp_path,
+        "small",
+        "en",
+        True,
+        ProgressReporter(),
+        duration_sec=10.0,
+    )
+
+    progress_index = captured_command.index("-progress")
+    assert captured_command[progress_index : progress_index + 2] == ["-progress", "pipe:2"]
+
+
 def test_extract_audio_reports_media_time_progress(
-    monkeypatch: Any,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     class FakePopen:
         returncode = 0
 
-        def __init__(self, command: list[str], **_kwargs: object) -> None:
-            assert "-progress" in command
-            self.stderr = iter(["out_time_ms=5000000\n"])
+        def __init__(self, _command: list[str], **_kwargs: object) -> None:
+            self.stderr = iter(["out_time=00:00:05.00\n"])
+
+        def communicate(self) -> tuple[str, str]:
+            return "", ""
+
+    monkeypatch.setattr("distill.transcript.subprocess.Popen", FakePopen)
+    monkeypatch.setattr(transcript, "transcribe_audio", lambda *_a, **_k: (None, []))
+    progress = ProgressReporter()
+
+    _result, warnings = transcribe_video(
+        tmp_path / "video.mp4",
+        tmp_path,
+        "small",
+        "en",
+        True,
+        progress,
+        duration_sec=10.0,
+    )
+
+    # 5 s of 10 s is exactly 50%: the percent is derived from the threaded
+    # duration_sec, so an inexact assertion here would not notice the
+    # duration failing to reach extract_audio at all.
+    assert any(
+        event.mechanism == "audio_extraction" and event.percent == 50.0
+        for event in progress.events
+    )
+    # The 50% event is emitted inside the stderr loop, before the returncode is
+    # ever checked, so the mid-run percent alone cannot tell a successful
+    # extraction from one that emitted progress and then failed.
+    assert warnings == []
+    assert progress.states["audio_extraction"].status == "completed"
+
+
+def test_extract_audio_emits_one_event_per_ffmpeg_progress_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A real ffmpeg -progress block reports the same instant under several keys.
+    block = [
+        "frame=125\n",
+        "fps=25.00\n",
+        "stream_0_0_q=-0.0\n",
+        "bitrate=  32.0kbits/s\n",
+        "total_size=20480\n",
+        "out_time_us=5000000\n",
+        "out_time_ms=5000000\n",
+        "out_time=00:00:05.000000\n",
+        "dup_frames=0\n",
+        "drop_frames=0\n",
+        "speed=  50x\n",
+        "progress=continue\n",
+    ]
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, _command: list[str], **_kwargs: object) -> None:
+            self.stderr = iter(block)
 
         def communicate(self) -> tuple[str, str]:
             return "", ""
@@ -151,18 +240,60 @@ def test_extract_audio_reports_media_time_progress(
     monkeypatch.setattr("distill.transcript.subprocess.Popen", FakePopen)
     progress = ProgressReporter()
 
-    warning = extract_audio(
+    extract_audio(
         tmp_path / "video.mp4",
         tmp_path / "audio.wav",
         progress,
         duration_sec=10.0,
     )
 
-    assert warning is None
-    assert any(
-        event.mechanism == "audio_extraction" and event.percent == 50.0 for event in progress.events
+    running_events = [
+        event
+        for event in progress.events
+        if event.mechanism == "audio_extraction" and event.status == "running"
+    ]
+    # One 0% start plus exactly one tick for the single block.
+    assert [event.percent for event in running_events] == [0.0, 50.0]
+
+
+def test_extract_audio_failure_reports_bounded_ffmpeg_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    noise = [f"noise line {index}\n" for index in range(transcript.STDERR_TAIL_LINES + 40)]
+
+    class FakePopen:
+        returncode = 1
+
+        def __init__(self, _command: list[str], **_kwargs: object) -> None:
+            self.stderr = iter(
+                [
+                    "out_time=00:00:05.000000\n",
+                    "progress=continue\n",
+                    *noise,
+                    "video.mp4: Invalid data found when processing input\n",
+                ]
+            )
+
+        def communicate(self) -> tuple[str, str]:
+            return "", ""
+
+    monkeypatch.setattr("distill.transcript.subprocess.Popen", FakePopen)
+
+    result = extract_audio(
+        tmp_path / "video.mp4",
+        tmp_path / "audio.wav",
+        ProgressReporter(),
+        duration_sec=10.0,
     )
-    assert progress.events[-1].status == "completed"
+
+    assert result is not None
+    assert result["code"] == "audio_extract_failed"
+    assert "Invalid data found when processing input" in result["message"]
+    # Bounded: only the tail is kept, and progress keys are never diagnostic.
+    assert "noise line 40" not in result["message"]
+    assert "out_time" not in result["message"]
+    assert len(result["message"]) <= transcript.STDERR_TAIL_CHARS + 64
 
 
 def test_transcription_progress_uses_segment_end_over_duration(tmp_path: Path) -> None:
