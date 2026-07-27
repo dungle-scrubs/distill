@@ -1,0 +1,410 @@
+"""Tests for the typed carriers **extracted text** travels in.
+
+The invariant under test is R-19/R-20's seam: extracted text is redacted where
+it *enters* a carrier, and a carrier whose **redaction** policy was never
+applied cannot be serialized into a **generation** or a **render**.
+
+Enforcement is layered (D-022) and these tests are written against the layer
+each one can actually reach: the type expresses intent, so it is tested for
+frozen-ness and for immutable nesting; the serializer performs the runtime
+check, so it is tested for refusal. Neither test claims the pair is a guarantee
+against a caller that deliberately declares a policy it never ran.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+from collections.abc import Mapping
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, ClassVar
+
+import pytest
+from test_local_integration import fake_transcribe, make_short_screencast
+
+from distill import pipeline as distill_session
+from distill.artifacts import (
+    EXTRACTED_TEXT_LIMIT_BYTES,
+    TRUNCATION_WARNING_CODE,
+    Carrier,
+    FrameArtifact,
+    RedactionPolicyNotApplied,
+    RedactionState,
+    StageResult,
+    Transcript,
+    serialize,
+)
+
+
+def make_frame(**overrides: Any) -> FrameArtifact:
+    fields: dict[str, Any] = {
+        "index": 1,
+        "timestamp_sec": 1.5,
+        "path": "/tmp/bundle/frames/frame_001.png",
+        "relative_path": "frames/frame_001.png",
+        "extracted_text": "AWS console",
+        "phash": "ffff0000ffff0000",
+        "source_candidate_index": 0,
+    }
+    fields.update(overrides)
+    return FrameArtifact(**fields)
+
+
+def make_transcript(**overrides: Any) -> Transcript:
+    fields: dict[str, Any] = {
+        "language": "en",
+        "language_probability": 0.99,
+        "segments": [
+            {"start_sec": 0.0, "end_sec": 1.0, "text": "hello there", "words": []},
+        ],
+    }
+    fields.update(overrides)
+    return Transcript(**fields)
+
+
+# 1. FrameArtifact and Transcript defined as frozen carriers
+
+
+def test_frame_artifact_and_transcript_are_frozen() -> None:
+    """A carrier's own fields cannot be reassigned after construction.
+
+    Frozen is the first layer only: it stops rebinding a field, which is why
+    the nested-collection test below exists as well.
+    """
+    frame: Any = make_frame(redaction=RedactionState.APPLIED)
+    transcript: Any = make_transcript(redaction=RedactionState.APPLIED)
+
+    # Typed as Any deliberately: `ty` rejects both assignments statically, and
+    # the static rejection is the layer being tested everywhere else. What is
+    # under test here is that the *runtime* refuses too, which is the layer an
+    # unchecked caller meets.
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        frame.extracted_text = "sk-live-0123456789abcdefghij"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        transcript.language = "fr"
+
+
+# 2. FAILS FIRST: serializing a carrier whose redaction policy was not applied
+#    raises
+
+
+def test_serializing_a_frame_whose_redaction_policy_was_not_applied_raises() -> None:
+    """Finding 4's shape: a frame reaches a writer without the policy having run."""
+    frame = make_frame(extracted_text="export API_KEY=sk-live-0123456789abcdefghij")
+
+    assert frame.redaction is RedactionState.NOT_APPLIED
+    with pytest.raises(RedactionPolicyNotApplied) as raised:
+        serialize(frame)
+    assert raised.value.code == "E_REDACTION_POLICY_NOT_APPLIED"
+
+
+def test_serializing_a_transcript_whose_redaction_policy_was_not_applied_raises() -> None:
+    """Finding 15's shape: the transcript took a path the redaction stage did not cover."""
+    transcript = make_transcript()
+
+    with pytest.raises(RedactionPolicyNotApplied):
+        serialize(transcript)
+
+
+def test_serializing_a_stage_result_whose_redaction_policy_was_not_applied_raises() -> None:
+    """A **stage result** is a **redaction sink** too - resume scratch is still on disk."""
+    stage_result = StageResult(
+        schema_version=1,
+        bundle_key="a" * 64,
+        stage="ocr",
+        payload={"frames": []},
+    )
+
+    with pytest.raises(RedactionPolicyNotApplied):
+        serialize(stage_result)
+
+
+# 3. The runtime check is performed in the SERIALIZER, not only in the type
+
+
+def test_the_check_lives_in_the_serializer_and_not_in_construction() -> None:
+    """Constructing an unredacted carrier is legal; serializing one is not.
+
+    This is the split D-022 asks for. Construction cannot be the check, because
+    the carrier is where extracted text is *held* before the policy runs; the
+    serializer is the last point before the text becomes durable, so that is
+    where the refusal has to be.
+    """
+    frame = make_frame()  # no raise: the type permits the state
+
+    assert frame.redaction is RedactionState.NOT_APPLIED
+    with pytest.raises(RedactionPolicyNotApplied):
+        serialize(frame)
+
+
+def test_a_carrier_rebuilt_through_replace_is_still_checked() -> None:
+    """Every route into the serializer is checked, not just the literal constructor."""
+    applied = make_frame(redaction=RedactionState.APPLIED)
+    assert serialize(applied)["extracted_text"] == "AWS console"
+
+    reverted = dataclasses.replace(applied, redaction=RedactionState.NOT_APPLIED)
+    with pytest.raises(RedactionPolicyNotApplied):
+        serialize(reverted)
+
+
+def test_the_serialized_document_records_which_policy_state_produced_it() -> None:
+    """The state is bundle content: a reader can tell redacted output from opted-out output."""
+    assert serialize(make_frame(redaction=RedactionState.APPLIED))["redaction"] == "applied"
+    assert serialize(make_frame(redaction=RedactionState.DISABLED))["redaction"] == "disabled"
+
+
+def test_a_serialized_document_is_json_writable() -> None:
+    """The serializer, not `_payload`, is what a writer can use.
+
+    The internal document is immutable and `json` cannot encode it, so the
+    naive bypass fails loudly instead of writing a mangled `mappingproxy`
+    repr into a bundle.
+    """
+    frame = make_frame(
+        redaction=RedactionState.APPLIED,
+        interpretation={"visual_summary": "a console", "detected_elements": ["a button"]},
+    )
+
+    document = serialize(frame)
+    assert json.loads(json.dumps(document))["interpretation"]["detected_elements"] == ["a button"]
+    with pytest.raises(TypeError):
+        json.dumps(frame._payload())
+
+
+# 4. An explicitly disabled policy satisfies the check
+
+
+def test_an_explicitly_disabled_policy_serializes(  # D-020
+) -> None:
+    """`--no-redact-secrets` is retained: the check is on the policy, not the text.
+
+    The text below is still secret-shaped. That is the point - a DISABLED
+    policy is applied, so the carrier serializes with the text intact.
+    """
+    secret = "export API_KEY=sk-live-0123456789abcdefghij"
+    frame = make_frame(extracted_text=secret, redaction=RedactionState.DISABLED)
+    transcript = make_transcript(redaction=RedactionState.DISABLED)
+
+    assert serialize(frame)["extracted_text"] == secret
+    assert serialize(transcript)["segments"][0]["text"] == "hello there"
+
+
+def test_disabled_is_a_policy_state_and_not_inferred_from_the_text(  # D-020
+) -> None:
+    """Unchanged text does not mean the policy ran, and changed text does not mean it did not.
+
+    A carrier holding text with nothing secret-shaped in it is still refused
+    when the policy never ran: the state is modelled, never inferred.
+    """
+    innocuous = make_frame(extracted_text="the title slide")
+
+    with pytest.raises(RedactionPolicyNotApplied):
+        serialize(innocuous)
+    assert RedactionState.DISABLED.policy_applied is True
+    assert RedactionState.APPLIED.policy_applied is True
+    assert RedactionState.NOT_APPLIED.policy_applied is False
+
+
+# 5. --no-redact-secrets still produces a bundle
+
+
+def test_no_redact_secrets_still_produces_a_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The opt-out reaches a published **generation**, end to end.
+
+    R-20 is a refusal, and a refusal wired to the wrong state fails closed on
+    exactly the users who opted out. This runs the real pipeline with
+    `redact_secrets` off and asserts a bundle came back.
+    """
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+
+    response = distill_session.process_local_video(
+        {
+            "path": str(video),
+            "output_dir": str(tmp_path / "cache"),
+            "ocr": False,
+            "redact_secrets": False,
+            "caption_frames": False,
+            "max_keyframes": 3,
+            "max_static_window_sec": 1,
+        }
+    )
+
+    assert response["cached"] is False
+    assert Path(response["markdown_path"]).is_file()
+    assert Path(response["transcript_path"]).is_file()
+    assert response["frames"]
+
+
+# 6. An extracted-text field beyond 256 KiB is truncated with a WARNING
+
+
+def test_extracted_text_beyond_the_cap_is_truncated_with_a_warning() -> None:
+    """R-58: the cap is per field, and truncation is recorded rather than silent."""
+    oversized = "x" * (EXTRACTED_TEXT_LIMIT_BYTES + 1)
+    frame = make_frame(extracted_text=oversized, redaction=RedactionState.APPLIED)
+
+    document = serialize(frame)
+    assert len(document["extracted_text"].encode()) == EXTRACTED_TEXT_LIMIT_BYTES
+    codes = [item["code"] for item in document["warnings"]]
+    assert codes == [TRUNCATION_WARNING_CODE]
+    assert "extracted_text" in document["warnings"][0]["message"]
+
+
+def test_the_cap_counts_bytes_and_never_splits_a_character() -> None:
+    """256 KiB is a byte budget; a multi-byte character must not be cut in half."""
+    oversized = "é" * EXTRACTED_TEXT_LIMIT_BYTES  # two bytes each
+    frame = make_frame(extracted_text=oversized, redaction=RedactionState.APPLIED)
+
+    text = serialize(frame)["extracted_text"]
+    assert len(text.encode()) <= EXTRACTED_TEXT_LIMIT_BYTES
+    assert text == "é" * (EXTRACTED_TEXT_LIMIT_BYTES // 2)
+
+
+def test_a_field_exactly_at_the_cap_is_not_truncated() -> None:
+    """The boundary is inclusive: 256 KiB is allowed, 256 KiB + 1 is not."""
+    exact = "x" * EXTRACTED_TEXT_LIMIT_BYTES
+    frame = make_frame(extracted_text=exact, redaction=RedactionState.APPLIED)
+
+    document = serialize(frame)
+    assert document["extracted_text"] == exact
+    assert document["warnings"] == []
+
+
+def test_the_cap_reaches_extracted_text_nested_inside_an_interpretation() -> None:
+    """An **interpretation** is extracted text too - the model echoes the screen back."""
+    frame = make_frame(
+        redaction=RedactionState.APPLIED,
+        interpretation={
+            "visual_summary": "a" * (EXTRACTED_TEXT_LIMIT_BYTES + 1),
+            "detected_elements": ["b" * (EXTRACTED_TEXT_LIMIT_BYTES + 1)],
+        },
+    )
+
+    document = serialize(frame)
+    assert len(document["interpretation"]["visual_summary"].encode()) == EXTRACTED_TEXT_LIMIT_BYTES
+    assert (
+        len(document["interpretation"]["detected_elements"][0].encode())
+        == EXTRACTED_TEXT_LIMIT_BYTES
+    )
+    messages = sorted(item["message"] for item in document["warnings"])
+    assert len(messages) == 2
+    assert "interpretation.detected_elements[0]" in messages[0]
+    assert "interpretation.visual_summary" in messages[1]
+
+
+def test_the_cap_reaches_transcript_segment_text() -> None:
+    """R-21: the transcript is extracted text on the same terms as keyframe text."""
+    transcript = make_transcript(
+        redaction=RedactionState.APPLIED,
+        segments=[{"start_sec": 0.0, "end_sec": 1.0, "text": "z" * (EXTRACTED_TEXT_LIMIT_BYTES + 1)}],
+    )
+
+    document = serialize(transcript)
+    assert len(document["segments"][0]["text"].encode()) == EXTRACTED_TEXT_LIMIT_BYTES
+    assert [item["code"] for item in document["warnings"]] == [TRUNCATION_WARNING_CODE]
+
+
+# 7. No aggregate bundle cap is imposed
+
+
+def test_no_aggregate_cap_is_imposed_across_a_bundles_carriers() -> None:
+    """D-045: 80 keyframes at the per-field cap is bounded enough.
+
+    Eighty frames each holding a full 256 KiB field is ~20 MiB of extracted
+    text. Every one of them serializes whole: an aggregate cap would add a
+    second failure mode for no extra protection.
+    """
+    at_cap = "x" * EXTRACTED_TEXT_LIMIT_BYTES
+    frames = [
+        make_frame(index=index, extracted_text=at_cap, redaction=RedactionState.APPLIED)
+        for index in range(80)
+    ]
+
+    documents = [serialize(frame) for frame in frames]
+    total = sum(len(document["extracted_text"].encode()) for document in documents)
+    assert total == 80 * EXTRACTED_TEXT_LIMIT_BYTES
+    assert all(document["warnings"] == [] for document in documents)
+
+
+# 8. Nested collections immutable so post-redaction mutation is impossible
+
+
+def test_mutating_the_dict_a_carrier_was_built_from_does_not_reach_the_carrier() -> None:
+    """The carrier copies on the way in; the caller keeps no handle into it."""
+    interpretation = {"visual_summary": "a console", "detected_elements": ["a button"]}
+    frame = make_frame(interpretation=interpretation, redaction=RedactionState.APPLIED)
+
+    interpretation["visual_summary"] = "sk-live-0123456789abcdefghij"
+    interpretation["detected_elements"].append("sk-live-0123456789abcdefghij")
+
+    assert serialize(frame)["interpretation"] == {
+        "visual_summary": "a console",
+        "detected_elements": ["a button"],
+    }
+
+
+def test_nested_collections_inside_a_carrier_cannot_be_mutated() -> None:
+    """Frozen is not enough when a field holds a list or a dict.
+
+    Post-redaction mutation is how redacted extracted text becomes unredacted
+    again between construction and the writer, so the nesting is immutable all
+    the way down rather than one level deep.
+    """
+    frame = make_frame(
+        redaction=RedactionState.APPLIED,
+        interpretation={"detected_elements": ["a button"], "nested": {"verbatim_text": "OK"}},
+    )
+    interpretation: Any = frame.interpretation
+    warnings: Any = frame.warnings
+
+    with pytest.raises(TypeError):
+        interpretation["visual_summary"] = "leaked"
+    with pytest.raises(TypeError):
+        interpretation["nested"]["verbatim_text"] = "leaked"
+    with pytest.raises(AttributeError):
+        interpretation["detected_elements"].append("leaked")
+    with pytest.raises(AttributeError):
+        warnings.append({"stage": "artifacts", "code": "x", "message": "y"})
+
+
+def test_a_serialized_document_is_a_copy_the_caller_cannot_write_back_through() -> None:
+    """Thawing for JSON must not hand out a window into the carrier."""
+    frame = make_frame(redaction=RedactionState.APPLIED, interpretation={"verbatim_text": "OK"})
+
+    document = serialize(frame)
+    document["interpretation"]["verbatim_text"] = "leaked"
+
+    assert serialize(frame)["interpretation"]["verbatim_text"] == "OK"
+
+
+def test_a_carrier_naming_an_extracted_text_field_it_does_not_have_is_refused() -> None:
+    """A misnamed region reads as capped and behaves as uncapped - the one silent hole.
+
+    R-58 is only as good as each carrier's declaration of which of its fields
+    hold extracted text, so a name that is not a field is a construction-time
+    failure rather than a field nobody notices went uncapped.
+    """
+
+    @dataclasses.dataclass(frozen=True, kw_only=True)
+    class Miscarrier(Carrier):
+        EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = ("ocr_text",)
+
+        extracted_text: str = ""
+
+        def _payload(self) -> Mapping[str, Any]:
+            return MappingProxyType({"extracted_text": self.extracted_text})
+
+    with pytest.raises(AssertionError, match="ocr_text"):
+        Miscarrier(redaction=RedactionState.APPLIED)
+
+
+def test_a_mutable_value_a_carrier_cannot_freeze_is_refused() -> None:
+    """An unsupported type is a defect at construction, not a hole at the writer."""
+    with pytest.raises(TypeError):
+        make_frame(interpretation={"detected_elements": {"a set is not frozen"}})

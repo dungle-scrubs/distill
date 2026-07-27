@@ -36,6 +36,7 @@ PIPELINE_VERSION = 27
 # ordering mechanical rather than incidental, and test_pipeline_signature
 # enforces that too.
 SIGNED_MODULES = (
+    "artifacts.py",
     "bundle_store.py",
     "capabilities.py",
     "cli.py",
