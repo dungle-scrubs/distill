@@ -276,6 +276,7 @@ class ProcessingRun:
                 paths.generation,
                 self.options,
                 self.progress,
+                duration_sec=self.source.duration_sec,
             )
             return {"transcript": transcript, "warnings": transcript_warnings}
 
@@ -587,7 +588,10 @@ def transcribe_with_imports(
     work_dir: Path,
     options: DistillOptions,
     progress: ProgressCounter | ProgressReporter,
+    duration_sec: float,
 ) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+    # No default: SourceInfo.duration_sec is always present, and omitting it here
+    # would silently disable ffmpeg -progress instead of failing loudly.
     from .transcript import transcribe_video
 
     return transcribe_video(
@@ -597,6 +601,7 @@ def transcribe_with_imports(
         options.whisper_language,
         options.vad_filter,
         progress,
+        duration_sec,
     )
 
 
