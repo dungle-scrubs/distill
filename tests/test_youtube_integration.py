@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import lease_is_held
 from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import pipeline as distill_session
@@ -148,10 +149,6 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
         def __init__(self, output_root: Path) -> None:
             self.lock_path = output_root / "_youtube_locks" / "mock-video.lock"
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-            # The same lock file the real downloader writes: release only drops
-            # a lock this process still holds, so a pid-less stand-in would be
-            # left behind and say nothing about the lease's lifetime.
-            self.lock_path.write_text(json.dumps({"pid": os.getpid()}))
 
         def acquire(
             self,
@@ -162,10 +159,12 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
             if progress:
                 progress.update("youtube_download", percent=55.0)
                 progress.complete("youtube_download", detail={"path": str(video)})
-            return AcquiredSource(
-                path=video,
-                lease=AcquisitionLease(lock_key=lock_key, lock_path=self.lock_path),
-            )
+            # A real lease, taken the way the real downloader takes it: a
+            # stand-in holding no lock would say nothing about when the run
+            # gives the source back.
+            lease = AcquisitionLease.take(lock_key, self.lock_path)
+            assert lease is not None
+            return AcquiredSource(path=video, lease=lease)
 
     def fake_probe(_config: object) -> LocalVisionProbe:
         return LocalVisionProbe(
@@ -191,7 +190,7 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
         lambda _url: YouTubeMetadata(video_id, "", []),
     )
     monkeypatch.setattr(distill_source, "check_disk_floor", lambda _path: None)
-    monkeypatch.setattr(distill_source, "probe_duration", lambda _path: 1.0)
+    monkeypatch.setattr(distill_source, "probe_duration", lambda _path: (1.0, []))
     monkeypatch.setattr(distill_session, "probe_local_vision", fake_probe)
     # R-36: transcription is the pipeline reading the acquired media, so the
     # lease must still be held while it runs. Observing it here rather than
@@ -201,7 +200,7 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     held_during_read: list[bool] = []
 
     def transcribe_under_the_lease(*args: Any, **kwargs: Any) -> Any:
-        held_during_read.append(lock_path.exists())
+        held_during_read.append(lease_is_held("mock-video", lock_path))
         return fake_transcribe(*args, **kwargs)
 
     monkeypatch.setattr(distill_session, "transcribe_with_imports", transcribe_under_the_lease)
@@ -223,7 +222,7 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     assert Path(response["manifest_path"]).exists()
     assert held_during_read == [True]
     # ... and released once the run has no further use for the media.
-    assert not lock_path.exists()
+    assert not lease_is_held("mock-video", lock_path)
     assert any(
         warning["code"] == "local_vision_rapid_mlx_unavailable" for warning in response["warnings"]
     )

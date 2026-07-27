@@ -90,20 +90,18 @@ def hermetic_user_directories(
         yield
 
 
-def unused_pid() -> int:
-    """A pid no live process holds, for standing in for a holder that is gone.
+def lease_is_held(lock_key: str, lock_path: Path) -> bool:
+    """Whether any run currently holds the **acquisition lease** at `lock_path`.
 
-    Acquisition decides a lock is abandoned by asking the kernel whether the
-    recorded pid still exists, so a test about an abandoned lock needs a pid
-    that genuinely does not. Searching downward from the top of the pid space
-    finds one without spawning and reaping a child, whose pid the kernel could
-    hand straight back to something else.
+    The lock file outlives every holder by design, so its presence on disk says
+    nothing. Asking for the lease and handing it straight back is the question
+    that has an answer: `flock` is per descriptor, so a lease held by this same
+    process is refused here exactly as another process's would be.
     """
-    for candidate in range(2**15 - 1, 1024, -1):
-        try:
-            os.kill(candidate, 0)
-        except ProcessLookupError:
-            return candidate
-        except OSError:
-            continue
-    raise RuntimeError("no unused pid found")
+    from distill.source import AcquisitionLease
+
+    lease = AcquisitionLease.take(lock_key, lock_path)
+    if lease is None:
+        return True
+    lease.release()
+    return False

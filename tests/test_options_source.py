@@ -4,17 +4,24 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from ast import literal_eval
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from conftest import unused_pid
-from fake_tools import FAKE_FFPROBE, FAKE_YTDLP_DOWNLOAD, FAKE_YTDLP_FAILING
+from conftest import lease_is_held
+from fake_tools import (
+    FAKE_FFPROBE,
+    FAKE_YTDLP_DOWNLOAD,
+    FAKE_YTDLP_FAILING,
+    fake_ffprobe_flooding_stderr,
+)
 
 from distill.errors import DistillError
 from distill.options import OPTION_DEFAULTS, DistillOptions
 from distill.progress import ProgressReporter
+from distill.run_command import OUTPUT_CAP_BYTES, TRUNCATION_WARNING_CODE
 from distill.source import (
     CONTENT_HASH_LIMIT_BYTES,
     FINGERPRINT_INTERIOR_ANCHORS,
@@ -33,7 +40,9 @@ from distill.source import (
     sensitive_path_match,
     source_hash,
     validate_output_root,
+    youtube_description,
     youtube_lock_key,
+    youtube_metadata,
     youtube_source_info,
 )
 
@@ -334,8 +343,8 @@ def test_youtube_source_info_carries_the_lease_into_the_read(
     video = tmp_path / "source.mp4"
     video.write_bytes(b"video")
     lock = tmp_path / "abc123.lock"
-    lock.write_text("{}")
-    lease = AcquisitionLease(lock_key="abc123", lock_path=lock)
+    lease = AcquisitionLease.take("abc123", lock)
+    assert lease is not None
     progress = ProgressReporter()
 
     class FakeDownloader:
@@ -366,7 +375,7 @@ def test_youtube_source_info_carries_the_lease_into_the_read(
             warnings=[],
         ),
     )
-    monkeypatch.setattr("distill.source.probe_duration", lambda _path: 12.0)
+    monkeypatch.setattr("distill.source.probe_duration", lambda _path: (12.0, []))
 
     source = youtube_source_info(
         "https://www.youtube.com/watch?v=abc123",
@@ -393,11 +402,12 @@ def test_youtube_source_info_carries_the_lease_into_the_read(
     ]
     assert source.acquisition_lease is lease
     assert lease.released is False
-    assert lock.exists()
+    assert lease_is_held("abc123", lock)
     assert any(
         event.mechanism == "duration_probe" and event.status == "completed"
         for event in progress.events
     )
+    lease.release()
 
 
 def test_options_payload_is_stable_json_hash() -> None:
@@ -406,39 +416,58 @@ def test_options_payload_is_stable_json_hash() -> None:
     assert options.opts_hash("local") == hashlib.sha256(raw).hexdigest()
 
 
-def test_youtube_stale_lock_takeover_is_covered(tmp_path: Path) -> None:
-    dead = unused_pid()
+def test_youtube_lock_wait_ends_in_the_lease_and_a_warning(tmp_path: Path) -> None:
+    """The wait budget is spent on a lease that is genuinely held, then reported.
+
+    A run that queued behind another run's download waited, and a **warning** is
+    how the run that waited says so. The held lease is released from a timer, so
+    the poll loop is what ends the wait rather than the budget running out - a
+    budget that expired would deny the lease instead (`E_LOCKED`).
+    """
     lock = tmp_path / "video.lock"
-    lock.write_text(
-        json.dumps({"pid": dead, "created_wall": "2026-01-01T00:00:00Z"})
-    )
-    downloader = YoutubeDownloader(tmp_path)
-
-    acquired, warnings = downloader._acquire(lock)
-
-    assert acquired is True
-    assert warnings == []
-    payload = json.loads(lock.read_text())
-    assert payload["pid"] != dead
-
-
-def test_youtube_long_lock_wait_emits_warning(tmp_path: Path) -> None:
-    lock = tmp_path / "video.lock"
-    lock.write_text(
-        json.dumps({"pid": unused_pid(), "created_wall": "2026-01-01T00:00:00Z"})
-    )
+    held = AcquisitionLease.take("video", lock)
+    assert held is not None
     downloader = YoutubeDownloader(
         tmp_path,
-        lock_wait_sec=0.05,
+        lock_wait_sec=10.0,
         lock_poll_sec=0.005,
         lock_warn_after_sec=0.0,
     )
+    releasing = threading.Timer(0.02, held.release)
+    releasing.start()
 
-    acquired, warnings = downloader._acquire(lock)
+    try:
+        lease, warnings = downloader._acquire("video", lock)
+    finally:
+        releasing.cancel()
 
-    assert acquired is True
+    assert lease is not None
     assert warnings
     assert warnings[0]["code"] == "long_lock_wait"
+    lease.release()
+
+
+def test_youtube_lock_wait_that_runs_out_denies_the_lease(tmp_path: Path) -> None:
+    """A budget that expires against a live holder is a denial, not a takeover.
+
+    Nothing about a held lease becomes stealable by being waited on: the run
+    that waited is told the source is locked and leaves the holder alone.
+    """
+    lock = tmp_path / "video.lock"
+    held = AcquisitionLease.take("video", lock)
+    assert held is not None
+    downloader = YoutubeDownloader(
+        tmp_path,
+        lock_wait_sec=0.02,
+        lock_poll_sec=0.005,
+    )
+
+    lease, warnings = downloader._acquire("video", lock)
+
+    assert lease is None
+    assert warnings == []
+    assert lease_is_held("video", lock)
+    held.release()
 
 
 def test_ytdlp_download_progress_is_read_from_stdout(
@@ -533,7 +562,7 @@ def test_probe_duration_emits_a_boundary_event(
     fake_tool("ffprobe", 'import sys\n\nsys.stdout.write(\'{"format": {"duration": "12.5"}}\')\n')
 
     with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
-        assert probe_duration(tmp_path / "video.mp4") == 12.5
+        assert probe_duration(tmp_path / "video.mp4") == (12.5, [])
 
     events = [json.loads(record.message) for record in caplog.records]
     assert [(event["detail"]["tool"], event["detail"]["stage"]) for event in events] == [
@@ -573,4 +602,64 @@ def test_youtube_downloader_releases_its_lock_when_ytdlp_fails(
     with pytest.raises(DistillError):
         YoutubeDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123")
 
-    assert not (tmp_path / "_youtube_locks" / "abc123.lock").exists()
+    # The lock file stays where it is; what a release gives up is the lock the
+    # kernel granted, and that is what the next run needs to find free.
+    assert not lease_is_held("abc123", tmp_path / "_youtube_locks" / "abc123.lock")
+
+
+def test_probe_duration_reports_the_truncation_its_probe_recorded(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """R-33: `run_json` is the caller's only reach into the invocation.
+
+    A duration returned on its own leaves the **warning** with nowhere to go,
+    and the **bundle** would be published never mentioning that ffprobe's own
+    output was cut short.
+    """
+    fake_tool("ffprobe", fake_ffprobe_flooding_stderr(OUTPUT_CAP_BYTES))
+    (tmp_path / "video.mp4").write_bytes(b"video")
+
+    duration, warnings = probe_duration(tmp_path / "video.mp4")
+
+    assert duration == 12.5
+    assert [item["code"] for item in warnings] == [TRUNCATION_WARNING_CODE]
+
+
+# A fake yt-dlp that answers `--dump-json` and floods stderr past the capture cap
+# while it does - yt-dlp is genuinely verbose there under a slow extractor.
+FAKE_YTDLP_METADATA_FLOODS_STDERR = f"""
+import json, sys
+
+sys.stdout.write(json.dumps({{"id": "abc123", "description": "hello"}}))
+sys.stderr.write("x" * ({OUTPUT_CAP_BYTES} + 1024))
+"""
+
+
+def test_youtube_metadata_carries_its_invocations_truncation_warning(
+    fake_tool: Callable[[str, str], Path],
+) -> None:
+    """R-33: metadata that parsed is not proof the invocation lost nothing."""
+    fake_tool("yt-dlp", FAKE_YTDLP_METADATA_FLOODS_STDERR)
+
+    metadata = youtube_metadata("https://youtu.be/abc123")
+
+    assert metadata.video_id == "abc123"
+    assert [item["code"] for item in metadata.warnings] == [TRUNCATION_WARNING_CODE]
+
+
+def test_an_absent_ytdlp_ends_the_run_even_on_the_best_effort_path(
+    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+) -> None:
+    """ADR-0002 / R-34: best-effort metadata does not downgrade a required tool.
+
+    `youtube_description` degrades when yt-dlp runs and cannot answer. An absent
+    yt-dlp is a different question, and the capability table is what answers it:
+    yt-dlp is required, so the run ends rather than continuing without a source.
+    """
+    with pytest.raises(DistillError) as failure:
+        youtube_description("https://youtu.be/abc123")
+
+    assert failure.value.code == "E_MISSING_TOOL"
+    assert "yt-dlp" in failure.value.message
+    assert failure.value.details["requirement"] == "required"

@@ -21,6 +21,11 @@ reading. `acquire` therefore hands the lease back to its caller inside an
 `AcquiredSource`, and the caller releases it when it is finished reading - see
 `pipeline.process_resolved_source`.
 
+Exclusion is the kernel's, via `flock` on a descriptor the lease keeps open for
+as long as it is held. A filesystem that cannot take that lock is a filesystem
+on which Distill cannot tell one run from two, so acquisition fails closed with
+`E_LOCK_UNSUPPORTED` rather than falling back to a weaker scheme.
+
 It does not write final bundle artifacts, own bundle-level locking (that is
 keyed by **bundle key** and belongs to the bundle store; the lease here is keyed
 by **lock key** and answers only "is another run fetching this source?"), decide
@@ -29,6 +34,8 @@ what a **generation** contains, or install anything.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -44,10 +51,18 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
+from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, warning
 from .options import DistillOptions
 from .progress import ProgressReporter
-from .run_command import CommandResult, CommandTimeouts, run, run_json, stream
+from .run_command import (
+    CommandResult,
+    CommandTimeouts,
+    run,
+    run_json,
+    silent_tool_timeouts,
+    stream,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,7 +76,12 @@ YOUTUBE_DISK_FLOOR_BYTES = 1024 * 1024 * 1024
 # Wall-clock ceilings so a wedged tool or a stalled network call cannot hang the
 # whole run. yt-dlp additionally gets `--socket-timeout` so it aborts a stalled
 # connection on its own rather than blocking until the outer timeout fires.
-FFPROBE_TIMEOUTS = CommandTimeouts(total_sec=60.0, idle_sec=30.0)
+# ffprobe is run as `-v error`, which is silent by construction: it prints its
+# document when it has the answer and nothing before then, so the idle clock
+# never resets - see `silent_tool_timeouts`, which is why one number governs
+# here. A lower idle value would not catch a stall, it would just cut the probe's
+# budget, and a probe that runs out is fatal (`E_COMMAND`), not a degradation.
+FFPROBE_TIMEOUTS = silent_tool_timeouts(60.0)
 YTDLP_METADATA_TIMEOUTS = CommandTimeouts(total_sec=120.0, idle_sec=60.0)
 # A download is bounded by silence, not by length (R-30): a legitimate multi-GB
 # fetch on a slow link may run for hours, while a wedged one stops emitting
@@ -136,47 +156,10 @@ def _acquisition_log(event: str, **detail: Any) -> None:
     )
 
 
-def _lock_owner_pid(lock_path: Path) -> int | None:
-    """The pid recorded in a lock file, or None if there is no usable one.
-
-    A missing, unreadable, malformed or pid-less lock file names no holder. It
-    is reported the same way as an absent one, because in both cases there is
-    nobody the lock can be said to belong to.
-    """
-    try:
-        payload = json.loads(lock_path.read_text())
-        pid = payload["pid"]
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-        return None
-    return pid if isinstance(pid, int) and pid > 0 else None
-
-
-def _holder_is_alive(pid: int) -> bool:
-    """Whether the process recorded in a lock file still exists.
-
-    Liveness, not age, is what says a lock is abandoned. The lease is held for
-    the media's whole read lifetime (R-36), which for any real run outlasts any
-    staleness window worth waiting out - transcription alone is minutes - so a
-    clock-based test would hand a live run's media to a second run. A signal 0
-    asks the kernel instead and is exact for as long as the pid is.
-
-    Residual risk: pid reuse. A holder that died and whose pid was handed to an
-    unrelated process still reads as alive, and - worse - a lock recorded by a
-    dead holder whose pid was reused can never be reclaimed here. R-07 replaces
-    this with `flock`, which the kernel releases when the holder exits: held for
-    the run's duration, no heartbeat, no staleness window, no pid to collide.
-    """
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # The process exists and belongs to another user. Existing is the whole
-        # question here, so this is a live holder.
-        return True
-    except OSError:
-        return True
-    return True
+# `flock` refusing a lock somebody else holds, which is an answer rather than a
+# failure. Every other errno says this filesystem cannot give Distill the
+# exclusion it asked for, and is fatal.
+_LOCK_HELD_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
 
 
 @dataclass
@@ -188,41 +171,85 @@ class AcquisitionLease:
     lease, which is exactly what stops the second from replacing media the first
     is still reading (R-36).
 
+    The lease *is* an open descriptor holding a `flock`, not a file whose
+    contents describe a holder. That is what makes it exclusive: a lock whose
+    content names its owner has to be created before it can be written, and a
+    contender reading it in between finds a lock nobody owns, calls it
+    abandoned, and takes it - two runs, one lock key. Here the lock exists for
+    exactly as long as the descriptor does, so there is nothing to publish, no
+    staleness to guess at, and no pid that could be reused. A holder killed
+    outright releases it the moment the kernel closes its descriptors.
+
     Held until `release`, which the reader calls when it is finished with the
     media - not when the download ends. `release` is idempotent, because the
     failure paths that release a lease early overlap with the caller's own
     cleanup.
 
-    `owner_pid` is what makes release safe: the lock file is a shared name, and
-    a lease that unlinked whatever happened to be at that name would destroy a
-    lock some other run had taken in the meantime.
+    Does not own: the media it protects, the staging directory, or bundle-level
+    locking, which is keyed by **bundle key** and belongs to the bundle store.
     """
 
     lock_key: str
     lock_path: Path
+    fd: int
     warnings: list[dict[str, str]] = field(default_factory=list)
     released: bool = False
-    owner_pid: int = field(default_factory=os.getpid)
+
+    @classmethod
+    def take(cls, lock_key: str, lock_path: Path) -> AcquisitionLease | None:
+        """Take the lease, or report `None` if another run holds it.
+
+        The descriptor stays open inside the returned lease: closing it is what
+        releasing means, so nothing else may close it. `flock` is per open file
+        description rather than per process, so a second lease taken against the
+        same path is refused even inside the process that holds the first.
+
+        A filesystem that cannot take the lock (`flock` reporting anything other
+        than "held") is fatal: `E_LOCK_UNSUPPORTED` rather than a fallback that
+        would let two runs read one source without either of them knowing.
+        """
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in _LOCK_HELD_ERRNOS:
+                return None
+            reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
+            raise DistillError(
+                "E_LOCK_UNSUPPORTED",
+                "youtube",
+                "filesystem cannot lock the YouTube source directory",
+                {"lock_path": str(lock_path), "errno": reported or str(exc.errno)},
+            ) from exc
+        except BaseException:
+            os.close(fd)
+            raise
+        return cls(lock_key=lock_key, lock_path=lock_path, fd=fd)
 
     def release(self) -> None:
-        """Drop the lease, but only if the lock file still records this holder.
+        """Give the lease up by closing the descriptor the kernel locked.
 
-        Unlinking unconditionally would let a run that has already lost its
-        lock - to a reclaim, or to a hand-edited directory - delete the lock a
-        different run now holds, and let a third run in behind it. So the file
-        is read back first, and a lock naming anyone else is left alone.
+        The lock file itself stays on disk, deliberately. Unlinking it is a
+        second way to lose exclusivity: a waiter that has already opened the
+        path holds a descriptor on an inode that now has no name, so it can lock
+        that inode while the next run creates a fresh file at the same path and
+        locks that - two runs, again, one lock key. Leaving the file costs one
+        empty inode per **lock key** and keeps the path itself the identity of
+        the lease. Reclaiming those files is **prune**'s business, not a
+        release's.
+
+        Closing releases only what this process was granted: a descriptor with
+        no lock behind it frees nobody, whatever the file at that path says.
         """
         if self.released:
             return
         self.released = True
-        held = _lock_owner_pid(self.lock_path) == self.owner_pid
-        if held:
-            self.lock_path.unlink(missing_ok=True)
+        os.close(self.fd)
         _acquisition_log(
             "lease_released",
             lock_key=self.lock_key,
             lock_path=str(self.lock_path),
-            held=held,
         )
 
 
@@ -299,8 +326,14 @@ class YouTubeDownloaderProtocol(Protocol):
     ) -> AcquiredSource: ...
 
 
-def probe_duration(path: Path) -> float:
-    data = run_json(
+def probe_duration(path: Path) -> tuple[float, list[dict[str, str]]]:
+    """The source's duration, with any **warning** the probe itself recorded.
+
+    The warnings are truncated capture (R-33). They are returned rather than
+    dropped because this is the only place they exist, and a caller that took
+    the duration alone would publish a **bundle** that never mentions the loss.
+    """
+    data, probe_warnings = run_json(
         [
             "ffprobe",
             "-v",
@@ -319,7 +352,7 @@ def probe_duration(path: Path) -> float:
         duration = float(data["format"]["duration"])
     except (KeyError, TypeError, ValueError) as exc:
         raise DistillError("E_FFPROBE", "source", "could not read video duration") from exc
-    return duration
+    return duration, list(probe_warnings)
 
 
 def ensure_duration_allowed(duration_sec: float, max_duration_sec: float) -> None:
@@ -478,7 +511,8 @@ class LocalSourceProvider:
             )
         if progress:
             progress.update("duration_probe", status="running")
-        duration = probe_duration(resolved)
+        duration, probe_warnings = probe_duration(resolved)
+        warnings.extend(probe_warnings)
         if progress:
             progress.complete("duration_probe", detail={"duration_sec": duration})
         ensure_duration_allowed(duration, options.max_duration_sec)
@@ -634,31 +668,36 @@ def _run_ytdlp(
     )
 
 
+def _metadata_unavailable() -> dict[str, str]:
+    return warning(
+        "youtube",
+        "metadata_unavailable",
+        "yt-dlp could not read YouTube description",
+    )
+
+
 def youtube_description(url: str) -> tuple[str, list[dict[str, str]]]:
     try:
         proc = _run_ytdlp(["--skip-download", "--print", "%(description)s"], url)
-    except DistillError:
-        # Description is best-effort metadata; degrade rather than fail the run.
-        return "", [
-            warning(
-                "youtube",
-                "metadata_unavailable",
-                "yt-dlp could not read YouTube description",
-            )
-        ]
+    except DistillError as exc:
+        # An absent tool is the capability table's decision here too. The
+        # description being best-effort does not make an absent yt-dlp a
+        # degradation - yt-dlp is a **required capability**, so this raises
+        # (ADR-0002, R-34). Anything else is yt-dlp having run and not answered,
+        # which costs the description and not the run.
+        if exc.code == MISSING_TOOL_CODE:
+            return "", [missing_tool_consequence("youtube", "yt-dlp", cause=exc)]
+        return "", [_metadata_unavailable()]
     if proc.returncode != 0:
-        return "", [
-            warning(
-                "youtube",
-                "metadata_unavailable",
-                "yt-dlp could not read YouTube description",
-            )
-        ]
-    return proc.stdout.strip(), []
+        return "", [*proc.warnings, _metadata_unavailable()]
+    return proc.stdout.strip(), list(proc.warnings)
 
 
 def youtube_metadata(url: str) -> YouTubeMetadata:
     proc = _run_ytdlp(["--skip-download", "--dump-json"], url)
+    # Carried whichever branch answers: a metadata invocation that lost part of
+    # its own output (R-33) is the same loss whether or not the document parsed.
+    probe_warnings = list(proc.warnings)
     if proc.returncode == 0:
         try:
             payload = json.loads(proc.stdout)
@@ -669,12 +708,16 @@ def youtube_metadata(url: str) -> YouTubeMetadata:
             return YouTubeMetadata(
                 video_id=video_id,
                 description=str(payload.get("description") or "").strip(),
-                warnings=[],
+                warnings=probe_warnings,
             )
 
     video_id = canonical_youtube_id(url)
     description, metadata_warnings = youtube_description(url)
-    return YouTubeMetadata(video_id=video_id, description=description, warnings=metadata_warnings)
+    return YouTubeMetadata(
+        video_id=video_id,
+        description=description,
+        warnings=[*probe_warnings, *metadata_warnings],
+    )
 
 
 def canonical_youtube_id(url: str) -> str:
@@ -813,7 +856,7 @@ def _probed_duration_sec(probe: Any) -> float:
         return 0.0
 
 
-def validate_media_file(path: Path) -> None:
+def validate_media_file(path: Path) -> list[dict[str, str]]:
     """Confirm a staged file is the media Distill asked for, before promoting it.
 
     A **fatal error**, not a **degradation** (ADR-0002): the media file is the
@@ -829,12 +872,16 @@ def validate_media_file(path: Path) -> None:
     the third, so neither can be promoted over media that answered all three.
     This is a separate probe from `probe_duration`, which reads the *promoted*
     path: the point of asking here is to ask before promotion.
+
+    It returns the probe's own **warnings** - truncated capture (R-33) - because
+    a verdict of "accepted" is not the same as "nothing was lost", and this is
+    the only place those warnings exist.
     """
     size = path.stat().st_size if path.is_file() else 0
     if size == 0:
         raise _reject_media(path, "empty_file", "downloaded source file is empty")
     try:
-        probe = run_json(
+        probe, probe_warnings = run_json(
             [
                 "ffprobe",
                 "-v",
@@ -880,6 +927,7 @@ def validate_media_file(path: Path) -> None:
         codec_types=codec_types,
         duration_sec=duration_sec,
     )
+    return list(probe_warnings)
 
 
 def promote_media(produced: Path, media_dir: Path) -> Path:
@@ -936,7 +984,7 @@ class YoutubeDownloader:
             try:
                 result = self._download(url, staging_dir, progress)
                 produced = select_downloaded_media(staging_dir)
-                validate_media_file(produced)
+                validation_warnings = validate_media_file(produced)
                 promoted = promote_media(produced, self._media_dir(lock_key))
             finally:
                 # The staging directory is scratch: whatever survived the run -
@@ -951,7 +999,7 @@ class YoutubeDownloader:
         return AcquiredSource(
             path=promoted,
             lease=lease,
-            warnings=[*lease.warnings, *result.warnings],
+            warnings=[*lease.warnings, *result.warnings, *validation_warnings],
         )
 
     def _media_dir(self, lock_key: str) -> Path:
@@ -985,14 +1033,15 @@ class YoutubeDownloader:
         lock = locks / f"{lock_key}.lock"
         if progress:
             progress.update("youtube_download", status="running", detail={"step": "lock"})
-        acquired, lock_warnings = self._acquire(lock)
-        if not acquired:
+        lease, lock_warnings = self._acquire(lock_key, lock)
+        if lease is None:
             _acquisition_log(
                 "lease_denied", lock_key=lock_key, lock_path=str(lock), reason="held"
             )
             raise DistillError("E_LOCKED", "youtube", "YouTube source is locked by another process")
+        lease.warnings.extend(lock_warnings)
         _acquisition_log("lease_acquired", lock_key=lock_key, lock_path=str(lock))
-        return AcquisitionLease(lock_key=lock_key, lock_path=lock, warnings=lock_warnings)
+        return lease
 
     def _download(
         self,
@@ -1056,12 +1105,22 @@ class YoutubeDownloader:
             error_code="E_YTDLP",
         )
 
-    def _acquire(self, lock: Path) -> tuple[bool, list[dict[str, str]]]:
+    def _acquire(
+        self,
+        lock_key: str,
+        lock: Path,
+    ) -> tuple[AcquisitionLease | None, list[dict[str, str]]]:
+        """Poll for the lease within this run's wait budget.
+
+        The budget is the only thing that ends the wait: a lock is held until
+        its holder gives it up or dies, and neither is something to time out on
+        a holder's behalf.
+        """
         started = time.monotonic()
         warnings: list[dict[str, str]] = []
         while True:
-            acquired = self._try_acquire_once(lock)
-            if acquired:
+            lease = AcquisitionLease.take(lock_key, lock)
+            if lease is not None:
                 waited = time.monotonic() - started
                 if waited >= self.lock_warn_after_sec:
                     warnings.append(
@@ -1071,40 +1130,10 @@ class YoutubeDownloader:
                             f"waited {waited:.1f}s for YouTube source lock",
                         )
                     )
-                return True, warnings
+                return lease, warnings
             if time.monotonic() - started >= self.lock_wait_sec:
-                return False, warnings
+                return None, warnings
             time.sleep(self.lock_poll_sec)
-
-    def _try_acquire_once(self, lock: Path) -> bool:
-        """Take the lock file, reclaiming it only from a holder that is gone.
-
-        A lock is stale when the process that wrote it no longer exists - not
-        when it is old. Nothing refreshes a lock file, and the lease outlives
-        the download by design (R-36), so age says nothing about whether the
-        holder is still reading. A lock file that names no holder at all is
-        stale too: it cannot be waited out, because nobody will release it.
-        """
-        payload = {
-            "pid": os.getpid(),
-            "created_wall": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            holder = _lock_owner_pid(lock)
-            if holder is not None and _holder_is_alive(holder):
-                return False
-            lock.unlink(missing_ok=True)
-            try:
-                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                # Another run reclaimed it inside the same window. It holds the
-                # lock now; the caller's poll loop decides whether to wait.
-                return False
-        with os.fdopen(fd, "w") as handle:
-            json.dump(payload, handle, sort_keys=True)
-        return True
 
 
 class YouTubeSourceProvider:
@@ -1177,7 +1206,8 @@ class YouTubeSourceProvider:
             warnings = [*metadata.warnings, *acquired.warnings]
             if progress:
                 progress.update("duration_probe", status="running")
-            duration = probe_duration(acquired.path)
+            duration, probe_warnings = probe_duration(acquired.path)
+            warnings.extend(probe_warnings)
             if progress:
                 progress.complete("duration_probe", detail={"duration_sec": duration})
             ensure_duration_allowed(duration, options.max_duration_sec)

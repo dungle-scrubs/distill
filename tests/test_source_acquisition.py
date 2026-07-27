@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
+import subprocess
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
-from conftest import unused_pid
 from fake_tools import (
     FAKE_FFPROBE,
     FAKE_FFPROBE_NO_DURATION,
@@ -21,12 +24,14 @@ from fake_tools import (
     FAKE_YTDLP_PRODUCES_EMPTY_FILE,
     FAKE_YTDLP_RECORDS_STAGING_DIR,
     FAKE_YTDLP_TRUNCATES_THEN_FAILS,
+    fake_ffprobe_flooding_stderr,
 )
 
 from distill import source as distill_source
 from distill.errors import DistillError
 from distill.progress import ProgressReporter
-from distill.source import YoutubeDownloader, select_downloaded_media
+from distill.run_command import OUTPUT_CAP_BYTES, TRUNCATION_WARNING_CODE
+from distill.source import AcquisitionLease, YoutubeDownloader, select_downloaded_media
 
 URL = "https://youtu.be/abc123"
 LOCK_KEY = "abc123"
@@ -148,6 +153,157 @@ def test_second_run_with_different_options_cannot_disturb_media_being_read(
     second.lease.release()
 
 
+CONTENDER = '''
+"""One run contending for the acquisition lease of a single **lock key**.
+
+It meets the other contender at the moment the lock file has just been opened
+and nobody has yet been established as its holder - the window a scheme that
+publishes the lock and then names its owner cannot close - and it holds
+whatever it won until the other contender has had its turn.
+"""
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from distill import source as distill_source
+from distill.errors import DistillError
+
+url, lock_key, output_root, rendezvous_dir, token, parties = sys.argv[1:]
+rendezvous = Path(rendezvous_dir)
+parties = int(parties)
+
+
+def meet(name):
+    """Block until every contender has reached `name`, or give up on them."""
+    (rendezvous / f"{name}-{token}").write_text("")
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if len(list(rendezvous.glob(f"{name}-*"))) >= parties:
+            return
+        time.sleep(0.005)
+
+
+class RendezvousOs:
+    """`os`, with the first successful open of a lock file made a meeting point."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.met = False
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def open(self, path, flags, *args, **kwargs):
+        fd = self._inner.open(path, flags, *args, **kwargs)
+        if not self.met and str(path).endswith(".lock"):
+            self.met = True
+            meet("window")
+        return fd
+
+
+rendezvous_os = RendezvousOs(os)
+distill_source.os = rendezvous_os
+try:
+    acquired = distill_source.YoutubeDownloader(Path(output_root)).acquire(url, lock_key)
+    verdict = {"acquired": True, "media": str(acquired.path)}
+except DistillError as exc:
+    verdict = {"acquired": False, "code": exc.code}
+verdict["met_in_window"] = rendezvous_os.met
+# Whatever was won is held until the other contender has finished trying: a
+# lease given up early would let the loser win a lock that was never free.
+meet("done")
+print(json.dumps(verdict))
+'''
+
+
+def race_for_the_lease(tmp_path: Path, parties: int = 2) -> list[dict[str, Any]]:
+    """Run `parties` real processes into acquisition and collect their verdicts."""
+    script = tmp_path / "contender.py"
+    script.write_text(CONTENDER)
+    rendezvous = tmp_path / "rendezvous"
+    rendezvous.mkdir()
+    contenders = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(script),
+                URL,
+                LOCK_KEY,
+                str(tmp_path),
+                str(rendezvous),
+                str(token),
+                str(parties),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for token in range(parties)
+    ]
+    verdicts: list[dict[str, Any]] = []
+    for contender in contenders:
+        out, err = contender.communicate(timeout=60)
+        assert contender.returncode == 0, err
+        verdicts.append(json.loads(out))
+    return verdicts
+
+
+def test_two_processes_racing_for_the_lease_leave_exactly_one_holder(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (RV-2, R-07): an unfinished lock file reads as an abandoned one.
+
+    A lock whose *content* names its holder is published empty and named a
+    moment later. A contender that reads it inside that window finds no holder,
+    concludes nobody will ever release it, unlinks it and creates its own - and
+    both runs then believe they hold the lease of a **lock key** that admits
+    one. The two contenders meet inside exactly that window, so the interleaving
+    is not left to timing, and exactly one of them may come out holding media.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+
+    verdicts = race_for_the_lease(tmp_path)
+
+    # Both contenders reaching the meeting point is what makes this a race and
+    # not two runs that happened to take turns.
+    assert [verdict["met_in_window"] for verdict in verdicts] == [True, True]
+    assert [verdict["acquired"] for verdict in verdicts].count(True) == 1
+    assert [verdict["code"] for verdict in verdicts if not verdict["acquired"]] == ["E_LOCKED"]
+
+
+def test_a_filesystem_that_cannot_grant_the_lock_stops_the_run(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A lock the kernel refuses to grant is a fatal error, not a weaker lock.
+
+    `ENOLCK` is what a filesystem with no lock manager answers - some network
+    mounts, and the reason R-09 exists. Distill cannot tell one run from two
+    there, so it says so and stops: continuing would mean going back to a scheme
+    where two runs can hold one **lock key**, which is what this replaced.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+
+    def refuse(_fd: int, _operation: int) -> None:
+        raise OSError(errno.ENOLCK, "no locks available")
+
+    monkeypatch.setattr(distill_source.fcntl, "flock", refuse)
+
+    with pytest.raises(DistillError) as exc:
+        YoutubeDownloader(tmp_path, lock_wait_sec=5.0).acquire(URL, LOCK_KEY)
+
+    assert exc.value.code == "E_LOCK_UNSUPPORTED"
+    assert exc.value.details["errno"] == "ENOLCK"
+    assert promoted_names(tmp_path) == []
+
+
 def test_a_lease_a_live_run_holds_is_not_stealable_however_old_it_is(
     fake_tool: Callable[[str, str], Path],
     monkeypatch: pytest.MonkeyPatch,
@@ -155,13 +311,12 @@ def test_a_lease_a_live_run_holds_is_not_stealable_however_old_it_is(
 ) -> None:
     """FAILS FIRST (RV-2, R-36): age decided staleness, and every real run is old.
 
-    The lease covers the media's whole read lifetime, and nothing refreshes the
-    lock file, so any run that gets as far as transcription holds a lock older
-    than a staleness window worth waiting out. A second run that read age as
-    abandonment would take the lease, download, and `os.replace` its result onto
-    the path the first run is still reading. Liveness is the only thing that
-    says the holder has stopped reading, so the clock is moved forward by an
-    hour and the lock file aged on disk to match: neither may matter.
+    The lease covers the media's whole read lifetime, so any run that gets as
+    far as transcription has held its lock for longer than a staleness window
+    worth waiting out. A second run that read age as abandonment would take the
+    lease, download, and `os.replace` its result onto the path the first run is
+    still reading. The clock is moved forward by an hour and the lock file aged
+    on disk to match: a held lease is held, and neither may matter.
     """
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
     fake_tool("ffprobe", FAKE_FFPROBE)
@@ -176,65 +331,106 @@ def test_a_lease_a_live_run_holds_is_not_stealable_however_old_it_is(
 
     assert exc.value.code == "E_LOCKED"
     assert first.path.read_bytes() == b"video"
-    assert json.loads(lock.read_text())["pid"] == os.getpid()
     first.lease.release()
 
 
-def test_a_lease_whose_holder_is_gone_is_reclaimed(
+HOLDER = '''
+"""A run that acquires the acquisition lease and then only holds it."""
+
+import sys
+import time
+from pathlib import Path
+
+from distill import source as distill_source
+
+url, lock_key, output_root = sys.argv[1:]
+acquired = distill_source.YoutubeDownloader(Path(output_root)).acquire(url, lock_key)
+print(acquired.path, flush=True)
+# Nothing here ever releases: giving the lease up is what killing this process
+# has to accomplish on its own.
+while True:
+    time.sleep(3600)
+'''
+
+
+def start_a_holding_run(tmp_path: Path) -> subprocess.Popen[str]:
+    """Start a real second run, returning once it holds the lease."""
+    script = tmp_path / "holder.py"
+    script.write_text(HOLDER)
+    holder = subprocess.Popen(
+        [sys.executable, str(script), URL, LOCK_KEY, str(tmp_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout is not None
+    assert holder.stdout.readline().strip().endswith("source.mp4")
+    return holder
+
+
+def test_a_lease_whose_holder_was_killed_is_reacquirable_at_once(
     fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
-    """FAILS FIRST: a lock outliving its holder blocked everyone for the window.
+    """FAILS FIRST: a pid that still resolves is not a holder that still holds.
 
-    A run killed mid-acquisition leaves its lock file behind, freshly written by
-    any clock. Waiting it out is waiting for a process that no longer exists, so
-    the lock is reclaimed the moment the holder is found to be gone. The lock
-    file here is the one production wrote, with only the holder changed, so the
-    test cannot pass by naming a field acquisition no longer keeps.
+    The holder is `SIGKILL`ed and deliberately not reaped, so it is a process
+    that has released nothing, cannot release anything, and whose pid the kernel
+    still answers for - which is also what a holder whose pid was handed to some
+    unrelated process looks like. Asking whether that pid exists says the lease
+    is held; asking the kernel for the lock says it is free, because the kernel
+    dropped it when the descriptor died with its owner.
     """
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
     fake_tool("ffprobe", FAKE_FFPROBE)
-    abandoned = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
-    lock = lock_path(tmp_path)
-    payload = json.loads(lock.read_text())
-    lock.write_text(json.dumps({**payload, "pid": unused_pid()}))
+    holder = start_a_holding_run(tmp_path)
+    holder.kill()
+    # Wait for the death without collecting it: WNOWAIT leaves the pid in the
+    # table, so this is a dead holder rather than a dying one, with no sleep.
+    os.waitid(os.P_PID, holder.pid, os.WEXITED | os.WNOWAIT)
 
     fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
     reclaimed = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     assert reclaimed.path.read_bytes() == b"clobbered"
-    assert json.loads(lock.read_text())["pid"] == os.getpid()
+    assert reclaimed.warnings == []
     reclaimed.lease.release()
-    abandoned.lease.release()
+    assert holder.wait() != 0
 
 
-def test_releasing_a_lease_this_run_no_longer_owns_leaves_the_holder_alone(
+def test_releasing_a_lease_this_process_does_not_hold_frees_nobody(
     fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
-    """FAILS FIRST: release unlinked the lock file whoever had written it.
+    """FAILS FIRST: release acted on the lock file rather than on what it holds.
 
-    Once a run has lost its lock - reclaimed after a stall, or replaced by hand -
-    the file at that path is somebody else's lease. Releasing by unlinking
-    whatever is there destroys that lease and lets a third run in behind it, so
-    release checks that the lock still names this process and otherwise does
-    nothing. The parent process stands in for the second run: a live pid that is
-    not this one, with no child to spawn.
+    A run that releases can only give up the exclusion it was granted. Here a
+    second process holds the lease and this one holds nothing but a descriptor
+    on the same path, with the lock file's content hand-written to name this
+    process - so any release that consults the path, or the file, or what the
+    file claims, frees a holder that never asked to be freed and lets a third
+    run in behind it.
     """
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
     fake_tool("ffprobe", FAKE_FFPROBE)
-    first = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    holder = start_a_holding_run(tmp_path)
     lock = lock_path(tmp_path)
-    other_holder = os.getppid()
-    lock.write_text(json.dumps({"pid": other_holder, "created_wall": "2026-01-01T00:00:00Z"}))
+    lock.write_text(json.dumps({"pid": os.getpid()}))
+    stray = AcquisitionLease(
+        lock_key=LOCK_KEY,
+        lock_path=lock,
+        fd=os.open(lock, os.O_CREAT | os.O_RDWR, 0o600),
+    )
 
-    first.lease.release()
+    stray.release()
 
-    assert lock.exists()
-    assert json.loads(lock.read_text())["pid"] == other_holder
+    fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
     with pytest.raises(DistillError) as exc:
         YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
     assert exc.value.code == "E_LOCKED"
+    assert promoted_names(tmp_path) == ["source.mp4"]
+    holder.kill()
+    holder.wait()
 
 
 def test_each_run_stages_its_download_in_its_own_directory(
@@ -369,9 +565,10 @@ def test_promotion_moves_the_validated_file_rather_than_copying_it(
     validated: list[int] = []
     real_validate = distill_source.validate_media_file
 
-    def record_inode(path: Path) -> None:
-        real_validate(path)
+    def record_inode(path: Path) -> list[dict[str, str]]:
+        probe_warnings = real_validate(path)
         validated.append(path.stat().st_ino)
+        return probe_warnings
 
     monkeypatch.setattr(distill_source, "validate_media_file", record_inode)
     previous = media_root(tmp_path)
@@ -495,3 +692,28 @@ def test_a_download_with_no_playable_duration_is_rejected_before_promotion(
     assert exc.value.code == "E_BAD_MEDIA"
     assert exc.value.details["duration_sec"] == 0.0
     assert promoted_names(tmp_path) == []
+
+
+def test_a_truncated_validation_probe_travels_with_the_acquired_source(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """R-33: validation accepting the media is not the same as losing nothing.
+
+    The verdict and the loss are separate answers. `validate_media_file` is the
+    only place the probe's **warning** exists, so a validator that returned
+    nothing would promote the media and drop the record of the truncation.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", fake_ffprobe_flooding_stderr(OUTPUT_CAP_BYTES))
+
+    acquired = YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    try:
+        assert acquired.path.exists()
+        assert [
+            item["code"]
+            for item in acquired.warnings
+            if item["code"] == TRUNCATION_WARNING_CODE
+        ] == [TRUNCATION_WARNING_CODE]
+    finally:
+        acquired.lease.release()
