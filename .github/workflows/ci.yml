@@ -12,11 +12,12 @@ concurrency:
 
 jobs:
   test:
-    name: Lint & test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Lint & test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest]
         python-version: ["3.13", "3.14"]
 
     steps:
@@ -33,11 +34,39 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --dev
 
+      # Distill's optional capabilities (ffmpeg for frame extraction, Tesseract
+      # for OCR) are not present on any GitHub runner image. Provisioning them
+      # on Linux is what makes the coverage floor below measure the real code
+      # paths instead of the skip branches.
+      - name: Install optional capabilities (ffmpeg, tesseract)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg tesseract-ocr
+
       - name: Lint (ruff)
         run: uv run ruff check .
 
+      - name: Type check (ty)
+        run: uv run ty check
+
+      # The coverage gate is Linux-only on purpose. A coverage floor is only
+      # meaningful where the optional capabilities are installed: without
+      # ffmpeg and Tesseract the extraction and OCR paths skip, and the same
+      # unchanged code measures ~74% instead of ~82%. macOS cannot be
+      # provisioned here because Homebrew is forbidden in this project, so
+      # pinning the floor to the one provisioned leg keeps it a deterministic
+      # property of the code rather than a property of the runner image.
+      - name: Test (pytest, with coverage floor)
+        if: matrix.os == 'ubuntu-latest'
+        run: uv run pytest --cov --cov-fail-under=80
+
+      # macOS runs the suite without the gate: R-52 asks macOS to prove the
+      # suite passes there, and it must pass with the optional capabilities
+      # absent (they degrade to skips, never to failures - see ADR-0002).
       - name: Test (pytest)
-        run: uv run pytest --cov
+        if: matrix.os != 'ubuntu-latest'
+        run: uv run pytest
 
   signature:
     name: Pipeline signature check

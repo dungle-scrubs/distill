@@ -1,4 +1,12 @@
-"""Command line interface for Distill."""
+"""Command line interface for Distill.
+
+This is a signed module (ADR-0003). It writes nothing into a bundle itself, but
+it decides which parsed values reach `DistillOptions`, and every manifest
+records the resulting option set - including `output_dir`, `force_reprocess`,
+and `resume_partial`, which are deliberately *not* part of the bundle key.
+Changing what this module forwards can therefore change manifest content at an
+unchanged bundle key, which is the stale hit the signature exists to catch.
+"""
 
 from __future__ import annotations
 

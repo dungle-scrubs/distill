@@ -25,3 +25,10 @@ htmlcov/
 Thumbs.db
 .idea/
 .vscode/
+
+# Internal planning ledger. Deliberately not published: while the audit
+# remediation plan is in flight, .plans/ documents confirmed unfixed
+# vulnerabilities in the released code (file:line, reproduction steps), so
+# publishing it ahead of the fixes would be premature disclosure. It also
+# holds plan.db, a binary SQLite file. Revisit once the plan is complete.
+.plans/

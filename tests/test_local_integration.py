@@ -12,6 +12,7 @@ from distill import pipeline as distill_session
 from distill.local_vision import LocalVisionProbe, LocalVisionResult
 from distill.options import DistillOptions
 from distill.progress import ProgressCounter, ProgressReporter
+from distill.source import probe_duration
 
 
 def make_short_screencast(path: Path) -> None:
@@ -44,12 +45,21 @@ def make_short_screencast(path: Path) -> None:
     )
 
 
+# Durations seen by fake_transcribe, newest last. The fake stands in for the
+# real transcriber in every local integration test, so without recording this it
+# would silently absorb the pipeline dropping duration_sec - the argument that
+# turns on ffmpeg's "-progress pipe:2" audio-extraction reporting.
+RECORDED_DURATIONS: list[float] = []
+
+
 def fake_transcribe(
     _video_path: Path,
     _work_dir: Path,
     _options: DistillOptions,
     progress: ProgressCounter,
+    duration_sec: float,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    RECORDED_DURATIONS.append(duration_sec)
     progress.increment()
     return (
         {
@@ -78,6 +88,7 @@ def test_short_local_screencast_fixture_produces_transcript_and_frames(
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
     monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    RECORDED_DURATIONS.clear()
 
     response = distill_session.process_local_video(
         {
@@ -96,6 +107,12 @@ def test_short_local_screencast_fixture_produces_transcript_and_frames(
     markdown = Path(response["markdown_path"]).read_text()
     assert "short screencast" in markdown
     assert "![Frame 1](frames/" in markdown
+    # The transcriber must receive the probed media duration, not None and not 0:
+    # extract_audio only asks ffmpeg for "-progress pipe:2" when it has one.
+    probed_duration = probe_duration(video)
+    assert probed_duration > 0
+    assert len(RECORDED_DURATIONS) == 1
+    assert RECORDED_DURATIONS[0] == probed_duration
 
 
 def test_cache_hit_returns_under_one_second(
