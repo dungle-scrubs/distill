@@ -173,7 +173,7 @@ def _boundary_log(event: str, detail: dict[str, Any]) -> None:
 
 
 def config_dir() -> Path:
-    return Path(os.environ.get("CONFIG_DIR", Path.home() / ".distill")).expanduser()
+    return Path(os.environ.get("DISTILL_CONFIG_DIR", Path.home() / ".distill")).expanduser()
 
 
 def _read_json(path: Path) -> dict[str, Any]:
