@@ -37,6 +37,7 @@ PIPELINE_VERSION = 23
 # enforces that too.
 SIGNED_MODULES = (
     "bundle.py",
+    "capabilities.py",
     "cli.py",
     "errors.py",
     "frame_selection.py",

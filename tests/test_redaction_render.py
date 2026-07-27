@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import subprocess
-
 import pytest
 
 from distill import ocr
@@ -265,49 +263,6 @@ def test_ocr_reports_frame_index_progress(monkeypatch: pytest.MonkeyPatch) -> No
     frame_events = [event for event in ocr_events if event.percent is not None]
     assert [event.percent for event in frame_events[:2]] == [50.0, 100.0]
     assert ocr_events[-1].status == "completed"
-
-
-def test_ocr_auto_installs_tesseract_with_brew_on_macos(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    lookups = {"tesseract": 0}
-    commands: list[list[str]] = []
-
-    def fake_which(command: str) -> str | None:
-        if command == "brew":
-            return "/opt/homebrew/bin/brew"
-        if command == "tesseract":
-            lookups["tesseract"] += 1
-            return "/opt/homebrew/bin/tesseract" if lookups["tesseract"] > 1 else None
-        return None
-
-    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
-        commands.append(command)
-        return subprocess.CompletedProcess(command, 0, "", "")
-
-    monkeypatch.setattr(ocr.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(ocr.shutil, "which", fake_which)
-    monkeypatch.setattr(ocr.Path, "exists", lambda _self: False)
-    monkeypatch.setattr(ocr.subprocess, "run", fake_run)
-
-    assert ocr.ensure_tesseract_available() is None
-    assert commands == [["/opt/homebrew/bin/brew", "install", "tesseract"]]
-
-
-def test_ocr_reports_install_warning_when_brew_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(ocr.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(ocr.shutil, "which", lambda _command: None)
-    monkeypatch.setattr(ocr.Path, "exists", lambda _self: False)
-
-    warning = ocr.ensure_tesseract_available()
-
-    assert warning == {
-        "stage": "ocr",
-        "code": "tesseract_brew_missing",
-        "message": "tesseract is missing and Homebrew is not available to install it",
-    }
 
 
 def test_no_content_escalates() -> None:

@@ -1,18 +1,19 @@
 """Tesseract OCR adapter for Distill keyframes.
 
-This module owns OCR invocation and per-frame OCR warnings. It does not own
-redaction policy or frame selection.
+This module owns OCR invocation, tesseract discovery, and per-frame OCR
+warnings. It does not own redaction policy, frame selection, or the decision
+that image-text extraction is an **optional capability** - that classification
+is stated once in `capabilities.py`. It never installs tesseract (R-34).
 """
 
 from __future__ import annotations
 
-import platform
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from .capabilities import missing_tool_warning
 from .errors import warning
 from .progress import ProgressCounter, ProgressReporter
 
@@ -66,50 +67,17 @@ def find_tesseract_command() -> str | None:
 
 
 def ensure_tesseract_available() -> dict[str, str] | None:
+    """Report whether tesseract is present, without ever installing it.
+
+    Per R-34 Distill installs nothing on a user's machine: no package manager
+    is consulted and no process is spawned here. Image-text extraction is an
+    **optional capability** (see `capabilities.EXTERNAL_TOOLS`), so an absent
+    binary yields a **warning** and the run continues with the rest of the
+    bundle intact.
+    """
     if find_tesseract_command():
         return None
-    if platform.system() != "Darwin":
-        return warning(
-            "ocr",
-            "tesseract_not_found",
-            "tesseract is not installed or not on PATH",
-        )
-    brew = shutil.which("brew")
-    if not brew:
-        return warning(
-            "ocr",
-            "tesseract_brew_missing",
-            "tesseract is missing and Homebrew is not available to install it",
-        )
-    try:
-        result = subprocess.run(
-            [brew, "install", "tesseract"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=600,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return warning(
-            "ocr",
-            "tesseract_install_failed",
-            f"failed to install tesseract with Homebrew: {exc}",
-        )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().splitlines()
-        suffix = f": {detail[-1]}" if detail else ""
-        return warning(
-            "ocr",
-            "tesseract_install_failed",
-            f"failed to install tesseract with Homebrew{suffix}",
-        )
-    if find_tesseract_command():
-        return None
-    return warning(
-        "ocr",
-        "tesseract_not_found",
-        "Homebrew installed tesseract, but the tesseract binary was not found",
-    )
+    return missing_tool_warning("ocr", "tesseract")
 
 
 def ocr_frame(
