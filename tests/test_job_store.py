@@ -6,11 +6,13 @@ an outcome is recorded whether the run succeeded or failed (finding 12), and
 that the identifier naming the record is a bounded domain rather than something
 sanitized into a shape two different identifiers can share.
 
-The run-shaped tests here drive `pipeline.process_resolved_source`, which is the
-seam every tool enters a run through, and read the record back through the
-`get_job_status` tool - the surface a poller actually has. Nothing here needs
-ffmpeg: the source is a stub and the generation-producing step is replaced, so
-what is under test is the record, not the pipeline.
+The run-shaped tests here drive the public tool handlers - `process_local_video`
+and its three siblings - and read the record back through the `get_job_status`
+tool. Both ends are the surface a caller actually has, which matters: driving an
+already-resolved source instead would skip the whole acquisition half of a run,
+and that half is exactly where the record used to be missing. Nothing here needs
+ffmpeg: source resolution is stubbed where a run has to get past it, and the
+generation-producing step is replaced, so what is under test is the record.
 
 One test needs a run whose holder is gone rather than one that returned, so it
 spawns a real process and has the kernel kill it. That is the only honest way to
@@ -21,6 +23,7 @@ descriptors release, and a holder that tidied up after itself is not a dead one.
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -34,10 +37,11 @@ import pytest
 from distill import pipeline
 from distill.errors import DistillError
 from distill.job_store import JobOutcome, JobStore
-from distill.options import DistillOptions
-from distill.progress import ProgressReporter
+from distill.source import SourceResolution
 
 STAGE_FAILURE = DistillError("E_STAGE_BOOM", "keyframes", "keyframe selection failed")
+PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH"
+VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 KILLED_MID_RUN = """
 import os
@@ -66,6 +70,33 @@ class StubSource:
     warnings: list[dict[str, str]] = field(default_factory=list)
 
 
+def stub_acquisition(monkeypatch: pytest.MonkeyPatch, source_hash: str = "abc123") -> None:
+    """Let a run past acquisition without a file, a probe or a network.
+
+    Acquisition is what these tests need to *survive*, not what they are about:
+    the tests that care about it fail it on purpose through the real path.
+    """
+
+    def resolve(
+        _source_type: str,
+        _value: str,
+        _options: Any,
+        *,
+        progress: Any = None,
+        downloader: Any = None,
+    ) -> SourceResolution:
+        # A stub stands in for the `SourceInfo` a real resolution returns: a run
+        # touches only its **bundle key** and its warnings before the stage
+        # these tests replace, and building a real one needs a real video.
+        return SourceResolution(
+            StubSource(source_hash=source_hash),  # ty: ignore[invalid-argument-type]
+            output_root=None,
+            progress=progress,
+        )
+
+    monkeypatch.setattr(pipeline, "resolve_source_for_processing", resolve)
+
+
 def run(
     monkeypatch: pytest.MonkeyPatch,
     root: Path,
@@ -75,11 +106,13 @@ def run(
     during: Callable[[], None] | None = None,
     source_hash: str = "abc123",
 ) -> dict[str, Any]:
-    """Drive one run to `outcome`, recording whatever the run records.
+    """Drive one `process_local_video` call to `outcome`, through the tool handler.
 
-    The stage that produces a **generation** is replaced rather than faked out
-    with tools, because what the run computes is not what these tests are about:
-    a run either reaches a result or raises, and both have to leave a record.
+    The entry point is the tool a caller invokes, because the record has to
+    cover everything that call does - acquisition included. The stage that
+    produces a **generation** is replaced rather than faked out with tools,
+    because what the run computes is not what these tests are about: a run
+    either reaches a result or raises, and both have to leave a record.
 
     `during` runs inside that stage, at the point a real run is midway through
     its work. It is the only moment from which "what does a poller see while
@@ -94,20 +127,192 @@ def run(
         return outcome
 
     monkeypatch.setattr(pipeline.ProcessingRun, "_produce_generation", produce)
+    stub_acquisition(monkeypatch, source_hash)
     root.mkdir(parents=True, exist_ok=True)
-    options = DistillOptions.from_args({"output_dir": str(root), "job_id": job_id})
-    return pipeline.process_resolved_source(
-        StubSource(source_hash=source_hash),
-        options,
-        root,
-        progress=ProgressReporter(emitter=lambda _event: None),
-        tool="process_local_video",
+    return pipeline.process_local_video(
+        {"path": "/stub/video.mp4", "output_dir": str(root), "job_id": job_id}
     )
 
 
 def status_of(root: Path, job_id: str) -> dict[str, Any]:
     """What a poller sees: the record read back through the `get_job_status` tool."""
     return pipeline.get_job_status({"output_dir": str(root), "job_id": job_id})
+
+
+# --- The envelope covers the whole tool call, acquisition included (R-17) ----
+#
+# A run does not begin at a resolved source. It begins at a tool call, and
+# everything between the two - a local probe, a **source fingerprint**, a
+# YouTube download, a directory scan, a playlist listing - can fail. A record
+# opened after all of that is finding 12 again for the entire acquisition half:
+# no `running` while it happens, and no terminal failure when it does not
+# finish. Job identifiers are reused, so what a poller reads in that window is
+# whatever the *previous* run under the identifier left behind.
+
+
+def test_a_local_run_that_never_reaches_a_source_records_a_failure(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 3-codex, R-17): the record started after acquisition.
+
+    Nothing is stubbed here: the path does not exist, which is the commonest way
+    a local run fails and the earliest. The record opened only once a resolved
+    source existed, so this run wrote nothing at all and a poller was told
+    `E_JOB_NOT_FOUND` - the answer a job that was never started gets.
+    """
+    root = tmp_path / "output"
+
+    with pytest.raises(DistillError) as failure:
+        pipeline.process_local_video(
+            {
+                "path": str(tmp_path / "no-such-video.mp4"),
+                "output_dir": str(root),
+                "job_id": "distill-no-source",
+            }
+        )
+    assert failure.value.code == "E_BAD_SOURCE"
+
+    status = status_of(root, "distill-no-source")
+    assert status["status"] == "failed"
+    assert status["tool"] == "process_local_video"
+    assert status["error"]["code"] == "E_BAD_SOURCE"
+
+
+def test_a_youtube_run_that_fails_while_acquiring_records_a_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (finding 3-codex, R-17): the download is inside the run.
+
+    A YouTube run spends most of its wall-clock time before it has a source at
+    all - metadata, the lock wait, the download itself - so acquisition is where
+    a poller is most likely to be asking and where a failure is most likely to
+    land. It is stubbed at the resolution seam because the failure under test is
+    that *any* of it raised, not which part.
+    """
+    root = tmp_path / "output"
+    download_failed = DistillError("E_YTDLP", "youtube", "yt-dlp exited 1")
+
+    def refuse(*_args: Any, **_kwargs: Any) -> SourceResolution:
+        raise download_failed
+
+    monkeypatch.setattr(pipeline, "resolve_source_for_processing", refuse)
+
+    with pytest.raises(DistillError):
+        pipeline.process_youtube_video(
+            {"url": VIDEO_URL, "output_dir": str(root), "job_id": "distill-download"}
+        )
+
+    status = status_of(root, "distill-download")
+    assert status["status"] == "failed"
+    assert status["tool"] == "process_youtube_video"
+    assert status["error"]["code"] == "E_YTDLP"
+
+
+def test_a_playlist_that_cannot_be_listed_records_a_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (finding 3-codex, R-17): enumeration precedes the batch.
+
+    The playlist listing is the parent job's first real step and its own
+    yt-dlp call. The record was opened around the per-item loop, so a playlist
+    that could not be listed had no loop to wrap and left nothing behind.
+    """
+    root = tmp_path / "output"
+    listing_failed = DistillError("E_YTDLP", "youtube", "yt-dlp could not list playlist videos")
+
+    def refuse(*_args: Any, **_kwargs: Any) -> list[str]:
+        raise listing_failed
+
+    monkeypatch.setattr(pipeline, "youtube_playlist_urls", refuse)
+
+    with pytest.raises(DistillError):
+        pipeline.process_youtube_playlist(
+            {"url": PLAYLIST_URL, "output_dir": str(root), "job_id": "distill-playlist"}
+        )
+
+    status = status_of(root, "distill-playlist")
+    assert status["status"] == "failed"
+    assert status["tool"] == "process_youtube_playlist"
+    assert status["error"]["code"] == "E_YTDLP"
+
+
+def test_a_directory_run_that_finds_no_directory_records_a_failure(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 3-codex, R-17): the scan precedes the batch too.
+
+    The directory batch refused a path that is not a directory before opening
+    its record, so the one failure every batch caller hits first was the one
+    failure that left no record.
+    """
+    root = tmp_path / "output"
+
+    with pytest.raises(DistillError) as failure:
+        pipeline.process_video_directory(
+            {
+                "path": str(tmp_path / "no-such-directory"),
+                "output_dir": str(root),
+                "job_id": "distill-directory",
+            }
+        )
+    assert failure.value.code == "E_BAD_SOURCE"
+
+    status = status_of(root, "distill-directory")
+    assert status["status"] == "failed"
+    assert status["tool"] == "process_video_directory"
+    assert status["error"]["code"] == "E_BAD_SOURCE"
+
+
+def test_a_reused_job_id_does_not_survive_a_failed_acquisition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (finding 3-codex, R-17): the sharp end of the same gap.
+
+    Writing no record is only half the damage. Identifiers are reused, so the
+    record left standing is the *previous* run's - and a caller polling the run
+    that just died in acquisition is handed `completed` and the earlier run's
+    manifest path. `start` replaces the prior record, so covering acquisition is
+    what makes that replacement happen before acquisition can fail.
+    """
+    root = tmp_path / "output"
+    run(monkeypatch, root, "distill-again", outcome={"manifest_path": "/first/manifest.json"})
+    assert status_of(root, "distill-again")["status"] == "completed"
+    monkeypatch.undo()
+
+    with pytest.raises(DistillError):
+        pipeline.process_local_video(
+            {
+                "path": str(tmp_path / "gone.mp4"),
+                "output_dir": str(root),
+                "job_id": "distill-again",
+            }
+        )
+
+    status = status_of(root, "distill-again")
+    assert status["status"] == "failed"
+    assert "result" not in status
+
+
+def test_a_tool_call_opens_exactly_one_job_envelope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One run, one record: the outer envelope replaces the inner one.
+
+    Moving the record out to the tool handler without removing the one inside
+    `process_resolved_source` would open two envelopes over one run. The second
+    is refused outright now that a held identifier cannot be started twice, so
+    the visible failure is a run that cannot run at all - but the property worth
+    pinning is the count, because that is what stays true if the refusal ever
+    softens.
+    """
+    root = tmp_path / "output"
+    started: list[str] = []
+    genuine_start = JobStore.start
+
+    def counted(self: Any, job_id: str, tool: str) -> Any:
+        started.append(job_id)
+        return genuine_start(self, job_id, tool)
+
+    monkeypatch.setattr(JobStore, "start", counted)
+    run(monkeypatch, root, "distill-one-envelope", outcome={"manifest_path": "/x/manifest.json"})
+
+    assert started == ["distill-one-envelope"]
 
 
 def test_a_failed_run_records_a_terminal_failure(
@@ -254,6 +459,90 @@ def test_a_second_live_run_cannot_start_under_a_job_id_already_held(tmp_path: Pa
     assert raised.value.code == "E_JOB_RUNNING"
 
 
+def test_one_store_cannot_start_the_same_job_id_twice(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 5-codex): a held identifier was startable again.
+
+    A store that already held the identifier returned from `start` without
+    taking anything, and wrote a fresh `running` record over the live run's -
+    two logical runs under one record, which is the collision R-18 exists to
+    stop. The refusal has to be the same one a second process gets, because the
+    two are the same mistake reached from different directions.
+    """
+    root = tmp_path / "output"
+    store = JobStore.open(root)
+    store.start("distill-twice", "process_local_video")
+
+    with pytest.raises(DistillError) as raised:
+        store.start("distill-twice", "process_video_directory")
+
+    assert raised.value.code == "E_JOB_RUNNING"
+    live = JobStore.open(root).read("distill-twice")
+    assert live is not None
+    assert live.tool == "process_local_video", "the live run's record was overwritten"
+
+
+def test_a_store_holding_no_lock_cannot_close_a_live_runs_record(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 5-codex): `finish` never asked who was running.
+
+    `finish` recovered the tool from whatever record was on disk, so a store
+    that had started nothing could replace a live holder's `running` record with
+    a terminal status - the run carries on, and the caller polling it is told it
+    is over. Closing a record is a thing only its holder may do; a record whose
+    holder is gone is answered by `abandoned`, which nobody has to write.
+    """
+    root = tmp_path / "output"
+    holder = JobStore.open(root)
+    holder.start("distill-live", "process_local_video")
+
+    with pytest.raises(DistillError) as raised:
+        JobStore.open(root).finish("distill-live", JobOutcome.success({"manifest_path": "/x.json"}))
+    assert raised.value.code == "E_JOB_NOT_HELD"
+
+    still_running = JobStore.open(root).read("distill-live")
+    assert still_running is not None
+    assert still_running.status == "running"
+
+    holder.finish("distill-live", JobOutcome.success({"manifest_path": "/mine.json"}))
+    closed = JobStore.open(root).read("distill-live")
+    assert closed is not None
+    assert closed.status == "completed"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can open a lock file whatever its mode")
+def test_a_lock_file_that_cannot_be_opened_is_not_read_as_nobody_running(tmp_path: Path) -> None:
+    """FAILS FIRST (finding 10-opus): the liveness question was asked with `take`.
+
+    `take` opens with `O_CREAT` because a run that needs the lock needs the
+    file; a reader must not, and a lock file it cannot open at all is not the
+    same as one nobody holds. Asked through `take`, an unopenable lock file
+    raised a bare `PermissionError` out of `get_job_status` - an inspection
+    crashing on a root it was only asked about. `probe` is the read-only
+    primitive for this, and it reports `unknown`, which is read as running:
+    "may not ask" must never resolve to "nobody is running".
+    """
+    root = tmp_path / "output"
+    store = JobStore.open(root)
+    (root / "_jobs").mkdir(parents=True)
+    store.record_path("distill-sealed").write_text(
+        json.dumps(
+            {
+                "job_id": "distill-sealed",
+                "tool": "process_local_video",
+                "status": "running",
+                "updated_at": "2026-01-01T00:00:00Z",
+            }
+        )
+    )
+    sealed = store.lock_path("distill-sealed")
+    sealed.write_bytes(b"")
+    sealed.chmod(0o000)
+
+    record = store.read("distill-sealed")
+
+    assert record is not None
+    assert record.status == "running"
+
+
 def test_a_job_id_differing_only_in_case_is_out_of_the_domain(tmp_path: Path) -> None:
     """R-18: an identifier is a filename, and a filename is not always case-sensitive.
 
@@ -360,7 +649,9 @@ def test_a_failed_record_write_does_not_leave_the_job_id_locked(
         started.finish("distill-unwritable", JobOutcome.success({"manifest_path": "/x.json"}))
     monkeypatch.undo()
 
-    assert JobStore.open(root).start("distill-unwritable", "process_local_video").status == "running"
+    assert (
+        JobStore.open(root).start("distill-unwritable", "process_local_video").status == "running"
+    )
 
 
 def test_a_job_outcome_must_be_terminal_and_carry_only_its_own_evidence() -> None:

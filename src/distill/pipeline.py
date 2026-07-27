@@ -90,40 +90,76 @@ class DistillSession:
             return {"error": {"message": error.to_json_text()}}
 
 
+def acquire_and_process(
+    source_type: str,
+    value: str,
+    options: DistillOptions,
+    root: Path,
+    *,
+    progress: ProgressReporter | None,
+    tool: str,
+    lock_wait_sec: float,
+) -> dict[str, Any]:
+    """Acquire the source and produce its **generation**: everything a run does.
+
+    Both halves belong to one job, which is why they are one function: the
+    **job record** wraps this, and a record that started after acquisition
+    described the second half of a run as though it were the whole of it.
+
+    A YouTube resolution reports the **output root** it validated and a local
+    one reports none, so the caller's root stands in - the same path, validated
+    before the record was opened rather than in the middle of the work.
+    """
+    resolution = resolve_source_for_processing(source_type, value, options, progress=progress)
+    return process_resolved_source(
+        resolution.source,
+        options,
+        resolution.output_root or root,
+        progress=resolution.progress,
+        tool=tool,
+        lock_wait_sec=lock_wait_sec,
+    )
+
+
 def process_local_video(
     args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
 ) -> dict[str, Any]:
     options = DistillOptions.from_args(args)
-    resolution = resolve_source_for_processing("local", str(args.get("path", "")), options)
-    return process_resolved_source(
-        resolution.source,
-        options,
-        resolution.output_root,
-        progress=resolution.progress,
-        tool="process_local_video",
-        lock_wait_sec=lock_wait_sec,
-    )
+    root = validate_output_root(options.output_dir)
+
+    def work() -> dict[str, Any]:
+        return acquire_and_process(
+            "local",
+            str(args.get("path", "")),
+            options,
+            root,
+            progress=None,
+            tool="process_local_video",
+            lock_wait_sec=lock_wait_sec,
+        )
+
+    return record_job(JobStore.open(root), options.job_id, "process_local_video", work)
 
 
 def process_youtube_video(
     args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
 ) -> dict[str, Any]:
     options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
+    root = validate_output_root(options.output_dir)
     progress = ProgressReporter(emitter=progress_emitter(options.job_id))
-    resolution = resolve_source_for_processing(
-        "youtube",
-        str(args.get("url", "")),
-        options,
-        progress=progress,
-    )
-    return process_resolved_source(
-        resolution.source,
-        options,
-        resolution.output_root,
-        progress=resolution.progress,
-        tool="process_youtube_video",
-        lock_wait_sec=lock_wait_sec,
-    )
+
+    def work() -> dict[str, Any]:
+        return acquire_and_process(
+            "youtube",
+            str(args.get("url", "")),
+            options,
+            root,
+            progress=progress,
+            tool="process_youtube_video",
+            lock_wait_sec=lock_wait_sec,
+        )
+
+    return record_job(JobStore.open(root), options.job_id, "process_youtube_video", work)
 
 
 def progress_emitter(job_id: str) -> Any:
@@ -465,6 +501,16 @@ def record_job(
     result was, so every way of not producing a result wrote nothing. A pair a
     caller assembles by hand is a pair a caller can assemble half of, and the
     half that gets forgotten is the one nobody exercises.
+
+    One envelope per tool call, opened as early as a record can be written -
+    after the arguments and the **output root** are validated, because an
+    unusable identifier or an unusable root leaves nowhere to write, and before
+    anything else. Everything after that point is work that can fail: a probe, a
+    download, a directory scan, a playlist listing. Wrapped further in, the
+    record covered only what happened after a source already existed, which is
+    finding 12 again for the whole acquisition half of a run. A second envelope
+    nested inside this one is refused by `JobStore.start` rather than trusted
+    not to exist.
     """
     store.start(job_id, tool)
     try:
@@ -485,11 +531,18 @@ def process_resolved_source(
     tool: str = "process_local_video",
     lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
 ) -> dict[str, Any]:
+    """Produce a **generation** from a source that has already been acquired.
+
+    Records nothing: the **job record** belongs to the tool call, which began
+    before the source existed. An envelope here would be the second one over the
+    same run - and, since a held identifier cannot be started twice, would make
+    every run fail rather than merely mis-report one.
+    """
     try:
         output_root = output_root or validate_output_root(options.output_dir)
         progress = progress or ProgressReporter(emitter=progress_emitter(options.job_id))
         run = ProcessingRun(source, options, output_root, progress, tool, lock_wait_sec)
-        return record_job(JobStore.open(output_root), options.job_id, tool, run.execute)
+        return run.execute()
     finally:
         # The end of the media file's read lifetime (R-36). Transcription and
         # keyframe selection both read `source.resolved_path`, so the
@@ -546,35 +599,37 @@ class BatchRunner:
 
 
 def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
-    directory = Path(str(args.get("path", ""))).expanduser()
-    if not directory.exists() or not directory.is_dir():
-        raise DistillError(
-            "E_BAD_SOURCE", "source", "directory does not exist", {"path": str(directory)}
-        )
     options = DistillOptions.from_args(args)
+    root = validate_output_root(options.output_dir)
     max_items = int(args.get("max_items", 50))
     recursive = bool(args.get("recursive", False))
-    pattern = "**/*" if recursive else "*"
-    files = [
-        path
-        for path in sorted(directory.glob(pattern))
-        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
-    ][:max_items]
-    root = validate_output_root(options.output_dir)
+    continue_on_error = bool_arg(args.get("continue_on_error"), True)
 
     def process_item(path_text: str, index: int) -> dict[str, Any]:
         child_args = {**args, "path": path_text, "job_id": f"{options.job_id}-{index}"}
         return process_local_video(child_args, lock_wait_sec=BATCH_ITEM_LOCK_WAIT_SEC)
 
-    runner = BatchRunner(
-        job_id=options.job_id,
-        tool="process_video_directory",
-        item_key="path",
-        items=[str(path) for path in files],
-        continue_on_error=bool_arg(args.get("continue_on_error"), True),
-    )
-
     def work() -> dict[str, Any]:
+        # Inside the record, because scanning a directory is work: the path may
+        # not be one, and a batch that finds nothing to do still ran.
+        directory = Path(str(args.get("path", ""))).expanduser()
+        if not directory.exists() or not directory.is_dir():
+            raise DistillError(
+                "E_BAD_SOURCE", "source", "directory does not exist", {"path": str(directory)}
+            )
+        pattern = "**/*" if recursive else "*"
+        files = [
+            path
+            for path in sorted(directory.glob(pattern))
+            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+        ][:max_items]
+        runner = BatchRunner(
+            job_id=options.job_id,
+            tool="process_video_directory",
+            item_key="path",
+            items=[str(path) for path in files],
+            continue_on_error=continue_on_error,
+        )
         results, errors = runner.run(process_item)
         return {
             "job_id": options.job_id,
@@ -586,7 +641,7 @@ def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
             "errors": errors,
         }
 
-    return record_job(JobStore.open(root), options.job_id, runner.tool, work)
+    return record_job(JobStore.open(root), options.job_id, "process_video_directory", work)
 
 
 def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
@@ -624,9 +679,8 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
     options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
     root = validate_output_root(options.output_dir)
     playlist_root = root / "playlists" / playlist_folder_name(url)
-    ensure_safe_directory(playlist_root, root)
     max_items = int(args.get("max_items", 25))
-    urls = youtube_playlist_urls(url, max_items)
+    continue_on_error = bool_arg(args.get("continue_on_error"), True)
 
     def process_item(video_url: str, index: int) -> dict[str, Any]:
         child_args = {
@@ -637,15 +691,19 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
         }
         return process_youtube_video(child_args, lock_wait_sec=BATCH_ITEM_LOCK_WAIT_SEC)
 
-    runner = BatchRunner(
-        job_id=options.job_id,
-        tool="process_youtube_playlist",
-        item_key="url",
-        items=urls,
-        continue_on_error=bool_arg(args.get("continue_on_error"), True),
-    )
-
     def work() -> dict[str, Any]:
+        # Inside the record: creating the playlist root writes, and listing the
+        # playlist is a yt-dlp call - the parent job's first real step and the
+        # first thing that can fail without a single item ever being tried.
+        ensure_safe_directory(playlist_root, root)
+        urls = youtube_playlist_urls(url, max_items)
+        runner = BatchRunner(
+            job_id=options.job_id,
+            tool="process_youtube_playlist",
+            item_key="url",
+            items=urls,
+            continue_on_error=continue_on_error,
+        )
         results, errors = runner.run(process_item)
         summary = {
             "job_id": options.job_id,
@@ -662,7 +720,7 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
         playlist_summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
         return summary
 
-    return record_job(JobStore.open(root), options.job_id, runner.tool, work)
+    return record_job(JobStore.open(root), options.job_id, "process_youtube_playlist", work)
 
 
 def _prune_policy(args: dict[str, Any]) -> PrunePolicy:

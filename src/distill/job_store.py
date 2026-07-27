@@ -34,11 +34,23 @@ reads while the run that owns them is still writing (R-14, D-033). A record
 caught half-written is unparseable, which a poller cannot tell apart from a job
 that never started.
 
+Writing a record is a thing only the run that owns the identifier may do, and
+owning it means holding its lock. `start` refuses an identifier any holder is
+live on - including this store, which used to be waved through - and `finish`
+refuses one this store does not hold. Without both, two runs can share one
+record from opposite ends: two `start`s writing over each other's `running`, or
+a stranger's `finish` replacing a live holder's record with a terminal status
+while that holder is still working. There is no way for a process to close out a
+record it did not open, deliberately: `abandoned` already answers "the holder is
+gone" and is reported rather than stored, so nothing is lost by refusing.
+
 What this module does not own: the durable-write mechanism and the lock
 (`bundle_store`), anything keyed by a **bundle key** - including cache-hit
 manifest patching, which is `BundleStore.patch_published` on a published
 snapshot - and what a run computes. It stores the result a run reports; it does
-not interpret it.
+not interpret it. It does not own where a run's envelope goes either: `pipeline`
+opens one per tool call, and this module only enforces that a second one under
+the same identifier cannot.
 """
 
 from __future__ import annotations
@@ -50,7 +62,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from .bundle_store import ExclusiveLock, atomic_write_text, confined_path, ensure_safe_directory
+from .bundle_store import (
+    ExclusiveLock,
+    LockState,
+    atomic_write_text,
+    confined_path,
+    ensure_safe_directory,
+)
 from .errors import DistillError
 
 JOB_DIR_NAME = "_jobs"
@@ -113,6 +131,16 @@ only a second read sees what it wrote. Two rounds end on a probe that came after
 the record it judges, which is the only order the verdict is sound in. A third
 would answer a different question: whether the identifier was started again
 after we looked, which is not something a snapshot owes anyone.
+"""
+
+HOLDER_PRESENT_STATES: frozenset[LockState] = frozenset({"live", "unknown"})
+"""The lock states `read` reports as a run still in progress.
+
+`live` is a holder. `unknown` is a lock file this process could not open at all,
+which is not the same as one nobody holds - prune reads it the same way, because
+"may not ask" must never resolve to "nobody is running". Reported as `running`
+it costs a poller another look; reported as `abandoned` it tells a caller its
+live run is dead.
 """
 
 
@@ -227,19 +255,32 @@ class JobRecord:
         return payload
 
 
+@dataclass(frozen=True)
+class JobHold:
+    """One live claim this store has on an identifier: the lock, and the tool.
+
+    The two are one fact, not two, so they are kept as one. Held separately they
+    can disagree, and the disagreement is a record closed out under a tool no
+    run ever started: `finish` is told the outcome, never the tool, because the
+    tool is not something an ending run gets to change.
+    """
+
+    lock: ExclusiveLock
+    tool: str
+
+
 @dataclass
 class JobStore:
     """The job records under one output root, and the locks proving who is live.
 
-    An instance holds the locks for the jobs *it* started, so `finish` can
-    release them. A store that never started a job can still read every record
-    under the root: reading is a question about the filesystem, not about this
-    process.
+    An instance holds the locks for the jobs *it* started, and those are the
+    only jobs it may finish. A store that never started a job can still read
+    every record under the root: reading is a question about the filesystem, not
+    about this process, and it takes nothing to ask.
     """
 
     root: Path
-    _held: dict[str, ExclusiveLock] = field(default_factory=dict)
-    _tools: dict[str, str] = field(default_factory=dict)
+    _held: dict[str, JobHold] = field(default_factory=dict)
 
     @classmethod
     def open(cls, root: Path) -> JobStore:
@@ -255,9 +296,8 @@ class JobStore:
         standing as though it described this one.
         """
         validate_job_id(job_id)
-        self._take_hold(job_id)
+        self._take_hold(job_id, tool)
         try:
-            self._tools[job_id] = tool
             return self._write(
                 JobRecord(job_id=job_id, tool=tool, status=RUNNING, updated_at=_timestamp())
             )
@@ -270,17 +310,31 @@ class JobStore:
             raise
 
     def finish(self, job_id: str, outcome: JobOutcome) -> JobRecord:
-        """Replace the `running` record with a terminal one, and release the lock.
+        """Replace this store's `running` record with a terminal one, releasing the lock.
 
         Called on the success path and the failure path alike; a run that ends
         without reaching here is what `abandoned` describes.
+
+        Only the holder may call it. A store that holds nothing here is not the
+        run whose record this is: it is either a process that never started the
+        job - whose terminal status would overwrite a live holder's record while
+        that holder carries on working - or this store finishing twice. Both
+        write an outcome for a run that did not end, so both are refused.
         """
         validate_job_id(job_id)
+        hold = self._held.get(job_id)
+        if hold is None:
+            raise DistillError(
+                "E_JOB_NOT_HELD",
+                JOB_STAGE,
+                "only the run holding a job_id may record its outcome",
+                {"job_id": job_id},
+            )
         try:
             return self._write(
                 JobRecord(
                     job_id=job_id,
-                    tool=self._tool_for(job_id),
+                    tool=hold.tool,
                     status=outcome.status,
                     updated_at=_timestamp(),
                     result=outcome.result,
@@ -359,15 +413,22 @@ class JobStore:
         )
         return record
 
-    def _take_hold(self, job_id: str) -> None:
-        """Claim liveness for `job_id`, refusing a job another run is live on.
+    def _take_hold(self, job_id: str, tool: str) -> None:
+        """Claim liveness for `job_id`, refusing a job any run is live on.
 
         Two runs sharing one identifier would share one record, which is the
         collision R-18 exists to stop - reached by agreement rather than by
         sanitizing, but the same single record describing two runs.
+
+        *Any* run includes this one. A store that already holds the identifier
+        is not a special case to wave through: waved through, it wrote a second
+        `running` record over the first run's and the two ran on under one
+        record, which is the whole of what this refuses. The kernel gives the
+        same answer either way - `flock` is per open file description, so a
+        second `take` against a path is refused inside the holding process
+        exactly as it is outside - so there is nothing here to special-case
+        with.
         """
-        if job_id in self._held:
-            return
         self._record_directory()
         path = self.lock_path(job_id)
         ensure_safe_directory(path, self.root, create_leaf=False)
@@ -379,12 +440,12 @@ class JobStore:
                 "another run is live under this job_id",
                 {"job_id": job_id},
             )
-        self._held[job_id] = lock
+        self._held[job_id] = JobHold(lock=lock, tool=tool)
 
     def _release(self, job_id: str) -> None:
-        lock = self._held.pop(job_id, None)
-        if lock is not None:
-            lock.release()
+        hold = self._held.pop(job_id, None)
+        if hold is not None:
+            hold.lock.release()
 
     def _holder_is_live(self, job_id: str) -> bool:
         """Whether a run is still live on `job_id`, asked of the lock, not a clock.
@@ -392,35 +453,24 @@ class JobStore:
         `flock` is per open file description, so the lock this process holds is
         refused here exactly as another process's would be - one answer, whoever
         the holder is.
-        """
-        path = self.lock_path(job_id)
-        if not path.is_file():
-            return False
-        lock = ExclusiveLock.take(job_id, path, stage=JOB_STAGE)
-        if lock is None:
-            return True
-        lock.release()
-        return False
 
-    def _tool_for(self, job_id: str) -> str:
-        """Which tool this job is running, recovered from `start` or from the record.
+        Asked through `probe`, which is the read-only way to ask it: `take`
+        opens with `O_CREAT` and would have a poller leave a lock file behind
+        for every identifier it asked about, and its existence pre-check was a
+        second syscall the answer could race - the file can be unlinked in
+        between, and the `O_CREAT` puts it back. `probe` also reports a lock
+        file it cannot open at all as `unknown` rather than raising, so a
+        `get_job_status` on a root whose permissions this process cannot satisfy
+        answers instead of crashing.
 
-        `finish` is told the outcome, not the tool, because the tool is not
-        something an ending run gets to change. A record written by an earlier
-        process still supplies it.
+        What no reader can avoid is holding the lock for the instant it takes to
+        find out: the only way to learn whether an `flock` is held is to ask for
+        a conflicting one. So a `start` that lands in that instant can still be
+        told `E_JOB_RUNNING` by a poller rather than by a run. That window is
+        the mechanism's, not this module's, and it is narrower than the wrong
+        answer any of the alternatives give.
         """
-        remembered = self._tools.get(job_id)
-        if remembered is not None:
-            return remembered
-        path = self.record_path(job_id)
-        if not path.is_file():
-            raise DistillError(
-                "E_JOB_NOT_STARTED",
-                JOB_STAGE,
-                "cannot finish a job that was never started",
-                {"job_id": job_id},
-            )
-        return self._parse(path.read_text(), job_id).tool
+        return ExclusiveLock.probe(self.lock_path(job_id)) in HOLDER_PRESENT_STATES
 
     def _parse(self, text: str, job_id: str) -> JobRecord:
         """Read one record, refusing anything that is not one.
