@@ -639,16 +639,63 @@ def test_a_run_takes_the_bundle_lock_for_the_budget_its_caller_named(
 
     root = tmp_path / "output"
     root.mkdir()
-    for budget in (None, BATCH_ITEM_LOCK_WAIT_SEC):
-        options = DistillOptions.from_args({"output_dir": str(root), "job_id": "j"})
-        extra = {} if budget is None else {"lock_wait_sec": budget}
-        with pytest.raises(DistillError):
-            pipeline.process_resolved_source(
-                StubSource(),
-                options,
-                root,
-                progress=ProgressReporter(emitter=lambda _event: None),
-                **extra,
-            )
+    options = DistillOptions.from_args({"output_dir": str(root), "job_id": "j"})
+    progress = ProgressReporter(emitter=lambda _event: None)
+
+    # The default is the single-source budget, so a caller that says nothing
+    # waits for the run a user is watching.
+    with pytest.raises(DistillError):
+        pipeline.process_resolved_source(StubSource(), options, root, progress=progress)
+    with pytest.raises(DistillError):
+        pipeline.process_resolved_source(
+            StubSource(),
+            options,
+            root,
+            progress=progress,
+            lock_wait_sec=BATCH_ITEM_LOCK_WAIT_SEC,
+        )
 
     assert budgets == [SINGLE_SOURCE_LOCK_WAIT_SEC, BATCH_ITEM_LOCK_WAIT_SEC]
+
+
+def test_a_run_that_fails_mid_stage_abandons_its_hold_and_says_why(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`BundleRun.abandon` had no caller until the pipeline entered through `begin`.
+
+    A run that raises leaves a bundle that did not change, which is otherwise
+    indistinguishable from a run that never happened - so the reason is the
+    record. The previous **active generation** is untouched and the **staging
+    directory** stays for the next run to **resume** from; only the lock goes.
+    """
+    from distill import pipeline
+    from distill.options import DistillOptions
+    from distill.progress import ProgressReporter
+
+    def explode(_self: object, _run: object, _heartbeat: object) -> dict[str, Any]:
+        raise DistillError("E_STAGE_BOOM", "keyframes", "keyframe selection failed")
+
+    monkeypatch.setattr(pipeline.ProcessingRun, "_produce_generation", explode)
+
+    class StubSource:
+        source_hash = BUNDLE_KEY
+        warnings: list[dict[str, str]] = []
+
+    root = tmp_path / "output"
+    root.mkdir()
+    caplog.set_level(logging.DEBUG, logger=bundle_store.LOGGER.name)
+
+    with pytest.raises(DistillError):
+        pipeline.process_resolved_source(
+            StubSource(),
+            DistillOptions.from_args({"output_dir": str(root), "job_id": "j"}),
+            root,
+            progress=ProgressReporter(emitter=lambda _event: None),
+        )
+
+    abandoned = [event for event in lock_events(caplog) if event["event"] == "run_abandoned"]
+    assert len(abandoned) == 1
+    assert abandoned[0]["detail"]["bundle_key"] == BUNDLE_KEY
+    assert "E_STAGE_BOOM" in abandoned[0]["detail"]["reason"]
+    assert (root / BUNDLE_KEY / ".tmp.g1").is_dir()
+    assert lock_is_held(lock_path(root)) is False

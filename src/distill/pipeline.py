@@ -166,6 +166,18 @@ def progress_summary_is_terminal(progress_summary: dict[str, Any]) -> bool:
     )
 
 
+def _abandon_reason(exc: BaseException) -> str:
+    """Why a run gave up, in the terms the rest of Distill reports failures in.
+
+    A `DistillError`'s code is the identity an operator correlates on, and
+    `str(exc)` does not carry it; anything else falls back to its type, because
+    an uncoded exception's message alone rarely says which stage produced it.
+    """
+    if isinstance(exc, DistillError):
+        return f"{exc.code}: {exc}"
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _as_stage_payload(name: str, recorded: Any) -> dict[str, Any] | None:
     """A recorded **stage result** in the shape this run expects, or `None`.
 
@@ -222,7 +234,15 @@ class ProcessingRun:
         heartbeat = ProgressHeartbeat(self.progress.counter).start()
         try:
             with began as run:
-                return self._produce_generation(run, heartbeat)
+                try:
+                    return self._produce_generation(run, heartbeat)
+                except BaseException as exc:
+                    # A bundle that did not change is otherwise indistinguishable
+                    # from a run that never happened: the reason is the record.
+                    # The previous **active generation** is untouched and the
+                    # **staging directory** stays for the next run to resume.
+                    run.abandon(_abandon_reason(exc))
+                    raise
         finally:
             heartbeat.stop()
 

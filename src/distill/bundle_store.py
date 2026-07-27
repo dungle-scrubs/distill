@@ -414,6 +414,34 @@ class ExclusiveLock:
             raise
         return cls(subject=subject, path=path, fd=fd)
 
+    @classmethod
+    def probe(cls, path: Path) -> LockState:
+        """Report whether anybody holds this lock, creating nothing.
+
+        `take` opens with `O_CREAT`, because a run that needs the lock needs the
+        file to exist. A probe must not: a caller that only wants to *know*
+        would otherwise leave a lock file behind for every key it asked about,
+        and `cache-doctor` is read-only (R-57). Checking existence first and
+        then calling `take` is not the same thing - between the two calls the
+        file can be unlinked, and the `O_CREAT` recreates it.
+
+        The lock is released immediately: holding it would answer the question
+        by making the answer true.
+        """
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            return "absent"
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in _LOCK_HELD_ERRNOS:
+                return "live"
+            raise
+        finally:
+            os.close(fd)
+        return "stale"
+
     def release(self) -> None:
         """Give the lock up by closing the descriptor the kernel locked.
 
@@ -909,6 +937,23 @@ class BundleStore:
         *this* directory, and the second is what makes a generation active, so
         an amendment that could set either would be a publish that skipped the
         rename, naming a generation that need not exist (finding 2's shape).
+
+        Refusing to *set* them is not enough, because a merge carries them.
+        `snapshot` is a document read at some earlier moment, typically by a
+        cache lookup that released the lock as soon as it had an answer - that
+        is what makes a hit cheap. Merging fields into that captured document
+        and writing the result brings its `active_generation` along, so a run
+        that published in the meantime is undone by a *reader*: the marker names
+        the older generation again and the newer one becomes an **orphan
+        generation**. The amendment therefore happens under the run lock and
+        against the manifest on disk, and declines when what it reads back is no
+        longer the generation it was handed.
+
+        Declining rather than waiting or failing is the right answer for what
+        this is used for. An amendment is a backfill, never the purpose of the
+        call that makes it, so it is not worth queueing behind a 40-minute run
+        and not worth ending a caller over: the caller is handed back what it
+        already had.
         """
         fixed = {
             field: value
@@ -923,13 +968,37 @@ class BundleStore:
                 "identity and the active generation are set by publish, not by an amendment",
                 {"bundle_key": snapshot.bundle_key, "fields": sorted(fixed)},
             )
-        manifest = {**snapshot.manifest, **fields}
-        validate_manifest_schema(manifest, require_active_generation=True)
-        write_manifest(snapshot.root, manifest)
+
+        path = self.lock_path(snapshot.bundle_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = ExclusiveLock.take(snapshot.bundle_key, path)
+        if lock is None:
+            _bundle_log(
+                "amend_declined",
+                bundle_key=snapshot.bundle_key,
+                reason="another run holds this bundle",
+            )
+            return snapshot
+        try:
+            current = self.load_active(snapshot.bundle_key)
+            if current is None or current.generation != snapshot.generation:
+                _bundle_log(
+                    "amend_declined",
+                    bundle_key=snapshot.bundle_key,
+                    reason="the active generation is no longer the one this amendment read",
+                    read=snapshot.generation.name,
+                    active=None if current is None else current.generation.name,
+                )
+                return snapshot
+            manifest = {**current.manifest, **fields}
+            validate_manifest_schema(manifest, require_active_generation=True)
+            write_manifest(current.root, manifest)
+        finally:
+            lock.release()
         return BundleSnapshot(
-            root=snapshot.root,
-            bundle_key=snapshot.bundle_key,
-            generation=snapshot.generation,
+            root=current.root,
+            bundle_key=current.bundle_key,
+            generation=current.generation,
             manifest=manifest,
         )
 
@@ -1458,16 +1527,11 @@ def lock_is_held(bundle_root: Path) -> bool:
     (finding 11's shape).
 
     A lock file that does not exist means no run has ever reached staging here,
-    so nothing is created to find that out: a plan mutates nothing.
+    so nothing is created to find that out: a plan mutates nothing, and the
+    probe is what guarantees it rather than an existence check the answer could
+    race.
     """
-    path = prune_lock_path(bundle_root)
-    if not path.is_file():
-        return False
-    lock = ExclusiveLock.take(bundle_root.name, path)
-    if lock is None:
-        return True
-    lock.release()
-    return False
+    return ExclusiveLock.probe(prune_lock_path(bundle_root)) == "live"
 
 
 def lock_report(subject: str, path: Path) -> LockReport:
@@ -1477,13 +1541,7 @@ def lock_report(subject: str, path: Path) -> LockReport:
     rather than created, so an inspection of a root no run has ever touched
     leaves it exactly as it was (R-57).
     """
-    if not path.is_file():
-        return LockReport(path=path, subject=subject, state="absent")
-    lock = ExclusiveLock.take(subject, path)
-    if lock is None:
-        return LockReport(path=path, subject=subject, state="live")
-    lock.release()
-    return LockReport(path=path, subject=subject, state="stale")
+    return LockReport(path=path, subject=subject, state=ExclusiveLock.probe(path))
 
 
 def lock_reports(lock_dir: Path) -> list[LockReport]:

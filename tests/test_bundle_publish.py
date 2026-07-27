@@ -591,3 +591,67 @@ def test_abandoning_a_run_reports_why_and_leaves_the_bundle_alone(
     assert snapshot.markdown.read_text() == "# first\n"
     # The scratch survives, because resuming from it is what it is for.
     assert (staged.generation / "_ocr.json").is_file()
+
+
+def test_an_amendment_cannot_reinstate_the_generation_it_read(tmp_path: Path) -> None:
+    """FAILS FIRST: a stale snapshot merged back over a newer manifest.
+
+    A cache hit reads the **manifest** and releases the lock - that is what
+    makes a hit cheap. If the reader then backfills a field by merging the
+    document it captured, everything else that manifest said travels with it,
+    including `active_generation`. A run that published `g2` in between is
+    undone by a *reader*: the marker names `g1` again and `g2` becomes an
+    **orphan generation**, which is finding 2's shape arriving from the side
+    nobody was watching.
+
+    The amendment therefore happens under the run lock and against the manifest
+    on disk, and declines rather than writes when what it reads back is no
+    longer what it was handed.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+    first = begin_run(store)
+    assemble(first.paths)
+    stale = first.commit(manifest_for())
+
+    # Between the read and the amendment, another run publishes over g1.
+    second = store.begin(BUNDLE_KEY, reuse_active=False)
+    assert isinstance(second, BundleRun)
+    assemble(second.paths)
+    published = second.commit(manifest_for())
+    assert published.generation.name == "g2"
+
+    amended = store.patch_published(stale, {"progress": {"overall_percent": 100.0}})
+
+    active = store.load_active(BUNDLE_KEY)
+    assert active is not None
+    assert active.manifest["active_generation"] == "g2"
+    assert active.manifest.get("progress") is None
+    assert amended.generation == stale.generation
+
+
+def test_an_amendment_defers_to_a_run_that_holds_the_bundle(tmp_path: Path) -> None:
+    """A live run is about to publish, so its manifest is the one that matters.
+
+    Amending is a backfill, never the point of the call that makes it: waiting
+    for a 40-minute run to finish, or racing it, would both cost more than the
+    field is worth. The lock says somebody else owns this bundle's manifest now.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+    first = begin_run(store)
+    assemble(first.paths)
+    snapshot = first.commit(manifest_for())
+    on_disk = (root / BUNDLE_KEY / "_manifest.json").read_bytes()
+
+    held = store.begin(BUNDLE_KEY, reuse_active=False)
+    assert isinstance(held, BundleRun)
+    try:
+        amended = store.patch_published(snapshot, {"progress": {"overall_percent": 100.0}})
+    finally:
+        held.release()
+
+    assert (root / BUNDLE_KEY / "_manifest.json").read_bytes() == on_disk
+    assert amended.generation == snapshot.generation

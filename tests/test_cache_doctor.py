@@ -21,10 +21,12 @@ exist and must not create it.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
+from distill import bundle_store
 from distill.bundle_store import ExclusiveLock
 from distill.cli import main
 from distill.pipeline import call_registered_tool
@@ -224,6 +226,37 @@ def test_cache_doctor_reports_every_skipped_directory_with_a_reason(tmp_path: Pa
     assert skipped[str(root / "_internal")]["verdict"] == "reserved"
     assert skipped[str(root / "link")]["verdict"] == "symlink"
     assert report["skipped_count"] == len(report["skipped"])
+
+
+def test_cache_doctor_never_asks_for_a_lock_file_to_be_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R-57: the lock probe reads; it does not bring a lock into existence.
+
+    Checking that a lock file exists and *then* taking it is two calls with a
+    gap: the file can be unlinked in between, and `take` opens with `O_CREAT`,
+    so the probe recreates what it was only supposed to look at. An inspection
+    of a thousand bundle keys would leave a thousand lock files behind. The
+    property is about the syscall, so that is what is asserted - a race cannot
+    be observed reliably, but the flag that makes it possible can.
+    """
+    root = tmp_path / "cache"
+    write_bundle(root, "aaa")
+    (root / "_locks").mkdir()
+    (root / "_locks" / "aaa.lock").touch()
+    real_open = os.open
+    creating: list[str] = []
+
+    def record(path: str | Path, flags: int, mode: int = 0o777) -> int:
+        if flags & os.O_CREAT:
+            creating.append(str(path))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(bundle_store.os, "open", record)
+
+    inspect(root)
+
+    assert creating == []
 
 
 def test_cache_doctor_creates_nothing_under_the_root_it_inspects(tmp_path: Path) -> None:
