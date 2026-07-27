@@ -277,6 +277,75 @@ def test_a_slow_but_progressing_child_is_not_killed_by_the_idle_timeout() -> Non
     assert result.stdout.splitlines() == [f"line {index}" for index in range(10)]
 
 
+CHATTY_FOREVER_WITH_PID = """
+import os, sys, time
+open(sys.argv[1], "w").write(str(os.getpid()))
+while True:
+    sys.stdout.write("tick\\n")
+    sys.stdout.flush()
+    time.sleep(0.01)
+"""
+
+
+def test_a_blocking_callback_cannot_suspend_the_deadlines(tmp_path: Path) -> None:
+    """FAILS FIRST (Codex finding 4): supervision waited on callback delivery.
+
+    Callbacks ran on the supervision thread, so while one was blocked - a
+    progress emitter writing to a full parent pipe - neither the total nor the
+    idle deadline was checked and the child ran on past both. That is the exact
+    class of defect this module exists to make impossible, so watching the
+    clock must not wait on the caller.
+
+    The join below is a budget rather than a measurement: a supervisor that
+    keeps its own clock ends this run at its 1 s total deadline, and one that
+    waits on the callback never ends it at all.
+    """
+    pid_file = tmp_path / "pid"
+    entered = threading.Event()
+    released = threading.Event()
+    outcome: list[BaseException] = []
+    delivered: list[str] = []
+
+    def block(line: str) -> None:
+        delivered.append(line)
+        entered.set()
+        released.wait(60)
+
+    def invoke() -> None:
+        try:
+            stream(
+                child(CHATTY_FOREVER_WITH_PID, str(pid_file)),
+                stage="youtube",
+                total_timeout_sec=1.0,
+                idle_timeout_sec=GENEROUS_IDLE_SEC,
+                terminate_grace_sec=0.2,
+                on_stdout_line=block,
+            )
+        except BaseException as exc:  # noqa: BLE001 - handed to the assertions below
+            outcome.append(exc)
+
+    caller = threading.Thread(target=invoke, name="blocked-caller", daemon=True)
+    caller.start()
+    try:
+        assert entered.wait(GENEROUS_IDLE_SEC), "the callback was never called"
+        caller.join(GENEROUS_TOTAL_SEC)
+
+        assert not caller.is_alive(), "the run was still blocked in a callback"
+        assert isinstance(outcome[0], DistillError)
+        assert outcome[0].details["timeout_fired"] == "total"
+        assert wait_until_gone(int(pid_file.read_text())), "the child was left running"
+
+        # The invocation is over, so nothing more may reach the caller: a
+        # callback that unblocks afterwards hands its line back to code that has
+        # already been told the run ended.
+        released.set()
+        assert not wait_for(lambda: len(delivered) > 1, timeout_sec=0.5), (
+            "a line was delivered after the invocation returned"
+        )
+    finally:
+        released.set()
+
+
 def test_both_timeouts_are_structurally_required() -> None:
     """There is no default that silently means "no limit" (R-30)."""
     for entry_point in (run, stream, run_json):
@@ -456,34 +525,71 @@ time.sleep(600)
     assert handled.read_text() == "sigterm"
 
 
-def test_a_grandchild_holding_the_pipes_does_not_hang_the_caller(
-    tmp_path: Path,
-) -> None:
-    """The child exits; a grandchild keeps stdout open. Draining must be bounded."""
-    pid_file = tmp_path / "grandchild-pid"
-    script = f"""
-import os, subprocess, sys, time
-grandchild = subprocess.Popen([{PYTHON!r}, "-c", "import time; time.sleep(30)"])
+def normally_exiting_parent_script(pid_file: Path) -> str:
+    """A child that exits 0 immediately, leaving a helper of its own running.
+
+    The yt-dlp shape on the *success* path: the tool spawns ffmpeg to merge the
+    streams, exits 0, and the merge keeps running. The helper's output goes to
+    /dev/null, because this test is about what is still running after a clean
+    exit rather than about draining around a pipe holder.
+    """
+    return f"""
+import subprocess, sys
+grandchild = subprocess.Popen(
+    [{PYTHON!r}, "-c", "import time; time.sleep(600)"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
 open({str(pid_file)!r}, "w").write(str(grandchild.pid))
 sys.stdout.write("bye\\n")
 sys.stdout.flush()
 """
 
-    result = run(
-        child(script),
-        stage="source",
-        total_timeout_sec=GENEROUS_TOTAL_SEC,
-        idle_timeout_sec=GENEROUS_IDLE_SEC,
-    )
 
-    assert result.returncode == 0
-    assert "bye" in result.stdout
-    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+def test_a_normally_exiting_child_leaves_nothing_of_its_group_running(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (Codex finding 2): a clean exit orphaned the rest of the group.
+
+    Termination only ran after a timeout or a callback error, so a direct child
+    that exited on its own left every other member of its group alive - yt-dlp
+    exiting 0 while the ffmpeg it spawned for the merge holds the network and a
+    partial file. Distill then reported success while the helper ran on, which
+    is finding 8's shape on the path that succeeds.
+
+    Nothing here kills the grandchild: that is the assertion.
+    """
+    pid_file = tmp_path / "grandchild-pid"
+
+    try:
+        result = run(
+            child(normally_exiting_parent_script(pid_file)),
+            stage="source",
+            total_timeout_sec=GENEROUS_TOTAL_SEC,
+            idle_timeout_sec=GENEROUS_IDLE_SEC,
+            terminate_grace_sec=0.2,
+        )
+
+        assert result.returncode == 0
+        assert "bye" in result.stdout
+        assert wait_until_gone(int(pid_file.read_text())), (
+            "the grandchild outlived the run that spawned it"
+        )
+    finally:
+        # Only reached when the assertion above already failed; a passing run
+        # leaves nothing to kill.
+        kill_all(pid_file)
 
 
+# A pipe holder that Distill's group termination cannot reach: it puts itself
+# in a new session, so it is no longer a member of the child's process group.
+# That is what still exercises bounded draining now that every surviving group
+# member is killed the moment the direct child exits.
 PIPE_HOLDING_GRANDCHILD = f"""
 import subprocess, sys
-grandchild = subprocess.Popen([{PYTHON!r}, "-c", "import time; time.sleep(60)"])
+grandchild = subprocess.Popen(
+    [{PYTHON!r}, "-c", "import time; time.sleep(60)"], start_new_session=True
+)
 open(sys.argv[1], "a").write("%d\\n" % grandchild.pid)
 sys.stdout.write("bye\\n")
 sys.stdout.flush()
@@ -997,12 +1103,17 @@ def test_line_delivery_stops_at_the_capture_cap() -> None:
     assert seen == [f"line {index:05d}" for index in range(len(seen))]
 
 
-def test_the_reader_threads_are_named_for_the_stream_they_drain(tmp_path: Path) -> None:
+def test_the_threads_an_invocation_runs_are_named_for_what_they_do(
+    tmp_path: Path,
+) -> None:
     """FAILS FIRST (finding 10): the intended names never reached the threads.
 
     A hung run is diagnosed from a stack dump, and "stdout" alone does not say
     which subsystem is blocked. The child is still running when the names are
-    read, so both readers are certainly alive.
+    read, so both readers are certainly alive - and the names are read from
+    inside a callback, so the delivery thread is running too. That one matters
+    most of the three: a stack dump of a caller's blocked callback is the only
+    thing that distinguishes a wedged tool from a wedged progress emitter.
     """
     acknowledgement = tmp_path / "ack"
     script = f"""
@@ -1027,7 +1138,11 @@ while not os.path.exists({str(acknowledgement)!r}) and time.monotonic() < deadli
         on_stdout_line=record,
     )
 
-    assert {"run_command-stdout", "run_command-stderr"} <= named
+    assert {
+        "run_command-stdout",
+        "run_command-stderr",
+        "run_command-dispatch",
+    } <= named
 
 
 # --- the boundary event (R-29 observability) ---------------------------------

@@ -30,11 +30,31 @@ required, `idle_timeout_sec` defaults to 120 s, and a non-finite or
 non-positive value for either is rejected.
 
 Why a process group (R-31). ffmpeg and yt-dlp spawn helpers. Signalling only
-the direct child on a timeout leaves those helpers running, holding the pipes
-and the network connection - finding 8. The child is started in its own
-session, and a timeout signals the group: SIGTERM, a grace period, then
-SIGKILL. Signals are sent while the direct child is still unreaped, so the
-group id cannot have been recycled onto an unrelated process.
+the direct child leaves those helpers running, holding the pipes and the
+network connection - finding 8. The child is started in its own session, and
+*every* path out of an invocation signals the group: SIGTERM, a grace period,
+then SIGKILL, whether the child hit a deadline, a callback raised, or the child
+exited on its own. The last of those is not an afterthought - yt-dlp exits 0
+the moment it hands the merge to ffmpeg, so terminating only on a timeout would
+report success while the helper kept the socket and a half-written file.
+Signals are sent while the direct child is still unreaped, so the group id
+cannot have been recycled onto an unrelated process.
+
+The contract that follows, stated so a later reader does not "fix" it back:
+Distill terminates the whole process group of every tool it runs, so a tool
+that deliberately spawns a process meant to outlive it is not supported here.
+For this tool set - ffmpeg, ffprobe, tesseract, yt-dlp - a helper that outlives
+its parent is a leak rather than a feature, and a leaked one holds a socket, a
+descriptor and a partial file that nothing will ever clean up. Sparing
+survivors would be safe only for a tool none of these are.
+
+Why callbacks get their own thread (R-30). A caller's progress callback is
+arbitrary code that can block - a progress emitter writing to a full parent
+pipe blocks indefinitely. Delivering lines on the supervision thread would put
+that block between the deadline checks, so neither limit would be enforced
+while it lasted: the one failure this module exists to make impossible. The
+supervisor watches the clock, `_Dispatcher` watches the queue, and neither
+waits on the other.
 
 Why a boundary event (R-29 observability). Because this is the only path an
 external tool is invoked on, one event emitted here covers every invocation in
@@ -42,13 +62,15 @@ the pipeline without a call site remembering to log. Every invocation emits
 exactly one, at the end, whether it succeeded, failed, or never started; see
 `_boundary_log`.
 
-Known limits. A grandchild that inherits the pipes and outlives its parent is
-not killed when the parent exits on its own - only a timeout terminates the
-group - and draining is bounded rather than waiting for such a grandchild to
-close the pipes. Past that bound the readers are stopped and the pipes closed
-regardless, so the tail is dropped instead of hanging the run or leaking a
-thread and two descriptors per invocation; the drop is recorded as truncation
-(R-33) rather than lost in silence. Process control here is POSIX-only.
+Known limits. A process that escapes the group - one that starts a session of
+its own - can inherit the pipes and hold them open after the group is gone, so
+draining is bounded rather than waiting for it. Past that bound the readers are
+stopped and the pipes closed regardless, so the tail is dropped instead of
+hanging the run or leaking a thread and two descriptors per invocation; the
+drop is recorded as truncation (R-33) rather than lost in silence. Line
+delivery is bounded the same way and for the same reason, except that what a
+blocked callback never received is still in the captured output. Process
+control here is POSIX-only.
 """
 
 from __future__ import annotations
@@ -96,8 +118,10 @@ _READ_CHUNK_BYTES = 64 * 1024
 # A "line" this long without a terminator is delivered as-is, so a tool that
 # never emits a newline cannot grow the pending buffer without bound.
 _MAX_LINE_BYTES = 64 * 1024
-# Lines handed to a callback per turn of the supervision loop.
-_DISPATCH_BATCH = 64
+# How long delivery gets to hand over what is already queued once the child is
+# gone. Bounded because a callback can block; what it never received is still in
+# the captured output.
+_DISPATCH_FINISH_GRACE_SEC = 1.0
 _STDERR_TAIL_CHARS = 2000
 _STDOUT = "stdout"
 _STDERR = "stderr"
@@ -248,17 +272,25 @@ def stream(
 ) -> CommandResult:
     """Run `argv`, handing each output line to a callback as it arrives.
 
-    Callbacks run on the calling thread, not on the reader threads, so a
-    caller's progress emitter needs no locking. Lines are delivered without
-    their terminator; both `\\n` and `\\r` end a line, because progress-writing
-    tools use either, and a `\\r` ends one the moment it arrives rather than at
-    EOF. Empty lines are not delivered.
+    Callbacks run on one delivery thread of their own - not on the reader
+    threads, which must keep draining, and not on the supervision thread, which
+    must keep checking the deadlines. They are serialized there, so a caller's
+    progress emitter needs no locking; a callback that blocks costs delivery
+    only, and neither stalls capture nor suspends a limit. A callback that
+    raises ends the invocation and is re-raised here, on the calling thread.
+
+    Lines are delivered without their terminator; both `\\n` and `\\r` end a
+    line, because progress-writing tools use either, and a `\\r` ends one the
+    moment it arrives rather than at EOF. Empty lines are not delivered.
 
     Delivery is bounded by the same cap as capture: once a stream passes
     `output_cap_bytes` its lines stop being handed over, because they are no
     longer being kept either. The drop is the truncation already recorded as a
     **warning**, and it is what bounds the queue of lines waiting for the
-    caller - at most one cap's worth per stream.
+    caller - at most one cap's worth per stream. Delivery is also bounded in
+    time once the child is gone: what a slow or blocked callback has not taken
+    by then is not handed over, and is still in `CommandResult.stdout` /
+    `.stderr`.
     """
     return _execute(
         argv,
@@ -607,11 +639,21 @@ def _validate_timeout(name: str, value: float) -> float:
 
 
 def _group_id(proc: subprocess.Popen[bytes]) -> int | None:
-    """The group to signal, or `None` if signalling one would be wrong."""
+    """The group to signal, or `None` if signalling one would be wrong.
+
+    `start_new_session` makes the child the leader of a new group, so the group
+    id *is* its pid; `getpgid` is asked first only to confirm that, and its
+    answer is preferred when it has one. It does not always have one: macOS
+    refuses `getpgid` for a process that has exited but not been reaped, which
+    is exactly the state the child is in on the path where it finished by
+    itself. Falling back to the pid there is what keeps that path able to reach
+    the survivors - and the pid is still this child's, because nothing reaps it
+    before the group has been signalled.
+    """
     try:
         pgid = os.getpgid(proc.pid)
-    except OSError:
-        return None
+    except OSError:  # exited and unreaped, or never ours
+        pgid = proc.pid
     if pgid == os.getpgrp():
         # start_new_session did not take effect; signalling this group would
         # signal Distill itself.
@@ -632,25 +674,34 @@ def _signal_group(
         pass
 
 
+def _has_exited(proc: subprocess.Popen[bytes]) -> bool:
+    """Whether the child has exited, without reaping it.
+
+    `Popen.poll` would reap, and reaping releases the pid that is also the group
+    id: the kernel holds that id only while the leader is unreaped or the group
+    still has members, so a reaped child leaves its group id free to be recycled
+    onto an unrelated process before the group is signalled. Every path out of
+    an invocation signals the group, so no path may notice the exit by reaping.
+    """
+    try:
+        return (
+            os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            is not None
+        )
+    except OSError:  # already reaped, or never ours
+        return True
+
+
 def _await_exit_without_reaping(proc: subprocess.Popen[bytes], grace_sec: float) -> None:
     """Give the child `grace_sec` to exit, leaving it unreaped either way.
 
-    Reaping would release the child's pid, and that pid is the group id. The
-    kernel keeps the id reserved while the leader is unreaped or the group still
-    has members, so not reaping here is what lets the SIGKILL that follows name
-    a group that is provably still this child's.
+    This is the SIGTERM grace period. It is spent without reaping for the reason
+    `_has_exited` states: the SIGKILL that follows must still name a group id
+    the kernel is holding for this child.
     """
-    if proc.returncode is not None:
-        return
     deadline = time.monotonic() + grace_sec
-    while True:
-        try:
-            exited = os.waitid(
-                os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
-            )
-        except OSError:  # already reaped, or never ours
-            return
-        if exited is not None or time.monotonic() >= deadline:
+    while not _has_exited(proc):
+        if time.monotonic() >= deadline:
             return
         time.sleep(_POLL_INTERVAL_SEC)
 
@@ -658,11 +709,14 @@ def _await_exit_without_reaping(proc: subprocess.Popen[bytes], grace_sec: float)
 def _terminate_group(proc: subprocess.Popen[bytes], grace_sec: float) -> int | None:
     """SIGTERM the child's group, then SIGKILL the group whatever the child did.
 
-    The forced kill is not an escalation reserved for a child that ignored
-    SIGTERM. yt-dlp exits cleanly on SIGTERM while the ffmpeg it spawned for the
-    merge - holding the network and the disk - does not, so returning as soon as
-    the direct child is gone orphans exactly the process that matters (R-31,
-    finding 8). The group SIGKILL therefore always runs.
+    Called on every path out of an invocation, not only after a timeout, and the
+    forced kill is not an escalation reserved for a child that ignored SIGTERM.
+    yt-dlp exits cleanly - on SIGTERM, or on its own the moment the download is
+    handed to the ffmpeg it spawned for the merge - while that ffmpeg, holding
+    the network and the disk, does not. Returning as soon as the direct child is
+    gone therefore orphans exactly the process that matters (R-31, finding 8),
+    whether the child was killed or finished by itself. The group SIGKILL always
+    runs, and reaping the leader is the last thing that happens.
 
     Both signals are sent while the direct child is still unreaped, so the group
     id cannot have been recycled onto an unrelated process.
@@ -677,57 +731,82 @@ def _terminate_group(proc: subprocess.Popen[bytes], grace_sec: float) -> int | N
         return proc.returncode
 
 
-def _deliver(
-    name: str,
-    text: str,
-    on_stdout_line: Callable[[str], None] | None,
-    on_stderr_line: Callable[[str], None] | None,
-) -> None:
-    if name == _STDOUT and on_stdout_line is not None:
-        on_stdout_line(text)
-    elif name == _STDERR and on_stderr_line is not None:
-        on_stderr_line(text)
+class _Dispatcher(threading.Thread):
+    """Hands queued lines to the caller's callbacks, and owns nothing else.
 
+    Delivery has a thread of its own so that supervision never waits on the
+    caller: a callback that blocks - a progress emitter writing to a full parent
+    pipe - would otherwise sit between two deadline checks and suspend both
+    limits for as long as it lasted (R-30). It does not decide when the
+    invocation ends, does not touch the child, and does not drain the pipes;
+    the readers do that, so a blocked callback cannot stall capture either.
 
-def _dispatch(
-    lines: queue.SimpleQueue[tuple[str, str]],
-    timeout_sec: float,
-    on_stdout_line: Callable[[str], None] | None,
-    on_stderr_line: Callable[[str], None] | None,
-) -> None:
-    """Hand queued lines to their callbacks, waiting up to `timeout_sec` for one.
-
-    Doubles as the wait in the supervision loop: with no callbacks registered
-    nothing is ever queued and this is simply a bounded sleep. A batch rather
-    than a single line per turn, so a burst is handed over promptly instead of
-    one line per poll interval - a chatty tool can still queue faster than this
-    drains it, and what bounds the queue is the capture cap, not this batch:
-    `_StreamReader._emit` stops queueing once its sink is full.
+    Callbacks are serialized here, so a caller's progress emitter needs no
+    locking of its own. A callback that raises stops delivery and leaves the
+    exception in `failure` for the supervision thread to re-raise, which is
+    where the caller can catch it.
     """
-    try:
-        name, text = lines.get(timeout=timeout_sec)
-    except queue.Empty:
+
+    def __init__(
+        self,
+        lines: queue.SimpleQueue[tuple[str, str]],
+        on_stdout_line: Callable[[str], None] | None,
+        on_stderr_line: Callable[[str], None] | None,
+    ) -> None:
+        super().__init__(name="run_command-dispatch", daemon=True)
+        self._lines = lines
+        self._on_stdout_line = on_stdout_line
+        self._on_stderr_line = on_stderr_line
+        self._finishing = threading.Event()
+        self._stopped = threading.Event()
+        self.failure: BaseException | None = None
+
+    def finish(self) -> None:
+        """Deliver what is already queued, then end. Called once the readers are done."""
+        self._finishing.set()
+
+    def stop(self) -> None:
+        """Deliver nothing further, whatever is left in the queue.
+
+        A blocked callback cannot be interrupted, so this is what guarantees no
+        line reaches the caller after the invocation has returned to it.
+        """
+        self._stopped.set()
+
+    def run(self) -> None:
+        while not self._stopped.is_set():
+            try:
+                name, text = self._lines.get(timeout=_POLL_INTERVAL_SEC)
+            except queue.Empty:
+                if self._finishing.is_set():
+                    return
+                continue
+            try:
+                self._deliver(name, text)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+                self.failure = exc
+                return
+
+    def _deliver(self, name: str, text: str) -> None:
+        if name == _STDOUT and self._on_stdout_line is not None:
+            self._on_stdout_line(text)
+        elif name == _STDERR and self._on_stderr_line is not None:
+            self._on_stderr_line(text)
+
+
+def _shutdown_dispatch(dispatcher: _Dispatcher | None) -> None:
+    """End delivery, giving queued lines a bounded window to be handed over.
+
+    Bounded for the same reason draining is: a callback that blocks cannot be
+    interrupted, and waiting on one would hang the return that the deadlines
+    just enforced. What a blocked callback never received is still in the
+    captured output, so the loss is delivery, not data.
+    """
+    if dispatcher is None:
         return
-    _deliver(name, text, on_stdout_line, on_stderr_line)
-    for _ in range(_DISPATCH_BATCH - 1):
-        try:
-            name, text = lines.get_nowait()
-        except queue.Empty:
-            return
-        _deliver(name, text, on_stdout_line, on_stderr_line)
-
-
-def _drain_queue(
-    lines: queue.SimpleQueue[tuple[str, str]],
-    on_stdout_line: Callable[[str], None] | None,
-    on_stderr_line: Callable[[str], None] | None,
-) -> None:
-    while True:
-        try:
-            name, text = lines.get_nowait()
-        except queue.Empty:
-            return
-        _deliver(name, text, on_stdout_line, on_stderr_line)
+    dispatcher.finish()
+    dispatcher.join(timeout=_DISPATCH_FINISH_GRACE_SEC)
+    dispatcher.stop()
 
 
 def _shutdown_readers(readers: Sequence[_StreamReader], proc: subprocess.Popen[bytes]) -> None:
@@ -877,13 +956,22 @@ def _execute(
     ]
     for reader in readers:
         reader.start()
+    dispatcher = _Dispatcher(lines, on_stdout_line, on_stderr_line) if deliver else None
+    if dispatcher is not None:
+        dispatcher.start()
 
     total_deadline = started + total
     timeout_fired: str | None = None
     try:
         while True:
-            if proc.poll() is not None:
+            # Never `proc.poll()`: noticing the exit must not reap it, or the
+            # group id below could already have been recycled.
+            if _has_exited(proc):
                 break
+            if dispatcher is not None and dispatcher.failure is not None:
+                # Ends the invocation now rather than at the deadline, which is
+                # what the old inline delivery did by propagating.
+                raise dispatcher.failure
             now = time.monotonic()
             if now >= total_deadline:
                 timeout_fired = "total"
@@ -893,7 +981,7 @@ def _execute(
                 timeout_fired = "idle"
                 break
             wait_for = min(total_deadline, idle_deadline, now + _POLL_INTERVAL_SEC) - now
-            _dispatch(lines, max(wait_for, 0.0), on_stdout_line, on_stderr_line)
+            time.sleep(max(wait_for, 0.0))
     except BaseException:
         # A callback raised, or the caller was interrupted: the child is still
         # ours to clean up. This path is reachable in production - a progress
@@ -902,6 +990,7 @@ def _execute(
         # can run and leave no trace.
         exit_status = _terminate_group(proc, grace)
         _shutdown_readers(readers, proc)
+        _shutdown_dispatch(dispatcher)
         _boundary_log(
             outcome="callback_error",
             stage=stage,
@@ -915,12 +1004,13 @@ def _execute(
         )
         raise
 
-    exit_status = (
-        _terminate_group(proc, grace) if timeout_fired is not None else proc.returncode
-    )
+    # Unconditional: a child that exited on its own can still have left the rest
+    # of its group running (R-31), and its exit status survives the group kill
+    # because the kernel is holding it for the reap `_terminate_group` ends with.
+    exit_status = _terminate_group(proc, grace)
 
     _shutdown_readers(readers, proc)
-    _drain_queue(lines, on_stdout_line, on_stderr_line)
+    _shutdown_dispatch(dispatcher)
 
     stdout_sink, stderr_sink = sinks[_STDOUT], sinks[_STDERR]
     duration_sec = time.monotonic() - started
@@ -939,8 +1029,17 @@ def _execute(
         duration_sec=duration_sec,
     )
 
+    # A callback can raise on the last line it is handed, after the supervision
+    # loop has already ended. That is still the caller's exception to see, and
+    # the invocation still reports how it ended.
+    callback_failure = dispatcher.failure if dispatcher is not None else None
+
     _boundary_log(
-        outcome=_outcome_of(timeout_fired, exit_status, check=check),
+        outcome=(
+            "callback_error"
+            if callback_failure is not None
+            else _outcome_of(timeout_fired, exit_status, check=check)
+        ),
         stage=stage,
         argv=command,
         sequence=sequence,
@@ -951,6 +1050,8 @@ def _execute(
         stderr_truncated=stderr_sink.truncated,
     )
 
+    if callback_failure is not None:
+        raise callback_failure
     if timeout_fired is not None:
         raise _failure(
             _TIMEOUT_KINDS[timeout_fired],
