@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from untrusted_blocks import SENTINEL, assert_delimited, attack
 
 from distill.artifacts import FrameArtifact, Interpretation
 from distill.errors import DistillError
@@ -368,6 +369,49 @@ def test_interpret_image_returns_structured_result(tmp_path: Path) -> None:
     assert result.verbatim_text == "Quarterly revenue"
     assert result.text_confidence == "high"
     assert result.frame_kind == "slide"
+
+
+def test_the_boundary_survives_from_the_frame_to_the_request_body(tmp_path: Path) -> None:
+    """R-28 asserted where the model actually reads it, not where it is built.
+
+    `vision_prompts` can delimit **extracted text** perfectly and the model
+    still receive none of it: the interpreter has to pass the frame's text to
+    the builder, and the request assembly has to carry the built prompt through
+    rather than replace it. Both links are checked here against one hostile
+    frame, because a boundary tested only at the builder is a boundary that
+    would survive `local_vision` dropping it.
+    """
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    payload = attack("frame")
+    sent: dict[str, str] = {}
+
+    def capture(
+        config: LocalVisionConfig,
+        image_path: Path,
+        prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[Interpretation, None]:
+        sent["prompt"] = prompt
+        return Interpretation(backend=config.backend, prompt_profile=prompt_profile), None
+
+    interpreter = FrameInterpreter(
+        LocalVisionConfig(), probe=_available_probe, try_interpret=capture
+    )
+    interpreter.interpret([_frame(1, image, extracted_text=payload)])
+
+    server = FakeRapidMlx(chat_content=_frame_json(verbatim_text="", text_confidence="none"))
+    _interpret_with_rapid_mlx(
+        LocalVisionConfig(), image, sent["prompt"], "technical", requestor=server
+    )
+    text = next(
+        part["text"]
+        for part in server.calls[0]["body"]["messages"][0]["content"]
+        if part.get("type") == "text"
+    )
+
+    assert_delimited(text, payload, SENTINEL)
 
 
 def test_interpret_image_retries_past_one_malformed_response(tmp_path: Path) -> None:

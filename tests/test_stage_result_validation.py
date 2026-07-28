@@ -41,8 +41,8 @@ from distill.bundle_store import (
     BundleRun,
     BundleStore,
     _read_regular_file,
-    _write_regular_file,
 )
+from distill.emit import EMITTER
 from distill.errors import DistillError
 from distill.options import DistillOptions
 from distill.pipeline import ProcessingRun
@@ -865,9 +865,9 @@ def test_the_stage_result_file_is_opened_in_a_way_that_cannot_be_redirected(
     a fifo swapped in answers `ENXIO` instead of making the run wait under its
     own lock for a reader that never comes.
 
-    Asked of the helpers directly, because the state check in front of them is
-    exactly what a race defeats: a test that went through it would be proving
-    the check, not the open.
+    Asked of the emitter and the reader directly, because the state check in
+    front of them is exactly what a race defeats: a test that went through it
+    would be proving the check, not the open.
     """
     outside = tmp_path / "co-tenant.json"
     outside.write_text("{}\n")
@@ -877,11 +877,11 @@ def test_the_stage_result_file_is_opened_in_a_way_that_cannot_be_redirected(
     os.mkfifo(fifo)
 
     with pytest.raises(OSError):
-        _write_regular_file(link, '{"payload": {}}')
+        EMITTER.emit(link, '{"payload": {}}')
     with pytest.raises(OSError):
         _read_regular_file(link)
     with pytest.raises(OSError):
-        _write_regular_file(fifo, '{"payload": {}}')
+        EMITTER.emit(fifo, '{"payload": {}}')
 
     assert outside.read_text() == "{}\n"
 

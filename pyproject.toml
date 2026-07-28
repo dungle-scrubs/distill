@@ -51,6 +51,11 @@ packages = ["src/distill"]
 
 [dependency-groups]
 dev = [
+    # The CommonMark parser the untrusted-data boundary tests read a render
+    # with. A hand-written scanner can only find the escapes its author thought
+    # of; a real parser decodes entity references, which is how the ampersand
+    # defect stayed invisible (R-27).
+    "markdown-it-py>=3.0.0",
     "pytest>=8.0.0",
     "pytest-cov>=5.0.0",
     "ruff>=0.8.0",

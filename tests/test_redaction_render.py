@@ -188,6 +188,15 @@ def test_render_interleaves_frame_and_transcript() -> None:
 
 
 def test_render_shows_visual_interpretation_adjacent_to_ocr() -> None:
+    """The reading sits above the image text it is a reading of, both delimited.
+
+    Adjacency is what this test is about and it is unchanged. What changed is
+    the form: R-26 puts every **interpretation** field inside a block it cannot
+    terminate, so the inline `- Summary: ...` bullets this used to pin are
+    gone - a bullet ended at the model's first newline, which is finding 5.
+    `tests/test_render_delimiting.py` is where that boundary is checked; here
+    the fields only have to still be there and still be in order.
+    """
     frame, _warnings = keyframe(extracted_text="Save").with_interpretation(
         Interpretation(
             visual_summary="A settings form",
@@ -199,10 +208,10 @@ def test_render_shows_visual_interpretation_adjacent_to_ocr() -> None:
     markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
 
     assert "Visual interpretation:" in markdown
-    assert "- Summary: A settings form" in markdown
-    assert "- Detected elements: save button" in markdown
+    assert "Summary:\n\n```untrusted-text\nA settings form\n```" in markdown
+    assert "Detected elements:\n\n```untrusted-text\nsave button\n```" in markdown
     assert markdown.index("Visual interpretation:") < markdown.index("OCR:")
-    assert "```text\nSave\n```" in markdown
+    assert "```untrusted-text\nSave\n```" in markdown
 
 
 def test_render_interleaves_frame_at_transcript_word_boundary() -> None:
@@ -318,7 +327,10 @@ def test_low_confidence_frame_renders_warning_marker_and_verbatim_block() -> Non
 
     assert "⚠ Low-confidence frame (ungrounded)" in markdown
     assert "treat the interpretation below as unverified" in markdown
-    assert "- Text confidence: none" in markdown
+    # The model's word about its own reading is the model's word: R-26 moved it
+    # out of the inline bullet this used to pin and into a delimited block. The
+    # marker above it is Distill's own assessment and stays document structure.
+    assert "Text confidence:\n\n```untrusted-text\nnone\n```" in markdown
 
 
 def test_grounded_frame_omits_warning_marker_and_shows_verbatim() -> None:
@@ -343,4 +355,6 @@ def test_grounded_frame_omits_warning_marker_and_shows_verbatim() -> None:
 
     assert "Low-confidence frame" not in markdown
     assert "Verbatim slide text:" in markdown
-    assert "```text\nWe're closer than you think\n```" in markdown
+    # Still fenced, and now tagged with the trust class the text has: verbatim
+    # text is the model's report of what a **keyframe** showed (R-26).
+    assert "```untrusted-text\nWe're closer than you think\n```" in markdown
