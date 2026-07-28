@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -369,6 +370,27 @@ def probe_duration(path: Path) -> tuple[float, list[WarningRecord]]:
 
 
 def ensure_duration_allowed(duration_sec: float, max_duration_sec: float) -> None:
+    """Refuse a **source** whose claimed duration is unusable or over the cap (R-47).
+
+    Two refusals, and they are not the same kind. The cap is the operator's
+    policy about a source that is genuinely too long. Usability is about the
+    number itself: a duration arrives from ffprobe, so it is data from outside
+    rather than operator error, and it is refused as `E_BAD_MEDIA` the way the
+    acquisition path refuses media it cannot use.
+
+    NaN is why this exists. It clears `> max_duration_sec` and it clears
+    `<= 0`, so the cap silently stopped existing and every window, interval and
+    percentage computed from the duration afterwards was NaN too.
+    """
+    if not math.isfinite(duration_sec) or duration_sec <= 0:
+        raise DistillError(
+            "E_BAD_MEDIA",
+            "source",
+            "source reports an unusable duration",
+            # Text, because a fatal error is published as JSON and a bare NaN
+            # is not JSON a strict reader will parse.
+            {"duration_sec": repr(duration_sec)},
+        )
     if duration_sec > max_duration_sec:
         raise DistillError(
             "E_DURATION_CAP",
@@ -899,9 +921,12 @@ def _probed_duration_sec(probe: Any) -> float:
     if not isinstance(value, (str, int, float)):
         return 0.0
     try:
-        return float(value)
+        duration = float(value)
     except ValueError:
         return 0.0
+    # A header claiming NaN or inf is a container without a playable duration,
+    # and reporting it as one is how it passed `duration_sec <= 0` (R-47).
+    return duration if math.isfinite(duration) else 0.0
 
 
 def validate_media_file(path: Path) -> list[WarningRecord]:

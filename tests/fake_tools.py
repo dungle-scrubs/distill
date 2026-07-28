@@ -176,6 +176,17 @@ sys.stderr.write("x" * ({cap_bytes} + 1024))
 """
 
 
+# A container whose header claims a duration that is not a number. ffprobe
+# reports what the header says, so `nan` reaches Distill as data rather than as
+# a probe failure.
+FAKE_FFPROBE_NAN_DURATION = """
+import json, sys
+
+sys.stdout.write(
+    json.dumps({"streams": [{"codec_type": "video"}], "format": {"duration": "nan"}})
+)
+"""
+
 # A container ffprobe can open and read a video stream from, but whose duration
 # it cannot determine - the shape of a transfer that stopped before the index
 # was written.

@@ -723,3 +723,219 @@ def test_an_absent_ytdlp_ends_the_run_even_on_the_best_effort_path(
     assert failure.value.code == "E_MISSING_TOOL"
     assert "yt-dlp" in failure.value.message
     assert failure.value.details["requirement"] == "required"
+
+
+def test_a_nan_max_duration_is_refused_rather_than_silencing_the_cap() -> None:
+    """FAILS FIRST (finding 18, R-47): NaN cleared `<= 0` and then never compared true.
+
+    A NaN is not merely a strange cap, it is a cap that cannot fire: every
+    comparison against it is false, so `duration > max_duration_sec` answers no
+    for a source of any length and the limit the operator asked for silently
+    stops existing. It is refused at the boundary, where the value still has a
+    name to report.
+    """
+    duration_sec, cap = 7200.0, float("nan")
+    assert not (duration_sec > cap), "a NaN cap silently answers 'not over the limit'"
+
+    with pytest.raises(DistillError) as exc:
+        DistillOptions.from_args({"max_duration_sec": float("nan")})
+
+    assert exc.value.code == "E_BAD_OPTIONS"
+    assert "max_duration_sec" in exc.value.message
+
+
+def test_a_negative_max_items_is_refused_rather_than_slicing_from_the_end(
+    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (nit, R-03): `items[:-1]` drops the last item and calls it a limit.
+
+    `max_items` says how many items a batch may take. Negative, it became a
+    negative slice - every item but the last few, taken from the wrong end -
+    and the batch reported the count it produced as though the limit had been
+    honoured.
+
+    The playlist half also pins *when*: the refusal lands before yt-dlp is
+    reached, so an unusable option is not reported as a missing tool.
+    """
+    from distill.pipeline import process_video_directory, process_youtube_playlist
+
+    assert ["a", "b", "c"][:-1] == ["a", "b"], "what a negative max_items meant"
+    directory = tmp_path / "videos"
+    directory.mkdir()
+
+    with pytest.raises(DistillError) as batch_exc:
+        process_video_directory(
+            {"path": str(directory), "output_dir": str(tmp_path / "cache"), "max_items": -1}
+        )
+
+    assert batch_exc.value.code == "E_BAD_OPTIONS"
+    assert "max_items" in batch_exc.value.message
+
+    with pytest.raises(DistillError) as playlist_exc:
+        process_youtube_playlist(
+            {
+                "url": "https://www.youtube.com/playlist?list=PLabc",
+                "output_dir": str(tmp_path / "cache"),
+                "max_items": -1,
+            }
+        )
+
+    assert playlist_exc.value.code == "E_BAD_OPTIONS"
+    assert "max_items" in playlist_exc.value.message
+
+
+def test_an_infinite_numeric_option_is_refused() -> None:
+    """R-47: `inf` is finite-looking to `> 0` and means nothing as a limit.
+
+    An infinite cap is the NaN failure with the sign flipped: the comparison
+    answers, and always answers "under the limit", so the run is unbounded
+    while reporting a bound. An infinite window or timeout is the same claim
+    about time nobody has.
+    """
+    for name in ("max_duration_sec", "max_static_window_sec", "local_vision_timeout_sec"):
+        for bad in (float("inf"), float("-inf")):
+            with pytest.raises(DistillError) as exc:
+                DistillOptions.from_args({name: bad})
+            assert exc.value.code == "E_BAD_OPTIONS"
+            assert name in exc.value.message
+
+
+def test_a_zero_or_negative_duration_option_is_refused() -> None:
+    """R-47: a limit of zero seconds admits no source, and a negative one no run.
+
+    `max_static_window_sec` is already pinned non-positive by
+    `test_non_positive_max_static_window_is_rejected`; this states the same for
+    the run's duration cap and the vision timeout, which had no floor at all.
+    """
+    for name in ("max_duration_sec", "local_vision_timeout_sec"):
+        for bad in (0.0, -1.0):
+            with pytest.raises(DistillError) as exc:
+                DistillOptions.from_args({name: bad})
+            assert exc.value.code == "E_BAD_OPTIONS"
+            assert name in exc.value.message
+
+
+def test_every_numeric_option_declares_a_domain_and_refuses_a_non_finite_value() -> None:
+    """R-47: finiteness is checked for the options that exist, not a list of them.
+
+    The fields are read off `DistillOptions` rather than spelled out, so a
+    numeric option added later is validated by construction: it either declares
+    what values it may take or this test names it.
+    """
+    from dataclasses import fields
+
+    from distill.options import NUMERIC_OPTION_DOMAINS
+
+    numeric = [field.name for field in fields(DistillOptions) if field.type in {"int", "float"}]
+    assert numeric, "the options dataclass has numeric fields to validate"
+
+    for name in numeric:
+        assert name in NUMERIC_OPTION_DOMAINS, f"{name} declares no numeric domain"
+        for bad in (float("nan"), float("inf")):
+            with pytest.raises(DistillError) as exc:
+                DistillOptions.from_args({name: bad})
+            assert exc.value.code == "E_BAD_OPTIONS", name
+            assert name in exc.value.message
+
+
+def test_a_numeric_option_refuses_a_value_that_is_not_a_number() -> None:
+    """R-47: one error shape for a bad option, whatever made it bad.
+
+    `int("lots")` and `int(float("nan"))` both raise, and neither raises
+    anything the CLI reports as an option problem: they escaped as a
+    `ValueError` traceback. A boolean is refused for the reason `PrunePolicy`
+    refuses one - `True` meaning 1 is a coincidence, not an instruction.
+    """
+    for bad in ("lots", None, True):
+        with pytest.raises(DistillError) as exc:
+            DistillOptions.from_args({"max_keyframes": bad})
+        assert exc.value.code == "E_BAD_OPTIONS"
+        assert "max_keyframes" in exc.value.message
+
+
+def test_max_keyframes_must_be_a_whole_number_of_frames() -> None:
+    """R-03: keyframes are counted, so a fractional count is refused, not floored.
+
+    `int(2.7)` silently answered 2. Truncating an operator's number is the same
+    class of quiet reinterpretation this milestone removes, and a value that is
+    already whole - `80`, or `80.0` from JSON - still passes.
+    """
+    with pytest.raises(DistillError) as exc:
+        DistillOptions.from_args({"max_keyframes": 2.7})
+    assert exc.value.code == "E_BAD_OPTIONS"
+    assert "max_keyframes" in exc.value.message
+
+    assert DistillOptions.from_args({"max_keyframes": 80.0}).max_keyframes == 80
+    assert DistillOptions.from_args({"max_keyframes": "80"}).max_keyframes == 80
+
+
+def test_the_spacing_floor_is_the_one_numeric_option_zero_still_means_something_to() -> None:
+    """R-47: zero is rejected per option's meaning, not everywhere.
+
+    `min_interval_sec` is the minimum gap between two **keyframes**; zero means
+    no gap is required, which is a spacing policy and not a broken one - the
+    production floor was already `< 0` rather than `<= 0`. Every other numeric
+    option counts something a run needs at least one of.
+    """
+    from distill.options import NUMERIC_OPTION_DOMAINS
+
+    assert DistillOptions.from_args({"min_interval_sec": 0.0}).min_interval_sec == 0.0
+    with pytest.raises(DistillError) as exc:
+        DistillOptions.from_args({"min_interval_sec": -0.5})
+    assert exc.value.code == "E_BAD_OPTIONS"
+
+    zero_admitted = [name for name, domain in NUMERIC_OPTION_DOMAINS.items() if domain.admits_zero]
+    assert zero_admitted == ["min_interval_sec"]
+
+
+def test_validating_numbers_leaves_a_valid_option_tuple_hashing_as_before() -> None:
+    """R-47: validation refuses values, it does not rewrite the ones it admits.
+
+    The **options hash** is sha256 over JSON, where `80` and `80.0` are
+    different text and therefore a different **bundle key**. A validator that
+    returned a float for a counted option would silently orphan every published
+    **bundle**, so the payload is compared as the JSON it is hashed as.
+    """
+    from distill.local_vision import (
+        DEFAULT_LOCAL_VISION_BACKEND,
+        DEFAULT_LOCAL_VISION_BASE_URL,
+        DEFAULT_LOCAL_VISION_MODEL,
+        DEFAULT_TIMEOUT_SEC,
+    )
+    from distill.version import PIPELINE_VERSION
+
+    options = DistillOptions.from_args(
+        {"max_keyframes": 80, "min_interval_sec": 4, "max_duration_sec": 7200}
+    )
+    expected = {
+        "caption_frames": True,
+        "local_vision_allow_remote_endpoint": False,
+        "local_vision_backend": DEFAULT_LOCAL_VISION_BACKEND,
+        "local_vision_base_url": DEFAULT_LOCAL_VISION_BASE_URL,
+        "local_vision_model": DEFAULT_LOCAL_VISION_MODEL,
+        "local_vision_timeout_sec": DEFAULT_TIMEOUT_SEC,
+        "max_duration_sec": 7200.0,
+        "max_keyframes": 80,
+        "max_static_window_sec": 90.0,
+        "min_interval_sec": 4.0,
+        "ocr": True,
+        "ocr_language": "eng",
+        "ocr_preprocess": True,
+        "pipeline_version": PIPELINE_VERSION,
+        "redact_secrets": True,
+        "vad_filter": True,
+        "whisper_language": "en",
+        "whisper_model": "small",
+    }
+    payload = options.cache_payload("youtube")
+
+    # Spelled as the JSON that is hashed: `80` and `80.0` compare equal in
+    # Python and hash differently here.
+    assert json.dumps(payload["max_keyframes"]) == "80"
+    assert json.dumps(payload["min_interval_sec"]) == "4.0"
+    assert json.dumps(payload["max_duration_sec"]) == "7200.0"
+    assert json.dumps(payload, sort_keys=True) == json.dumps(expected, sort_keys=True)
+    assert options.opts_hash("youtube") == hashlib.sha256(
+        json.dumps(expected, sort_keys=True).encode()
+    ).hexdigest()

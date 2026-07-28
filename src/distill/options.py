@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -65,6 +66,103 @@ OPTION_SPECS: tuple[OptionSpec, ...] = (
     OptionSpec("resume_partial", True, bool, boolean=True, cache_key=False),
 )
 OPTION_DEFAULTS = {spec.name: spec.default for spec in OPTION_SPECS}
+
+
+@dataclass(frozen=True)
+class NumericDomain:
+    """The values one numeric option may take (R-03, R-47).
+
+    Every numeric option is a quantity of something a run needs at least some
+    of - frames, seconds, items - so the floor is zero for all of them and the
+    only questions left are whether zero itself is a policy and whether the
+    quantity is counted or measured. `admits_zero` answers the first,
+    `integral` the second. Nothing here is infinite or unknown: a NaN limit
+    cannot fire at all and an infinite one is an unbounded run reporting a
+    bound.
+    """
+
+    integral: bool = False
+    admits_zero: bool = False
+
+
+NUMERIC_OPTION_DOMAINS: dict[str, NumericDomain] = {
+    "max_keyframes": NumericDomain(integral=True),
+    # Zero is a spacing policy, not a broken one: it means no gap is required
+    # between two keyframes. It is the only numeric option zero means something
+    # to, which is why the domain is per option rather than one global floor.
+    "min_interval_sec": NumericDomain(admits_zero=True),
+    "max_duration_sec": NumericDomain(),
+    "max_static_window_sec": NumericDomain(),
+    "local_vision_timeout_sec": NumericDomain(),
+    # Not a `DistillOptions` field - `max_items` bounds a batch rather than a
+    # bundle, so it is not part of the options hash - but it is an operator's
+    # number arriving at the same boundary and it is refused the same way.
+    "max_items": NumericDomain(integral=True),
+}
+"""Every numeric option a run is configured with, and the values each admits.
+
+A table rather than a check per call site, because the check that is written
+where a value is *used* is the one that is missing at the second use: the
+duration cap was validated in `from_args` and the batch limit nowhere, and
+`max_items=-1` became a slice taken from the wrong end.
+
+Retention's numbers - `keep_generations` and `max_age_days` - are not here.
+They belong to `PrunePolicy`, which validates them where the policy is built
+(R-03) and reports them at the `prune` stage rather than as run options.
+"""
+
+
+def _bad_number(name: str, value: Any, domain: NumericDomain) -> DistillError:
+    quantity = "a whole number" if domain.integral else "a finite number"
+    floor = "0 or greater" if domain.admits_zero else "greater than 0"
+    return DistillError(
+        "E_BAD_OPTIONS",
+        "options",
+        f"{name} must be {quantity} {floor}",
+        # `repr`, because the value that provoked this may be a NaN, and a
+        # fatal error is published as JSON that a strict reader has to parse.
+        {name: repr(value)},
+    )
+
+
+def validated_number(name: str, value: Any) -> int | float:
+    """The value `name` may take, or `E_BAD_OPTIONS` naming what was wrong.
+
+    Rejection happens here, at the boundary, because a number that is refused
+    is still attached to the option it came from; three stages later a NaN is
+    just a comparison that answers no. Booleans are refused for the reason
+    `PrunePolicy` refuses them - `True` meaning 1 is a coincidence rather than
+    an instruction - and a value that is not a number at all is refused as the
+    same option error rather than escaping as a `ValueError`.
+
+    It does not decide what any option *means*; `NUMERIC_OPTION_DOMAINS` owns
+    that, and an option missing from it is a programming error, not an input.
+    """
+    domain = NUMERIC_OPTION_DOMAINS[name]
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise _bad_number(name, value, domain)
+    try:
+        number = float(value)
+    except ValueError:
+        raise _bad_number(name, value, domain) from None
+    if not math.isfinite(number):
+        raise _bad_number(name, value, domain)
+    if number < 0 or (number == 0 and not domain.admits_zero):
+        raise _bad_number(name, value, domain)
+    if domain.integral:
+        # `int(2.7)` answered 2. Truncating an operator's number is the quiet
+        # reinterpretation this validation exists to remove.
+        if number != int(number):
+            raise _bad_number(name, value, domain)
+        return int(number)
+    return number
+
+
+def validated_count(name: str, value: Any) -> int:
+    """`validated_number` for an option counted in whole units, typed as one."""
+    return int(validated_number(name, value))
+
+
 CACHE_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.cache_key)
 PROCESSING_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.name != "cache_mode")
 LOCAL_VISION_OPTION_NAMES = (
@@ -140,6 +238,10 @@ class DistillOptions:
             raw_value = args.get(spec.name, default)
             if spec.boolean:
                 values[spec.name] = _coerce_bool(raw_value, bool(default))
+            elif spec.name in NUMERIC_OPTION_DOMAINS:
+                # Before the `None` branch below: `None` is a legitimate value
+                # for `output_dir` and an unusable one for a quantity.
+                values[spec.name] = validated_number(spec.name, raw_value)
             elif raw_value is None:
                 values[spec.name] = None
             else:
@@ -163,7 +265,14 @@ class DistillOptions:
             local_vision_backend=local_vision.backend,
             local_vision_model=local_vision.model,
             local_vision_base_url=local_vision.base_url,
-            local_vision_timeout_sec=local_vision.timeout_sec,
+            # The raw argument when the caller supplied one, because the config
+            # layer's coercion answers an unusable number with the default -
+            # reasonable for a config file, and silence where an operator just
+            # named a timeout on the command line.
+            local_vision_timeout_sec=validated_number(
+                "local_vision_timeout_sec",
+                args.get("local_vision_timeout_sec", local_vision.timeout_sec),
+            ),
             local_vision_allow_remote_endpoint=local_vision.allow_remote_endpoint,
             job_id=str(values["job_id"] or f"distill-{uuid4().hex}"),
             resume_partial=values["resume_partial"],
@@ -175,16 +284,9 @@ class DistillOptions:
                 "cache_mode must be 'fingerprint' or 'content'",
                 {"cache_mode": options.cache_mode},
             )
-        if options.max_keyframes < 1:
-            raise DistillError("E_BAD_OPTIONS", "options", "max_keyframes must be positive")
-        if options.min_interval_sec < 0:
-            raise DistillError("E_BAD_OPTIONS", "options", "min_interval_sec must be >= 0")
-        if options.max_duration_sec <= 0:
-            raise DistillError("E_BAD_OPTIONS", "options", "max_duration_sec must be positive")
-        if options.max_static_window_sec <= 0:
-            raise DistillError(
-                "E_BAD_OPTIONS", "options", "max_static_window_sec must be positive"
-            )
+        # Every numeric floor is `NUMERIC_OPTION_DOMAINS`, applied above as the
+        # value is read. A check here would run after construction, which is
+        # after `local_vision_config_from_args` has already spent the value.
         if options.local_vision_backend != "rapid-mlx":
             raise DistillError(
                 "E_BAD_OPTIONS",
