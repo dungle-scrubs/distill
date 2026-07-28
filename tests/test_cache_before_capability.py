@@ -286,7 +286,36 @@ def test_a_playlist_attached_url_is_not_served_from_the_video_ids_bundle(
     assert failure.value.details["tool"] == "yt-dlp"
 
 
-def test_a_manifest_duration_over_the_cap_is_refused_rather_than_served(
+def test_a_youtube_manifest_duration_over_the_cap_is_refused_rather_than_served(
+    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    tmp_path: Path,
+) -> None:
+    """The same refusal on the path the cache reorder actually added.
+
+    The local hit re-applies the cap in a branch of its own; the YouTube hit
+    read the manifest's number and returned. So a bundle claiming 99999s was
+    handed back under `--max-duration-sec 5`, and the same claim on the same
+    run's local path was `E_DURATION_CAP`: one operator policy, two answers,
+    decided by which kind of **source** the bundle happened to be for.
+    """
+    args = youtube_args(tmp_path, max_duration_sec=5.0)
+    options = DistillOptions.from_args(args)
+    bundle_key = source_hash(
+        hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
+    )
+    write_published_bundle(
+        tmp_path / "cache", bundle_key, source_type="youtube", duration_sec=99999.0
+    )
+
+    with pytest.raises(DistillError) as failure:
+        distill_session.process_youtube_video(dict(args))
+
+    assert failure.value.code == "E_DURATION_CAP"
+    assert failure.value.stage == "source"
+    assert failure.value.details["duration_sec"] == 99999.0
+
+
+def test_a_local_manifest_duration_over_the_cap_is_refused_rather_than_served(
     fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
     tmp_path: Path,
 ) -> None:

@@ -1461,6 +1461,15 @@ class YouTubeSourceProvider:
         naming a generation retention deleted is a promise, not evidence, and
         reusing the media path it records would resolve a source for a bundle
         nobody can serve (D-041).
+
+        The duration the manifest records is then put through the same cap the
+        local hit applies, for the reason `LocalSourceProvider.resolve` gives:
+        `max_duration_sec` is in the **options hash**, so a bundle under this
+        **bundle key** was published by a run that accepted its duration - but
+        a manifest is a document another process wrote, and R-23's premise is
+        that its claims are input rather than facts. Skipping the probe is what
+        a cache hit is entitled to; skipping the operator's policy is not, and
+        one policy cannot answer differently by kind of **source**.
         """
         if request.output_root is None:
             raise DistillError("E_BAD_OUTPUT_DIR", "youtube", "output_root is required")
@@ -1474,6 +1483,7 @@ class YouTubeSourceProvider:
         resolved_path = manifest.get("source_resolved_path")
         if duration is None or not isinstance(resolved_path, str):
             return None
+        ensure_duration_allowed(duration, request.options.max_duration_sec)
         return SourceInfo(
             source_type="youtube",
             resolved_path=Path(resolved_path),
