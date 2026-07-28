@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import struct
 import urllib.error
 import zlib
@@ -341,13 +340,6 @@ def test_local_vision_diagnostics_describe_rapid_mlx(
     assert "release_warning" not in diagnostics
 
 
-def _a_port_nothing_is_listening_on() -> int:
-    """A loopback port bound and released, so connecting to it is refused at once."""
-    with socket.socket() as bound:
-        bound.bind(("127.0.0.1", 0))
-        return int(bound.getsockname()[1])
-
-
 @pytest.mark.parametrize(
     "supplied",
     [
@@ -360,40 +352,36 @@ def _a_port_nothing_is_listening_on() -> int:
 )
 def test_a_vision_timeout_no_socket_can_take_is_answered_by_the_default(
     supplied: object,
+    tmp_path: Path,
 ) -> None:
-    """`--local-vision-timeout-sec inf` ended in an uncaught OverflowError.
+    """A config *file* naming an unusable timeout gets the default, not a refusal.
 
     `_coerce_float` is the config layer's door, and its whole contract is to
     answer an unusable number with the default rather than refuse it - which is
-    what a config *file* should do. It admitted `inf` because `inf > 0`, so the
-    number travelled all the way into `socket.settimeout` and came back as
-    `OverflowError: timestamp out of range for platform time_t` - a traceback
-    from the stdlib, on a command whose entire job is to report a diagnosis.
+    what a config file should do, since a file nobody is looking at should not
+    stop a run. It admitted `inf` because `inf > 0`, so the number travelled all
+    the way into `socket.settimeout` and came back as `OverflowError: timestamp
+    out of range for platform time_t`.
 
     `inf` is not the only number a socket cannot take, which is why the bound
     here is the socket's own: a timeout is nanoseconds in a signed 64-bit
     integer, so `1e300` is finite, positive, and just as much an
     `OverflowError`. `nan` and `true` are the same door from the other side: a
     NaN timeout is a comparison that always answers no, and a config file saying
-    `"timeout_sec": true` is not a one-second timeout. `DistillOptions.from_args`
-    refuses the non-finite three outright, because the run path validates the
-    raw argument rather than coercing it; `1e300` it still admits, and that is
-    an uncaught traceback M9.1 owns rather than something this door can fix for
-    it. This door coerces, and coercing has to reach a number a socket can take.
+    `"timeout_sec": true` is not a one-second timeout.
 
-    The probe is aimed at a port nothing is listening on, so what comes back is
-    the typed unavailability every other unreachable endpoint produces.
+    Driven through the file, deliberately. The *override* door - the flag an
+    operator typed - refuses these instead of coercing them, because a command
+    that reports what your arguments resolve to must not answer a rejected
+    argument by printing the default as though it were in force. That half is
+    `test_a_diagnostics_timeout_outside_the_domain_is_refused_like_a_run_path`,
+    and the two doors are the recorded scoping rather than an inconsistency.
     """
-    diagnostics = local_vision_diagnostics(
-        {
-            "local_vision_timeout_sec": supplied,
-            "local_vision_base_url": f"http://127.0.0.1:{_a_port_nothing_is_listening_on()}/v1",
-        }
-    )
+    (tmp_path / "distill.local-vision.json").write_text(json.dumps({"timeout_sec": supplied}))
 
-    assert diagnostics["config"]["timeout_sec"] == DEFAULT_TIMEOUT_SEC
-    assert diagnostics["probe"]["available"] is False
-    assert diagnostics["probe"]["code"] == "local_vision_rapid_mlx_unavailable"
+    config = load_local_vision_config(tmp_path)
+
+    assert config.timeout_sec == DEFAULT_TIMEOUT_SEC
 
 
 def test_interpret_image_returns_structured_result(tmp_path: Path) -> None:

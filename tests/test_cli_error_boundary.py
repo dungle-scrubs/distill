@@ -33,6 +33,7 @@ import pytest
 
 from distill.cli import build_parser, main
 from distill.errors import DistillError
+from distill.local_vision import MAX_SOCKET_TIMEOUT_SEC
 
 APP = Path(__file__).resolve().parents[1]
 
@@ -642,6 +643,68 @@ def test_details_json_cannot_write_still_reach_the_operator_as_a_record(
     payload = error_object(capsys)
     assert payload["code"] == "E_BAD_MEDIA"
     assert "clip.mp4" in payload["details"]["path"]
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    ["-5", "0", "nan", "1e300", repr(MAX_SOCKET_TIMEOUT_SEC)],
+    ids=["negative", "zero", "not-a-number", "over-ceiling", "at-ceiling"],
+)
+def test_a_diagnostics_timeout_outside_the_domain_is_refused_like_a_run_path(
+    timeout: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FAILS FIRST: the diagnostics door coerced what the run path refuses.
+
+    Two doors, one option, two answers. `--local-vision-timeout-sec -5` on
+    `process-local-video` is `E_BAD_OPTIONS` naming the option, which is what
+    the README says happens to a value outside a numeric domain. The same flag
+    on `local-vision-diagnostics` went straight to the config layer, whose
+    contract is to *coerce* - so `-5`, `0`, `nan` and `1e300` all printed
+    `timeout_sec: 30.0` and exited 0, telling an operator checking their vision
+    settings that the setting they just named is in force.
+
+    Coercion is right for a config file, which a run should not stop for, and
+    wrong for a number an operator typed at a diagnostic command whose whole
+    purpose is to report what their arguments resolve to.
+    """
+    with pytest.raises(SystemExit) as exit_info:
+        main(["local-vision-diagnostics", "--local-vision-timeout-sec", timeout])
+
+    assert exit_info.value.code == 2
+    payload = error_object(capsys)
+    assert payload["code"] == "E_BAD_OPTIONS"
+    assert payload["stage"] == "options"
+    assert "local_vision_timeout_sec" in payload["details"]
+
+
+def test_a_diagnostics_timeout_inside_the_domain_is_still_honoured(
+    capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The refusal is the domain's edge, not the flag's."""
+    main(["local-vision-diagnostics", "--local-vision-timeout-sec", "12.5"])
+
+    assert json.loads(capsys.readouterr().out)["config"]["timeout_sec"] == 12.5
+
+
+def test_an_output_dir_that_is_not_a_path_is_refused_as_a_bad_option(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FAILS FIRST: `Path(5)` is a `TypeError`, reported as `E_INTERNAL`.
+
+    `--args` is a JSON document, so every argument arrives with a type the
+    operator chose. A wrongly typed value inside a well-formed object is a typo
+    like any other and gets the answer `PrunePolicy` already gives one - the
+    option named, at the boundary that reads it - rather than the catch-all's
+    "an unexpected error", which sends the operator looking for a defect in
+    Distill.
+    """
+    with pytest.raises(SystemExit) as exit_info:
+        main(["call-tool", "cache_doctor", "--args", json.dumps({"output_dir": 5})])
+
+    assert exit_info.value.code == 2
+    payload = error_object(capsys)
+    assert payload["code"] == "E_BAD_OPTIONS"
+    assert payload["details"]["output_dir"] == "5"
 
 
 def test_the_error_object_names_the_exception_without_printing_its_stack(

@@ -41,7 +41,7 @@ from .local_vision import (
     try_interpret_image,
 )
 from .ocr import ocr_frames
-from .options import DistillOptions, validated_count
+from .options import DistillOptions, validated_count, validated_number
 from .progress import (
     TERMINAL_PROGRESS_STATUSES,
     OverallProgressAggregator,
@@ -1217,7 +1217,26 @@ def run_timeout_probe(probe_ms: int) -> dict[str, Any]:
 
 
 def local_vision_diagnostics(args: dict[str, Any] | None = None) -> dict[str, Any]:
-    config = local_vision_config_from_args(args or {})
+    """What the configured vision endpoint resolves to, and whether it answers.
+
+    A timeout named *here* is validated before the config layer sees it, on the
+    same terms as the run path and against the same domain. The config layer's
+    contract is to coerce - a config file naming an unusable timeout should not
+    stop a run - and that is the wrong contract for a number an operator just
+    typed at the command whose whole purpose is to report what their arguments
+    resolve to: `-5`, `0`, `nan` and `1e300` all printed the default and exited
+    0, which told the operator their setting was in force.
+
+    Only the override. A value read from a config file still takes the config
+    layer's answer, because that scoping is the recorded decision and not an
+    oversight.
+    """
+    args = dict(args or {})
+    if "local_vision_timeout_sec" in args:
+        args["local_vision_timeout_sec"] = validated_number(
+            "local_vision_timeout_sec", args["local_vision_timeout_sec"]
+        )
+    config = local_vision_config_from_args(args)
     probe = probe_local_vision(config)
     return {
         "config": config.public_dict(),

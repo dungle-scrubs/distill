@@ -735,7 +735,22 @@ def validate_output_root(output_dir: str | None, *, create: bool = True) -> Path
 
     The root is resolved first, so confinement is decided on the real path a
     symlinked argument points at rather than on the name given.
+
+    A value that is not a path *at all* is refused before any of that, as a bad
+    option rather than as a bad output directory: the other refusals here are
+    policy about a location Distill understood, and this one is an argument it
+    could not read. `--args` is a JSON document, so every tool argument arrives
+    with a type the operator chose, and `{"output_dir": 5}` reached `Path` as an
+    `int` and left as a `TypeError` - an operator's typo diagnosed as an
+    internal defect, with the option's name thrown away.
     """
+    if output_dir is not None and not isinstance(output_dir, str):
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "options",
+            "output_dir must be a path written as text",
+            {"output_dir": repr(output_dir)},
+        )
     root = Path(output_dir).expanduser() if output_dir else Path.home() / ".cache" / "distill"
     root = root.resolve()
     home = Path.home().resolve()
