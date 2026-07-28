@@ -231,24 +231,25 @@ class TextEmitter:
         longest = max((len(run.group()) for run in _BACKTICK_RUN_RE.finditer(text)), default=0)
         return "`" * max(MIN_FENCE_BACKTICKS, longest + 1)
 
-    def delimit(self, text: str, *, label: str = UNTRUSTED_TEXT_LABEL) -> list[str]:
-        """`text` as a fenced block it cannot terminate, tagged with its trust class.
+    def delimit(self, text: str) -> list[str]:
+        """`text` as a fenced block it cannot terminate, tagged as **extracted text**.
 
         Lines rather than a string because a **render** is assembled as lines,
         and the caller decides what surrounds the block.
 
-        The label is written as the block's info string, which is where a
-        reader - person or model - is told what it is about to read. A label
-        holding a backtick would not be an info string at all, so it is refused
-        rather than sanitized: the labels are Distill's own words, and one that
-        cannot be written is a mistake in this module, not input to defend
-        against.
+        The tag is not a parameter. A caller able to choose it is a caller able
+        to label attacker-chosen text as something else, and there is nothing
+        for the other value to be: text Distill wrote needs no block, and text
+        it did not write is all one trust class.
+
+        Line endings are normalized before the fence is chosen, because the
+        fence has to be measured against the lines the block will actually
+        hold: a `\\r\\n` left in place makes the content one line here and two
+        to a reader (CommonMark ends a line on `\\r`, `\\n` or `\\r\\n`).
         """
-        if "`" in label:
-            raise ValueError(f"a fenced block's info string cannot hold a backtick: {label!r}")
         body = text.replace("\r\n", "\n").replace("\r", "\n")
         fence = self.fence_for(body)
-        return [f"{fence}{label}", *body.split("\n"), fence]
+        return [f"{fence}{UNTRUSTED_TEXT_LABEL}", *body.split("\n"), fence]
 
     def link_label(self, text: str) -> str:
         """`text` escaped so it cannot end the link label holding it (R-27).

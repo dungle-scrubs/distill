@@ -53,11 +53,18 @@ class FencedBlock:
 def _scan(markdown: str) -> tuple[list[FencedBlock], list[str]]:
     """Split `markdown` into the blocks the render opened and everything else.
 
-    A block counts only when the render opened it and tagged it - a fence the
-    *content* opened is not a delimiter, it is a payload that got loose, and
-    counting it would let the worst failure hide the evidence of itself: an
-    undelimited line beginning with three backticks swallows the rest of the
-    document, and a check that honoured it would call that quoted.
+    A block counts only when the render opened it, tagged it, and closed it.
+    Two failures would otherwise hide themselves from this check:
+
+    A fence the *content* opened is not a delimiter, it is a payload that got
+    loose - an undelimited line beginning with three backticks swallows the
+    rest of the document, and a parser that honoured it would call that quoted.
+
+    A block the render never closed is not a block either. Its "body" would run
+    to the end of the document, so every later payload would appear to be
+    inside it, and an assertion that the payload is delimited would pass
+    because the delimiter failed. Unclosed lines go back to the structure they
+    are in fact part of.
 
     Within a block the closing rule is CommonMark's own - a run of backticks at
     least as long as the opener, carrying no info string - because that is what
@@ -74,18 +81,22 @@ def _scan(markdown: str) -> tuple[list[FencedBlock], list[str]]:
             index += 1
             continue
         fence = opening.group(1)
+        opened_at = index
         body: list[str] = []
         index += 1
+        closed = False
         while index < len(lines):
             closing = FENCE_CLOSE_RE.match(lines[index])
             if closing is not None and len(closing.group(1)) >= len(fence):
                 index += 1
+                closed = True
                 break
             body.append(lines[index])
             index += 1
-        blocks.append(
-            FencedBlock(info=UNTRUSTED_TEXT_LABEL, body="\n".join(body), fence=fence)
-        )
+        if not closed:
+            structure.extend(lines[opened_at:])
+            break
+        blocks.append(FencedBlock(info=UNTRUSTED_TEXT_LABEL, body="\n".join(body), fence=fence))
     return blocks, structure
 
 
@@ -278,6 +289,57 @@ def test_verbatim_text_is_delimited() -> None:
     markdown = render(frames=[frame_reading(read(verbatim_text=attack("verbatim")))])
 
     assert_delimited(markdown, SENTINEL, "# verbatim")
+
+
+def test_the_low_confidence_banner_is_bounded_to_one_line() -> None:
+    """The banner is Distill's own voice, and it is held to being one line.
+
+    A **grounding** is Distill's assessment and its level and reason are
+    literals in `grounding.py`, so the banner is not delimited - the render is
+    speaking. But a `GroundingAssessment` rebuilt from a document takes what the
+    document held, and "another module only ever writes literals here" is a
+    claim about that module rather than a property of this text. Folding the
+    banner onto one line costs nothing for the literals and leaves a reason
+    that grew a line ending unable to continue as document structure.
+    """
+    frame, _warnings = keyframe().with_interpretation(
+        read(visual_summary="A dark slide"),
+        grounding={
+            "level": "ungrounded",
+            "text_overlap": None,
+            "reason": f"no readable text\n\n# grounding\n\n{SENTINEL}",
+        },
+    )
+    markdown = render(frames=[frame])
+    banner = next(
+        line for line in outside_fences(markdown).split("\n") if "Low-confidence frame" in line
+    )
+
+    assert SENTINEL in banner
+    assert not any(
+        line.lstrip().startswith("# grounding") for line in outside_fences(markdown).split("\n")
+    )
+
+
+def test_the_banner_names_a_level_only_when_it_is_one() -> None:
+    """A `level` this codebase does not define is not repeated as though it were one.
+
+    `GroundingAssessment.from_document` passes an unrecognized level through
+    deliberately - anything but `grounded` reads as low confidence - so the
+    banner says low confidence for it without quoting the string back.
+    """
+    frame, _warnings = keyframe().with_interpretation(
+        read(visual_summary="A dark slide"),
+        grounding={
+            "level": f"weak): {SENTINEL} (",
+            "text_overlap": None,
+            "reason": "no readable text",
+        },
+    )
+    markdown = render(frames=[frame])
+
+    assert "Low-confidence frame (low):" in markdown
+    assert SENTINEL not in markdown
 
 
 # --- R-26: the transcript ---------------------------------------------------

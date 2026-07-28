@@ -40,10 +40,21 @@ from typing import Any
 from .artifacts import Carrier, FrameArtifact, Interpretation, Transcript, serialize
 from .emit import EMITTER
 from .errors import DistillError
-from .grounding import GroundingAssessment
+from .grounding import GROUNDED, UNGROUNDED, WEAK, GroundingAssessment
 from .links import RelatedLink
 
 MIN_TRANSCRIPT_CHARS = 3
+
+GROUNDING_LEVELS = frozenset({GROUNDED, WEAK, UNGROUNDED})
+"""The levels this document is willing to print as a level.
+
+`GroundingAssessment.from_document` passes an unrecognized level through on
+purpose - anything that is not `grounded` reads as low confidence, which is the
+answer that does not vouch for text nobody checked - so what arrives here is not
+guaranteed to be one of `grounding.py`'s words. The banner still says low
+confidence for it; it just does not repeat the string as though it named a
+level.
+"""
 
 UNTRUSTED_DATA_PREAMBLE = (
     "> **Untrusted data.** Most of what follows was chosen by whoever produced",
@@ -299,14 +310,29 @@ def _low_confidence_lines(assessment: GroundingAssessment | None, caveat: str) -
     Absent for a grounded frame, and absent for a frame nobody assessed: a
     banner that appeared whenever the assessment was missing would report low
     confidence for every frame produced before the vision pass ran.
+
+    Distill's own voice, so it is not delimited: a **grounding** is Distill's
+    assessment of a reading, and its level and reason are literals in
+    `grounding.py`. What holds that is a claim about another module rather than
+    a property of this text, and an assessment rebuilt from a document takes
+    whatever the document held - so the banner is *made* one line rather than
+    trusted to be one, and the level is printed only when it is a level this
+    codebase defines. Neither is a delimiter and neither pretends to be one:
+    they bound the banner to the line it is supposed to be, so a reason that
+    grew a line ending cannot continue as document structure.
     """
     if assessment is None or not assessment.is_low_confidence:
         return []
-    level = assessment.level.strip() or "low"
+    level = assessment.level if assessment.level in GROUNDING_LEVELS else "low"
     return [
-        f"> ⚠ Low-confidence frame ({level}): {assessment.reason.strip()}. {caveat}",
+        f"> ⚠ Low-confidence frame ({level}): {_one_line(assessment.reason)}. {caveat}",
         "",
     ]
+
+
+def _one_line(text: str) -> str:
+    """`text` with every run of whitespace, line endings included, made a space."""
+    return " ".join(text.split())
 
 
 def _reading_lines(reading: Interpretation) -> list[str]:
