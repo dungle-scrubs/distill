@@ -174,9 +174,16 @@ class _TransportBreaker:
     only one of them is worth stopping for. Failures on this side of the wire
     (an unreadable image, a cancellation) neither count nor reset.
 
-    Thread-safe because the pool may attempt keyframes concurrently; with
-    ``max_parallel > 1`` "consecutive" means consecutive in completion order,
-    and attempts already dispatched when it opens still run.
+    Thread-safe because the pool may attempt keyframes concurrently, and with
+    ``max_parallel > 1`` "consecutive" means consecutive in *completion* order
+    rather than keyframe order. That is the only order that exists there - the
+    keyframes were in flight together - and the consequence is worth stating: a
+    fast success landing between two slow timeouts resets a count that keyframe
+    order would have kept climbing, so a partly-working server takes longer to
+    give up on than a dead one. A dead one returns no successes at all, which
+    is the case this exists for. Attempts already dispatched when it opens
+    still run, and ``DEFAULT_MAX_PARALLEL`` is 1, so the ordinary run has one
+    order.
     """
 
     def __init__(self, limit: int = CONSECUTIVE_TRANSPORT_FAILURE_LIMIT) -> None:
