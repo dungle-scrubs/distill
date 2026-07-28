@@ -205,10 +205,19 @@ class _TransportBreaker:
         """Fold one attempt's outcome in; the state transition it caused, or `None`."""
         with self._lock:
             self._attempts += 1
+            if self._opened is not None:
+                # An attempt that passed admission before the trip returns
+                # after it. Nothing it says is a state change, because the
+                # breaker does not close: reporting one would put a reset in
+                # the log of a run still skipping every remaining keyframe, and
+                # zero the count that explains why.
+                if code in TRANSPORT_FAILURE_CODES:
+                    self._transport_failures += 1
+                return None
             if code in TRANSPORT_FAILURE_CODES:
                 self._consecutive += 1
                 self._transport_failures += 1
-                if self._consecutive < self._limit or self._opened is not None:
+                if self._consecutive < self._limit:
                     return None
                 self._opened = {
                     "state": "open",
@@ -906,8 +915,16 @@ class FrameInterpreter:
         self._breaker = _TransportBreaker()
 
     def _record_warning(self, warning_payload: WarningRecord) -> None:
+        """Tally one **warning** by what it says happened, not by being one record.
+
+        A carrier hands back warnings the **redaction** policy already folded,
+        so one record can stand for four confusable matches. Counting records
+        made `debug_info` and the **manifest** disagree about the same run.
+        """
         code = warning_payload.get("code", "unknown")
-        self._warning_counts[code] = self._warning_counts.get(code, 0) + 1
+        occurrences = warning_payload.get("occurrences", 1)
+        counted = occurrences if isinstance(occurrences, int) and occurrences >= 1 else 1
+        self._warning_counts[code] = self._warning_counts.get(code, 0) + counted
 
     def _log(self, event: str, detail: dict[str, Any]) -> None:
         if self._debug_enabled:

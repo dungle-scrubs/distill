@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .errors import WarningRecord, aggregate_warnings, warning
+from .errors import WarningRecord, warning
 
 CONFUSABLES = str.maketrans(
     {
@@ -164,22 +164,23 @@ def redact_text(text: str) -> RedactionResult:
                 if original_slice and original_slice in redacted:
                     count += redacted.count(original_slice)
                     redacted = redacted.replace(original_slice, "[REDACTED]")
-        for _match in possible_matches:
+        if possible_matches:
+            # R-41: one record per match would bury a **manifest**, which is
+            # what the old cap was for - it emitted ten and then a second
+            # **warning** saying how many it had suppressed, so a reader who
+            # wanted the real number had to add two records together. One
+            # record says it once and says it exactly, so there is nothing left
+            # to cap. Counted rather than accumulated and folded afterwards:
+            # how many matches there are is decided by text Distill did not
+            # write, and a record per match is a list held in memory whether or
+            # not it is the list anybody sees.
             warnings.append(
                 warning(
                     "redaction",
                     "possible_confusable_secret",
                     "OCR text contained a secret-like value after confusable normalization",
+                    occurrences=len(possible_matches),
                 )
             )
 
-    # R-41: one record per match would bury a **manifest**, which is what the
-    # old cap was for - it emitted ten and then a second **warning** saying how
-    # many it had suppressed, so a reader who wanted the real number had to add
-    # two records together. The fold says it once and says it exactly, so there
-    # is nothing left to cap.
-    return RedactionResult(
-        text=redacted,
-        warnings=aggregate_warnings(warnings),
-        redaction_count=count,
-    )
+    return RedactionResult(text=redacted, warnings=warnings, redaction_count=count)

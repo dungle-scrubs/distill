@@ -16,7 +16,7 @@ import pytest
 from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import pipeline as distill_session
-from distill.artifacts import FrameArtifact
+from distill.artifacts import FrameArtifact, Interpretation
 from distill.bundle_store import BundleRun, BundleStore
 from distill.errors import aggregate_warnings, warning
 from distill.local_vision import (
@@ -27,6 +27,7 @@ from distill.local_vision import (
 )
 from distill.options import DistillOptions
 from distill.progress import ProgressReporter
+from distill.redact_secrets import redact_text
 
 
 def test_a_warning_records_one_occurrence_from_the_start() -> None:
@@ -264,3 +265,71 @@ def test_a_published_manifest_carries_one_record_per_stage_and_code(
     # being shown one timeout and left to assume it happened once.
     markdown = Path(response["markdown_path"]).read_text()
     assert "occurrences: 5" in markdown
+
+
+def test_a_folded_warning_is_counted_by_what_it_says_happened(tmp_path: Path) -> None:
+    """The interpreter's own tally reads the count, not the record.
+
+    A carrier hands back **warnings** the **redaction** policy already folded,
+    so one record can stand for four confusable matches. Counting records
+    rather than occurrences made `debug_info` disagree with the **manifest**
+    about the same run.
+    """
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    confusable = " ".join(["ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef"] * 4)
+
+    def reader(
+        config: LocalVisionConfig,
+        _image_path: Path,
+        _prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[Interpretation, None]:
+        return (
+            Interpretation(
+                visual_summary=confusable,
+                detected_elements=(),
+                interpretation="a screen holding four secret-shaped values",
+                uncertainty="Low",
+                backend=config.backend,
+                model=config.model,
+                prompt_profile=prompt_profile,
+                verbatim_text="on-screen text",
+                text_confidence="high",
+            ),
+            None,
+        )
+
+    frame = FrameArtifact(
+        index=1,
+        timestamp_sec=0.0,
+        path=str(image),
+        relative_path="frames/frame.png",
+        extracted_text="on-screen text",
+    )
+    interpreter = FrameInterpreter(
+        LocalVisionConfig(), probe=_available_probe, try_interpret=reader
+    )
+    _frames, warnings = interpreter.interpret([frame])
+
+    folded = [item for item in warnings if item["code"] == "possible_confusable_secret"]
+    assert [item["occurrences"] for item in folded] == [4]
+    assert interpreter.debug_info()["warning_counts"]["possible_confusable_secret"] == 4
+
+
+def test_two_hundred_confusable_matches_are_one_record_saying_two_hundred() -> None:
+    """The count is exact and is not built one record at a time.
+
+    The cap R-41 removed existed because a record per match is a list nobody
+    can read; a record per match built and then folded is the same list, held
+    in memory first. Text Distill did not write decides how many matches there
+    are, so the count is counted rather than accumulated.
+    """
+    text = " ".join(["ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef"] * 200)
+
+    result = redact_text(text)
+
+    assert [(item["code"], item["occurrences"]) for item in result.warnings] == [
+        ("possible_confusable_secret", 200)
+    ]

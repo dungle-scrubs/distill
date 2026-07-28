@@ -22,6 +22,7 @@ from distill.local_vision import (
     LocalVisionConfig,
     LocalVisionFailure,
     LocalVisionProbe,
+    _TransportBreaker,
 )
 
 TIMEOUT = LocalVisionFailure(
@@ -292,3 +293,26 @@ def test_the_reset_of_a_partial_failure_run_is_emitted_too(tmp_path: Path) -> No
         "attempt": 3,
         "frame": 3,
     }
+
+
+def test_a_late_response_cannot_report_a_reset_for_an_open_breaker() -> None:
+    """An attempt that was already in flight lands after the trip.
+
+    With a parallel pool, a request that passed admission before the third
+    failure returns after it. The breaker does not close, so nothing that
+    arrives afterwards is a state transition - reporting one would put
+    `breaker.reset` in the log of a run whose every remaining keyframe was
+    still being skipped, and zero the count that explains why.
+    """
+    breaker = _TransportBreaker()
+    for frame_number in (1, 2):
+        assert breaker.record(frame_number=frame_number, code="local_vision_timeout") is None
+    tripped = breaker.record(frame_number=3, code="local_vision_timeout")
+    assert tripped is not None and tripped["state"] == "open"
+
+    assert breaker.record(frame_number=4, code=None) is None
+    assert breaker.record(frame_number=5, code="local_vision_malformed_response") is None
+
+    state = breaker.state()
+    assert state["open"] is True
+    assert state["consecutive_failures"] == 3
