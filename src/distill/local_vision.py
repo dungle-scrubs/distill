@@ -372,9 +372,17 @@ def _boundary_log(event: str, detail: dict[str, Any]) -> None:
 def _reject_endpoint(reason: str, message: str, **detail: Any) -> NoReturn:
     """Refuse an endpoint, saying why, in the log and in the exception alike.
 
-    Every rejection goes through here so the observability is a property of
-    the rule rather than of whoever wrote the call site: there is one event,
-    it always carries the reason, and no new rule can forget to emit it.
+    Every rejection *this module makes* goes through here, so the
+    observability is a property of the rule rather than of whoever wrote the
+    call site: there is one event, it always carries the reason, and no new
+    rule can forget to emit it.
+
+    Not every refusal is one of this module's. urllib turns a 3xx it cannot
+    act on into an `HTTPError` before `_RedirectsAreRejected` sees it, so a
+    redirect with no `Location`, or one naming a scheme urllib will not open,
+    ends the request without an `endpoint_rejected` event. Nothing is followed
+    in either case - which is why the fix there was the message an operator
+    gets, not a handler override to route the refusal back through here.
     """
     _boundary_log("endpoint_rejected", {"reason": reason, **detail})
     raise EndpointRejected(reason, message, detail)
@@ -1081,14 +1089,32 @@ class FrameInterpreter:
         )
         if frame_warning:
             warnings.append(frame_warning)
+        read_code = frame_warning.get("code") if frame_warning else None
         if result is not None and not result.carries_a_reading:
             # R-39 where a reading arrives by any route: the transport path
             # rejects an empty payload as malformed, and a reading that reached
             # here saying nothing is the same non-answer one step later. It is
             # not attached and it is not counted, so a run cannot report a
             # frame as interpreted on the strength of an empty object.
+            #
+            # And it leaves by the same door, because it is the same finding: a
+            # reading dropped silently left `read_code` unset, so no warning was
+            # raised, no **grounding** was attached, and the breaker read the
+            # attempt as a success. From every seam the frame was
+            # indistinguishable from one the model read and had nothing to
+            # remark on - which is the claim R-39 exists to refuse. Malformed
+            # rather than a transport code: the response arrived, so it is
+            # evidence the transport works and must reset the breaker's tally
+            # rather than count toward it.
             result = None
-        read_code = frame_warning.get("code") if frame_warning else None
+            read_code = "local_vision_malformed_response"
+            warnings.append(
+                warning(
+                    "local_vision",
+                    read_code,
+                    f"frame {frame.index or index + 1} interpretation carried no reading",
+                )
+            )
         if result:
             return self._interpreted(frame, result, index, warnings), True, read_code
         if read_code in FRAME_READ_FAILURE_CODES:
@@ -1499,6 +1525,17 @@ def _urlopen_json(
             if hasattr(exc, "read")
             else ""
         )
+        if 300 <= exc.code < 400:
+            # A redirect this module never got to refuse: urllib turns a 3xx it
+            # cannot act on - no `Location`, or one naming a scheme it will not
+            # open - into an `HTTPError` before `_RedirectsAreRejected` is
+            # consulted. A 3xx carries no body, so quoting one leaves an
+            # operator with `HTTP 302 from …: ` and nothing to act on. Nothing
+            # is followed either way; only the message was the mystery.
+            raise RuntimeError(
+                f"HTTP {exc.code} from {url}: the endpoint answered a redirect that could not "
+                "be followed, and redirects are not followed in any case"
+            ) from exc
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail[:200]}") from exc
     except http.client.IncompleteRead as exc:
         # A server that closes the connection mid-body (crash/restart) yields a

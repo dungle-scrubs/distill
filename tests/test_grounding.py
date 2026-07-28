@@ -228,3 +228,30 @@ def test_a_reading_that_said_nothing_at_all_still_reaches_the_unmarked_answer() 
 
     assert reading.carries_a_reading is False
     assert _graded(ocr_text="", reading=reading).level == CORROBORATED
+
+
+def test_a_reading_rebuilt_from_a_drifted_document_shows_no_elements_it_invented() -> None:
+    """R-39's shape rule holds on the way back in, not only on the way in.
+
+    A **resume** and a **cache** hit rebuild a reading from a mapping that was
+    written by some other run, so `detected_elements` can arrive as anything.
+    `document_carries_a_reading` refuses a string there - it is not the shape
+    the field is declared with - while `from_document` iterated it into
+    characters, so a frame that did NOT count as a reading could still DISPLAY
+    `a`, `x`, `i`, `s` as four elements the model never detected.
+    """
+    from distill.artifacts import document_carries_a_reading
+
+    for wrong_shape in ("axis", 42, {"label": "axis"}, None):
+        document = {"detected_elements": wrong_shape}
+
+        assert document_carries_a_reading(document) is False
+        rebuilt = Interpretation.from_document(document)
+        assert rebuilt is not None
+        assert rebuilt.detected_elements == ()
+        assert rebuilt.carries_a_reading is False
+
+    # A well-shaped list keeps its strings and drops only what is not one.
+    mixed = Interpretation.from_document({"detected_elements": ["axis", 7, {"a": 1}, "legend"]})
+    assert mixed is not None
+    assert mixed.detected_elements == ("axis", "legend")

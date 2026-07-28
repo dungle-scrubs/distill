@@ -13,6 +13,7 @@ from untrusted_blocks import SENTINEL, assert_delimited, attack
 
 from distill.artifacts import FrameArtifact, Interpretation
 from distill.errors import DistillError
+from distill.grounding import UNGROUNDED
 from distill.local_vision import (
     DEFAULT_LOCAL_VISION_BASE_URL,
     DEFAULT_LOCAL_VISION_MODEL,
@@ -651,6 +652,13 @@ def test_a_reading_that_says_nothing_is_neither_carried_nor_counted(tmp_path: Pa
     `Interpretation` holding nothing but its backend is the same non-answer with
     a dataclass around it, and a **frame artifact** that carried it would make
     `render` announce a visual interpretation with nothing under the heading.
+
+    It is the *same* non-answer, so it takes the same route out: the
+    malformed-response **warning**, the `UNGROUNDED` assessment saying the
+    model produced no usable output, and a breaker that counts it as a
+    delivered response. Dropping it silently left a frame whose reading was
+    discarded looking, from every seam, exactly like a frame the vision pass
+    read successfully and had nothing to remark on.
     """
     image = tmp_path / "frame.png"
     image.write_bytes(b"png")
@@ -681,8 +689,16 @@ def test_a_reading_that_says_nothing_is_neither_carried_nor_counted(tmp_path: Pa
     frames, warnings = interpreter.interpret([_frame(1, image, extracted_text="Hello")])
 
     assert frames[0].reading is None
-    assert warnings == []
+    assert [w["code"] for w in warnings] == ["local_vision_malformed_response"]
     assert interpreter.debug_info()["interpreted_count"] == 0
+    # The frame says why it has no reading, rather than looking like a frame
+    # that had nothing to say.
+    assert frames[0].grounding is not None
+    assert frames[0].grounding["level"] == UNGROUNDED
+    assert "no usable output" in frames[0].grounding["reason"]
+    # A response arrived, so the breaker takes it as evidence the transport
+    # works: it is not a consecutive transport failure and it clears the tally.
+    assert interpreter.debug_info()["breaker"]["transport_failures"] == 0
 
 
 def test_a_truncated_json_body_is_rejected(

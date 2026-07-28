@@ -286,6 +286,34 @@ def test_the_resolved_address_is_checked_on_every_request(
     assert transport.requested == [named_url]
 
 
+def test_a_redirect_urllib_will_not_act_on_still_tells_the_operator_it_was_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The redirect that never reaches `_RedirectsAreRejected`.
+
+    A 302 whose `Location` names a scheme urllib will not open - or carries no
+    `Location` at all - is refused by urllib itself, before the handler that
+    exists to refuse redirects is consulted. Nothing leaks: the request is not
+    followed either way. What the operator got was `HTTP 302 from …: ` with an
+    empty quote, because a 3xx has no body, and no clue that the endpoint had
+    answered with a redirect at all.
+    """
+    for location in ({"Location": "file:///etc/passwd"}, {}):
+        response = _CannedResponse(MODELS_URL, status=302, headers=location)
+        transport = _FakeTransport({MODELS_URL: response})
+        monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+
+        with pytest.raises(RuntimeError) as caught:
+            _urlopen_json("GET", MODELS_URL, None, 5.0)
+
+        message = str(caught.value)
+        assert "302" in message
+        assert "redirect" in message
+        # And it is not a rejection this module made, so it does not claim to
+        # be one.
+        assert not isinstance(caught.value, LocalVisionFailure)
+
+
 def test_the_scheme_is_re_checked_on_the_request_not_only_on_the_config() -> None:
     """R-43: the per-request check is the static one too, not just the resolved one.
 

@@ -580,8 +580,7 @@ class Interpretation:
             return None
         fields = {field.name for field in dataclasses.fields(cls)}
         values = {key: value for key, value in document.items() if key in fields}
-        elements = values.get("detected_elements", ())
-        values["detected_elements"] = tuple(str(item) for item in elements)
+        values["detected_elements"] = _declared_elements(values.get("detected_elements"))
         return cls(**values)
 
 
@@ -616,13 +615,27 @@ def document_carries_a_reading(document: Mapping[str, Any] | None) -> bool:
     )
 
 
+def _declared_elements(value: Any) -> tuple[str, ...]:
+    """`detected_elements` from a document, in the one shape the field is declared with.
+
+    A sequence of strings, and nothing else: anything else is dropped rather
+    than coerced. Stated once because both readers of the field ask it, and
+    they answered differently - `document_carries_a_reading` refused a
+    `detected_elements` of `"axis"` as the wrong shape, while `from_document`
+    iterated the string and rebuilt a reading displaying `a`, `x`, `i`, `s` as
+    four elements the model never detected. A **resume** or a **cache** hit is
+    where that mattered: those are the documents another run wrote.
+    """
+    if not isinstance(value, list | tuple):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
+
+
 def _substantive_text(name: str, value: Any) -> str:
     """The text one substantive field would contribute to a reading, if any."""
     if name == "detected_elements":
         # The one substantive field declared as a sequence of strings.
-        if not isinstance(value, list | tuple):
-            return ""
-        return "".join(item.strip() for item in value if isinstance(item, str))
+        return "".join(item.strip() for item in _declared_elements(value))
     return value.strip() if isinstance(value, str) else ""
 
 
