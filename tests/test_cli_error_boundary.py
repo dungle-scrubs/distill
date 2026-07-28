@@ -419,13 +419,24 @@ def test_a_permission_error_on_the_output_root_is_reported_as_the_json_error_obj
     calls `mkdir`, which is where the filesystem gets its say. `PermissionError`
     is an `OSError`, so it walked straight past a boundary that named only
     `DistillError`.
+
+    Driven through `cleanup-cache`, because the exception this covers is the one
+    `mkdir` raises and `cache-doctor` deliberately never calls it (R-57): the
+    read-only command validates its root with `create=False`. It provoked a
+    `PermissionError` anyway on Python 3.13, from the `Path.is_dir()` behind
+    `survey` - and on 3.14, where `Path.is_dir()` returns `False` for `EACCES`
+    instead of raising, the same command succeeded and printed a report. The
+    root that cannot be reached is now `cache-doctor`'s own typed refusal
+    (`E_OUTPUT_ROOT_UNREADABLE`), which is a different contract from this one;
+    what belongs here is a command that really does try to create the root, and
+    that is every writing command.
     """
     unreadable = tmp_path / "unreadable"
     unreadable.mkdir()
     unreadable.chmod(0o000)
     try:
         with pytest.raises(SystemExit) as exit_info:
-            main(["cache-doctor", "--output-dir", str(unreadable / "root")])
+            main(["cleanup-cache", "--output-dir", str(unreadable / "root")])
     finally:
         unreadable.chmod(0o700)
 

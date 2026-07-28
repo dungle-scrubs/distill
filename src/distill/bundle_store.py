@@ -36,6 +36,10 @@ Every question this module asks of the filesystem can be refused, and none of
 them may end a walk. A directory prune cannot read is a **skip with a reason**
 like any other (R-57), not a `PermissionError` out of `cache-doctor` - the
 read-only command that exists *because* the destructive ones were unpreviewable.
+The output root itself is the one refusal that ends the command rather than
+becoming a skip, because a root that cannot be reached leaves no walk to save
+and no report to salvage - see `_root_directory_exists`, which is also where the
+rule that a root nobody could stat is not a root that is absent is stated.
 
 What this module does not own: what a pipeline stage computes, what a
 **generation** contains, job records (`job_store`), the **source fingerprint**
@@ -1214,8 +1218,12 @@ class BundleStore:
         than the liveness probe, so every decision in the returned plan is a
         decision about a moment that has already passed. `apply_prune` makes it
         again under the lock.
+
+        The root guard is `survey`'s, for the same reason the walk is: an empty
+        plan over a root nobody could reach says "nothing to reclaim" about a
+        cache that may be full (see `_root_directory_exists`).
         """
-        if not self.root.is_dir():
+        if not _root_directory_exists(self.root):
             return PrunePlan(root=self.root, policy=policy)
         scan = _Scan()
         targets: list[PruneTarget] = []
@@ -1363,8 +1371,11 @@ class BundleStore:
         Liveness is asked of the kernel, never of a timestamp: a lock file
         outlives its holder by design, so only `flock` separates a run in
         progress from a leftover (R-06).
+
+        A root that cannot be reached at all is refused rather than reported as
+        absent - see `_root_directory_exists`.
         """
-        if not self.root.is_dir():
+        if not _root_directory_exists(self.root):
             return StoreSurvey(root=self.root, root_exists=False)
         scan = _Scan()
         bundles: list[BundleReport] = []
@@ -1895,6 +1906,45 @@ def _file_state(path: Path) -> FileState:
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
     return "regular" if stat.S_ISREG(info.st_mode) else "irregular"
+
+
+def _root_directory_exists(root: Path) -> bool:
+    """Whether there is a directory at `root`, refusing to guess when it cannot be asked.
+
+    `Path.is_dir()` cannot answer this, and answers it differently on different
+    interpreters, which is how the difference stayed hidden. Reaching a path
+    needs execute on every directory above it, so a root whose parent this
+    process may not search cannot be stat'ed at all - and `is_dir()` reports
+    that as `False` on Python 3.14 (where it delegates to `os.path.isdir`, which
+    swallows every `OSError`) and raises `PermissionError` on 3.13 (where only
+    the not-there errnos are ignored). One interpreter answered "no root here"
+    about a directory that may hold every bundle the user owns; the other ended
+    the read-only command with an internal fault.
+
+    Neither is the answer, because neither is known. This is `_file_state`'s rule
+    applied to the root: "not there" and "may not be asked about" are different
+    facts, and guessing between them is how a permission problem became a crash
+    or a deletion. The first is reported (`root_exists: false`, an empty plan);
+    the second is refused, because a report about a root nobody could reach is
+    a claim with nothing behind it (D-022).
+
+    Refused rather than recorded as a **skip with a reason**, which is what a
+    directory *under* the root gets: a skip exists so one unreadable directory
+    does not cost the report on all the others, and when the root itself cannot
+    be reached there are no others - there is no report left to save.
+    """
+    try:
+        info = root.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        raise DistillError(
+            "E_OUTPUT_ROOT_UNREADABLE",
+            "bundle",
+            "output root could not be read",
+            {"root": str(root), "errno": _errno_name(exc)},
+        ) from exc
+    return stat.S_ISDIR(info.st_mode)
 
 
 def _entry_kind(directory_entry: Path) -> EntryKind:

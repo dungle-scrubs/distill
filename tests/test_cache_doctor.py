@@ -27,8 +27,9 @@ from pathlib import Path
 import pytest
 
 from distill import bundle_store
-from distill.bundle_store import ExclusiveLock
+from distill.bundle_store import BundleStore, ExclusiveLock
 from distill.cli import main
+from distill.errors import DistillError
 from distill.pipeline import call_registered_tool
 
 ROOT_ARGS = {"keep_generations": 2}
@@ -273,6 +274,81 @@ def test_cache_doctor_creates_nothing_under_the_root_it_inspects(tmp_path: Path)
     assert report["root_exists"] is False
     assert report["bundles"] == []
     assert report["considered"] == 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is not refused by directory permissions")
+def test_a_root_that_cannot_be_reached_is_refused_rather_than_reported_absent(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: `root_exists: false` for a root nobody was able to ask about.
+
+    "It is not there" and "I may not look" are different answers, and only one
+    of them was on offer. The guard asked `Path.is_dir()`, which answers `False`
+    for a root whose parent this user cannot search - so the doctor reported an
+    empty, absent root for a directory that may hold every bundle the user owns,
+    and an operator reading `root_exists: false` would go and create one.
+
+    `_file_state` already states the rule this restores: a path this process may
+    not stat into is a different answer from one holding nothing, and guessing
+    between them is how a permission problem became a crash or a deletion.
+    """
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    unreachable = sealed / "cache"
+    sealed.chmod(0o000)
+    try:
+        with pytest.raises(DistillError) as failure:
+            inspect(unreachable)
+    finally:
+        sealed.chmod(0o700)
+
+    assert failure.value.code == "E_OUTPUT_ROOT_UNREADABLE"
+    assert failure.value.stage == "bundle"
+    assert failure.value.details == {"root": str(unreachable), "errno": "EACCES"}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is not refused by directory permissions")
+def test_the_survey_behind_the_report_refuses_the_root_the_prune_preview_does(
+    tmp_path: Path,
+) -> None:
+    """The report is a survey *and* a prune preview, so one guard is not enough.
+
+    Asserted at the seam because the tool cannot tell the two apart: `survey`
+    runs first, so a guard present only in `plan_prune` still refuses the whole
+    report, and the surface test above would pass over a survey that had gone
+    back to answering "no root here" for a root it could not reach.
+    """
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    unreachable = sealed / "cache"
+    sealed.chmod(0o000)
+    try:
+        with pytest.raises(DistillError) as failure:
+            BundleStore.open(unreachable).survey()
+    finally:
+        sealed.chmod(0o700)
+
+    assert failure.value.code == "E_OUTPUT_ROOT_UNREADABLE"
+    assert failure.value.details == {"root": str(unreachable), "errno": "EACCES"}
+
+
+def test_a_root_that_is_a_regular_file_holds_no_bundles_and_is_not_created(
+    tmp_path: Path,
+) -> None:
+    """The other control: `root_exists` asks whether an output root is there.
+
+    A regular file at that path is not one, and `cache-doctor` cannot make it
+    one - it creates nothing. So this is reported rather than refused, unlike
+    the root above: the answer is known, and it is "no bundles here".
+    """
+    root = tmp_path / "not-a-directory"
+    root.write_text("this is a file\n")
+
+    report = inspect(root)
+
+    assert report["root_exists"] is False
+    assert report["bundles"] == []
+    assert root.read_text() == "this is a file\n"
 
 
 def test_cache_doctor_leaves_a_bundle_untouched(tmp_path: Path) -> None:
