@@ -7,6 +7,7 @@ import pytest
 from distill import ocr
 from distill.artifacts import FrameArtifact, Interpretation, RedactionState, Transcript
 from distill.errors import DistillError
+from distill.grounding import assess_grounding
 from distill.progress import ProgressReporter
 from distill.redact_secrets import redact_text
 from distill.render import frames_are_useless, render_markdown, transcript_is_empty
@@ -343,11 +344,69 @@ def test_low_confidence_frame_renders_warning_marker_and_verbatim_block() -> Non
     assert "Text confidence:\n\n```untrusted-text\nnone\n```" in markdown
 
 
-def test_grounded_frame_omits_warning_marker_and_shows_verbatim() -> None:
-    frame, _warnings = keyframe(
-        extracted_text="We're closer than you think"
-    ).with_interpretation(
-        Interpretation(
+def graded(*, ocr_text: str, reading: Interpretation) -> FrameArtifact:
+    """A **frame artifact** carrying the **grounding** the pipeline would assess for it.
+
+    The two marker tests below go through `assess_grounding` rather than
+    hand-writing a level, because what they are about is which readings the
+    render marks - and a hand-written level makes that a question about the
+    string the test chose instead of about the reading. It is the same call
+    `local_vision._interpreted` makes, in the same order: grounding is assessed
+    against what the model returned, and the carrier redacts on the way in.
+    """
+    frame, _warnings = keyframe(extracted_text=ocr_text).with_interpretation(
+        reading,
+        grounding=assess_grounding(
+            ocr_text=ocr_text,
+            verbatim_text=reading.verbatim_text,
+            text_confidence=reading.text_confidence,
+            has_interpretation=reading.has_interpretation,
+        ).public_dict(),
+    )
+    return frame
+
+
+def test_a_lone_confident_reader_still_gets_the_low_confidence_marker() -> None:
+    """R-42: the render does not suppress the marker on a reader's own say-so.
+
+    OCR recovered nothing, so the only evidence for this slide's text is the
+    model's report of having read it. The reading is still shown - it may well
+    be right - but it is shown under the banner, because a reader given it
+    unmarked would have no way to tell it from text two readers agreed on.
+    """
+    frame = graded(
+        ocr_text="",
+        reading=Interpretation(
+            visual_summary="A dark slide",
+            detected_elements=("title",),
+            interpretation="The slide lists what a software factory needs.",
+            uncertainty="Low",
+            verbatim_text="What a software factory needs Agent Runtimes Orchestration",
+            text_confidence="high",
+        ),
+    )
+
+    markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
+
+    assert "⚠ Low-confidence frame (self_report)" in markdown
+    assert "treat the interpretation below as unverified" in markdown
+    # The reading is marked, not withheld.
+    assert "```untrusted-text\nWhat a software factory needs Agent Runtimes Orchestration\n```" in (
+        markdown
+    )
+
+
+def test_a_corroborated_frame_omits_the_marker_and_shows_verbatim() -> None:
+    """The other direction of R-42: genuine agreement is still not marked.
+
+    Two readers independently recovered the same text, which is what
+    **corroborated** means and the one thing that earns an unmarked reading.
+    Marking this one too would answer the finding by making the banner say
+    nothing.
+    """
+    frame = graded(
+        ocr_text="We're closer than you think",
+        reading=Interpretation(
             visual_summary="A title slide",
             detected_elements=("title",),
             interpretation="Closing slide.",
@@ -355,11 +414,6 @@ def test_grounded_frame_omits_warning_marker_and_shows_verbatim() -> None:
             verbatim_text="We're closer than you think",
             text_confidence="high",
         ),
-        grounding={
-            "level": "grounded",
-            "text_overlap": 1.0,
-            "reason": "OCR corroborates the transcribed text",
-        },
     )
     markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
 
