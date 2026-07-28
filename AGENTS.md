@@ -2,6 +2,31 @@
 
 Guidance for agents (and humans) working in this repository.
 
+## External tools and what their absence costs
+
+`src/distill/capabilities.py` owns the classification below; this table is the
+same statement in prose, and `tests/test_documentation_claims.py` fails if the
+two disagree. Per ADR-0002 the class decides the consequence: an absent
+**optional capability** is a **degradation** - a **warning** recorded on the
+bundle, and the run continues - while an absent **required capability** is a
+**fatal error** that ends the run before it does the work.
+
+| Tool | Capability | Class | What its absence costs |
+| --- | --- | --- | --- |
+| `ffmpeg` | audio extraction and keyframe extraction | required | no audio can be extracted and no keyframe can be captured, which leaves a generation with neither a transcript nor frame artifacts and no usable bundle to publish |
+| `ffprobe` | source duration probing | required | the source's duration cannot be read, so keyframe timestamps and the duration cap have nothing to work from and the run ends before any stage produces output |
+| `yt-dlp` | YouTube source acquisition and metadata | required | the source cannot be acquired at all, so a YouTube run has nothing to process |
+| `tesseract` | image-text extraction from keyframes | optional | keyframes contribute no extracted text, so interpretations cannot be corroborated and grounding falls back to the vision model alone; the transcript, keyframes and render are unaffected |
+
+A call site that catches a missing tool asks `missing_tool_consequence` what the
+absence costs rather than deciding for itself, so no site can quietly degrade a
+required capability. Distill installs nothing: an absent optional tool is a
+warning, never a package manager Distill runs on the user's behalf.
+
+The vision server is not a tool Distill runs, so it is not in that table. Its
+absence degrades the same way tesseract's does - OCR-only output, one warning -
+and the local-vision tests are what hold that.
+
 ## Local vision: Rapid-MLX, direct
 
 Distill's frame interpretation talks to a local **Rapid-MLX** server directly
@@ -11,35 +36,46 @@ backend.
 - **Default model**: `mlx-community/Qwen3-VL-8B-Instruct-8bit` (Qwen3-VL-8B at
   8-bit). This is the eval-chosen reader.
 - **Default endpoint**: `http://127.0.0.1:8000/v1` (Rapid-MLX's default port).
-- **Start the server yourself** — Distill assumes it is already running:
+- **Loopback only by default** (R-43): every address the configured host
+  resolves to must be loopback, re-checked per request rather than once at
+  configuration time, and the scheme must be `http` or `https`. Reaching a
+  server elsewhere is deliberate: `--local-vision-allow-remote-endpoint` on
+  `process-local-video`, `process-youtube-video`, `process-youtube-playlist` and
+  `local-vision-diagnostics`, or `"allow_remote_endpoint": true` in the
+  local-vision config. The opt-out widens the host and nothing else - redirects
+  stay disabled and the 32 MiB response cap stays, wherever the endpoint is.
+- **Start the server yourself** - Distill assumes it is already running:
   ```bash
   rapid-mlx serve mlx-community/Qwen3-VL-8B-Instruct-8bit
   ```
 - Distill probes availability with `GET <base_url>/models` and posts
   chat-completion requests to `POST <base_url>/chat/completions` using only the
   stdlib `urllib` (no new runtime dependency).
-- If the server is down or the configured model is not loaded, Distill degrades
-  to OCR-only output rather than failing the run.
+- If the server is down, the configured model is not loaded, or the endpoint is
+  refused, Distill degrades to OCR-only output rather than failing the run, and
+  records a **warning** naming which of those it was.
 
 ### Single vision backend
 
 - **Rapid-MLX is the only local vision path.** Distill owns the HTTP call
-  directly via the stdlib `urllib` — no lifecycle/leasing/proxy layer, no
+  directly via the stdlib `urllib` - no lifecycle/leasing/proxy layer, no
   alternative runtime shims. Do not add backend branches for other providers.
 - **No `local_vision_provider` option.** `backend` is fixed to `rapid-mlx` and
-  `model` selects the served model. Overrides are `--local-vision-model` and
-  `--local-vision-base-url`.
+  `model` selects the served model. The per-run overrides are
+  `--local-vision-backend`, `--local-vision-model`, `--local-vision-base-url`,
+  `--local-vision-timeout-sec`, `--local-vision-allow-remote-endpoint` and
+  `--caption-frames`/`--no-caption-frames`.
 
 ### Why this model (eval rationale)
 
 A human-verified 16-frame text-recovery eval (`tests/evals/`) selected the
 8-bit reader. Do not change the default without re-running the eval:
 
-- **8-bit over 4-bit** — quantization directly costs readable text.
-- **Bigger is not better** — Qwen3-VL-30B gave no accuracy gain; a real jump
+- **8-bit over 4-bit** - quantization directly costs readable text.
+- **Bigger is not better** - Qwen3-VL-30B gave no accuracy gain; a real jump
   would require a frontier *cloud* reader, not a larger local one.
-- **MLX over Ollama** — ~28% faster on Apple Silicon at equal quality.
-- **OCR specialists aren't worth a backend** — Tesseract ≈ PaddleOCR-VL (~0.53
+- **MLX over Ollama** - ~28% faster on Apple Silicon at equal quality.
+- **OCR specialists aren't worth a backend** - Tesseract ≈ PaddleOCR-VL (~0.53
   raw recall), both dwarfed by the VLM's 0.91.
 
 Reproduce with `uv run python tests/evals/score.py --with-vision`.
