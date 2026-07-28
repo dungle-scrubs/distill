@@ -123,13 +123,22 @@ def fixed_interval_candidates(duration_sec: float, interval_sec: float) -> list[
     to the end would sample there instead - a step of 90 seconds across a
     ten-second source would produce two samples where the interval asked for
     one.
+
+    `interval_sec` is taken as given, with no floor of its own. This is the
+    schedule a source no detector answered for gets - the static-slide case
+    `max_static_window_sec` exists for - so a floor here would answer a
+    validated 0.002s window with a schedule 500 times coarser and no way to
+    tell, which is the widening `ensure_static_window_is_expressible` refuses
+    at the other door. Termination does not need one either: `_step_from`
+    answers with a strictly greater timestamp or with nothing, and the
+    validated quantum floor keeps that step from rounding back onto its anchor
+    (R-48).
     """
     if duration_sec <= 0:
         return []
-    interval = max(1.0, interval_sec)
     values = [0.0]
     while True:
-        current = _step_from(values[-1], interval, math.inf)
+        current = _step_from(values[-1], interval_sec, math.inf)
         if current is None or current >= duration_sec:
             break
         values.append(current)

@@ -106,11 +106,44 @@ def test_the_fallback_walk_samples_the_interval_it_was_given() -> None:
     source is where this walk stops rather than a place it is pulled back to.
     Each sample is on the millisecond it will be sought at, so a **frame
     artifact** records the timestamp ffmpeg was actually given.
+
+    The sub-second intervals are the range the name only used to be true over.
+    A one-second floor lived here, so an operator who asked for 0.002s was
+    answered 500x coarser - the widening `ensure_static_window_is_expressible`
+    refuses at the other door, done silently at this one.
     """
     assert frame_selection.fixed_interval_candidates(10.0004, 90.0) == [0.0]
     assert frame_selection.fixed_interval_candidates(4.1, 1.0004) == [0.0, 1.0, 2.0, 3.0, 4.0]
     assert frame_selection.fixed_interval_candidates(4.0, 1.0) == [0.0, 1.0, 2.0, 3.0]
     assert frame_selection.fixed_interval_candidates(0.0, 1.0) == []
+    assert frame_selection.fixed_interval_candidates(0.01, 0.002) == [
+        0.0,
+        0.002,
+        0.004,
+        0.006,
+        0.008,
+    ]
+    assert frame_selection.fixed_interval_candidates(0.005, QUANTUM) == [
+        0.0,
+        0.001,
+        0.002,
+        0.003,
+        0.004,
+    ]
+    assert frame_selection.fixed_interval_candidates(1.0, 0.25) == [0.0, 0.25, 0.5, 0.75]
+
+
+def test_a_source_no_detector_answered_for_is_still_sampled_at_the_static_window() -> None:
+    """The window is the schedule when the detector offered nothing.
+
+    An empty candidate list is exactly the static-slide case
+    `max_static_window_sec` exists for - one slide on screen for the whole
+    source, no scene change to detect - so it is the last place the window may
+    be reinterpreted. A validated 0.002s window answered as 1.0s is
+    under-sampling by a factor of 500, reported as nothing.
+    """
+    assert filtered_candidates([], 0.01, 0.0, 0.002) == [0.0, 0.002, 0.004, 0.006, 0.008]
+    assert filtered_candidates([], 2.0, 0.0, 0.5) == [0.0, 0.5, 1.0, 1.5]
 
 
 # The sweep is executed, so it is bounded: a tuple whose schedule cannot
@@ -210,6 +243,16 @@ def test_candidate_generation_terminates_for_every_validated_option_tuple() -> N
         step = max(window - QUANTUM / 2, QUANTUM)
         bound = math.ceil(duration / step) + len(set(candidates)) + 2
         assert len(schedule) <= bound, tuple_report
+        if not candidates:
+            # The bound above is an upper one, so it cannot see under-sampling:
+            # a schedule of one entry satisfies it for every window. With no
+            # detector behind it the whole schedule is the window, so this is
+            # where a widened window is visible - every gap is at most the
+            # window (plus the half quantum rounding may add), and there are at
+            # least as many entries as the source has windows in it.
+            for earlier, later in itertools.pairwise(schedule):
+                assert later - earlier <= window + QUANTUM / 2, tuple_report
+            assert len(schedule) >= duration / (window + QUANTUM / 2), tuple_report
 
 
 # A pHash sequence whose neighbours are 64 bits apart, so nothing dedupes and
