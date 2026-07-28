@@ -264,6 +264,48 @@ def test_response_frames_keep_ocr_and_visual_interpretation_separate(
     )
 
 
+def test_the_summary_does_not_claim_an_interpretation_that_interprets_nothing(
+    tmp_path: Path,
+) -> None:
+    """R-39 at the sentence a caller reads.
+
+    The count was of frames carrying the key, so a **manifest** written while a
+    server answered `{}` for every **keyframe** - or one written before an empty
+    response was rejected, which a **cache** hit reads back unchanged - made the
+    response claim interpretations that say nothing. Three frames here, one of
+    which is a reading.
+    """
+    _, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+    snapshot = run.commit(minimal_manifest(tmp_path))
+
+    def frame(index: int, interpretation: dict[str, object]) -> dict[str, object]:
+        return {
+            "index": index,
+            "timestamp_sec": float(index),
+            "path": str(snapshot.frames / f"frame{index}.png"),
+            "relative_path": f"frames/frame{index}.png",
+            "ocr_text": "raw text",
+            "visual_interpretation": interpretation,
+        }
+
+    frames = [
+        frame(1, {}),
+        # Metadata describes a reading; it is not one.
+        frame(2, {"frame_kind": "slide", "text_confidence": "high", "backend": "rapid-mlx"}),
+        frame(3, {"visual_summary": "A chart", "detected_elements": ["axis"]}),
+    ]
+
+    response = run_response(snapshot, source(tmp_path), frames, False, [], cached=True)
+
+    assert response["summary"] == (
+        "Processed 1.0s video with 3 keyframes and visual interpretation for 1 frames"
+    )
+    # The documents themselves are handed back untouched: the count is a claim
+    # about them, and correcting the claim is not licence to rewrite the bundle.
+    assert response["frames"][0]["visual_interpretation"] == {}
+
+
 def test_a_cache_lookup_never_fails_the_run_over_a_manifest_it_cannot_use(
     tmp_path: Path,
 ) -> None:

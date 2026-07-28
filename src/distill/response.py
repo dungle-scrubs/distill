@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .artifacts import FrameArtifact, serialize
+from .artifacts import FrameArtifact, document_carries_a_reading, serialize
 from .bundle_store import BundleSnapshot
 from .links import RelatedLink
 from .options import DistillOptions
@@ -162,8 +162,12 @@ def run_response(
     a fresh run got from `response_frames` and a cache hit read out of the
     **manifest** the previous run wrote.
     """
+    # Counted on what a reading says, not on a key being present (R-39): a
+    # **manifest** written before an empty response was rejected, or by a server
+    # answering `{}`, carries interpretations that interpret nothing, and this
+    # sentence is where a caller would be told they exist.
     visual_count = sum(
-        1 for frame in frames if isinstance(frame.get("visual_interpretation"), dict)
+        1 for frame in frames if document_carries_a_reading(frame.get("visual_interpretation"))
     )
     summary = f"Processed {source.duration_sec:.1f}s video with {len(frames)} keyframes"
     if visual_count:

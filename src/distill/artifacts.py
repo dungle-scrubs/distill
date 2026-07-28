@@ -490,7 +490,21 @@ class Interpretation:
     It is not a carrier: it holds no policy state and never reaches a writer on
     its own. The frame artifact it belongs to is what makes it durable, and
     that is where the policy runs (D-019).
+
+    `SUBSTANTIVE_FIELDS` names the fields that carry what the model saw, as
+    opposed to the ones that describe the reading (`frame_kind`,
+    `text_confidence`, `uncertainty`) or the backend that produced it. It lives
+    here for the reason the field names do: the module that fills a reading in
+    decides whether a response was a reading at all (R-39), and it should not
+    have to restate which fields that question is about.
     """
+
+    SUBSTANTIVE_FIELDS: ClassVar[tuple[str, ...]] = (
+        "visual_summary",
+        "detected_elements",
+        "interpretation",
+        "verbatim_text",
+    )
 
     visual_summary: str = ""
     detected_elements: tuple[str, ...] = ()
@@ -514,6 +528,11 @@ class Interpretation:
     def has_interpretation(self) -> bool:
         """Whether the model said anything about the frame beyond reading it."""
         return bool(self.interpretation.strip() or self.detected_elements)
+
+    @property
+    def carries_a_reading(self) -> bool:
+        """Whether this says anything about the **keyframe** at all (R-39)."""
+        return document_carries_a_reading(self.document())
 
     def document(self) -> dict[str, Any]:
         """This reading as the plain mapping a **frame artifact** carries."""
@@ -539,6 +558,47 @@ class Interpretation:
         elements = values.get("detected_elements", ())
         values["detected_elements"] = tuple(str(item) for item in elements)
         return cls(**values)
+
+
+def document_carries_a_reading(document: Mapping[str, Any] | None) -> bool:
+    """Whether a mapping says anything about the **keyframe** (R-39).
+
+    True when at least one of `Interpretation.SUBSTANTIVE_FIELDS` holds text.
+    Emptiness is judged the way a reading judges it - stripped - so a mapping
+    whose substantive fields are all blank, whitespace, or an empty list is as
+    empty as `{}`, and so is one holding nothing but the metadata that
+    describes a reading.
+
+    A field counts only in the shape it is declared with. Anything else is a
+    value `Interpretation` would drop or mangle rather than read: a
+    `detected_elements` of `"axis"` is not a list and becomes no elements at
+    all, and one of `[{"label": "axis"}]` would become the single element
+    `"{'label': 'axis'}"`.
+
+    A question about a mapping rather than about an `Interpretation`, because
+    both callers have one and only one of them can afford to build a reading:
+    `local_vision` asks it of what a model returned before there is a reading
+    to ask, and `response` asks it of a **manifest** a **cache** hit read back,
+    which is a document that may not rebuild at all. It is a function rather
+    than a method for the reason the field names are here: the answer must not
+    differ between the module that fills a reading in and the module that
+    counts them.
+    """
+    if not isinstance(document, Mapping):
+        return False
+    return any(
+        _substantive_text(name, document.get(name)) for name in Interpretation.SUBSTANTIVE_FIELDS
+    )
+
+
+def _substantive_text(name: str, value: Any) -> str:
+    """The text one substantive field would contribute to a reading, if any."""
+    if name == "detected_elements":
+        # The one substantive field declared as a sequence of strings.
+        if not isinstance(value, list | tuple):
+            return ""
+        return "".join(item.strip() for item in value if isinstance(item, str))
+    return value.strip() if isinstance(value, str) else ""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -710,9 +770,7 @@ class Transcript(Carrier):
     language_probability: float = 0.0
 
     @classmethod
-    def from_document(
-        cls, document: Mapping[str, Any], *, redaction: RedactionState
-    ) -> Transcript:
+    def from_document(cls, document: Mapping[str, Any], *, redaction: RedactionState) -> Transcript:
         """Rebuild a transcript from a document a **stage result** recorded.
 
         The resume route, on the same terms as `FrameArtifact.from_document`,

@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from .artifacts import FrameArtifact, Interpretation
+from .artifacts import FrameArtifact, Interpretation, document_carries_a_reading
 from .errors import warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
@@ -642,6 +642,13 @@ class FrameInterpreter:
         )
         if frame_warning:
             warnings.append(frame_warning)
+        if result is not None and not result.carries_a_reading:
+            # R-39 where a reading arrives by any route: the transport path
+            # rejects an empty payload as malformed, and a reading that reached
+            # here saying nothing is the same non-answer one step later. It is
+            # not attached and it is not counted, so a run cannot report a
+            # frame as interpreted on the strength of an empty object.
+            result = None
         if result:
             return self._interpreted(frame, result, index, warnings), True
         if frame_warning and frame_warning.get("code") in FRAME_READ_FAILURE_CODES:
@@ -926,6 +933,12 @@ def _result_from_payload(
     config: LocalVisionConfig,
     prompt_profile: str,
 ) -> Interpretation:
+    """The reading a payload `parse_interpretation_json` accepted describes.
+
+    Every field is optional here because the payload has already been checked
+    for one that is not (R-39): what is missing from a validated payload is a
+    field the model left out, not an answer that said nothing.
+    """
     elements = interpreted.get("detected_elements", [])
     if not isinstance(elements, list):
         elements = []
@@ -954,6 +967,15 @@ def _normalize_text_confidence(value: Any) -> str:
 
 
 def parse_interpretation_json(raw_response: str) -> dict[str, Any] | None:
+    """The model's answer as an interpretation payload, or `None` if it is not one.
+
+    `None` means malformed, and covers three things the caller handles
+    identically: text that is not JSON, JSON that is not an object, and an
+    object that carries no reading (R-39). The third is why this is not a bare
+    parser - a server that is up and answers `{}` for every keyframe parses
+    perfectly, and counting that as an interpretation is what makes a dead
+    model look like a working one.
+    """
     stripped = raw_response.strip()
     if stripped.startswith("```"):
         lines = stripped.splitlines()
@@ -966,7 +988,9 @@ def parse_interpretation_json(raw_response: str) -> dict[str, Any] | None:
         parsed = json.loads(stripped)
     except json.JSONDecodeError:
         parsed = _extract_first_json_object(stripped)
-    return parsed if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict) or not document_carries_a_reading(parsed):
+        return None
+    return parsed
 
 
 def _extract_first_json_object(text: str) -> dict[str, Any] | None:
