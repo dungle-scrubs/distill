@@ -935,6 +935,76 @@ def test_max_keyframes_must_be_a_whole_number_of_frames() -> None:
     assert DistillOptions.from_args({"max_keyframes": "80"}).max_keyframes == 80
 
 
+def test_a_counted_option_is_validated_without_being_rewritten() -> None:
+    """R-03: an integral option survives validation as the integer it arrived as.
+
+    Validation went through `float`, so `--max-keyframes 9007199254740993` was
+    admitted as 9007199254740992: a rewritten option, and a different
+    **bundle key** than the one the operator's number names. That is exactly
+    what `test_validating_numbers_leaves_a_valid_option_tuple_hashing_as_before`
+    promises does not happen, asserted there only for a value small enough for a
+    float to carry.
+
+    A decimal string is read as the integer it spells for the same reason. A
+    float cannot be: `9007199254740993.0` is already 9007199254740992.0 by the
+    time it reaches here, so honouring it would be publishing a number nobody
+    typed. Above the range where a float names one integer, a float is refused.
+    """
+    beyond_float = 9007199254740993
+
+    assert DistillOptions.from_args({"max_keyframes": beyond_float}).max_keyframes == beyond_float
+    assert (
+        DistillOptions.from_args({"max_keyframes": str(beyond_float)}).max_keyframes
+        == beyond_float
+    )
+    assert json.dumps(
+        DistillOptions.from_args({"max_keyframes": beyond_float}).cache_payload("local")[
+            "max_keyframes"
+        ]
+    ) == str(beyond_float)
+
+    with pytest.raises(DistillError) as beyond_precision:
+        DistillOptions.from_args({"max_keyframes": 1e300})
+    assert beyond_precision.value.code == "E_BAD_OPTIONS"
+    assert "max_keyframes" in beyond_precision.value.message
+
+
+def test_a_numeric_option_too_large_for_a_float_is_an_option_error() -> None:
+    """R-47: one error shape for a bad option, including the one float() refuses.
+
+    JSON has no integer ceiling and Python's `int` has none either, so
+    `10**400` is a value an operator or a config file can genuinely supply. It
+    reached `float()` and came back as a bare `OverflowError` traceback -
+    the same escape `"lots"` used to make as a `ValueError`.
+    """
+    for name in ("max_duration_sec", "min_interval_sec", "max_static_window_sec"):
+        with pytest.raises(DistillError) as exc:
+            DistillOptions.from_args({name: 10**400})
+        assert exc.value.code == "E_BAD_OPTIONS", name
+        assert exc.value.stage == "options", name
+        assert name in exc.value.message, name
+
+    with pytest.raises(DistillError) as as_text:
+        DistillOptions.from_args({"max_duration_sec": "1" + "0" * 400})
+    assert as_text.value.code == "E_BAD_OPTIONS"
+
+
+def test_a_negative_zero_spacing_hashes_as_the_zero_it_is() -> None:
+    """R-47: two spellings of one number are one **bundle key**, not two.
+
+    `min_interval_sec` is the one option that admits zero, and `-0.0` clears
+    every guard `0.0` clears - it is the same quantity, and a run configured
+    with it asks for exactly the same schedule. `json.dumps` writes it as
+    `-0.0`, so the **options hash** was over different text and the run
+    published a second **bundle** for a run already on disk.
+    """
+    negative = DistillOptions.from_args({"min_interval_sec": -0.0})
+    positive = DistillOptions.from_args({"min_interval_sec": 0.0})
+
+    assert json.dumps(negative.cache_payload("local")["min_interval_sec"]) == "0.0"
+    assert negative.opts_hash("local") == positive.opts_hash("local")
+
+
 def test_the_spacing_floor_is_the_one_numeric_option_zero_still_means_something_to() -> None:
     """R-47: zero is rejected per option's meaning, not everywhere.
 

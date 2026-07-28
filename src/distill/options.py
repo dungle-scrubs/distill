@@ -122,20 +122,63 @@ They belong to `PrunePolicy`, which validates them where the policy is built
 """
 
 
-def _bad_number(name: str, value: Any, domain: NumericDomain) -> DistillError:
+EXACT_INTEGER_FLOAT_LIMIT = 2**53
+"""Above this, a float no longer names one integer, so it cannot carry a count.
+
+`float` steps in twos past 2**53: `9007199254740993.0` *is* `9007199254740992.0`
+before anything here sees it. An integer arriving as an `int` or as a decimal
+string is exact and is kept exact; one arriving as a float above this limit is
+refused rather than published as a number the operator did not name.
+"""
+
+
+def _bad_number(name: str, value: Any, domain: NumericDomain, reason: str = "") -> DistillError:
     quantity = "a whole number" if domain.integral else "a finite number"
     if domain.floor:
         floor = f"{domain.floor} or greater"
     else:
         floor = "0 or greater" if domain.admits_zero else "greater than 0"
+    message = f"{name} must be {quantity} {floor}"
     return DistillError(
         "E_BAD_OPTIONS",
         "options",
-        f"{name} must be {quantity} {floor}",
+        f"{message} ({reason})" if reason else message,
         # `repr`, because the value that provoked this may be a NaN, and a
         # fatal error is published as JSON that a strict reader has to parse.
         {name: repr(value)},
     )
+
+
+def _integral_value(name: str, value: int | float | str, domain: NumericDomain) -> int:
+    """A counted option as the whole number it names, with no float in between.
+
+    `int` first, and exactly: a count is a count, and `int` has no ceiling in
+    Python, so `--max-keyframes 9007199254740993` is that number rather than the
+    even one nearest it. A decimal string spelling an integer is read the same
+    way, for the same reason.
+
+    Only what is left goes through `float`, and then it has to name a whole
+    number *and* be small enough for a float to name only that one. `int(2.7)`
+    answered 2 and `float(9007199254740993)` answers 9007199254740992; both are
+    an operator's number rewritten, which is what this validation exists to
+    remove.
+    """
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        raise _bad_number(name, value, domain) from None
+    if not math.isfinite(number) or number != int(number):
+        raise _bad_number(name, value, domain)
+    if abs(number) > EXACT_INTEGER_FLOAT_LIMIT:
+        raise _bad_number(name, value, domain, "a float this large does not name one whole number")
+    return int(number)
 
 
 def validated_number(name: str, value: Any) -> int | float:
@@ -146,7 +189,8 @@ def validated_number(name: str, value: Any) -> int | float:
     just a comparison that answers no. Booleans are refused for the reason
     `PrunePolicy` refuses them - `True` meaning 1 is a coincidence rather than
     an instruction - and a value that is not a number at all is refused as the
-    same option error rather than escaping as a `ValueError`.
+    same option error rather than escaping as a `ValueError` or, for a number
+    too large for a float, as an `OverflowError`.
 
     It does not decide what any option *means*; `NUMERIC_OPTION_DOMAINS` owns
     that, and an option missing from it is a programming error, not an input.
@@ -154,20 +198,25 @@ def validated_number(name: str, value: Any) -> int | float:
     domain = NUMERIC_OPTION_DOMAINS[name]
     if isinstance(value, bool) or not isinstance(value, int | float | str):
         raise _bad_number(name, value, domain)
-    try:
-        number = float(value)
-    except ValueError:
-        raise _bad_number(name, value, domain) from None
-    if not math.isfinite(number):
-        raise _bad_number(name, value, domain)
+    number: int | float
+    if domain.integral:
+        number = _integral_value(name, value, domain)
+    else:
+        try:
+            number = float(value)
+        except (ValueError, OverflowError):
+            raise _bad_number(name, value, domain) from None
+        if not math.isfinite(number):
+            raise _bad_number(name, value, domain)
+    # An `int` compares against these exactly however large it is, so a count no
+    # float could hold is still judged against its own domain here.
     if number < 0 or (number == 0 and not domain.admits_zero) or number < domain.floor:
         raise _bad_number(name, value, domain)
-    if domain.integral:
-        # `int(2.7)` answered 2. Truncating an operator's number is the quiet
-        # reinterpretation this validation exists to remove.
-        if number != int(number):
-            raise _bad_number(name, value, domain)
-        return int(number)
+    if number == 0:
+        # `-0.0` is the same quantity as `0.0` and asks for the same run, but
+        # `json.dumps` writes it as `-0.0` - two **bundle keys** for one set of
+        # processing choices.
+        return 0 if domain.integral else 0.0
     return number
 
 
