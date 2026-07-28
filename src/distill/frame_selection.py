@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .artifacts import FrameArtifact, RedactionState
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
-from .errors import DistillError, warning
+from .errors import DistillError, WarningRecord, warning
 from .progress import ProgressCounter, ProgressReporter
 from .run_command import CommandTimeouts, run
 
@@ -181,7 +181,7 @@ def select_keyframes(
     source is a policy no later stage can forget to pass on (D-020).
     """
     frames_dir.mkdir(parents=True, exist_ok=True)
-    warnings: list[dict[str, str]] = []
+    warnings: list[WarningRecord] = []
     candidates = filtered_candidates(
         scene_midpoint_candidates(video_path, duration_sec),
         duration_sec,

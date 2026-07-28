@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from .errors import DistillError, warning
+from .errors import DistillError, WarningRecord, warning
 from .run_command import ERROR_CODES, FailureKind
 
 # The code `run_command` raises when a tool is not installed. Named here so a
@@ -130,7 +130,7 @@ def _absence_message(tool: ExternalTool) -> str:
     return f"{tool.name} is not installed or not on PATH; {tool.absence_cost}"
 
 
-def missing_tool_warning(stage: str, tool_name: str) -> dict[str, str]:
+def missing_tool_warning(stage: str, tool_name: str) -> WarningRecord:
     """The degradation **warning** for an absent **optional capability**.
 
     Raises `ValueError` for a tool classified required: a required tool's

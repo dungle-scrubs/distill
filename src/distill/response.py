@@ -23,6 +23,7 @@ from typing import Any
 
 from .artifacts import FrameArtifact, document_carries_a_reading, serialize
 from .bundle_store import BundleSnapshot
+from .errors import WarningRecord
 from .links import RelatedLink
 from .options import DistillOptions
 from .release import DISTILL_VERSION
@@ -36,7 +37,7 @@ def manifest_document(
     *,
     transcript_present: bool,
     frames: list[dict[str, Any]],
-    warnings: list[dict[str, str]],
+    warnings: list[WarningRecord],
 ) -> dict[str, Any]:
     """The **manifest** content for one published **generation**.
 
@@ -148,7 +149,7 @@ def run_response(
     source: SourceInfo,
     frames: list[dict[str, Any]],
     transcript_present: bool,
-    warnings: list[dict[str, str]],
+    warnings: list[WarningRecord],
     cached: bool,
     progress: dict[str, Any] | None = None,
     job_id: str | None = None,

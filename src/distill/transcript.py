@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
-from .errors import DistillError, warning
+from .errors import DistillError, WarningRecord, warning
 from .progress import ProgressCounter, ProgressReporter
 from .run_command import CommandTimeouts, stream
 
@@ -223,7 +223,7 @@ def transcribe_audio(
     progress: ProgressCounter | ProgressReporter | None = None,
     adapter: WhisperAdapter | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
-    warnings: list[dict[str, str]] = []
+    warnings: list[WarningRecord] = []
     if adapter is None:
         try:
             adapter = FasterWhisperAdapter(model_name)
@@ -298,7 +298,7 @@ def transcribe_audio(
         return None, [warning("transcript", "whisper_failed", f"Whisper failed: {exc}")]
 
 
-def vad_drop_warnings(info: Any, vad_filter: bool) -> list[dict[str, str]]:
+def vad_drop_warnings(info: Any, vad_filter: bool) -> list[WarningRecord]:
     if not vad_filter:
         return []
     duration = float(getattr(info, "duration", 0.0) or 0.0)

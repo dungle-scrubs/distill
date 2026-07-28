@@ -39,7 +39,7 @@ from typing import Any
 
 from .artifacts import Carrier, FrameArtifact, Interpretation, Transcript, serialize
 from .emit import EMITTER
-from .errors import DistillError
+from .errors import DistillError, WarningRecord
 from .grounding import GROUNDED, UNGROUNDED, WEAK, GroundingAssessment
 from .links import RelatedLink
 
@@ -149,7 +149,7 @@ def render_markdown(
     duration_sec: float,
     transcript: Transcript | None,
     frames: list[FrameArtifact],
-    warnings: list[dict[str, str]],
+    warnings: list[WarningRecord],
     related_links: list[RelatedLink] | None = None,
 ) -> str:
     _require_redaction_policy(

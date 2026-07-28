@@ -59,7 +59,7 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
-from .errors import DistillError, warning
+from .errors import DistillError, WarningRecord, warning
 from .links import RelatedLink, extract_relevant_links
 from .options import DistillOptions
 from .progress import ProgressReporter
@@ -194,7 +194,7 @@ class AcquisitionLease:
     lock_key: str
     lock_path: Path
     lock: ExclusiveLock
-    warnings: list[dict[str, str]] = field(default_factory=list)
+    warnings: list[WarningRecord] = field(default_factory=list)
 
     @property
     def released(self) -> bool:
@@ -259,7 +259,7 @@ class AcquiredSource:
 
     path: Path
     lease: AcquisitionLease
-    warnings: list[dict[str, str]] = field(default_factory=list)
+    warnings: list[WarningRecord] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -269,7 +269,7 @@ class SourceInfo:
     duration_sec: float
     source_fingerprint: str
     source_hash: str
-    warnings: list[dict[str, str]]
+    warnings: list[WarningRecord]
     youtube_video_id: str | None = None
     youtube_lock_key: str | None = None
     related_links: list[RelatedLink] | None = None
@@ -327,7 +327,7 @@ class SourceResolution:
 class YouTubeMetadata:
     video_id: str
     description: str
-    warnings: list[dict[str, str]]
+    warnings: list[WarningRecord]
 
 
 class YouTubeDownloaderProtocol(Protocol):
@@ -513,7 +513,7 @@ class LocalSourceProvider:
                 "E_BAD_SOURCE", "source", "local video does not exist", {"path": path_text}
             )
         resolved = original.resolve()
-        warnings: list[dict[str, str]] = []
+        warnings: list[WarningRecord] = []
         if resolved != original.absolute():
             warnings.append(
                 warning(
@@ -1214,7 +1214,7 @@ class YoutubeDownloader:
         which is the window the check exists to close.
         """
         started = time.monotonic()
-        warnings: list[dict[str, str]] = []
+        warnings: list[WarningRecord] = []
         while True:
             confined_path(lock, self.output_root)
             lease = AcquisitionLease.take(lock_key, lock)

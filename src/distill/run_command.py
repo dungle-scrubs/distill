@@ -93,7 +93,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from .errors import DistillError, warning
+from .errors import DistillError, WarningRecord, warning
 
 LOGGER = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ class CommandResult:
     stdout_truncated: bool
     stderr_truncated: bool
     duration_sec: float
-    warnings: tuple[dict[str, str], ...] = ()
+    warnings: tuple[WarningRecord, ...] = ()
 
     @property
     def truncated(self) -> bool:

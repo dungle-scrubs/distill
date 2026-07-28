@@ -844,7 +844,12 @@ def test_frame_interpreter_debug_info_tracks_run_state(tmp_path: Path) -> None:
         },
         {
             "event": "interpret.complete",
-            "detail": {"frames": 1, "interpreted_frames": 1, "warnings": 0},
+            "detail": {
+                "frames": 1,
+                "interpreted_frames": 1,
+                "warnings": 0,
+                "warning_occurrences": 0,
+            },
         },
     ]
 
@@ -990,11 +995,15 @@ def test_frame_interpreter_records_unavailable_probe_warning() -> None:
     frames, warnings = interpreter.interpret([unreached])
 
     assert frames == [unreached]
+    # Classified *defect* against R-41: the record now carries its occurrence
+    # count, and the probe's warning is built by the one builder every other
+    # warning goes through rather than assembled as a bare mapping beside it.
     assert warnings == [
         {
             "stage": "local_vision",
             "code": "local_vision_rapid_mlx_unavailable",
             "message": "missing",
+            "occurrences": 1,
         }
     ]
     assert interpreter.debug_info()["warning_counts"] == {

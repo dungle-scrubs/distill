@@ -130,6 +130,7 @@ def test_extract_frame_degrades_when_ffmpeg_fails(
             "stage": "frames",
             "code": "frame_extract_failed",
             "message": "could not extract frame at 1.500s",
+            "occurrences": 1,
         }
     ]
 

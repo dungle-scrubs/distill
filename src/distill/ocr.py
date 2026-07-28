@@ -24,7 +24,7 @@ from typing import Any
 
 from .artifacts import FrameArtifact
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
-from .errors import DistillError, warning
+from .errors import DistillError, WarningRecord, warning
 from .progress import ProgressCounter, ProgressReporter
 from .run_command import run, silent_tool_timeouts
 
@@ -220,7 +220,7 @@ def ocr_frames(
     A disabled pass records the empty reading the same way, so a frame's
     `extracted_text` means "nothing was read" rather than "nobody looked".
     """
-    warnings: list[dict[str, str]] = []
+    warnings: list[WarningRecord] = []
     updated: list[FrameArtifact] = []
     tesseract_cmd = None
     if enabled:

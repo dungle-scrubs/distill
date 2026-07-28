@@ -128,6 +128,7 @@ def test_vad_drop_ratio_warning_tiers_are_emitted(tmp_path: Path) -> None:
             "stage": "transcript",
             "code": "vad_drop_ratio_warning",
             "message": "VAD removed 60% of audio",
+            "occurrences": 1,
         }
     ]
     assert high_warnings == [
@@ -135,6 +136,7 @@ def test_vad_drop_ratio_warning_tiers_are_emitted(tmp_path: Path) -> None:
             "stage": "transcript",
             "code": "vad_drop_ratio_high",
             "message": "VAD removed 95% of audio",
+            "occurrences": 1,
         }
     ]
 
@@ -333,6 +335,7 @@ def test_faster_whisper_missing_degrades_without_adapter(
             "stage": "transcript",
             "code": "faster_whisper_missing",
             "message": "faster-whisper is not installed",
+            "occurrences": 1,
         }
     ]
 

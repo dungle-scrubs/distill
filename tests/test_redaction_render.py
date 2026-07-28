@@ -160,18 +160,28 @@ def test_ordinary_words_ending_in_a_suffix_are_not_redacted() -> None:
         assert result.redaction_count == 0, text
 
 
-def test_possible_secret_warnings_are_capped_with_aggregate_warning() -> None:
-    text = " ".join(["ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef"] * 4)
-    result = redact_text(text, max_possible_secret_warnings=2)
+def test_four_confusable_secrets_are_one_warning_that_says_four() -> None:
+    """R-41 replaces the cap this test was named for.
 
-    assert [item["code"] for item in result.warnings] == [
-        "possible_confusable_secret",
-        "possible_confusable_secret",
-        "possible_secret_warnings_truncated",
+    Classified *defect*: the old contract emitted one record per match up to a
+    cap, then a second record saying how many records it had suppressed - a
+    **warning** about Distill's own bookkeeping, and a reader who wanted the
+    real number had to add the two together. Folding on stage and code says it
+    once and says it exactly, so the cap and its truncation record are gone.
+    """
+    text = " ".join(["ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef"] * 4)
+    result = redact_text(text)
+
+    assert result.warnings == [
+        {
+            "stage": "redaction",
+            "code": "possible_confusable_secret",
+            "message": (
+                "OCR text contained a secret-like value after confusable normalization"
+            ),
+            "occurrences": 4,
+        }
     ]
-    assert result.warnings[-1]["message"] == (
-        "2 additional possible-secret warnings were truncated"
-    )
 
 
 def test_render_interleaves_frame_and_transcript() -> None:

@@ -30,7 +30,7 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .cache_doctor import inspect_cache
-from .errors import DistillError
+from .errors import DistillError, WarningRecord, aggregate_warnings
 from .frame_selection import select_keyframes
 from .job_store import JobOutcome, JobStore
 from .local_vision import (
@@ -298,7 +298,7 @@ class ProcessingRun:
         self,
         run: BundleRun,
         heartbeat: ProgressHeartbeat,
-        warnings: list[dict[str, str]],
+        warnings: list[WarningRecord],
         name: str,
         skipped_mechanisms: tuple[str, ...],
         producer: Callable[[], dict[str, Any]],
@@ -576,6 +576,16 @@ class ProcessingRun:
         else:
             self.progress.skip_cached("local_vision", detail={"reason": "disabled"})
 
+        # R-41's fold, at the one point that sees every stage's warnings
+        # together. A stage can only aggregate what it produced; what a reader
+        # of a published **generation** gets is decided here, and the folded
+        # record with its count *is* the warning carried, so ADR-0002's promise
+        # that every warning reaches the **manifest** is kept by the count
+        # rather than by the repetition. The **render**, the manifest and the
+        # response are handed the same folded list, so no reader of a bundle
+        # sees a different account of the run than another.
+        warnings = aggregate_warnings(warnings)
+
         self.progress.update("rendering", status="running")
         markdown = render_markdown(
             str(self.source.resolved_path),
@@ -655,7 +665,7 @@ def _revived[StageValue](
     return revive(payload)
 
 
-def _stage_warnings(payload: dict[str, Any]) -> list[dict[str, str]]:
+def _stage_warnings(payload: dict[str, Any]) -> list[WarningRecord]:
     """The **warnings** a stage payload carries, as plain documents.
 
     Copied out rather than passed through: a carrier's warnings are

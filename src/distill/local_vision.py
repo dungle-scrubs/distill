@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import FrameArtifact, Interpretation, document_carries_a_reading
-from .errors import warning
+from .errors import WarningRecord, aggregate_warnings, warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
 from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
@@ -107,12 +107,8 @@ class LocalVisionProbe:
     message: str
     detail: dict[str, Any]
 
-    def warning(self) -> dict[str, str]:
-        return {
-            "stage": "local_vision",
-            "code": self.code,
-            "message": self.message,
-        }
+    def warning(self) -> dict[str, Any]:
+        return warning("local_vision", self.code, self.message)
 
 
 class LocalVisionFailure(Exception):
@@ -122,12 +118,8 @@ class LocalVisionFailure(Exception):
         self.message = message
         self.detail = detail or {}
 
-    def warning(self) -> dict[str, str]:
-        return {
-            "stage": "local_vision",
-            "code": self.code,
-            "message": self.message,
-        }
+    def warning(self) -> dict[str, Any]:
+        return warning("local_vision", self.code, self.message)
 
 
 ProbeLocalVision = Callable[[LocalVisionConfig], LocalVisionProbe]
@@ -146,7 +138,7 @@ class _FrameOutcome:
     index: int
     frame: FrameArtifact
     interpreted: bool
-    warnings: list[dict[str, str]]
+    warnings: list[WarningRecord]
     path: str
     has_extracted_text: bool
     # The code of the read/transport failure this frame's attempt ended in, or
@@ -239,7 +231,7 @@ class _TransportBreaker:
                 "frame": frame_number,
             }
 
-    def summary_warning(self, frame_count: int) -> dict[str, str] | None:
+    def summary_warning(self, frame_count: int) -> WarningRecord | None:
         """The one **warning** R-40 asks for, or `None` if the breaker held.
 
         One record for every keyframe the run gave up on, carrying the count
@@ -588,7 +580,7 @@ class FrameInterpreter:
             self._log("interpret.unavailable", {"code": probe.code})
             return frames, [probe_warning]
 
-        warnings: list[dict[str, str]] = []
+        warnings: list[WarningRecord] = []
         interpreted_frames = frames
         try:
             if not frames:
@@ -608,15 +600,21 @@ class FrameInterpreter:
             interpreted_frames = self._interpret_frames(resolved, frames, warnings)
             if self.progress:
                 self.progress.complete("local_vision", detail={"frames": len(frames)})
+            # R-41 where the vision pass is done producing warnings: eighty
+            # keyframes failing the same way is one finding with a count on it,
+            # not eighty records of the same sentence. `_warning_counts` still
+            # has the unfolded tally for `debug_info`.
+            folded = aggregate_warnings(warnings)
             self._log(
                 "interpret.complete",
                 {
                     "frames": len(interpreted_frames),
                     "interpreted_frames": self._interpreted_count,
-                    "warnings": len(warnings),
+                    "warnings": len(folded),
+                    "warning_occurrences": sum(item["occurrences"] for item in folded),
                 },
             )
-            return interpreted_frames, warnings
+            return interpreted_frames, folded
         finally:
             # Nothing to release: Rapid-MLX manages its own lifecycle. The
             # finally block stays so the run-state semantics read the same as
@@ -637,7 +635,7 @@ class FrameInterpreter:
         self,
         config: LocalVisionConfig,
         frames: list[FrameArtifact],
-        warnings: list[dict[str, str]],
+        warnings: list[WarningRecord],
     ) -> list[FrameArtifact]:
         """Interpret every frame, capping concurrency at the admission limit.
 
@@ -694,7 +692,7 @@ class FrameInterpreter:
                 has_extracted_text=bool(frame.extracted_text.strip()),
                 warning_code=None,
             )
-        local_warnings: list[dict[str, str]] = []
+        local_warnings: list[WarningRecord] = []
         interpreted_frame, was_interpreted, read_code = self._interpret_frame(
             config, index, frame, frame_count, local_warnings
         )
@@ -713,7 +711,7 @@ class FrameInterpreter:
     def _merge_outcomes(
         self,
         outcomes: list[_FrameOutcome],
-        warnings: list[dict[str, str]],
+        warnings: list[WarningRecord],
     ) -> list[FrameArtifact]:
         frame_count = len(outcomes)
         frames: list[FrameArtifact] = []
@@ -784,7 +782,7 @@ class FrameInterpreter:
         index: int,
         frame: FrameArtifact,
         frame_count: int,
-        warnings: list[dict[str, str]],
+        warnings: list[WarningRecord],
     ) -> tuple[FrameArtifact, bool, str | None]:
         """Interpret a single frame without mutating shared interpreter state.
 
@@ -863,7 +861,7 @@ class FrameInterpreter:
         frame: FrameArtifact,
         reading: Interpretation,
         index: int,
-        warnings: list[dict[str, str]],
+        warnings: list[WarningRecord],
     ) -> FrameArtifact:
         """The frame carrying the model's reading and Distill's grounding of it.
 
@@ -907,7 +905,7 @@ class FrameInterpreter:
         # never be spoken to again.
         self._breaker = _TransportBreaker()
 
-    def _record_warning(self, warning_payload: dict[str, str]) -> None:
+    def _record_warning(self, warning_payload: WarningRecord) -> None:
         code = warning_payload.get("code", "unknown")
         self._warning_counts[code] = self._warning_counts.get(code, 0) + 1
 
