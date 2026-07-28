@@ -29,6 +29,7 @@ import http.client
 import json
 import logging
 import os
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -56,6 +57,24 @@ DEBUG_ENV = "DISTILL_LOCAL_VISION_DEBUG"
 # Cap on in-flight vision requests. Rapid-MLX batches internally, so Distill
 # keeps a small fixed pool rather than fanning out unbounded. 1 == serial.
 DEFAULT_MAX_PARALLEL = 1
+# Consecutive transport failures after which the run stops attempting keyframes
+# (R-40). Three, because one is noise and two is a coincidence.
+CONSECUTIVE_TRANSPORT_FAILURE_LIMIT = 3
+# The failures that say something about the transport rather than about the
+# answer: nothing arrived. A refused or reset connection reaches the caller as
+# the unavailable code, a deadline as the timeout code.
+TRANSPORT_FAILURE_CODES = frozenset(
+    {
+        "local_vision_timeout",
+        "local_vision_rapid_mlx_unavailable",
+    }
+)
+# Failures that arrived *as a response*: the transport carried them, so they are
+# evidence it works. A success is the other member of this class and needs no
+# code. Everything else (an unreadable image file, a cancelled run) happened on
+# this side of the wire and says nothing either way.
+DELIVERED_RESPONSE_CODES = frozenset({"local_vision_malformed_response"})
+BREAKER_WARNING_CODE = "local_vision_transport_breaker_open"
 FRAME_READ_FAILURE_CODES = frozenset(
     {
         "local_vision_malformed_response",
@@ -130,7 +149,127 @@ class _FrameOutcome:
     warnings: list[dict[str, str]]
     path: str
     has_extracted_text: bool
+    # The code of the read/transport failure this frame's attempt ended in, or
+    # `None` if a response arrived. Not "the first warning": a frame that was
+    # read successfully can still warn about **grounding**, and the breaker
+    # must not read that as the transport having failed.
     warning_code: str | None
+    # The breaker state change this frame's outcome caused, if any. Carried
+    # rather than logged where it happened so the ordered consumer emits it in
+    # frame order even when the pool ran the frames out of order.
+    breaker_transition: dict[str, Any] | None = None
+
+
+class _TransportBreaker:
+    """One run's consecutive-transport-failure count, and the state it decides.
+
+    Owns the count, the open/closed state, and the record of what tripped it:
+    which attempt, which **keyframe**, which code. It is asked `admit()` before
+    every attempt and told `record()` after every one, and those two calls are
+    the whole interface.
+
+    It does not own what a skipped keyframe becomes - the caller hands the
+    **frame artifact** back untouched, which is the OCR-only **degradation**
+    ADR-0002 asks for - and it does not own the **warning**: it supplies the
+    counts, `summary_warning` phrases them. It never closes again either. A
+    half-open probe would be a fourth timeout to learn what three already
+    said, and a server that died mid-run is not coming back inside the run.
+
+    Which failures count is a distinction, not a list: a **transport** failure
+    means nothing arrived, so the run has no evidence the server is there. A
+    malformed body arrived, so it is evidence the transport works and resets
+    the count - a wrong server and a dead server are different findings, and
+    only one of them is worth stopping for. Failures on this side of the wire
+    (an unreadable image, a cancellation) neither count nor reset.
+
+    Thread-safe because the pool may attempt keyframes concurrently; with
+    ``max_parallel > 1`` "consecutive" means consecutive in completion order,
+    and attempts already dispatched when it opens still run.
+    """
+
+    def __init__(self, limit: int = CONSECUTIVE_TRANSPORT_FAILURE_LIMIT) -> None:
+        self._limit = max(int(limit), 1)
+        self._lock = threading.Lock()
+        self._consecutive = 0
+        self._attempts = 0
+        self._transport_failures = 0
+        self._skipped = 0
+        self._opened: dict[str, Any] | None = None
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._opened is not None
+
+    def admit(self) -> bool:
+        """Whether a **keyframe** may be attempted, counting the skip when not."""
+        with self._lock:
+            if self._opened is None:
+                return True
+            self._skipped += 1
+            return False
+
+    def record(self, *, frame_number: int, code: str | None) -> dict[str, Any] | None:
+        """Fold one attempt's outcome in; the state transition it caused, or `None`."""
+        with self._lock:
+            self._attempts += 1
+            if code in TRANSPORT_FAILURE_CODES:
+                self._consecutive += 1
+                self._transport_failures += 1
+                if self._consecutive < self._limit or self._opened is not None:
+                    return None
+                self._opened = {
+                    "state": "open",
+                    "consecutive_failures": self._consecutive,
+                    "limit": self._limit,
+                    "attempt": self._attempts,
+                    "frame": frame_number,
+                    "code": code,
+                }
+                return dict(self._opened)
+            if code is not None and code not in DELIVERED_RESPONSE_CODES:
+                return None
+            cleared, self._consecutive = self._consecutive, 0
+            if not cleared:
+                return None
+            return {
+                "state": "closed",
+                "cleared_failures": cleared,
+                "attempt": self._attempts,
+                "frame": frame_number,
+            }
+
+    def summary_warning(self, frame_count: int) -> dict[str, str] | None:
+        """The one **warning** R-40 asks for, or `None` if the breaker held.
+
+        One record for every keyframe the run gave up on, carrying the count
+        that tripped it and the count that cost - which is the whole point of
+        the breaker: 77 timeouts said this once each.
+        """
+        with self._lock:
+            opened = self._opened
+            skipped = self._skipped
+        if opened is None:
+            return None
+        return warning(
+            "local_vision",
+            BREAKER_WARNING_CODE,
+            f"local vision stopped after {opened['consecutive_failures']} consecutive "
+            f"transport failures ({opened['code']}) at keyframe {opened['frame']}; "
+            f"{skipped} of {frame_count} keyframes continue with OCR-only output.",
+        )
+
+    def state(self) -> dict[str, Any]:
+        """What the breaker saw, for `debug_info`."""
+        with self._lock:
+            return {
+                "open": self._opened is not None,
+                "limit": self._limit,
+                "consecutive_failures": self._consecutive,
+                "transport_failures": self._transport_failures,
+                "skipped_keyframes": self._skipped,
+                "opened_by": None if self._opened is None else dict(self._opened),
+            }
 
 
 # Injectable HTTP entry points. Production uses urllib against the running
@@ -428,6 +567,7 @@ class FrameInterpreter:
     _max_parallel: int = 1
     _warning_counts: dict[str, int] = field(default_factory=dict)
     _trace_events: list[dict[str, Any]] = field(default_factory=list)
+    _breaker: _TransportBreaker = field(default_factory=_TransportBreaker)
 
     def interpret(
         self, frames: list[FrameArtifact]
@@ -523,7 +663,14 @@ class FrameInterpreter:
                 ):
                     ordered[outcome.index] = outcome
             outcomes = [outcome for outcome in ordered if outcome is not None]
-        return self._merge_outcomes(outcomes, warnings)
+        interpreted = self._merge_outcomes(outcomes, warnings)
+        breaker_warning = self._breaker.summary_warning(frame_count)
+        if breaker_warning is not None:
+            # Last, so it reads as the account of the run rather than as one
+            # more per-frame failure: the frames it speaks for are above it.
+            warnings.append(breaker_warning)
+            self._record_warning(breaker_warning)
+        return interpreted
 
     def _interpret_one(
         self,
@@ -533,13 +680,25 @@ class FrameInterpreter:
         frame_count: int,
     ) -> _FrameOutcome:
         self._ensure_frame_invariants(index, frame, frame_count)
+        if not self._breaker.admit():
+            # R-40's **degradation**: the keyframe is not attempted and not
+            # warned about on its own - the breaker's single warning speaks for
+            # all of them - and it is handed back carrying the **extracted
+            # text** OCR already read, which is what OCR-only means.
+            return _FrameOutcome(
+                index=index,
+                frame=frame,
+                interpreted=False,
+                warnings=[],
+                path=frame.path,
+                has_extracted_text=bool(frame.extracted_text.strip()),
+                warning_code=None,
+            )
         local_warnings: list[dict[str, str]] = []
-        interpreted_frame, was_interpreted = self._interpret_frame(
+        interpreted_frame, was_interpreted, read_code = self._interpret_frame(
             config, index, frame, frame_count, local_warnings
         )
-        # The first frame warning (if any) is the read/transport warning surfaced
-        # by _try_interpret_frame; trailing ones are grounding and carrier warnings.
-        warning_code = local_warnings[0].get("code") if local_warnings else None
+        transition = self._breaker.record(frame_number=index + 1, code=read_code)
         return _FrameOutcome(
             index=index,
             frame=interpreted_frame,
@@ -547,7 +706,8 @@ class FrameInterpreter:
             warnings=local_warnings,
             path=frame.path,
             has_extracted_text=bool(frame.extracted_text.strip()),
-            warning_code=warning_code,
+            warning_code=read_code,
+            breaker_transition=transition,
         )
 
     def _merge_outcomes(
@@ -569,6 +729,12 @@ class FrameInterpreter:
             frames.append(outcome.frame)
             if outcome.interpreted:
                 self._interpreted_count += 1
+            if outcome.breaker_transition is not None:
+                transition = outcome.breaker_transition
+                self._log(
+                    "breaker.open" if transition["state"] == "open" else "breaker.reset",
+                    transition,
+                )
             for frame_warning in outcome.warnings:
                 warnings.append(frame_warning)
                 self._record_warning(frame_warning)
@@ -604,6 +770,7 @@ class FrameInterpreter:
             "interpreted_count": self._interpreted_count,
             "max_parallel": self._max_parallel,
             "warning_counts": dict(sorted(self._warning_counts.items())),
+            "breaker": self._breaker.state(),
             "trace_events": list(self._trace_events),
         }
 
@@ -618,11 +785,15 @@ class FrameInterpreter:
         frame: FrameArtifact,
         frame_count: int,
         warnings: list[dict[str, str]],
-    ) -> tuple[FrameArtifact, bool]:
+    ) -> tuple[FrameArtifact, bool, str | None]:
         """Interpret a single frame without mutating shared interpreter state.
 
         Appends any frame warnings to the supplied (per-frame) ``warnings`` list
-        and returns the interpreted frame plus whether a result was produced.
+        and returns the interpreted frame, whether a result was produced, and the
+        code of the read failure it ended in (``None`` when a response arrived).
+        That third value is the breaker's evidence and is returned rather than
+        recovered from the warning list, because the warning list also holds
+        **grounding** warnings a *successful* read produced.
         Trace events, progress updates, and counters are emitted by the caller in
         frame order so the parallel path stays deterministic and thread-safe.
 
@@ -649,20 +820,21 @@ class FrameInterpreter:
             # not attached and it is not counted, so a run cannot report a
             # frame as interpreted on the strength of an empty object.
             result = None
+        read_code = frame_warning.get("code") if frame_warning else None
         if result:
-            return self._interpreted(frame, result, index, warnings), True
-        if frame_warning and frame_warning.get("code") in FRAME_READ_FAILURE_CODES:
+            return self._interpreted(frame, result, index, warnings), True, read_code
+        if read_code in FRAME_READ_FAILURE_CODES:
             unusable = GroundingAssessment(
                 UNGROUNDED,
                 None,
-                f"vision model produced no usable output ({frame_warning.get('code')})",
+                f"vision model produced no usable output ({read_code})",
             )
             carried, carrier_warnings = frame.with_interpretation(
                 None, grounding=unusable.public_dict()
             )
             warnings.extend(carrier_warnings)
-            return carried, False
-        return frame, False
+            return carried, False, read_code
+        return frame, False, read_code
 
     def _try_interpret_frame(
         self,
@@ -730,6 +902,10 @@ class FrameInterpreter:
         self._max_parallel = 1
         self._warning_counts = {}
         self._trace_events = []
+        # A breaker is a fact about one run: an interpreter reused for a second
+        # run starts closed, or a server that recovered between runs would
+        # never be spoken to again.
+        self._breaker = _TransportBreaker()
 
     def _record_warning(self, warning_payload: dict[str, str]) -> None:
         code = warning_payload.get("code", "unknown")
