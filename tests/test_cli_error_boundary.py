@@ -263,6 +263,116 @@ def test_a_command_whose_stderr_is_a_broken_pipe_still_exits_two(tmp_path: Path)
     assert result.stdout == ""
 
 
+A_STREAM_CLOSED_BEFORE_THE_COMMAND = """
+import sys
+sys.path.insert(0, {src!r})
+sys.{stream}.close()
+from distill.cli import main
+main(["get-job-status", "corrupt-job", "--output-dir", sys.argv[1]])
+"""
+"""A command whose stream object is closed, which is not the same as a dead fd.
+
+A closed `TextIOWrapper` answers a write or a flush with `ValueError: I/O
+operation on closed file`, not with an `OSError` - so a guard written for the
+descriptor going away lets the stream going away straight through.
+"""
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_a_command_whose_stream_was_closed_still_exits_two(stream: str, tmp_path: Path) -> None:
+    """FAILS FIRST: `ValueError` from the guarded flush. Exit 1, with a stack.
+
+    The guards named `OSError`, which is the whole vocabulary of a descriptor
+    that has gone away and none of the vocabulary of a *stream* that has. Python
+    closes both on `sys.stdout.close()`, and an embedder or a wrapper script that
+    tidies up its streams before handing over does the same thing.
+    """
+    a_corrupt_job_record(tmp_path, "corrupt-job")
+    script = tmp_path / "closed.py"
+    script.write_text(
+        A_STREAM_CLOSED_BEFORE_THE_COMMAND.format(src=str(APP / "src"), stream=stream)
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=cli_child_env(),
+    )
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stdout
+    if stream == "stdout":
+        assert json.loads(result.stderr)["code"] == "E_INTERNAL"
+
+
+A_DESCRIPTOR_CLOSED_UNDER_A_BUFFERED_WRITE = """
+import os, sys
+sys.path.insert(0, {src!r})
+sys.stdout.write("a partial result")
+os.close(1)
+from distill.cli import main
+main(["get-job-status", "corrupt-job", "--output-dir", sys.argv[1]])
+"""
+"""Buffered output, and the descriptor under it closed before the command fails.
+
+The buffer is what makes this different from a closed stream: something is
+waiting to be written when the boundary reaches for the descriptor, and again
+when the interpreter does on the way out.
+"""
+
+
+def test_a_command_whose_stdout_descriptor_vanished_still_exits_two(tmp_path: Path) -> None:
+    """FAILS FIRST: exit 120, with the interpreter's flush noise after the record.
+
+    `_discard` opens the null device and `dup2`s it over the descriptor - but
+    with file descriptor 1 *closed*, `os.open` is handed 1 as the lowest free
+    number, so the null device already is the descriptor, `dup2(1, 1)` does
+    nothing, and closing what it opened closes stdout for the second time. The
+    shutdown flush then finds a bad descriptor exactly as before.
+    """
+    a_corrupt_job_record(tmp_path, "corrupt-job")
+    script = tmp_path / "vanished.py"
+    script.write_text(A_DESCRIPTOR_CLOSED_UNDER_A_BUFFERED_WRITE.format(src=str(APP / "src")))
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=cli_child_env(),
+    )
+
+    assert result.returncode == 2
+    assert "Exception ignored" not in result.stderr
+    assert json.loads(result.stderr)["code"] == "E_INTERNAL"
+
+
+def test_a_broken_pipe_that_is_not_the_callers_output_is_not_read_as_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FAILS FIRST: exit 141 for a broken pipe that had nothing to do with stdout.
+
+    `BrokenPipeError` means "this pipe has no reader", and only the one Distill
+    writes its *result* to says anything about the caller. A progress record
+    written to a stderr nobody is reading raises the same class, and so would any
+    socket or pipe a stage holds - and answering those with the caller-left-early
+    exit turns an uncoded failure into a success-adjacent one nobody reported.
+    """
+
+    def fault(*_args: object, **_kwargs: object) -> Any:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr("distill.cli.timeout_diagnostics", fault)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["timeout-diagnostics"])
+
+    assert exit_info.value.code == 2
+    assert error_object(capsys)["code"] == "E_INTERNAL"
+
+
 def test_call_tool_with_unparseable_args_is_reported_as_the_json_error_object(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

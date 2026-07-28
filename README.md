@@ -50,10 +50,13 @@ immediately, naming the tool and what its absence costs, rather than doing the
 work and producing a bundle with nothing in it.
 
 Both classes are about a run that does the work. A run that hits the cache does
-none of it - it serves the **generation** already on disk and invokes no
-external tool at all - so a cached YouTube bundle is servable with `yt-dlp`
-absent and a cached local bundle with `ffprobe` absent. Per tool, an absence
-costs:
+none of it: it serves the **generation** already on disk, so a cached local
+bundle is servable with `ffprobe` absent, and a cached YouTube bundle with
+`yt-dlp` absent - as long as the video id can be read from the URL itself. A URL
+that also names a playlist, or whose id is not exactly eleven id characters, or
+that names more than one video, has to be resolved by `yt-dlp` before its
+**bundle key** is known, so a run of one needs the tool whether or not the
+bundle is already there. Per tool, an absence costs:
 
 | Tool | Class | What its absence costs |
 | --- | --- | --- |
@@ -167,9 +170,12 @@ contract.
 
 Two endings are deliberately not that shape, because neither is a failure to
 diagnose. `Ctrl-C` ends the command with Python's own `KeyboardInterrupt`
-traceback and exit 130 - the operator stopped their own command. A caller that
-stops reading stdout (`distill … | head`) ends it at exit 141, the conventional
-128 + `SIGPIPE`, with nothing on stderr.
+traceback and exit 130 - the operator stopped their own command. A write to a
+stdout nobody is reading (`distill … | head`) ends it at exit 141, the
+conventional 128 + `SIGPIPE`, and Distill writes no error record, because
+nothing failed. A result small enough to reach the pipe before the reader leaves
+is written and the command succeeds as usual: 141 is what a *write with no
+reader* produces, not what `| head` always produces.
 
 **stderr carries two kinds of record.** A processing run reports progress there
 as it goes - one NDJSON record per event, each carrying `"type":
@@ -223,12 +229,14 @@ one is refused rather than read as a slice from the end.
 
 A batch run (`process-video-directory`, `process-youtube-playlist`) that
 continues past a failed item - the default, `--continue-on-error` - reports each
-one as the whole error record: `code`, `stage`, `message`, `details`, plus the
-`batch_index` it failed at, so an item that a re-run would pick up can be told
-from one that will fail the same way forever. With `--no-continue-on-error`
-there is no such report: the first item's error ends the batch and is raised as
-the run's own fatal error, so it reaches you as the error object on stderr,
-naming no item and no index.
+one as the whole error record: `code`, `stage`, `message` and `details`, plus
+the item itself under `path` or `url` and the `batch_index` it failed at, so an
+item that a re-run would pick up can be told from one that will fail the same
+way forever. With `--no-continue-on-error` there is no such report: the first
+item's error ends the batch and is raised as the run's own fatal error, so it
+reaches you as the error object on stderr, carrying no `batch_index` and no item
+key - whatever the failing stage happened to put in `details` is all that ties
+it to an item.
 
 ### Upgrading a cache written by 0.1.0
 

@@ -1623,6 +1623,12 @@ class BundleRun:
         The release failure is not dropped, because a lock this process believes
         it released and did not is a **bundle key** no later run can take. It is
         recorded, beside the failure it declined to replace.
+
+        `Exception`, so a `BaseException` raised *by the release* still
+        propagates - a second `Ctrl-C` landing inside cleanup, say. Swallowing an
+        interrupt in order to preserve an earlier one is not an improvement on
+        losing the earlier one, and an operator interrupting twice is asking
+        harder rather than asking again.
         """
         try:
             self.release()

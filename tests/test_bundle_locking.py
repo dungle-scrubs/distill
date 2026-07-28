@@ -578,7 +578,7 @@ def test_a_run_releases_its_lock_when_used_as_a_context_manager(tmp_path: Path) 
 
 
 def test_an_interrupt_survives_a_release_that_fails_on_the_way_out(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """FAILS FIRST: the release's `RuntimeError` replaces the `KeyboardInterrupt`.
 
@@ -586,13 +586,19 @@ def test_an_interrupt_survives_a_release_that_fails_on_the_way_out(
     already travelling *substitutes* that exception - so an operator's `Ctrl-C`
     left the CLI boundary as `E_INTERNAL`, exit 2, saying an unexpected
     `RuntimeError` ended the command. The interrupt is the true diagnosis and it
-    is the one that was thrown away; the release failure is real too, which is
-    why it is recorded rather than dropped.
+    is the one that was thrown away.
+
+    Both halves are asserted, because declining to raise and dropping the
+    failure look identical from the caller's side: the interrupt reaches the
+    caller, *and* the lock that was not given up is recorded with the failure
+    that was in flight when it happened. A run that leaves a **bundle key**
+    locked and says nothing is the same defect one turn later.
     """
     root = tmp_path / "output"
     root.mkdir()
     store = BundleStore.open(root)
     run = begin_run(store)
+    caplog.set_level(logging.DEBUG, logger=bundle_store.LOGGER.name)
 
     def refuse_to_release() -> None:
         raise RuntimeError("the descriptor could not be closed")
@@ -601,6 +607,12 @@ def test_an_interrupt_survives_a_release_that_fails_on_the_way_out(
 
     with pytest.raises(KeyboardInterrupt), run:
         raise KeyboardInterrupt
+
+    failures = [event for event in lock_events(caplog) if event["event"] == "lock_release_failed"]
+    assert len(failures) == 1
+    assert failures[0]["detail"]["bundle_key"] == BUNDLE_KEY
+    assert "could not be closed" in failures[0]["detail"]["error"]
+    assert failures[0]["detail"]["during"] == "KeyboardInterrupt"
 
 
 def test_a_release_that_fails_on_a_clean_exit_is_still_a_failure(

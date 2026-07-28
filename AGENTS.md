@@ -17,6 +17,13 @@ capability is fatal to a run that has to *produce* a **generation**; a **bundle*
 already on disk is servable with `yt-dlp` or `ffprobe` missing, and the tests
 that hold that are in `tests/test_cache_before_capability.py`.
 
+One scope inside that scope: a YouTube run can only skip `yt-dlp` when the
+**bundle key** is knowable from the URL, which is what
+`source.youtube_fast_path_video_id` decides. It declines a URL that also names a
+playlist, one whose id is not exactly eleven id characters, and one that names
+more than one video - each of those is resolved by `yt-dlp` before the cache is
+consulted, so a run of one needs the tool with or without a bundle on disk.
+
 | Tool | Capability | Class | What its absence costs |
 | --- | --- | --- | --- |
 | `ffmpeg` | audio extraction and keyframe extraction | required | no audio can be extracted and no keyframe can be captured, which leaves a generation with neither a transcript nor frame artifacts and no usable bundle to publish |

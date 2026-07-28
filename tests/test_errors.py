@@ -177,6 +177,23 @@ def test_a_detail_too_long_to_publish_is_capped_rather_than_dropped() -> None:
     assert details["blob"].endswith(DETAIL_TRUNCATION_SUFFIX)
 
 
+def test_an_integer_too_large_to_write_down_is_described_instead() -> None:
+    """FAILS FIRST: `Exceeds the limit (4300 digits) for integer string conversion`.
+
+    An `int` is JSON's own type, which is exactly why it was passed through
+    untouched - but CPython refuses to *render* one past
+    `sys.get_int_max_str_digits()`, so `json.dumps` raises `ValueError` on a
+    value it would otherwise have written happily. A number that large in
+    `details` is a bug's own arithmetic arriving at a boundary, which is the
+    moment the boundary must not add a second failure.
+    """
+    details = json.loads(DistillError("E_X", "s", "m", {"value": 10**5000}).to_json_text())[
+        "details"
+    ]
+
+    assert details["value"] == "<int>"
+
+
 def test_an_exception_that_cannot_say_what_went_wrong_still_becomes_a_record() -> None:
     """FAILS FIRST: `from_unexpected` calls `str(exc)`, which raises.
 

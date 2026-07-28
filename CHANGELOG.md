@@ -33,11 +33,12 @@ stay readable where the format allows and are otherwise reprocessed.
 - **Batch item errors carry the whole record.** `process-video-directory` and
   `process-youtube-playlist` reported a failed item as `{item_key, message}`.
   A batch that continues past a failure - the default - now reports each one
-  with `code`, `stage`, `message`, `details` and its `batch_index`; the
-  flattened `message`-only shape is gone, as is the `DistillSession` envelope
-  that hid the record inside a message string. `--no-continue-on-error` is
-  unchanged and produces no such report: the first item's error ends the batch
-  and is raised as the run's own fatal error, naming no item and no index.
+  with `code`, `stage`, `message`, `details`, the item under `path` or `url`,
+  and its `batch_index`; the flattened `message`-only shape is gone, as is the
+  `DistillSession` envelope that hid the record inside a message string.
+  `--no-continue-on-error` is unchanged and produces no such report: the first
+  item's error ends the batch and is raised as the run's own fatal error,
+  carrying no `batch_index` and no item key.
 - **Numeric options are validated rather than taken as written.** Each has a
   domain, and a value outside it is refused with `E_BAD_OPTIONS` naming the
   option. The domain is a finite quantity above zero, with three exceptions:
@@ -143,8 +144,11 @@ stay readable where the format allows and are otherwise reprocessed.
 - Resume scratch is stripped before a generation is published, so a stage result
   can no longer reach a reader as part of a bundle.
 - A cache hit is served without invoking a tool that is only needed to *produce*
-  a bundle: a cached YouTube bundle is servable with `yt-dlp` absent, and a
-  cached local bundle with `ffprobe` absent.
+  a bundle: a cached local bundle is servable with `ffprobe` absent, and a
+  cached YouTube bundle with `yt-dlp` absent whenever the video id can be read
+  from the URL. A URL that also names a playlist, that names more than one
+  video, or whose id is not exactly eleven id characters is still resolved by
+  `yt-dlp` before its bundle key is known.
 - A large `stdout` no longer deadlocks a subprocess whose `stderr` is also being
   read, and a child that ignores `SIGTERM` leaves no grandchild behind.
 - The documented default output directory was wrong: bundles have always landed

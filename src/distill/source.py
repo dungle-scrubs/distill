@@ -320,6 +320,10 @@ def release_acquisition_lease(source: Any, *, during: BaseException | None = Non
     failure is logged instead of raised; with none, it is raised, because a
     lease this process believes it released and did not is a **lock key** the
     next run of the same source will wait out.
+
+    An `Exception` from the release, not a `BaseException`: a second `Ctrl-C`
+    landing inside cleanup still propagates, because swallowing an interrupt to
+    preserve an earlier one is not an improvement on losing the earlier one.
     """
     lease = getattr(source, "acquisition_lease", None)
     if not isinstance(lease, AcquisitionLease):

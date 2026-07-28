@@ -74,6 +74,31 @@ def _args_payload(args: argparse.Namespace, keys: tuple[str, ...]) -> dict[str, 
     return payload
 
 
+class _NobodyIsReadingTheOutput(Exception):
+    """Raised where Distill writes its result and finds the pipe has no reader.
+
+    A marker, not a diagnosis. `BrokenPipeError` means "this pipe has no
+    reader", and only the pipe carrying the *result* says anything about the
+    caller: a **progress** record written to a stderr nobody reads raises the
+    same class, and so would any socket or pipe a stage happens to hold. Caught
+    around the whole dispatch, `BrokenPipeError` answered all of those with the
+    caller-left-early exit, which turns an uncoded failure into something that
+    looks like a caller's choice.
+
+    So the two places Distill writes to stdout raise this instead, and `main`
+    catches this rather than `BrokenPipeError`. Anything else that breaks a pipe
+    reaches the boundary as what it is: an exception a command raised.
+    """
+
+
+def _write_stdout(text: str) -> None:
+    """Put `text` on stdout, saying so if the caller has stopped reading."""
+    try:
+        print(text)
+    except BrokenPipeError as gone:
+        raise _NobodyIsReadingTheOutput from gone
+
+
 def _print_json(payload: Any) -> None:
     """The one write to stdout, so the boundary's guarantees cover all of them.
 
@@ -81,7 +106,7 @@ def _print_json(payload: Any) -> None:
     used to print from `pipeline` and so sat outside whatever this boundary
     promises about the output stream.
     """
-    print(json.dumps(payload, indent=2, sort_keys=True))
+    _write_stdout(json.dumps(payload, indent=2, sort_keys=True))
 
 
 BROKEN_PIPE_EXIT = 141
@@ -91,6 +116,16 @@ BROKEN_PIPE_EXIT = 141
 not the operator's mistake either. Reported as an `E_INTERNAL` record it read as
 a defect in Distill; reported as the conventional signal exit it reads as what
 it is, and a shell that checks `$?` sees the number every other program uses.
+"""
+
+GONE_STREAM_ERRORS = (OSError, ValueError)
+"""What a stream that is no longer usable answers with, both spellings.
+
+`OSError` is a descriptor that has gone away: closed underneath the stream,
+`EPIPE`, `EBADF`. `ValueError: I/O operation on closed file` is the *stream*
+having gone away, which is a different object being in a different state, and a
+guard that names only the first lets the second out of a boundary that exists so
+nothing gets out.
 """
 
 
@@ -105,16 +140,29 @@ def _discard(stream: Any) -> None:
     contract names. Re-pointing the descriptor is the standard recipe: the
     buffered bytes have nowhere to go either way, and this is the only way to
     say so before shutdown asks.
+
+    The descriptor may already *be* the null device, and then there is nothing
+    to do and something not to do. With file descriptor 1 closed rather than
+    dead, `os.open` is handed 1 as the lowest free number, so the open itself
+    installs the null device where stdout belongs; `dup2` is then a no-op and
+    closing what was opened closes stdout a second time, which is the failure
+    this function was called to prevent, one step later.
     """
     if stream is None:
+        return
+    try:
+        target = stream.fileno()
+    except GONE_STREAM_ERRORS:
         return
     try:
         devnull = os.open(os.devnull, os.O_WRONLY)
     except OSError:
         return
+    if devnull == target:
+        return
     try:
-        os.dup2(devnull, stream.fileno())
-    except (OSError, ValueError):
+        os.dup2(devnull, target)
+    except OSError:
         pass
     finally:
         os.close(devnull)
@@ -133,7 +181,7 @@ def _flush_stdout_quietly() -> None:
         return
     try:
         stream.flush()
-    except OSError:
+    except GONE_STREAM_ERRORS:
         _discard(stream)
 
 
@@ -173,7 +221,7 @@ def _emit_error(error: dict[str, Any]) -> None:
     try:
         print(json.dumps(error, sort_keys=True), file=stream)
         stream.flush()
-    except OSError:
+    except GONE_STREAM_ERRORS:
         # A failed flush leaves the bytes in the buffer, where the interpreter's
         # own shutdown flush finds them and fails again - which is the exit-120
         # path, one step further along.
@@ -435,10 +483,12 @@ def main(argv: list[str] | None = None) -> None:
     operator interrupting their own command, which is not a failure to diagnose
     and not Distill's to relabel.
 
-    `BrokenPipeError` is caught first and separately. It is the one `OSError`
-    that is not a failure at all - it means the caller stopped reading, which
+    `_NobodyIsReadingTheOutput` is caught first and separately. It is the one
+    ending that is not a failure at all - the caller stopped reading, which
     `| head` does on purpose - so it ends the command on the conventional signal
-    exit rather than as a record saying an unexpected error occurred.
+    exit rather than as a record saying an unexpected error occurred. It is
+    raised only where Distill writes its result, so a broken pipe anywhere else
+    is still an exception a command raised and is reported as one.
     """
     try:
         _dispatch(argv)
@@ -447,8 +497,11 @@ def main(argv: list[str] | None = None) -> None:
             # a pipe, so a caller that walked away is not discovered until the
             # buffer is emptied - and left to the interpreter's own shutdown
             # flush, that discovery happens where nothing can handle it.
-            sys.stdout.flush()
-    except BrokenPipeError:
+            try:
+                sys.stdout.flush()
+            except BrokenPipeError as gone:
+                raise _NobodyIsReadingTheOutput from gone
+    except _NobodyIsReadingTheOutput:
         _discard(sys.stdout)
         raise SystemExit(BROKEN_PIPE_EXIT) from None
     except DistillError as exc:

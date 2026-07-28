@@ -77,7 +77,18 @@ def _json_safe(value: Any, seen: tuple[int, ...] = (), depth: int = 0) -> Any:
     described rather than walked, and a container that contains itself reports
     `<recursive>` instead of a `ValueError: Circular reference detected`.
     """
-    if value is None or isinstance(value, bool | int):
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        # An `int` is JSON's own type and still not always writable: CPython
+        # refuses to *render* one past `sys.get_int_max_str_digits()`, so
+        # `json.dumps` answers a large enough integer with `ValueError`. Asked
+        # rather than compared against a bit count, because the limit is a
+        # runtime setting and the question is exactly "can this be written".
+        try:
+            str(value)
+        except ValueError:
+            return _described(value)
         return value
     if isinstance(value, float):
         # `inf` and `nan` are not JSON. `repr` names them the way the option
