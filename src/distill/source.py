@@ -44,11 +44,13 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
+from .artifacts import RedactionState
 from .bundle_store import (
     SINGLE_SOURCE_LOCK_WAIT_SEC,
     BundleStore,
@@ -58,6 +60,7 @@ from .bundle_store import (
 )
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, warning
+from .links import RelatedLink, extract_relevant_links
 from .options import DistillOptions
 from .progress import ProgressReporter
 from .run_command import (
@@ -269,7 +272,14 @@ class SourceInfo:
     warnings: list[dict[str, str]]
     youtube_video_id: str | None = None
     youtube_lock_key: str | None = None
-    related_links: list[dict[str, str]] | None = None
+    related_links: list[RelatedLink] | None = None
+    """The **related links** this source's metadata named, as carriers (R-21).
+
+    Carriers and not documents, because every sink they reach - the **render**,
+    the **manifest**, the caller's response - is a sink R-20 is stated about,
+    and a document handed to one has bypassed the check that a document is all
+    it can perform (finding 5). Serializing them is the sink's job.
+    """
     # Present only for a source this run acquired. A cache hit reads no media
     # and holds no lease; a local source has nothing to lease.
     acquisition_lease: AcquisitionLease | None = None
@@ -1224,6 +1234,35 @@ class YoutubeDownloader:
             time.sleep(self.lock_poll_sec)
 
 
+def _manifest_related_links(
+    manifest: Mapping[str, Any], options: DistillOptions
+) -> list[RelatedLink] | None:
+    """The **related links** a servable **manifest** recorded, as carriers again.
+
+    A cache hit describes a source it did not read, so its links come off disk -
+    and they come back as carriers because the run reusing them hands them to
+    the same sinks a fresh run does, which are the sinks R-20 is stated about.
+
+    The policy is this run's and never the document's claim about itself, for
+    the reason `FrameArtifact.from_document` gives: a manifest is something
+    another process wrote, and `redact_secrets` participates in the **options
+    hash** and so in the **bundle key**, so a manifest under this bundle key was
+    written by a run under this policy.
+
+    An entry that is not a mapping is dropped rather than refused: a link that
+    cannot be rebuilt costs that link, not the cache hit.
+    """
+    recorded = manifest.get("related_links")
+    if not isinstance(recorded, list):
+        return None
+    policy = RedactionState.NOT_APPLIED if options.redact_secrets else RedactionState.DISABLED
+    return [
+        RelatedLink.from_document(entry, redaction=policy)
+        for entry in recorded
+        if isinstance(entry, Mapping)
+    ]
+
+
 class YouTubeSourceProvider:
     def cached(
         self,
@@ -1262,9 +1301,7 @@ class YouTubeSourceProvider:
             warnings=[],
             youtube_video_id=video_id,
             youtube_lock_key=youtube_lock_key(video_id),
-            related_links=list(manifest.get("related_links", []))
-            if isinstance(manifest.get("related_links"), list)
-            else None,
+            related_links=_manifest_related_links(manifest, request.options),
         )
 
     def resolve(
@@ -1288,8 +1325,6 @@ class YouTubeSourceProvider:
         lock_key = youtube_lock_key(video_id)
         fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
         source = source_hash(fingerprint, options.opts_hash("youtube"))
-        from .links import extract_relevant_links
-
         downloader = downloader or YoutubeDownloader(
             output_root, lock_wait_sec=request.lock_wait_sec
         )
@@ -1320,7 +1355,15 @@ class YouTubeSourceProvider:
             related_links = extract_relevant_links(
                 metadata.description,
                 source="youtube_description",
+                redact=options.redact_secrets,
             )
+            # Construction is where the **redaction** policy runs over a link's
+            # label and destination, so the **warnings** it raises there are
+            # this run's: a confusable-obfuscated key it had to normalize, a
+            # label it truncated. They travel with the source's other warnings
+            # rather than inside the link, which is bundle content and not a
+            # place a **degradation** can be counted (finding 7).
+            warnings.extend(dict(item) for link in related_links for item in link.warnings)
         except BaseException:
             acquired.lease.release()
             raise

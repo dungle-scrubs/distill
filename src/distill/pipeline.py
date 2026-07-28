@@ -11,12 +11,13 @@ import os
 import re
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .artifacts import FrameArtifact, RedactionState, Transcript
 from .bundle_store import (
     BATCH_ITEM_LOCK_WAIT_SEC,
     DEFAULT_KEEP_GENERATIONS,
@@ -47,9 +48,8 @@ from .progress import (
     ProgressHeartbeat,
     ProgressReporter,
 )
-from .redact_secrets import redact_text
 from .render import render_markdown
-from .response import manifest_document, run_response
+from .response import manifest_document, response_frames, run_response
 from .source import (
     normalize_youtube_url,
     release_acquisition_lease,
@@ -227,21 +227,6 @@ def _abandon_reason(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def _as_stage_payload(name: str, recorded: Any) -> dict[str, Any] | None:
-    """A recorded **stage result** in the shape this run expects, or `None`.
-
-    Anything else is treated as absent rather than as an error: a stage result
-    is scratch, so a shape a newer run does not recognize costs a recomputation
-    and nothing more. The one accommodation is a bare list under `frames`, which
-    is how an older run recorded that stage before payloads carried warnings.
-    """
-    if isinstance(recorded, dict):
-        return recorded
-    if name == "frames" and isinstance(recorded, list):
-        return {"frames": recorded, "warnings": []}
-    return None
-
-
 @dataclass
 class ProcessingRun:
     source: Any
@@ -309,7 +294,7 @@ class ProcessingRun:
             job_id=self.options.job_id,
         )
 
-    def _run_stage(
+    def _run_stage[StageValue](
         self,
         run: BundleRun,
         heartbeat: ProgressHeartbeat,
@@ -317,54 +302,189 @@ class ProcessingRun:
         name: str,
         skipped_mechanisms: tuple[str, ...],
         producer: Callable[[], dict[str, Any]],
-    ) -> dict[str, Any]:
+        revive: Callable[[dict[str, Any]], _Recovered[StageValue] | None],
+    ) -> StageValue:
         """Recover a **stage result** or produce one, recording it either way.
 
-        Resume is the store's answer, not this module's: `read_stage` reports
-        `None` for every reason a recorded result cannot be used - the run is
-        not resuming, nothing was recorded, or what was recorded is unreadable -
-        and every one of them means the same thing here, which is compute it.
-        """
-        payload = _as_stage_payload(name, run.read_stage(name))
-        if payload is not None:
-            for mechanism in skipped_mechanisms:
-                self.progress.skip_cached(mechanism, detail={"source": "partial_resume"})
-        else:
-            payload = producer()
-            heartbeat.check()
-            run.write_stage(name, payload)
-        warnings.extend(list(payload.get("warnings", [])))
-        return payload
+        What a caller gets back is what the stage *speaks* - carriers - and
+        never the payload they were read out of, which is what makes the
+        recovery total. `revive` is the stage's own answer to "is this the shape
+        I produce", asked of a resumed document and of a fresh one alike, and
+        the only caller of it: nothing downstream subscripts a payload, so there
+        is no field left for a document to be missing.
 
-    def _produce_ocr(self, frames: list[dict]) -> dict[str, Any]:
+        Two reasons a stage runs, and this is deliberately one branch. `None`
+        from `read_stage` is the store's: the run is not resuming, nothing was
+        recorded, what was recorded is unreadable, or it failed the checks R-23
+        puts a resumed document through. `None` from `revive` is this module's:
+        the envelope held up but the payload inside it is not the shape this
+        stage reads - an older Distill's spelling, a truncated write, scratch
+        somebody edited. D-030 answers both the same way, which is compute it. A
+        resume that could *end* a run would be worse than the trust it replaced
+        (RV-8), and a shape check that raised would be exactly that with an
+        extra step (boundary review, finding 2).
+
+        A payload this run just produced is a different matter. If the stage's
+        own output is not the shape the stage reads, nothing about resuming is
+        wrong and recomputing would not fix it, so it is reported as the defect
+        it is rather than retried - and reported before it is recorded, because
+        scratch this run cannot read is scratch no later run could read either.
+        """
+        recorded = run.read_stage(name)
+        if recorded is not None:
+            recovered = _revived(recorded, revive)
+            if recovered is not None:
+                for mechanism in skipped_mechanisms:
+                    self.progress.skip_cached(mechanism, detail={"source": "partial_resume"})
+                warnings.extend(_stage_warnings(recorded))
+                return recovered.value
+            run.discard_stage(name, "payload_shape_unusable")
+        payload = producer()
+        heartbeat.check()
+        produced = _revived(payload, revive)
+        if produced is None:
+            raise DistillError(
+                "E_BAD_STAGE_PAYLOAD",
+                "pipeline",
+                f"the {name} stage produced a payload of a shape it does not read",
+                {"stage": name},
+            )
+        run.write_stage(name, payload, redaction=self._redaction_policy)
+        warnings.extend(_stage_warnings(payload))
+        return produced.value
+
+    def _recovered_frames(
+        self, payload: dict[str, Any]
+    ) -> _Recovered[list[FrameArtifact]] | None:
+        """The **frame artifacts** `payload` holds, or `None` if it holds none.
+
+        A stage that just ran hands back carriers. A stage a **resume**
+        recovered hands back the documents `bundle_store` serialized them into,
+        because a stage result is JSON on disk and nothing else. Both are the
+        same frames, so the difference is settled here rather than by every
+        consumer downstream.
+
+        Total over both, which is the point: this is handed a document another
+        process wrote, so `frames` may be absent, may not be a list, may hold
+        strings, and may hold mappings that are missing a field a frame has.
+        None of those is a run's business - the frames stage can always select
+        the keyframes again - so each of them is `None` here and a recomputation
+        upstream.
+
+        `redaction` is this run's policy, applied to a rebuilt frame whatever
+        the document says about itself: R-23's premise is that a stage result's
+        claims are input rather than facts.
+        """
+        items = payload.get("frames")
+        if not isinstance(items, list | tuple):
+            return None
+        frames: list[FrameArtifact] = []
+        for item in items:
+            if isinstance(item, FrameArtifact):
+                frames.append(item)
+                continue
+            if not isinstance(item, Mapping):
+                return None
+            try:
+                frames.append(
+                    FrameArtifact.from_document(item, redaction=self._redaction_policy)
+                )
+            except Exception:
+                # Deliberately broad, for the reason `read_stage_result`'s guard
+                # is: every way a document can fail to become a carrier - a
+                # missing field, a type a carrier cannot freeze, a nesting depth
+                # that exhausts the walk - costs the same recomputation, and
+                # there is no way to fail here that is worth ending a run over.
+                return None
+        return _Recovered(frames)
+
+    def _recovered_transcript(self, payload: dict[str, Any]) -> _Recovered[Transcript | None] | None:
+        """The **transcript** carrier `payload` holds, on the same terms.
+
+        A run that produced no transcript carries nothing at all, which is why
+        the answer is wrapped: `_Recovered(None)` is a stage whose value is
+        legitimately absent, and a bare `None` is a payload this stage cannot
+        read. Collapsing the two would make "the video had no speech" and "the
+        scratch is unusable" the same answer.
+
+        Which is also why the field has to be *there*. A recorded `null` is this
+        stage saying it found no speech; a payload with no `transcript` key at
+        all is a payload that has not answered, and reading it as "no speech"
+        would publish a **generation** with no transcript for a video that has
+        one, having skipped the transcription that would have found it.
+        """
+        if "transcript" not in payload:
+            return None
+        item = payload["transcript"]
+        if item is None or isinstance(item, Transcript):
+            return _Recovered(item)
+        if not isinstance(item, Mapping):
+            return None
+        try:
+            return _Recovered(Transcript.from_document(item, redaction=self._redaction_policy))
+        except Exception:
+            return None
+
+    def _produce_ocr(self, frames: list[FrameArtifact]) -> dict[str, Any]:
+        """Read every **keyframe**'s image text onto the artifact that names it.
+
+        No translation step is left here. `ocr_frames` takes the carriers
+        `select_keyframes` produced and hands back carriers, so the **redaction**
+        policy runs where the text enters (R-19) and the **stage result** this
+        payload becomes cannot hold it raw - which is finding 4, closed at the
+        seam it was hiding in rather than downstream of it.
+        """
         ocr = self.options.ocr_config()
-        ocr_frames_result, ocr_warnings = ocr_frames(
+        read, ocr_warnings = ocr_frames(
             frames,
             ocr.language,
             ocr.enabled,
             self.progress,
             ocr.preprocess,
         )
-        return {"frames": ocr_frames_result, "warnings": ocr_warnings}
+        return {"frames": read, "warnings": ocr_warnings}
 
-    def _produce_redaction(self, frames: list[dict]) -> dict[str, Any]:
-        redaction_warnings: list[dict[str, str]] = []
-        redacted_frames = []
-        for index, frame in enumerate(frames):
-            copied = dict(frame)
-            result = redact_text(str(copied.get("ocr_text", "")))
-            copied["ocr_text"] = result.text
-            redaction_warnings.extend(result.warnings)
-            redacted_frames.append(copied)
-            self.progress.update(
-                "redaction",
-                percent=((index + 1) / max(1, len(frames))) * 100,
-                detail={"frame": index + 1, "frames": len(frames)},
-            )
-        self.progress.complete("redaction", detail={"frames": len(frames)})
-        return {"frames": redacted_frames, "warnings": redaction_warnings}
+    @property
+    def _redaction_policy(self) -> RedactionState:
+        """The **redaction** policy this run's carriers are constructed under.
 
-    def _produce_local_vision(self, frames: list[dict]) -> dict[str, Any]:
+        `DISABLED` is `--no-redact-secrets` and is recorded in what the run
+        publishes; anything else means the policy runs (D-020).
+        """
+        return (
+            RedactionState.NOT_APPLIED
+            if self.options.redact_secrets
+            else RedactionState.DISABLED
+        )
+
+    def _carry_transcript(self, transcript: Any) -> tuple[Transcript | None, list[dict]]:
+        """Put the **transcript** through a carrier on the same terms (R-21).
+
+        Finding 15: no stage covered the transcript, so a secret somebody said
+        out loud was published verbatim in the transcript the store writes. It
+        is extracted text like any other - the person who recorded the video
+        chose the words - and the carrier is what makes "the same terms" mean
+        the same policy rather than a second implementation of it.
+
+        A run with no transcript carries nothing: `None` is the absence of the
+        document, not an empty one, and inventing an empty transcript here would
+        publish a transcript for a video that has none.
+
+        The translation stays because `transcript.py` has not been migrated -
+        it produces the mapping faster-whisper gave it, and this is where that
+        mapping becomes a carrier. The frames need no equivalent any more.
+        """
+        if transcript is None:
+            return None, []
+        carrier = Transcript(
+            language=str(transcript.get("language", "")),
+            language_probability=float(transcript.get("language_probability", 0.0)),
+            segments=tuple(transcript.get("segments", ())),
+            redaction=self._redaction_policy,
+        )
+        return carrier, [dict(item) for item in carrier.warnings]
+
+    def _produce_local_vision(self, frames: list[FrameArtifact]) -> dict[str, Any]:
         vision_frames, vision_warnings = interpret_frames_with_local_vision(
             frames,
             self.options,
@@ -387,17 +507,21 @@ class ProcessingRun:
                 self.progress,
                 duration_sec=self.source.duration_sec,
             )
-            return {"transcript": transcript, "warnings": transcript_warnings}
+            carried, carrier_warnings = self._carry_transcript(transcript)
+            return {
+                "transcript": carried,
+                "warnings": [*transcript_warnings, *carrier_warnings],
+            }
 
-        transcript_payload = self._run_stage(
+        transcript = self._run_stage(
             run,
             heartbeat,
             warnings,
             "transcript",
             ("transcription", "audio_extraction"),
             produce_transcript,
+            self._recovered_transcript,
         )
-        transcript = transcript_payload.get("transcript")
 
         def produce_frames() -> dict[str, Any]:
             frame_selection = self.options.frame_selection_config()
@@ -409,52 +533,46 @@ class ProcessingRun:
                 frame_selection.min_interval_sec,
                 frame_selection.max_static_window_sec,
                 self.progress,
+                redaction=self._redaction_policy,
             )
             return {"frames": frames, "warnings": frame_warnings}
 
-        frames_payload = self._run_stage(
+        frames = self._run_stage(
             run,
             heartbeat,
             warnings,
             "frames",
             ("frame_selection",),
             produce_frames,
+            self._recovered_frames,
         )
-        frames = frames_payload["frames"]
 
-        ocr_payload = self._run_stage(
+        frames = self._run_stage(
             run,
             heartbeat,
             warnings,
             "ocr",
             ("ocr",),
             lambda: self._produce_ocr(frames),
+            self._recovered_frames,
         )
-        frames = ocr_payload["frames"]
 
-        if self.options.redact_secrets:
-            redaction_payload = self._run_stage(
-                run,
-                heartbeat,
-                warnings,
-                "redaction",
-                ("redaction",),
-                lambda: self._produce_redaction(frames),
-            )
-            frames = redaction_payload["frames"]
-        else:
-            self.progress.skip_cached("redaction", detail={"reason": "disabled"})
+        # No redaction stage: the policy ran inside `_produce_ocr`, where the
+        # text entered its carrier (D-019). A stage here would be a stage that
+        # runs after `write_stage` has already put the raw text on disk, which
+        # is finding 4, and it would report a progress mechanism for work no
+        # longer done in one place.
 
         if self.options.caption_frames:
-            vision_payload = self._run_stage(
+            frames = self._run_stage(
                 run,
                 heartbeat,
                 warnings,
                 "local_vision",
                 ("local_vision",),
                 lambda: self._produce_local_vision(frames),
+                self._recovered_frames,
             )
-            frames = vision_payload["frames"]
         else:
             self.progress.skip_cached("local_vision", detail={"reason": "disabled"})
 
@@ -476,7 +594,7 @@ class ProcessingRun:
             self.source,
             self.options,
             transcript_present=transcript is not None,
-            frames=frames,
+            frames=response_frames(frames),
             warnings=warnings,
         )
         self.progress.complete("bundle_publish", detail={"generation": run.generation_name})
@@ -484,21 +602,68 @@ class ProcessingRun:
         manifest["progress"] = progress_summary
         snapshot = run.commit(manifest)
 
-        final_frames = []
-        for frame in frames:
-            copied = dict(frame)
-            copied["path"] = str(snapshot.frames / Path(str(frame["path"])).name)
-            final_frames.append(copied)
+        # The publish renamed the **staging directory**, so the image path each
+        # artifact recorded while staging is not where a reader will find it.
+        published = [
+            frame.relocated(str(snapshot.frames / Path(frame.path).name)) for frame in frames
+        ]
         return run_response(
             snapshot,
             self.source,
-            final_frames,
+            response_frames(published),
             transcript is not None,
             warnings,
             cached=False,
             progress=progress_summary,
             job_id=self.options.job_id,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _Recovered[StageValue]:
+    """What a stage payload turned into, kept distinct from having failed to.
+
+    One wrapper rather than a bare optional, because a stage's value can itself
+    be `None`: a run whose video has no speech carries no **transcript**, and a
+    reviver returning `None` for both that and "this payload is not the shape I
+    read" would make `_run_stage` recompute a transcript that does not exist,
+    every time, forever.
+    """
+
+    value: StageValue
+
+
+def _revived[StageValue](
+    payload: dict[str, Any],
+    revive: Callable[[dict[str, Any]], _Recovered[StageValue] | None],
+) -> _Recovered[StageValue] | None:
+    """`payload` as the value its stage speaks, or `None` if it is not one.
+
+    The common half of every reviver: the **warnings** every stage payload
+    carries. A reviver is left owning only its own stage's field, and the
+    envelope both of them share is checked once.
+
+    Warnings are checked here rather than tolerated downstream because they are
+    published: a resumed `"warnings": "truncated"` was iterated as a string, so
+    a **generation**'s **manifest** recorded eleven warnings, one per character.
+    """
+    recorded = payload.get("warnings", ())
+    if not isinstance(recorded, list | tuple):
+        return None
+    if not all(isinstance(item, Mapping) for item in recorded):
+        return None
+    return revive(payload)
+
+
+def _stage_warnings(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """The **warnings** a stage payload carries, as plain documents.
+
+    Copied out rather than passed through: a carrier's warnings are
+    `MappingProxyType`, which `json` cannot encode, and these end up in a
+    **manifest**. Reached only for a payload `_revived` accepted, so every item
+    is a mapping.
+    """
+    return [dict(item) for item in payload.get("warnings", ())]
 
 
 def record_job(
@@ -844,13 +1009,19 @@ def transcribe_with_imports(
 
 
 def interpret_frames_with_local_vision(
-    frames: list[dict],
+    frames: list[FrameArtifact],
     options: DistillOptions,
     progress: ProgressReporter | None = None,
-) -> tuple[list[dict], list[dict[str, str]]]:
+) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+    """Interpret every frame, under the **redaction** policy the frames carry.
+
+    The interpreter is told nothing about redaction. `--no-redact-secrets` is
+    recorded on each **frame artifact** by `select_keyframes` and travels with
+    it, so the model's words are redacted where they enter the carrier (R-19)
+    rather than by a helper the vision pass had to remember to call.
+    """
     interpreter = FrameInterpreter(
         config=options.local_vision_config(),
-        redact_secrets=options.redact_secrets,
         progress=progress,
         probe=probe_local_vision,
         try_interpret=try_interpret_image,

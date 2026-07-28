@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from distill.artifacts import FrameArtifact, Transcript
 from distill.bundle_store import (
     BundleRun,
     BundleStore,
@@ -20,12 +21,33 @@ from distill.bundle_store import (
     stage_paths,
 )
 from distill.errors import DistillError
+from distill.links import extract_relevant_links
 from distill.options import DistillOptions
-from distill.response import manifest_document, run_response
+from distill.response import (
+    manifest_document,
+    response_frames,
+    response_related_links,
+    run_response,
+)
 from distill.source import SourceInfo
 from distill.version import PIPELINE_VERSION
 
 BUNDLE_KEY = "hash"
+
+
+def spoken(*segments: dict[str, object]) -> Transcript:
+    """A **transcript** carrier holding exactly these segments.
+
+    `write_transcript` takes a carrier and not a document (R-20): `serialize`
+    is the last check before **extracted text** becomes durable, so a caller
+    that could hand in a mapping would be a caller that had already skipped it.
+    """
+    return Transcript(language="en", segments=tuple(segments))
+
+
+# Secret-shaped by `redact_secrets.SECRET_PATTERNS`, placed in both halves of a
+# **related link** so the manifest is asked about the label and the destination.
+LINK_SECRET = "sk-live-0123456789abcdefghij"
 
 
 def source(tmp_path: Path) -> SourceInfo:
@@ -51,14 +73,15 @@ def youtube_source(tmp_path: Path) -> SourceInfo:
         source_fingerprint="fingerprint",
         source_hash=BUNDLE_KEY,
         warnings=[],
-        related_links=[
-            {
-                "url": "https://github.com/example/catch-me-up",
-                "label": "Skill repo",
-                "source": "youtube_description",
-                "reason": "code_or_reference_domain",
-            }
-        ],
+        # Built the way a run builds them - `extract_relevant_links` is where
+        # the carrier is constructed, and R-19 puts the **redaction** policy
+        # there - rather than hand-written, which would describe a source no
+        # run can produce.
+        related_links=extract_relevant_links(
+            f"Skill repo ({LINK_SECRET}): "
+            f"https://github.com/example/catch-me-up?api_key={LINK_SECRET}",
+            source="youtube_description",
+        ),
     )
 
 
@@ -92,17 +115,19 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
     store, run = begin(tmp_path / "output")
     frame = run.frames_dir / "frame_0001.png"
     frame.write_bytes(b"png")
-    frames = [
-        {
-            "index": 1,
-            "timestamp_sec": 0.0,
-            "path": str(frame),
-            "relative_path": "frames/frame_0001.png",
-            "ocr_text": "text",
-        }
-    ]
+    frames = response_frames(
+        [
+            FrameArtifact(
+                index=1,
+                timestamp_sec=0.0,
+                path=str(frame),
+                relative_path="frames/frame_0001.png",
+                extracted_text="text",
+            )
+        ]
+    )
     run.write_render("# Video\n")
-    run.write_transcript({"segments": [{"start": 0, "end": 1, "text": "hi"}]})
+    run.write_transcript(spoken({"start": 0, "end": 1, "text": "hi"}))
 
     snapshot = run.commit(
         manifest_document(
@@ -134,7 +159,7 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
 def test_response_shape(tmp_path: Path) -> None:
     _, run = begin(tmp_path / "output")
     run.write_render("# Video\n")
-    run.write_transcript({})
+    run.write_transcript(spoken())
     snapshot = run.commit(minimal_manifest(tmp_path))
 
     response = run_response(snapshot, source(tmp_path), [], True, [], cached=False)
@@ -147,10 +172,24 @@ def test_response_shape(tmp_path: Path) -> None:
 
 
 def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> None:
+    """Both documents carry the links, and neither carries what the policy removed.
+
+    R-21: a **related link**'s label and destination are **extracted text**, so
+    what reaches the durable **manifest** is what came out of the carrier. The
+    old assertion was that the manifest matched the source byte for byte, which
+    holds whether or not anything redacted them - so it is stated here as an
+    absence of the secret as well as a presence of the links.
+
+    Carried byte-for-byte is also no longer what either document does: a source
+    holds carriers now, and each sink serializes them into the four fields that
+    describe a link. `redaction` and `warnings` are the carrier's bookkeeping
+    and stay out of both (finding 7) - the policy is recorded once, under
+    `options`, and a link's warnings travel with the source's.
+    """
     store, run = begin(tmp_path / "output")
     source_info = youtube_source(tmp_path)
     run.write_render("# Video\n")
-    run.write_transcript({"segments": [{"start": 0, "end": 1, "text": "hi"}]})
+    run.write_transcript(spoken({"start": 0, "end": 1, "text": "hi"}))
 
     snapshot = run.commit(
         manifest_document(
@@ -165,14 +204,19 @@ def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> N
 
     active = store.load_active(BUNDLE_KEY)
     assert active is not None
-    assert active.manifest["related_links"] == source_info.related_links
-    assert response["related_links"] == source_info.related_links
+    documents = response_related_links(source_info.related_links)
+    assert active.manifest["related_links"] == documents
+    assert response["related_links"] == documents
+    assert [sorted(link) for link in documents] == [["label", "reason", "source", "url"]]
+    published = json.dumps(active.manifest) + json.dumps(response)
+    assert LINK_SECRET not in published
+    assert "github.com/example/catch-me-up" in published
 
 
 def test_response_can_include_progress_summary(tmp_path: Path) -> None:
     _, run = begin(tmp_path / "output")
     run.write_render("# Video\n")
-    run.write_transcript({})
+    run.write_transcript(spoken())
     snapshot = run.commit(minimal_manifest(tmp_path))
 
     response = run_response(

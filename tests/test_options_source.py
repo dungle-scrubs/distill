@@ -19,6 +19,7 @@ from fake_tools import (
     fake_ffprobe_flooding_stderr,
 )
 
+from distill.artifacts import RedactionState
 from distill.errors import DistillError
 from distill.options import OPTION_DEFAULTS, DistillOptions
 from distill.progress import ProgressReporter
@@ -436,13 +437,22 @@ def test_youtube_source_info_carries_the_lease_into_the_read(
     )
 
     assert source.duration_sec == 12.0
-    assert source.related_links == [
-        {
-            "url": "https://github.com/example/catch-me-up",
-            "label": "Skill repo",
-            "source": "youtube_description",
-            "reason": "code_or_reference_domain",
-        }
+    # R-21: a **related link** is **extracted text** on both halves, so what the
+    # resolver hands back is a carrier that records the policy which produced
+    # it, exactly as a **frame artifact** does - and never a document, which is
+    # what a sink can no longer refuse (finding 5).
+    assert source.related_links is not None
+    assert [
+        (link.url, link.label, link.source, link.reason, link.redaction)
+        for link in source.related_links
+    ] == [
+        (
+            "https://github.com/example/catch-me-up",
+            "Skill repo",
+            "youtube_description",
+            "code_or_reference_domain",
+            RedactionState.APPLIED,
+        )
     ]
     assert [event.detail for event in progress.events if event.mechanism == "youtube_download"][
         :2

@@ -9,6 +9,7 @@ or render markdown.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -48,6 +49,31 @@ class GroundingAssessment:
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any] | None) -> GroundingAssessment | None:
+        """Rebuild an assessment from the mapping a **frame artifact** carries.
+
+        A **frame artifact** holds its grounding as a mapping, because that is
+        what the carrier freezes; this is how a reader gets the assessment back
+        without restating these three field names somewhere else. `None` in and
+        `None` out: a frame the vision pass never reached has no assessment, and
+        inventing a grounded one for it would say two readers agreed when
+        neither was asked.
+
+        A `level` this module does not define is passed through rather than
+        refused. `is_low_confidence` is stated against `GROUNDED` alone, so an
+        unrecognized level reads as low confidence, which is the answer that
+        does not vouch for text nobody checked.
+        """
+        if document is None:
+            return None
+        overlap = document.get("text_overlap")
+        return cls(
+            level=str(document.get("level", "")),
+            text_overlap=None if overlap is None else float(overlap),
+            reason=str(document.get("reason", "")),
+        )
 
 
 def assess_grounding(

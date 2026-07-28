@@ -94,7 +94,9 @@ DEFAULT_MECHANISM_WEIGHTS: tuple[MechanismWeight, ...] = (
     MechanismWeight("scene_detection", 4.0),
     MechanismWeight("frame_extraction", 12.0),
     MechanismWeight("ocr", 10.0),
-    MechanismWeight("redaction", 3.0),
+    # No "redaction" weight: D-019 made redaction part of constructing a
+    # carrier rather than a stage of its own, so nothing reports it. A weight
+    # for a mechanism nothing reports is a share of the bar that never fills.
     MechanismWeight("local_vision", 10.0),
     MechanismWeight("rendering", 4.0),
     MechanismWeight("bundle_publish", 3.0),

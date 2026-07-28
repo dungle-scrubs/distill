@@ -15,12 +15,31 @@ from unittest.mock import patch
 import pytest
 
 from distill import ocr
+from distill.artifacts import FrameArtifact, RedactionState
 from distill.capabilities import EXTERNAL_TOOLS
 from distill.ocr import (
     find_tesseract_command,
     ocr_frame,
     ocr_frames,
 )
+
+
+def keyframe(index: int, image: Path, **overrides: Any) -> FrameArtifact:
+    """One **frame artifact** as `select_keyframes` hands it to the OCR pass.
+
+    A carrier and not a mapping: R-19 moved the frame schema onto
+    `FrameArtifact`, so a test that built a bare frame dict here would be
+    asserting against a shape `ocr_frames` is no longer given and would keep
+    passing while the real caller broke.
+    """
+    fields: dict[str, Any] = {
+        "index": index,
+        "timestamp_sec": float(index),
+        "path": str(image),
+        "relative_path": f"frames/{image.name}",
+    }
+    fields.update(overrides)
+    return FrameArtifact(**fields)
 
 
 def _absent_tesseract_with_brew(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,14 +81,11 @@ def test_missing_tesseract_warns_and_the_run_continues(
 ) -> None:
     """ADR-0002: image-text extraction is optional, so its absence degrades."""
     _absent_tesseract_with_brew(monkeypatch)
-    frames = [
-        {"index": 1, "path": str(tmp_path / "f1.png"), "relative_path": "frames/f1.png"},
-        {"index": 2, "path": str(tmp_path / "f2.png"), "relative_path": "frames/f2.png"},
-    ]
+    frames = [keyframe(1, tmp_path / "f1.png"), keyframe(2, tmp_path / "f2.png")]
 
     updated, warnings = ocr_frames(frames, "eng", enabled=True)
 
-    assert [frame["ocr_text"] for frame in updated] == ["", ""]
+    assert [frame.extracted_text for frame in updated] == ["", ""]
     assert [warning["code"] for warning in warnings] == ["tesseract_not_found"]
     # The warning states the cost the capability table records, not a bespoke
     # message that could drift from it.
@@ -205,23 +221,24 @@ def test_ocr_frame_emits_a_boundary_event(
     assert events[0]["detail"]["tool"] == str(command)
 
 
-def test_ocr_frames_sets_empty_ocr_text_when_disabled(tmp_path: Path) -> None:
-    frames = [
-        {"index": 1, "path": str(tmp_path / "f1.png"), "relative_path": "frames/f1.png"},
-        {"index": 2, "path": str(tmp_path / "f2.png"), "relative_path": "frames/f2.png"},
-    ]
+def test_ocr_frames_records_an_empty_reading_when_disabled(tmp_path: Path) -> None:
+    """A disabled pass still produces the carrier, holding nothing.
+
+    "Nobody looked" and "nothing was there" have to look the same downstream,
+    because the **render** and the **manifest** are written from the artifact
+    either way; what distinguishes them is the **warning**, not a missing field.
+    """
+    frames = [keyframe(1, tmp_path / "f1.png"), keyframe(2, tmp_path / "f2.png")]
 
     updated, warnings = ocr_frames(frames, "eng", enabled=False)
 
     assert len(updated) == 2
-    assert all(frame["ocr_text"] == "" for frame in updated)
+    assert all(frame.extracted_text == "" for frame in updated)
     assert warnings == []
 
 
 def test_ocr_frames_skips_ocr_when_tesseract_unavailable(tmp_path: Path) -> None:
-    frames = [
-        {"index": 1, "path": str(tmp_path / "f1.png"), "relative_path": "frames/f1.png"},
-    ]
+    frames = [keyframe(1, tmp_path / "f1.png")]
 
     with (
         patch("distill.ocr.find_tesseract_command", return_value=None),
@@ -234,28 +251,58 @@ def test_ocr_frames_skips_ocr_when_tesseract_unavailable(tmp_path: Path) -> None
         }
         updated, warnings = ocr_frames(frames, "eng", enabled=True)
 
-    assert updated[0]["ocr_text"] == ""
+    assert updated[0].extracted_text == ""
     assert any(w["code"] == "tesseract_not_found" for w in warnings)
 
 
-def test_ocr_frames_processes_frames_when_tesseract_available(
-    tmp_path: Path,
-) -> None:
+def test_what_tesseract_read_lands_on_the_carrier_redacted(tmp_path: Path) -> None:
+    """The reading reaches the **frame artifact**, through the redaction policy.
+
+    R-19: this is the seam finding 4 was hiding in. What `ocr_frame` returns is
+    raw, and the next thing that happens to a frame is a `write_stage`, so the
+    only arrangement in which a secret cannot become durable is one where the
+    text is already inside a carrier when this function returns.
+    """
     frame_path = tmp_path / "f1.png"
     frame_path.write_bytes(b"fake")
-    frames = [
-        {"index": 1, "path": str(frame_path), "relative_path": "frames/f1.png"},
-    ]
+    reading = "hello world OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz"
 
     with (
         patch("distill.ocr.find_tesseract_command", return_value="/usr/bin/tesseract"),
         patch("distill.ocr.ensure_tesseract_available", return_value=None),
-        patch("distill.ocr.ocr_frame", return_value=("hello world", [])),
+        patch("distill.ocr.ocr_frame", return_value=(reading, [])),
     ):
-        updated, warnings = ocr_frames(frames, "eng", enabled=True)
+        updated, warnings = ocr_frames([keyframe(1, frame_path)], "eng", enabled=True)
 
-    assert updated[0]["ocr_text"] == "hello world"
+    assert updated[0].extracted_text == "hello world OPENAI_API_KEY=[REDACTED]"
+    assert updated[0].redaction is RedactionState.APPLIED
     assert warnings == []
+
+
+def test_the_opt_out_travels_on_the_frame_rather_than_being_passed_again(
+    tmp_path: Path,
+) -> None:
+    """`--no-redact-secrets` is the frame's policy, and OCR never asks about it.
+
+    R-20 keeps the opt-out working, and D-020 makes it a recorded state rather
+    than an inference. `ocr_frames` takes no redaction argument at all: the
+    policy entered the artifact at `select_keyframes` and every later stage
+    inherits it, so there is no stage that can be given the wrong one.
+    """
+    frame_path = tmp_path / "f1.png"
+    frame_path.write_bytes(b"fake")
+    reading = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz"
+    opted_out = keyframe(1, frame_path, redaction=RedactionState.DISABLED)
+
+    with (
+        patch("distill.ocr.find_tesseract_command", return_value="/usr/bin/tesseract"),
+        patch("distill.ocr.ensure_tesseract_available", return_value=None),
+        patch("distill.ocr.ocr_frame", return_value=(reading, [])),
+    ):
+        updated, _warnings = ocr_frames([opted_out], "eng", enabled=True)
+
+    assert updated[0].extracted_text == reading
+    assert updated[0].redaction is RedactionState.DISABLED
 
 
 def test_a_tesseract_that_vanished_mid_run_still_only_degrades(tmp_path: Path) -> None:

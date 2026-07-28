@@ -6,6 +6,13 @@ that image-text extraction is an **optional capability** - that classification
 is stated once in `capabilities.py`. It never installs tesseract (R-34), and it
 does not own how a subprocess is run: tesseract is invoked through
 `run_command`, like every other external tool (R-29).
+
+It does not own the shape of a **frame artifact**. It takes the artifacts
+`frame_selection` produced, reads the image each one names, and hands back the
+same artifacts carrying what tesseract read. Putting the text on the carrier is
+what applies the **redaction** policy to it (R-19, D-019): before M4.4 this
+module wrote the reading onto a bare dict, and the raw text was durable in a
+**stage result** before any redaction ran (finding 4).
 """
 
 from __future__ import annotations
@@ -15,6 +22,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .artifacts import FrameArtifact
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, warning
 from .progress import ProgressCounter, ProgressReporter
@@ -199,14 +207,21 @@ def _ocr_processed_image(
 
 
 def ocr_frames(
-    frames: list[dict],
+    frames: list[FrameArtifact],
     language: str,
     enabled: bool,
     progress: ProgressCounter | ProgressReporter | None = None,
     preprocess: bool = True,
-) -> tuple[list[dict], list[dict[str, str]]]:
+) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+    """Read every **keyframe**'s image text onto the artifact that names it.
+
+    The text goes onto the carrier rather than beside it, which is what puts it
+    through the run's **redaction** policy before anything can write it (R-19).
+    A disabled pass records the empty reading the same way, so a frame's
+    `extracted_text` means "nothing was read" rather than "nobody looked".
+    """
     warnings: list[dict[str, str]] = []
-    updated: list[dict] = []
+    updated: list[FrameArtifact] = []
     tesseract_cmd = None
     if enabled:
         if not find_tesseract_command() and isinstance(progress, ProgressReporter):
@@ -227,18 +242,17 @@ def ocr_frames(
                     detail={"dependency": "tesseract", "path": tesseract_cmd},
                 )
     for frame in frames:
-        copied = dict(frame)
+        text = ""
         if enabled and tesseract_cmd:
             text, frame_warnings = ocr_frame(
-                Path(str(copied["path"])),
+                Path(frame.path),
                 language,
                 tesseract_cmd,
                 preprocess,
             )
-            copied["ocr_text"] = text
             warnings.extend(frame_warnings)
-        else:
-            copied["ocr_text"] = ""
+        read, carrier_warnings = frame.with_extracted_text(text)
+        warnings.extend(carrier_warnings)
         if isinstance(progress, ProgressReporter):
             progress.update(
                 "ocr",
@@ -247,7 +261,7 @@ def ocr_frames(
             )
         elif progress:
             progress.increment()
-        updated.append(copied)
+        updated.append(read)
     if isinstance(progress, ProgressReporter):
         progress.complete("ocr", detail={"frames": len(frames)})
     return updated, warnings

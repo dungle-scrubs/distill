@@ -2,38 +2,63 @@
 
 This module owns deterministic `video.md` assembly. It does not write manifests
 or run extraction stages.
+
+It reads carriers rather than dicts (R-19, M4.4). What a **frame artifact**
+holds is `artifacts.FrameArtifact`'s to say, what an **interpretation** holds is
+`artifacts.Interpretation`'s, what a **related link** holds is
+`links.RelatedLink`'s, and what a **grounding** holds is
+`grounding.GroundingAssessment`'s - so this module asks each of them rather than
+restating their field names, and a field renamed at its source is a type error
+here instead of a section that silently stops rendering.
+
+Carriers rather than dicts is also what makes the render a **redaction sink**
+it can be one. A related link arrived here as a mapping until finding 5, which
+is text no policy was known to have run over reaching a document a user reads.
+
+What it still spells out itself: the shape of a **transcript** segment, which is
+`transcript.py`'s, and every heading, bullet and fence in the document, which is
+this module's alone.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
+from .artifacts import Carrier, FrameArtifact, Interpretation, Transcript, serialize
 from .errors import DistillError
+from .grounding import GroundingAssessment
+from .links import RelatedLink
 
 MIN_TRANSCRIPT_CHARS = 3
 
+UNVERIFIED_CAVEAT = (
+    "On-screen text may be unreadable; treat the interpretation below as unverified."
+)
+NO_OUTPUT_CAVEAT = "The vision model returned no usable output for this frame."
 
-def transcript_is_empty(transcript: dict[str, Any] | None) -> bool:
+
+def transcript_is_empty(transcript: Transcript | None) -> bool:
     """Return true when transcript text has fewer than 3 non-space characters."""
-    if not transcript:
+    if transcript is None:
         return True
-    text = "".join(
-        str(segment.get("text", "")).strip() for segment in transcript.get("segments", [])
-    )
+    text = "".join(str(segment.get("text", "")).strip() for segment in transcript.segments)
     return len(text) < MIN_TRANSCRIPT_CHARS
 
 
-def frames_are_useless(frames: list[dict]) -> bool:
-    """Return true when every frame is explicitly blank or lacks an image path."""
+def frames_are_useless(frames: list[FrameArtifact]) -> bool:
+    """Return true when no frame names an image a reader could be shown.
+
+    A **keyframe** whose extraction failed never becomes a **frame artifact** -
+    `select_keyframes` drops it - so the only way a frame is useless here is
+    having no path into the **generation** to point at.
+    """
     if not frames:
         return True
-    return all(
-        bool(frame.get("blank")) or not str(frame.get("relative_path", "")).strip()
-        for frame in frames
-    )
+    return all(not frame.relative_path.strip() for frame in frames)
 
 
-def ensure_content(transcript: dict[str, Any] | None, frames: list[dict]) -> None:
+def ensure_content(transcript: Transcript | None, frames: list[FrameArtifact]) -> None:
     if transcript_is_empty(transcript) and frames_are_useless(frames):
         raise DistillError(
             "E_NO_CONTENT",
@@ -42,14 +67,41 @@ def ensure_content(transcript: dict[str, Any] | None, frames: list[dict]) -> Non
         )
 
 
+def _require_redaction_policy(*carriers: Carrier) -> None:
+    """Refuse to render a carrier whose **redaction** policy has not been applied.
+
+    R-20 names a **render** as a sink beside a **generation**, so the check that
+    guards the one has to guard the other. `serialize` is where it is written,
+    and it is asked here rather than reimplemented - a second copy of "has the
+    policy run" is a second answer that can drift from the first.
+
+    Every carrier the render prints, not the two it started with: **related
+    links** reached this function as plain documents and so were checked by
+    nobody, which is the layer finding 5 found missing. Stated as varargs over
+    `Carrier` so a family added later is a type error at the call site rather
+    than a silent omission here.
+
+    Nothing else is taken from the serialized documents. The render reads the
+    carriers, because what it needs is their typed fields; this is the check and
+    only the check.
+    """
+    for carrier in carriers:
+        serialize(carrier)
+
+
 def render_markdown(
     source_label: str,
     duration_sec: float,
-    transcript: dict[str, Any] | None,
-    frames: list[dict],
+    transcript: Transcript | None,
+    frames: list[FrameArtifact],
     warnings: list[dict[str, str]],
-    related_links: list[dict[str, str]] | None = None,
+    related_links: list[RelatedLink] | None = None,
 ) -> str:
+    _require_redaction_policy(
+        *frames,
+        *(() if transcript is None else (transcript,)),
+        *(related_links or ()),
+    )
     ensure_content(transcript, frames)
     lines = [
         "# Video Bundle",
@@ -64,24 +116,23 @@ def render_markdown(
     if related_links:
         lines.extend(["## Related links", ""])
         for link in related_links:
-            label = str(link.get("label", "")).strip() or str(link.get("url", "")).strip()
-            url = str(link.get("url", "")).strip()
-            reason = str(link.get("reason", "")).strip()
+            url = link.url.strip()
             if not url:
                 continue
-            suffix = f" ({reason})" if reason else ""
+            label = link.label.strip() or url
+            suffix = f" ({link.reason.strip()})" if link.reason.strip() else ""
             lines.append(f"- [{label}]({url}){suffix}")
         lines.append("")
-    segments = transcript.get("segments", []) if transcript else []
+    segments = list(transcript.segments) if transcript else []
     frame_index = 0
     for segment in segments:
         start = float(segment.get("start", 0.0))
         end = float(segment.get("end", start))
-        while frame_index < len(frames) and float(frames[frame_index]["timestamp_sec"]) < start:
+        while frame_index < len(frames) and frames[frame_index].timestamp_sec < start:
             lines.extend(_frame_lines(frames[frame_index]))
             frame_index += 1
-        segment_frames: list[dict] = []
-        while frame_index < len(frames) and float(frames[frame_index]["timestamp_sec"]) <= end:
+        segment_frames: list[FrameArtifact] = []
+        while frame_index < len(frames) and frames[frame_index].timestamp_sec <= end:
             segment_frames.append(frames[frame_index])
             frame_index += 1
         lines.extend(_segment_lines(segment, segment_frames))
@@ -91,7 +142,7 @@ def render_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _segment_lines(segment: dict[str, Any], frames: list[dict]) -> list[str]:
+def _segment_lines(segment: Mapping[str, Any], frames: list[FrameArtifact]) -> list[str]:
     start = float(segment.get("start", 0.0))
     end = float(segment.get("end", start))
     lines = [f"## {format_timestamp(start)} - {format_timestamp(end)}", ""]
@@ -104,9 +155,8 @@ def _segment_lines(segment: dict[str, Any], frames: list[dict]) -> list[str]:
 
     word_index = 0
     for frame in frames:
-        frame_timestamp = float(frame["timestamp_sec"])
         chunk: list[str] = []
-        while word_index < len(words) and float(words[word_index]["end"]) <= frame_timestamp:
+        while word_index < len(words) and float(words[word_index]["end"]) <= frame.timestamp_sec:
             chunk.append(str(words[word_index].get("word", "")).strip())
             word_index += 1
         if chunk:
@@ -122,65 +172,59 @@ def _segment_lines(segment: dict[str, Any], frames: list[dict]) -> list[str]:
     return lines
 
 
-def _frame_lines(frame: dict) -> list[str]:
-    timestamp = format_timestamp(float(frame["timestamp_sec"]))
+def _frame_lines(frame: FrameArtifact) -> list[str]:
+    timestamp = format_timestamp(frame.timestamp_sec)
     lines = [
-        f"## Frame {frame['index']} - {timestamp}",
+        f"## Frame {frame.index} - {timestamp}",
         "",
-        f"![Frame {frame['index']}]({frame['relative_path']})",
+        f"![Frame {frame.index}]({frame.relative_path})",
         "",
     ]
-    ocr_text = str(frame.get("ocr_text", "")).strip()
-    visual_interpretation = frame.get("visual_interpretation")
-    if isinstance(visual_interpretation, dict):
+    reading = frame.reading
+    assessment = GroundingAssessment.from_document(frame.grounding)
+    if reading is not None:
         lines.extend(["Visual interpretation:", ""])
-        confidence = frame.get("visual_confidence")
-        if isinstance(confidence, dict) and confidence.get("level") != "grounded":
-            reason = str(confidence.get("reason", "")).strip()
-            level = str(confidence.get("level", "")).strip() or "low"
-            lines.extend(
-                [
-                    f"> ⚠ Low-confidence frame ({level}): {reason}. "
-                    "On-screen text may be unreadable; treat the interpretation below as unverified.",
-                    "",
-                ]
-            )
-        summary = str(visual_interpretation.get("visual_summary", "")).strip()
-        interpretation = str(visual_interpretation.get("interpretation", "")).strip()
-        uncertainty = str(visual_interpretation.get("uncertainty", "")).strip()
-        verbatim = str(visual_interpretation.get("verbatim_text", "")).strip()
-        text_confidence = str(visual_interpretation.get("text_confidence", "")).strip()
-        elements = visual_interpretation.get("detected_elements", [])
-        if summary:
-            lines.extend([f"- Summary: {summary}"])
-        if isinstance(elements, list) and elements:
-            lines.extend([f"- Detected elements: {', '.join(str(item) for item in elements)}"])
-        if interpretation:
-            lines.extend([f"- Interpretation: {interpretation}"])
-        if text_confidence:
-            lines.extend([f"- Text confidence: {text_confidence}"])
-        if uncertainty:
-            lines.extend([f"- Uncertainty: {uncertainty}"])
+        lines.extend(_low_confidence_lines(assessment, UNVERIFIED_CAVEAT))
+        lines.extend(_reading_lines(reading))
         lines.append("")
-        if verbatim:
-            lines.extend(["Verbatim slide text:", "", "```text", verbatim, "```", ""])
-    else:
-        confidence = frame.get("visual_confidence")
-        if isinstance(confidence, dict) and confidence.get("level") != "grounded":
-            reason = str(confidence.get("reason", "")).strip()
-            level = str(confidence.get("level", "")).strip() or "low"
+        if reading.verbatim_text.strip():
             lines.extend(
-                [
-                    "Visual interpretation:",
-                    "",
-                    f"> ⚠ Low-confidence frame ({level}): {reason}. "
-                    "The vision model returned no usable output for this frame.",
-                    "",
-                ]
+                ["Verbatim slide text:", "", "```text", reading.verbatim_text.strip(), "```", ""]
             )
-    if ocr_text:
-        lines.extend(["OCR:", "", "```text", ocr_text, "```", ""])
+    elif assessment is not None and assessment.is_low_confidence:
+        lines.extend(["Visual interpretation:", ""])
+        lines.extend(_low_confidence_lines(assessment, NO_OUTPUT_CAVEAT))
+    if frame.extracted_text.strip():
+        lines.extend(["OCR:", "", "```text", frame.extracted_text.strip(), "```", ""])
     return lines
+
+
+def _low_confidence_lines(assessment: GroundingAssessment | None, caveat: str) -> list[str]:
+    """The banner a **grounding** that is not grounded puts above a reading.
+
+    Absent for a grounded frame, and absent for a frame nobody assessed: a
+    banner that appeared whenever the assessment was missing would report low
+    confidence for every frame produced before the vision pass ran.
+    """
+    if assessment is None or not assessment.is_low_confidence:
+        return []
+    level = assessment.level.strip() or "low"
+    return [
+        f"> ⚠ Low-confidence frame ({level}): {assessment.reason.strip()}. {caveat}",
+        "",
+    ]
+
+
+def _reading_lines(reading: Interpretation) -> list[str]:
+    """One bullet per field of an **interpretation** the model filled in."""
+    bullets: list[tuple[str, str]] = [
+        ("Summary", reading.visual_summary.strip()),
+        ("Detected elements", ", ".join(reading.detected_elements)),
+        ("Interpretation", reading.interpretation.strip()),
+        ("Text confidence", reading.text_confidence.strip()),
+        ("Uncertainty", reading.uncertainty.strip()),
+    ]
+    return [f"- {label}: {value}" for label, value in bullets if value]
 
 
 def format_timestamp(seconds: float) -> str:
@@ -189,3 +233,15 @@ def format_timestamp(seconds: float) -> str:
     minutes, sec = divmod(total, 60)
     hours, minute = divmod(minutes, 60)
     return f"{hours:02d}:{minute:02d}:{sec:02d}.{millis:03d}"
+
+
+__all__ = [
+    "MIN_TRANSCRIPT_CHARS",
+    "NO_OUTPUT_CAVEAT",
+    "UNVERIFIED_CAVEAT",
+    "ensure_content",
+    "format_timestamp",
+    "frames_are_useless",
+    "render_markdown",
+    "transcript_is_empty",
+]

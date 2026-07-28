@@ -6,6 +6,7 @@ import pytest
 
 from distill.errors import DistillError
 from distill.progress import (
+    DEFAULT_MECHANISM_WEIGHTS,
     PROGRESS_STATUSES,
     MechanismState,
     MechanismWeight,
@@ -172,14 +173,23 @@ def test_heartbeat_works_through_progress_reporter_counter() -> None:
 
 
 def test_progress_math_is_pure_and_inspectable() -> None:
+    """Overall percent is one weighted share of the default table, derivable by hand.
+
+    The constant is `ocr`'s weight of 10, half done, over the 107 the table
+    totals: 10 * 0.5 / 107 = 4.673%. It is written out rather than recomputed
+    from `DEFAULT_MECHANISM_WEIGHTS` so that a weight added or removed - as
+    `redaction`'s was when D-019 stopped it being a stage - has to be
+    acknowledged here instead of being absorbed silently.
+    """
     reporter = ProgressReporter()
     reporter.update("ocr", percent=50, detail={"frame": 1, "frames": 2})
 
+    assert sum(weight.weight for weight in DEFAULT_MECHANISM_WEIGHTS) == 107.0
     assert reporter.debug_info() == {
         "event_count": 1,
         "counter": 1,
         "last_sequence": 1,
-        "overall_percent": 4.545,
+        "overall_percent": 4.673,
         "mechanisms": {
             "ocr": {
                 "status": "running",

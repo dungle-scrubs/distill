@@ -65,6 +65,23 @@ read by other processes and are written by atomic replace, while **stage
 results** are written into a **staging directory** held under the run lock,
 which nothing else may read, and are ordinary writes.
 
+Nothing durable is written from a document a caller assembled: a **transcript**
+and a **stage result** are handed in as carriers and serialized here, because
+`artifacts.serialize` is the last point at which a carrier whose **redaction**
+policy never ran can be refused (R-20). A writer that accepted the document
+instead would accept text that had already been past that check without going
+through it.
+
+Written cheaply, read suspiciously. A **stage result** is durable scratch a
+*later* run reads back, so this module also owns what one must prove before a
+**resume** believes it: the schema version it was written under, the **bundle
+key** it belongs to, and that no path in it leaves the bundle root (R-23). It
+does not own what the payload means - a stage's own output stays the stage's -
+and it never fails a run over one. A document that does not hold up is
+discarded and the stage recomputed (D-030), because a stage result is by
+definition something that can be produced again, and a resume that could end a
+run would be worse than the trust it replaced (RV-8).
+
 **Prune** is two operations, not one (D-018). *Generation retention* keeps the
 newest `keep_generations` **generations** of a bundle and never proposes the
 **active generation** at any value - the old code kept `len - keep_generations`
@@ -101,12 +118,20 @@ import re
 import shutil
 import stat
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from .artifacts import (
+    Carrier,
+    RedactionState,
+    StageResult,
+    Transcript,
+    is_path_field,
+    serialize,
+)
 from .errors import DistillError
 
 LOGGER = logging.getLogger(__name__)
@@ -160,6 +185,16 @@ added to the list. Everything matching this shape goes, whoever wrote it.
 The name is scoped to the generation directory. The **manifest** and the
 **ownership marker** carry the same underscore convention but live at the bundle
 root, which is not renamed and is never walked by the strip.
+"""
+
+STAGE_RESULT_SCHEMA_VERSION = 1
+"""The schema this Distill writes a **stage result** under, and the only one it reads.
+
+A single known version rather than a set: D-015 says pre-1.0 there are no
+dependents and on-disk breakage is acceptable, and a stage result is scratch, so
+the cost of not understanding an older one is a recomputation. A set of accepted
+versions would be the beginning of a migration path that nothing needs and that
+nothing could test against a schema that does not exist yet.
 """
 
 ATOMIC_TEMP_SUFFIX = ".tmp"
@@ -1588,17 +1623,44 @@ class BundleRun:
         """How long this run has spent assembling its **staging directory**."""
         return self.store.clock() - self.staged_at
 
-    def read_stage(self, name: str) -> Any | None:
+    def read_stage(self, name: str) -> dict[str, Any] | None:
         """The recorded **stage result** for `name`, or `None` to recompute it.
 
         `None` for every reason a stage result cannot be used: the run is not
-        resuming, nothing was recorded, or what was recorded is unreadable. A
-        stage result is scratch - recomputing it is always available, so nothing
-        about it is worth ending a run over.
+        resuming, nothing was recorded, what was recorded is unreadable, or it
+        fails the checks R-23 puts a resumed document through. A stage result is
+        scratch - recomputing it is always available, so nothing about it is
+        worth ending a run over (D-030).
+
+        The **bundle key** the document is checked against is this run's, and
+        the root paths inside it are confined to is this bundle's: the run
+        asking the question is the only thing entitled to answer what "belongs
+        to this bundle" means.
         """
         if not self.resumed:
             return None
-        return read_stage_result(self.paths.generation, name)
+        return read_stage_result(
+            self.paths.generation, name, bundle_key=self.bundle_key, root=self.paths.root
+        )
+
+    def discard_stage(self, name: str, reason: str) -> None:
+        """Record that this run read a **stage result** it cannot use.
+
+        The other half of `read_stage`, for the rejections this module is not
+        entitled to make. What a payload *means* is the stage's - R-23 checks
+        the envelope and hands the payload back unexamined - so a consumer that
+        finds the shape inside it is not the shape it produces is the only one
+        that can say so. Where that is *recorded* is still here, in the one
+        stream that answers what a run did with a **bundle key**: a discard the
+        store logs and a discard the pipeline logs are the same event, and a
+        second implementation of it in the caller would be a second answer.
+
+        Recording only. Discarding a stage result *is* recomputing its stage,
+        which the caller then does - nothing here removes the file, because the
+        recomputation overwrites it and a run that dies before then is better
+        off leaving the next one something to check than nothing at all.
+        """
+        _reject_stage_result(name, self.bundle_key, reason)
 
     @property
     def generation_name(self) -> str:
@@ -1646,13 +1708,27 @@ class BundleRun:
         self.paths.markdown.write_text(markdown)
         return self.paths.markdown
 
-    def write_transcript(self, transcript: dict[str, Any]) -> Path:
-        """Write the **transcript** into the staging directory, on the same terms."""
+    def write_transcript(self, transcript: Transcript) -> Path:
+        """Write the **transcript** into the staging directory, on the same terms.
+
+        A carrier and not a document, because `serialize` is where R-20 is
+        enforced: a transcript whose **redaction** policy never ran is refused
+        here rather than written and refused later by nobody. A caller holding
+        a document has bypassed the check already, so it cannot be allowed to
+        hand one in (finding 15).
+        """
         ensure_safe_directory(self.paths.transcript, self.paths.root, create_leaf=False)
-        self.paths.transcript.write_text(json.dumps(transcript, indent=2, sort_keys=True) + "\n")
+        document = serialize(transcript)
+        self.paths.transcript.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
         return self.paths.transcript
 
-    def write_stage(self, name: str, result: Any) -> None:
+    def write_stage(
+        self,
+        name: str,
+        result: Any,
+        *,
+        redaction: RedactionState = RedactionState.NOT_APPLIED,
+    ) -> None:
         """Record a completed stage so an interrupted run can **resume**.
 
         An ordinary write, deliberately (D-033). The target is inside a
@@ -1660,8 +1736,20 @@ class BundleRun:
         read it, and no reader is ever entitled to it, so there is nobody an
         atomic replace would protect. A torn stage result costs the one run that
         wrote it a recomputation.
+
+        The **bundle key** stamped into the document is this run's, which is
+        what `read_stage` later checks it against (R-23). `redaction` is the
+        caller's policy, because which policy a run is under is the pipeline's
+        knowledge and not the store's; the default runs it.
         """
-        write_stage_result(self.paths.generation, name, result, root=self.paths.root)
+        write_stage_result(
+            self.paths.generation,
+            name,
+            result,
+            root=self.paths.root,
+            bundle_key=self.bundle_key,
+            redaction=redaction,
+        )
 
     def commit(self, manifest: dict[str, Any]) -> BundleSnapshot:
         """**Publish** the staging directory as the **active generation**.
@@ -2371,27 +2459,336 @@ def stage_result_path(generation: Path, name: str) -> Path:
     return generation / f"{STAGE_RESULT_PREFIX}{name}{STAGE_RESULT_SUFFIX}"
 
 
-def read_stage_result(generation: Path, name: str) -> Any | None:
-    """The recorded **stage result** for `name`, or `None` if it cannot be used.
+def read_stage_result(
+    generation: Path, name: str, *, bundle_key: str, root: Path
+) -> dict[str, Any] | None:
+    """The usable **stage result** for `name`, or `None` if there is not one.
 
-    Unreadable scratch is a miss, not a failure: the stage that produced it can
-    always produce it again, and a run that ends over its own scratch is a run
-    that cannot recover from an interruption it was interrupted by.
+    Unusable scratch is a miss, not a failure (D-030): the stage that produced
+    it can always produce it again, and a run that ends over its own scratch is
+    a run that cannot recover from the interruption the scratch exists for.
+    That covers an absent file, an unreadable one, one that is not a file at
+    all, and - since R-23 - one whose envelope does not hold up.
+
+    A stage result is what is at the name, not what the name points at, so the
+    state is `lstat`'s (`_file_state`), the open is `O_NOFOLLOW`'s, and a
+    symlink is refused rather than followed. Reading through one would have let
+    a document planted outside the **output root** be resumed from on the
+    strength of carrying the right **bundle key**, and `write_stage_result`
+    refuses the same link, so nothing this run did would ever have replaced it
+    (R-16, boundary review finding 1).
+
+    The guard is over the parse *and* the validation, and it is deliberately
+    broad. What is being read is a document some other process wrote, so
+    everything about it is input: a nesting depth that exhausts the parser's
+    stack, a name too long for the filesystem to answer questions about. There
+    is no way for validating an untrusted document to fail that is worth ending
+    a run over, and the fallback - do the work - is always available. `except
+    Exception` and not `BaseException`, so an interrupt still ends the run.
     """
     path = stage_result_path(generation, name)
-    if not path.is_file():
+    try:
+        state = _file_state(path)
+    except OSError as exc:
+        _reject_stage_result(name, bundle_key, f"unstattable: {_errno_name(exc)}")
+        return None
+    if state == "absent":
+        return None
+    if state != "regular":
+        _reject_stage_result(name, bundle_key, f"not_a_regular_file: {state}")
         return None
     try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
+        document = json.loads(_read_regular_file(path))
+        return validated_stage_payload(document, stage=name, bundle_key=bundle_key, root=root)
+    except Exception as exc:
+        _reject_stage_result(name, bundle_key, f"unreadable: {type(exc).__name__}")
         return None
 
 
-def write_stage_result(generation: Path, name: str, payload: Any, *, root: Path) -> None:
-    """Record a completed stage as resume scratch. An ordinary write (D-033)."""
+def _reject_stage_result(stage: str, bundle_key: str, reason: str) -> None:
+    """Record that a **stage result** was discarded, and why.
+
+    A rejection is invisible from the outside - the run simply does the work -
+    so without this a bundle key that can never resume looks like a pipeline
+    that is merely slow.
+    """
+    _bundle_log("stage_result_rejected", bundle_key=bundle_key, stage=stage, reason=reason)
+
+
+def validated_stage_payload(
+    document: Any, *, stage: str, bundle_key: str, root: Path
+) -> dict[str, Any] | None:
+    """The payload `document` may be resumed from, or `None` to recompute the stage.
+
+    R-23, and the answer to RV-8: a **stage result** is read back off disk by a
+    process that did not write it, so everything it claims is a claim. Four of
+    them are checked, and any failure discards the whole document:
+
+    - the schema version is the one this code writes. An unknown version is
+      refused outright rather than parsed for the fields that happen to be
+      recognizable - two schemas can spell different things the same way, so a
+      best-effort parse is how a schema change becomes silent corruption;
+    - the **bundle key** is this run's. Scratch carrying another key describes
+      a different **source fingerprint**, different **options**, or both, and
+      reusing it would publish a **generation** for a source that never
+      produced it;
+    - the stage is the one being read, so a document cannot answer for a stage
+      it is not the output of;
+    - every path in the payload stays under the bundle root.
+
+    A rejection is never fatal. The caller recomputes (D-030), which is what
+    keeps the validation cheaper than the trust it replaced.
+    """
+    if not isinstance(document, dict):
+        _reject_stage_result(stage, bundle_key, "not_a_document")
+        return None
+    version = document.get("schema_version")
+    # `type(...) is not int` rather than `isinstance`, because `True` is an
+    # instance of `int` and equals 1: a document whose version field is a
+    # boolean would otherwise read as version 1 and be resumed from.
+    if type(version) is not int or version != STAGE_RESULT_SCHEMA_VERSION:
+        _reject_stage_result(stage, bundle_key, "unknown_schema_version")
+        return None
+    if document.get("bundle_key") != bundle_key:
+        _reject_stage_result(stage, bundle_key, "bundle_key_mismatch")
+        return None
+    if document.get("stage") != stage:
+        _reject_stage_result(stage, bundle_key, "stage_mismatch")
+        return None
+    payload = document.get("payload")
+    if not isinstance(payload, dict):
+        _reject_stage_result(stage, bundle_key, "payload_not_a_document")
+        return None
+    if not _paths_are_confined(payload, root):
+        _reject_stage_result(stage, bundle_key, "path_outside_bundle_root")
+        return None
+    return _with_recorded_warnings(payload, document.get("warnings"))
+
+
+def _with_recorded_warnings(payload: dict[str, Any], recorded: Any) -> dict[str, Any]:
+    """Fold the envelope's **warnings** into the payload a **resume** carries forward.
+
+    The carrier that wrote the document can have changed what it holds - R-58
+    caps an extracted-text field at 256 KiB - and the record of that is on the
+    envelope, not in the payload. A run resuming from the truncated text is the
+    run the warning describes, so it is the run that has to carry it: dropping
+    it here would publish a **generation** built from shortened text with
+    nothing saying so.
+
+    Only folded when both sides are lists, so a payload using `warnings` for
+    something else is passed through rather than rewritten.
+    """
+    if not isinstance(recorded, list) or not recorded:
+        return payload
+    existing = payload.get("warnings", [])
+    if not isinstance(existing, list):
+        return payload
+    return {**payload, "warnings": [*existing, *recorded]}
+
+
+def _paths_are_confined(value: Any, root: Path) -> bool:
+    """Whether every path field under `value` stays inside the bundle root.
+
+    Which keys name a path is `artifacts.is_path_field`'s, and deliberately the
+    same answer the carrier uses to decide what the **redaction** policy may
+    rewrite: a field the policy treats as extracted text and this treats as a
+    path is a path the policy is free to mangle into one that fails here.
+
+    `confined_path` decides confinement - the same refusal every write and every
+    deletion is put through (R-16, D-041), rather than a second rule that could
+    disagree with it. Not `ensure_safe_directory`, because that one *creates* what is
+    missing: validating a resumed payload must not leave directories behind, and
+    a relative path field would otherwise mkdir its way into the bundle root
+    just for being read.
+
+    A relative path is confined against the bundle root, which is where
+    `confined_path` joins it - so `frames/frame_0001.png` is inside and
+    `../../etc/passwd` is not.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if is_path_field(str(key)) and isinstance(item, str):
+                try:
+                    confined_path(Path(item), root)
+                except DistillError:
+                    return False
+            elif not _paths_are_confined(item, root):
+                return False
+        return True
+    if isinstance(value, list):
+        return all(_paths_are_confined(item, root) for item in value)
+    return True
+
+
+def write_stage_result(
+    generation: Path,
+    name: str,
+    payload: Any,
+    *,
+    root: Path,
+    bundle_key: str,
+    redaction: RedactionState = RedactionState.NOT_APPLIED,
+) -> None:
+    """Record a completed stage as resume scratch. An ordinary write (D-033).
+
+    What lands on disk is a serialized `StageResult`: the payload the stage
+    produced, wrapped in the schema version and the **bundle key** that make it
+    checkable when some later run reads it back (R-23). The envelope is the
+    store's and not the stage's - a stage owns what its payload says, never
+    which bundle it belongs to.
+
+    Going through the carrier is also what makes this a covered **redaction
+    sink**: a stage result is durable, and finding 4 is what happened when that
+    was treated as a detail. `redaction` is the run's policy, so
+    `--no-redact-secrets` reaches the scratch it reaches the **generation**
+    with, and a resumed run is not handed text a first run would not have had.
+
+    A payload holding carriers is serialized carrier by carrier first, which is
+    what puts each of them through R-20's check: a **frame artifact** whose
+    redaction policy never ran is refused here, at the write, rather than
+    flattened into JSON by a `default=str` that would have made its text durable
+    and unreadable at once.
+
+    What is left after that is turned into plain JSON, which is what the write
+    did anyway. It matters here because the carrier refuses a type it cannot
+    freeze: normalizing first means the stage result caps and redacts exactly
+    the strings that are about to be on disk, instead of `write_stage` becoming
+    a new way for a run to die on its own scratch.
+
+    Neither is the target. A stage result that cannot be recorded is recorded
+    nowhere and costs the *next* **resume** one recomputation, which is what a
+    stage result is for; the run that could not write it carries on and
+    publishes (D-046, boundary review finding 1). The alternative was a bundle
+    key that could never complete again: the write refused a symlink at its
+    target with `E_BAD_OUTPUT_DIR`, and since a failing run keeps its **staging
+    directory** and `resume_partial` defaults on, the next run reached the same
+    link and died the same way.
+
+    What is *not* relaxed is the confinement (R-16). The link is refused, the
+    directory is refused, and neither is followed or removed - the target is a
+    regular file this process may write, or there is nowhere to record. The
+    refusal is asked twice on purpose: once of what is on disk, for a reason an
+    operator can read, and once by the kernel at the open, because the path
+    could have changed in between.
+
+    Serialization happens first so that R-20 is unconditional: a carrier whose
+    redaction policy never ran is refused whatever is at the path, rather than
+    slipping through on the one run whose scratch could not be written.
+    """
     path = stage_result_path(generation, name)
-    ensure_safe_directory(path, root, create_leaf=False)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
+    document = serialize(
+        StageResult(
+            schema_version=STAGE_RESULT_SCHEMA_VERSION,
+            bundle_key=bundle_key,
+            stage=name,
+            payload=json.loads(json.dumps(_serialized(payload), default=str)),
+            redaction=redaction,
+        )
+    )
+    if not _recordable_stage_result(path, root=root, stage=name, bundle_key=bundle_key):
+        return
+    try:
+        _write_regular_file(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    except OSError as exc:
+        # A full disk, a read-only mount, a file this process may not write:
+        # scratch that cannot be recorded, on the same terms as a target that
+        # was never usable. The run has the payload in hand either way.
+        _unrecordable_stage_result(name, bundle_key, f"write_refused: {_errno_name(exc)}")
+
+
+def _recordable_stage_result(
+    path: Path, *, root: Path, stage: str, bundle_key: str
+) -> bool:
+    """Whether a **stage result** may be written at `path`, logging why not.
+
+    Two questions, and a refusal to either is a stage result that goes
+    unrecorded rather than a run that ends:
+
+    - confinement, which is `ensure_safe_directory`'s and unchanged - the path
+      stays under the bundle root and no component of it is a symlink (R-16);
+    - what is already there, which is `lstat`'s. A regular file is overwritten
+      and an absent one is created; a directory, a socket or a fifo is not a
+      stage result and never becomes one by being written to. A fifo is the
+      reason this is asked rather than left to the write: opening one for
+      writing blocks until a reader appears, so a run would hang rather than
+      fail, which is the worse of the two failures the finding describes.
+    """
+    try:
+        ensure_safe_directory(path, root, create_leaf=False)
+        state = _file_state(path)
+    except DistillError as exc:
+        _unrecordable_stage_result(stage, bundle_key, f"path_refused: {exc.code}")
+        return False
+    except OSError as exc:
+        _unrecordable_stage_result(stage, bundle_key, f"unstattable: {_errno_name(exc)}")
+        return False
+    if state == "irregular":
+        _unrecordable_stage_result(stage, bundle_key, "not_a_regular_file")
+        return False
+    return True
+
+
+def _write_regular_file(path: Path, text: str) -> None:
+    """Write `text` at `path`, refusing anything but a regular file at the open.
+
+    `_recordable_stage_result` asks what is there and this refuses to be
+    redirected by what is there *now*: between an `lstat` and an `open` a path
+    can be replaced, and the check is the half that goes out of date. `O_NOFOLLOW`
+    is R-16 decided by the kernel at the moment of use, so a link swapped in
+    after the check fails with `ELOOP` rather than being written through.
+
+    `O_NONBLOCK` covers the one file kind that would not fail: a fifo with no
+    reader answers `ENXIO` instead of waiting for one, so the failure mode is an
+    errno rather than a run hanging under its own lock.
+
+    Both surface as `OSError`, which the caller already treats as scratch that
+    could not be recorded.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags, 0o644), "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _read_regular_file(path: Path) -> str:
+    """Read `path` on the same terms, refusing to be redirected at the open.
+
+    The read half of the same window: a **stage result** is what is at the name,
+    and `O_NOFOLLOW` is what makes that true of the bytes rather than of a check
+    that ran first. `O_NONBLOCK` so a fifo swapped in cannot make the read wait
+    for a writer.
+    """
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as handle:
+        return handle.read()
+
+
+def _unrecordable_stage_result(stage: str, bundle_key: str, reason: str) -> None:
+    """Record that a **stage result** could not be written, and why.
+
+    The counterpart of `_reject_stage_result`, and needed for the same reason:
+    the run carries on, so from the outside a bundle key whose scratch can never
+    be recorded is indistinguishable from one that simply never resumes - a
+    pipeline that looks slow rather than one whose staging directory somebody
+    has to look at.
+    """
+    _bundle_log("stage_result_not_recorded", bundle_key=bundle_key, stage=stage, reason=reason)
+
+
+def _serialized(value: Any) -> Any:
+    """Replace every carrier under `value` with the document `serialize` allows out.
+
+    A stage hands its result along as carriers, because that is what the stages
+    speak to each other (R-19). Turning them into documents is this module's
+    job and not theirs: `serialize` is the last check before **extracted text**
+    becomes durable (R-20), and a stage that flattened its own carriers would
+    be a stage that could skip it.
+    """
+    if isinstance(value, Carrier):
+        return serialize(value)
+    if isinstance(value, Mapping):
+        return {key: _serialized(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_serialized(item) for item in value]
+    return value
 
 
 def strip_stage_results(generation: Path) -> list[str]:
@@ -2406,12 +2803,35 @@ def strip_stage_results(generation: Path) -> list[str]:
     redacts **extracted text** at carrier construction, so a stage result is not
     unredacted on disk in the first place. Both are needed - one keeps secrets
     out of scratch, this one keeps scratch out of bundles.
+
+    R-13 is about the name, so the strip is too: a directory, a link or a fifo
+    called `_ocr.json` is not a stage result and is still an entry a published
+    **generation** must not carry. Only regular files went before, which was
+    unreachable while `write_stage_result` ended the run over one - and stopped
+    being unreachable the moment it stopped doing that. A link is asked about
+    before anything else and then removed, never followed or descended: what it
+    points at is outside the bundle and none of this module's business (R-16).
+
+    An entry that refuses to be removed fails the **publish**, deliberately.
+    R-13 is a promise about what a **generation** contains, and the way to keep
+    it when the strip cannot is to not publish - the previous **active
+    generation** stays servable and the **staging directory** stays for somebody
+    to look at. That is the one thing here that is not scratch's tolerance: a
+    stage result that cannot be *written* costs a resume (D-030), while one that
+    cannot be *removed* would cost the bundle its invariant.
     """
     removed = []
     for path in sorted(generation.rglob(STAGE_RESULT_GLOB)):
-        if path.is_file():
-            path.unlink()
-            removed.append(path.name)
+        try:
+            if path.is_symlink() or not path.is_dir():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+        except FileNotFoundError:
+            # Named inside a directory this loop already removed. `rglob` lists
+            # a parent before its children and the walk is not re-read.
+            continue
+        removed.append(path.name)
     return removed
 
 
