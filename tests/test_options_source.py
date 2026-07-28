@@ -39,8 +39,10 @@ from distill.source import (
     parse_youtube_url,
     parse_ytdlp_progress,
     probe_duration,
+    resolve_local_source,
     sensitive_path_match,
     source_hash,
+    source_path_kind,
     validate_output_root,
     youtube_description,
     youtube_fast_path_video_id,
@@ -266,6 +268,96 @@ def test_content_mode_distinguishes_the_crafted_pair(tmp_path: Path) -> None:
     left, right = _write_crafted_collision_pair(tmp_path)
 
     assert local_fingerprint(left, "content") != local_fingerprint(right, "content")
+
+
+# --- What a local source is, and the three ways it is not one --------------
+
+
+def resolve_local(path_text: str) -> object:
+    """The local resolver as a run reaches it, with no cache and no progress."""
+    return resolve_local_source(path_text, DistillOptions())
+
+
+def test_a_local_source_that_is_not_there_does_not_exist(tmp_path: Path) -> None:
+    """The control: an absent path is the refusal the message has always named."""
+    with pytest.raises(DistillError) as failure:
+        resolve_local(str(tmp_path / "no-such-video.mp4"))
+
+    assert failure.value.code == "E_BAD_SOURCE"
+    assert failure.value.message == "local video does not exist"
+
+
+def test_a_local_source_that_is_a_directory_is_not_a_video(tmp_path: Path) -> None:
+    """The second control, and the only one that separates "is a regular file"
+    from "could be stat'ed"."""
+    directory = tmp_path / "videos"
+    directory.mkdir()
+
+    with pytest.raises(DistillError) as failure:
+        resolve_local(str(directory))
+
+    assert failure.value.code == "E_BAD_SOURCE"
+    assert failure.value.message == "local video does not exist"
+
+
+def test_a_local_source_that_is_neither_a_file_nor_a_directory_is_not_a_video(
+    tmp_path: Path,
+) -> None:
+    """The third control: a path that is there and is not a regular file either.
+
+    A FIFO is the case that pays for itself, and the reason this one is asserted
+    at the seam rather than through the resolver: a guard asking only "is it not
+    a directory" accepts one, and the **source fingerprint** that follows opens
+    it and blocks until a writer that will never come. A test that drove the
+    resolver would prove that by hanging. `is_file()` refused a FIFO by asking
+    `S_ISREG`, and so does what replaced it.
+    """
+    fifo = tmp_path / "video.mp4"
+    os.mkfifo(fifo)
+
+    assert source_path_kind(fifo) == "other"
+
+
+def test_a_local_source_path_that_no_filesystem_can_hold_does_not_exist() -> None:
+    """A NUL in the path is refused as a path, not raised as a `ValueError`.
+
+    `--args` is a JSON document, so an operator can put a NUL in a path and a
+    `stat` of it raises `ValueError` rather than any `OSError` - the one input
+    class an errno split does not cover. Both `Path.exists()` implementations
+    swallow it deliberately, and so does this: a path no filesystem can hold
+    names no video, which is the answer the operator already got.
+    """
+    with pytest.raises(DistillError) as failure:
+        resolve_local("/tmp/a\x00b.mp4")
+
+    assert failure.value.code == "E_BAD_SOURCE"
+    assert failure.value.message == "local video does not exist"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is not refused by directory permissions")
+def test_a_local_source_that_may_not_be_looked_at_says_so(tmp_path: Path) -> None:
+    """FAILS FIRST: "local video does not exist" about a video that is right there.
+
+    The resolver opened with `Path.exists()`, on the run path every single-video
+    command takes. On 3.14 it answers `False` for a file whose directory this
+    user may not search, so an operator was told their own video is not there;
+    on 3.13 it raised `PermissionError`, which the CLI boundary reports as
+    `E_INTERNAL` - a defect in Distill rather than a permission to grant.
+    """
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    video = sealed / "video.mp4"
+    video.write_bytes(b"\x00")
+    sealed.chmod(0o000)
+    try:
+        with pytest.raises(DistillError) as failure:
+            resolve_local(str(video))
+    finally:
+        sealed.chmod(0o700)
+
+    assert failure.value.code == "E_SOURCE_UNREADABLE"
+    assert failure.value.stage == "source"
+    assert failure.value.details == {"path": str(video), "errno": "EACCES"}
 
 
 def test_output_dir_must_be_under_home_or_temp(tmp_path: Path) -> None:

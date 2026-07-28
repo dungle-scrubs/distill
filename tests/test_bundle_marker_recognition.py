@@ -17,11 +17,19 @@ non-symlink regular files: a link named `_owner.json` or `_manifest.json`
 pointing at a marker Distill did write recognized a directory Distill did not.
 
 The second half is the walk itself. Every `iterdir()` and `is_file()` in it was
-bare, and `Path.is_file()` does not swallow `EACCES` - so one unreadable
-directory under the root ended `cache-doctor` with a `PermissionError`. The
-read-only command that exists *because* the destructive ones were unpreviewable
-could not report on that root at all. R-57 already requires a reason per skip;
-an unreadable directory is a skip with a reason like any other.
+bare, and on Python 3.13 `Path.is_file()` did not swallow `EACCES` - so one
+unreadable directory under the root ended `cache-doctor` with a
+`PermissionError`. The read-only command that exists *because* the destructive
+ones were unpreviewable could not report on that root at all. R-57 already
+requires a reason per skip; an unreadable directory is a skip with a reason like
+any other.
+
+The walk asks `lstat` directly and catches, which is why these tests read the
+same on both supported interpreters: Python 3.14 reimplemented `is_file()`,
+`is_dir()` and `exists()` on top of the `os.path` predicates, which answer
+`False` for *every* `OSError` rather than only for the not-there ones. Under
+that behaviour the original defect would not have raised - it would have
+reported the user's unreadable directory as not a directory at all.
 """
 
 from __future__ import annotations
@@ -281,9 +289,12 @@ def test_cache_doctor_reports_an_unreadable_directory_rather_than_failing(
 ) -> None:
     """The read-only command must be able to report on the root it is given.
 
-    `Path.is_file()` does not swallow `EACCES`, so `read_marker` raised out of
-    the walk and the whole inspection ended as `E_INTERNAL` - on a root whose
-    only problem was one directory this user cannot look inside.
+    On Python 3.13 `Path.is_file()` did not swallow `EACCES`, so `read_marker`
+    raised out of the walk and the whole inspection ended as `E_INTERNAL` - on a
+    root whose only problem was one directory this user cannot look inside. On
+    3.14 it would have been reported as no directory at all. The assertion is
+    the same either way, because the walk stopped asking a predicate that
+    decides for itself what a refusal means.
     """
     report = doctor(unreadable, capsys)
 

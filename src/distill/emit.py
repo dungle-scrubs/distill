@@ -62,7 +62,6 @@ claims more.
 
 from __future__ import annotations
 
-import errno
 import itertools
 import logging
 import os
@@ -70,6 +69,8 @@ import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import ClassVar
+
+from .errors import errno_name
 
 LOGGER = logging.getLogger(__name__)
 
@@ -390,16 +391,12 @@ def _fsync_directory(directory: Path) -> None:
     try:
         fd = os.open(directory, os.O_RDONLY)
     except OSError as exc:
-        LOGGER.debug("directory not open-able for fsync: %s", _errno_name(exc))
+        LOGGER.debug("directory not open-able for fsync: %s", errno_name(exc))
         return
     try:
         os.fsync(fd)
     except OSError as exc:
-        LOGGER.debug("directory fsync refused: %s", _errno_name(exc))
+        LOGGER.debug("directory fsync refused: %s", errno_name(exc))
     finally:
         os.close(fd)
 
-
-def _errno_name(exc: OSError) -> str:
-    """The symbolic errno of a refusal, for a reason a user can act on."""
-    return (errno.errorcode.get(exc.errno, "") if exc.errno is not None else "") or str(exc.errno)

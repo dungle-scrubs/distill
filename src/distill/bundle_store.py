@@ -36,6 +36,10 @@ Every question this module asks of the filesystem can be refused, and none of
 them may end a walk. A directory prune cannot read is a **skip with a reason**
 like any other (R-57), not a `PermissionError` out of `cache-doctor` - the
 read-only command that exists *because* the destructive ones were unpreviewable.
+The output root itself is the one refusal that ends the command rather than
+becoming a skip, because a root that cannot be reached leaves no walk to save
+and no report to salvage - see `_root_directory_exists`, which is also where the
+rule that a root nobody could stat is not a root that is absent is stated.
 
 What this module does not own: what a pipeline stage computes, what a
 **generation** contains, job records (`job_store`), the **source fingerprint**
@@ -135,7 +139,7 @@ from .artifacts import (
     serialize,
 )
 from .emit import EMITTER
-from .errors import DistillError
+from .errors import DistillError, errno_name
 
 LOGGER = logging.getLogger(__name__)
 
@@ -508,7 +512,6 @@ class ExclusiveLock:
                 os.close(fd)
             if exc.errno in _LOCK_HELD_ERRNOS:
                 return None
-            reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
             raise DistillError(
                 "E_LOCK_UNSUPPORTED",
                 stage,
@@ -516,7 +519,7 @@ class ExclusiveLock:
                 {
                     "subject": subject,
                     "lock_path": str(path),
-                    "errno": reported or str(exc.errno),
+                    "errno": errno_name(exc),
                 },
             ) from exc
         except BaseException:
@@ -564,7 +567,6 @@ class ExclusiveLock:
         except OSError as exc:
             if exc.errno in _LOCK_HELD_ERRNOS:
                 return
-            reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
             raise DistillError(
                 "E_LOCK_UNSUPPORTED",
                 stage,
@@ -572,7 +574,7 @@ class ExclusiveLock:
                 {
                     "subject": subject,
                     "lock_path": str(directory),
-                    "errno": reported or str(exc.errno),
+                    "errno": errno_name(exc),
                 },
             ) from exc
         else:
@@ -1214,8 +1216,12 @@ class BundleStore:
         than the liveness probe, so every decision in the returned plan is a
         decision about a moment that has already passed. `apply_prune` makes it
         again under the lock.
+
+        The root guard is `survey`'s, for the same reason the walk is: an empty
+        plan over a root nobody could reach says "nothing to reclaim" about a
+        cache that may be full (see `_root_directory_exists`).
         """
-        if not self.root.is_dir():
+        if not _root_directory_exists(self.root):
             return PrunePlan(root=self.root, policy=policy)
         scan = _Scan()
         targets: list[PruneTarget] = []
@@ -1347,7 +1353,7 @@ class BundleStore:
             # proved and a user may have taken away. One target Distill cannot
             # remove must not cost the report on every target it did - the
             # command that deletes is the one that most has to say what it did.
-            return PruneResult(target, "skipped", f"removal failed: {_errno_name(exc)}")
+            return PruneResult(target, "skipped", f"removal failed: {errno_name(exc)}")
         return PruneResult(target, "deleted", target.reason)
 
     def survey(self) -> StoreSurvey:
@@ -1363,8 +1369,11 @@ class BundleStore:
         Liveness is asked of the kernel, never of a timestamp: a lock file
         outlives its holder by design, so only `flock` separates a run in
         progress from a leftover (R-06).
+
+        A root that cannot be reached at all is refused rather than reported as
+        absent - see `_root_directory_exists`.
         """
-        if not self.root.is_dir():
+        if not _root_directory_exists(self.root):
             return StoreSurvey(root=self.root, root_exists=False)
         scan = _Scan()
         bundles: list[BundleReport] = []
@@ -1434,7 +1443,7 @@ class BundleStore:
                 scan.considered += 1
                 scan.skipped.append(
                     DirectorySkip(
-                        child, "unreadable", f"entry could not be read: {_errno_name(exc)}"
+                        child, "unreadable", f"entry could not be read: {errno_name(exc)}"
                     )
                 )
                 continue
@@ -1610,11 +1619,54 @@ class BundleRun:
         """End the hold. Idempotent, and safe to call from a failure path."""
         self.lock.release()
 
+    def _release_without_replacing(self, failure: BaseException) -> None:
+        """Release while `failure` is travelling, and never take its place.
+
+        Cleanup that raises during an exception *substitutes* that exception for
+        its own. Here the exception being replaced was the run's real diagnosis
+        and the replacement is a note about a descriptor: an operator's `Ctrl-C`
+        reached the CLI boundary as `E_INTERNAL` saying an unexpected
+        `RuntimeError` ended the command, which is wrong twice - the run was not
+        interrupted by a defect, and the interrupt was not Distill's to relabel.
+
+        The release failure is not dropped, because a lock this process believes
+        it released and did not is a **bundle key** no later run can take. It is
+        recorded, beside the failure it declined to replace.
+
+        `Exception`, so a `BaseException` raised *by the release* still
+        propagates - a second `Ctrl-C` landing inside cleanup, say. Swallowing an
+        interrupt in order to preserve an earlier one is not an improvement on
+        losing the earlier one, and an operator interrupting twice is asking
+        harder rather than asking again.
+        """
+        try:
+            self.release()
+        except Exception as release_failure:
+            _bundle_log(
+                "lock_release_failed",
+                bundle_key=self.bundle_key,
+                error=repr(release_failure),
+                during=type(failure).__name__,
+            )
+
     def __enter__(self) -> BundleRun:
         return self
 
-    def __exit__(self, *_exc: object) -> None:
-        self.release()
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        """End the hold, and let whatever is travelling keep travelling.
+
+        A release failure with nothing in flight is raised normally: it is the
+        only report that a lock was not given up.
+        """
+        if exc is None:
+            self.release()
+        else:
+            self._release_without_replacing(exc)
 
     @property
     def staging_duration_sec(self) -> float:
@@ -1772,7 +1824,7 @@ class BundleRun:
             manifest=published_manifest(manifest, final_paths),
         )
 
-    def abandon(self, reason: str) -> None:
+    def abandon(self, reason: str, *, during: BaseException | None = None) -> None:
         """Give up the run, leaving the previous **active generation** intact.
 
         The **staging directory** stays: its **stage results** are what a later
@@ -1782,6 +1834,10 @@ class BundleRun:
 
         The reason is the record: a bundle that did not change is otherwise
         indistinguishable from a run that never happened.
+
+        `during` is the failure this abandonment is cleaning up after, when
+        there is one. Named, because a release that raises while it travels
+        would replace it - see `_release_without_replacing`.
         """
         _bundle_log(
             "run_abandoned",
@@ -1790,7 +1846,10 @@ class BundleRun:
             staging=str(self.paths.generation),
             staging_duration_sec=self.staging_duration_sec,
         )
-        self.release()
+        if during is None:
+            self.release()
+        else:
+            self._release_without_replacing(during)
 
 
 UNRECLAIMABLE_NOTE = (
@@ -1821,11 +1880,6 @@ def _skip_reason(verdict: MarkerVerdict) -> str:
     return verdict.reason
 
 
-def _errno_name(exc: OSError) -> str:
-    """The symbolic errno of a refusal, for a reason a user can act on."""
-    return (errno.errorcode.get(exc.errno, "") if exc.errno is not None else "") or str(exc.errno)
-
-
 def _file_state(path: Path) -> FileState:
     """What is at `path`: an ordinary file, something else, or nothing.
 
@@ -1845,6 +1899,45 @@ def _file_state(path: Path) -> FileState:
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
     return "regular" if stat.S_ISREG(info.st_mode) else "irregular"
+
+
+def _root_directory_exists(root: Path) -> bool:
+    """Whether there is a directory at `root`, refusing to guess when it cannot be asked.
+
+    `Path.is_dir()` cannot answer this, and answers it differently on different
+    interpreters, which is how the difference stayed hidden. Reaching a path
+    needs execute on every directory above it, so a root whose parent this
+    process may not search cannot be stat'ed at all - and `is_dir()` reports
+    that as `False` on Python 3.14 (where it delegates to `os.path.isdir`, which
+    swallows every `OSError`) and raises `PermissionError` on 3.13 (where only
+    the not-there errnos are ignored). One interpreter answered "no root here"
+    about a directory that may hold every bundle the user owns; the other ended
+    the read-only command with an internal fault.
+
+    Neither is the answer, because neither is known. This is `_file_state`'s rule
+    applied to the root: "not there" and "may not be asked about" are different
+    facts, and guessing between them is how a permission problem became a crash
+    or a deletion. The first is reported (`root_exists: false`, an empty plan);
+    the second is refused, because a report about a root nobody could reach is
+    a claim with nothing behind it (D-022).
+
+    Refused rather than recorded as a **skip with a reason**, which is what a
+    directory *under* the root gets: a skip exists so one unreadable directory
+    does not cost the report on all the others, and when the root itself cannot
+    be reached there are no others - there is no report left to save.
+    """
+    try:
+        info = root.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        raise DistillError(
+            "E_OUTPUT_ROOT_UNREADABLE",
+            "bundle",
+            "output root could not be read",
+            {"root": str(root), "errno": errno_name(exc)},
+        ) from exc
+    return stat.S_ISDIR(info.st_mode)
 
 
 def _entry_kind(directory_entry: Path) -> EntryKind:
@@ -1880,7 +1973,7 @@ def _listing(directory: Path) -> tuple[list[Path], str | None]:
     try:
         return sorted(directory.iterdir()), None
     except OSError as exc:
-        return [], f"directory could not be listed: {_errno_name(exc)}"
+        return [], f"directory could not be listed: {errno_name(exc)}"
 
 
 def prune_lock_path(bundle_root: Path) -> Path:
@@ -2116,7 +2209,7 @@ def read_marker(directory: Path) -> MarkerVerdict:
     except OSError as exc:
         return MarkerVerdict(
             kind="unreadable",
-            reason=f"directory could not be read: {_errno_name(exc)}",
+            reason=f"directory could not be read: {errno_name(exc)}",
         )
 
     for name, state in (
@@ -2439,7 +2532,7 @@ def read_stage_result(
     try:
         state = _file_state(path)
     except OSError as exc:
-        _reject_stage_result(name, bundle_key, f"unstattable: {_errno_name(exc)}")
+        _reject_stage_result(name, bundle_key, f"unstattable: {errno_name(exc)}")
         return None
     if state == "absent":
         return None
@@ -2642,7 +2735,7 @@ def write_stage_result(
         # A full disk, a read-only mount, a file this process may not write:
         # scratch that cannot be recorded, on the same terms as a target that
         # was never usable. The run has the payload in hand either way.
-        _unrecordable_stage_result(name, bundle_key, f"write_refused: {_errno_name(exc)}")
+        _unrecordable_stage_result(name, bundle_key, f"write_refused: {errno_name(exc)}")
 
 
 def _recordable_stage_result(
@@ -2672,7 +2765,7 @@ def _recordable_stage_result(
         _unrecordable_stage_result(stage, bundle_key, f"path_refused: {exc.code}")
         return False
     except OSError as exc:
-        _unrecordable_stage_result(stage, bundle_key, f"unstattable: {_errno_name(exc)}")
+        _unrecordable_stage_result(stage, bundle_key, f"unstattable: {errno_name(exc)}")
         return False
     if state == "irregular":
         _unrecordable_stage_result(stage, bundle_key, "not_a_regular_file")
@@ -2851,7 +2944,7 @@ def _require_render(paths: BundlePaths) -> None:
         state = _file_state(render)
     except OSError as exc:
         state = "absent"
-        LOGGER.debug("render state unreadable: %s", _errno_name(exc))
+        LOGGER.debug("render state unreadable: %s", errno_name(exc))
     if state != "regular":
         raise DistillError(
             "E_INCOMPLETE_GENERATION",

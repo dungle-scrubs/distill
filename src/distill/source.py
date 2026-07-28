@@ -60,6 +60,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -67,7 +68,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from .artifacts import RedactionState
@@ -79,7 +80,7 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
-from .errors import DistillError, WarningRecord, warning
+from .errors import DistillError, WarningRecord, errno_name, warning
 from .links import RelatedLink, extract_relevant_links
 from .options import DistillOptions
 from .progress import ProgressReporter
@@ -93,6 +94,15 @@ from .run_command import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+SourcePathKind = Literal["file", "directory", "other", "absent"]
+"""What a caller found at a path a user named. See `source_path_kind`.
+
+Four answers and not a boolean, because the two callers want different kinds -
+a video is a regular file, a batch is a directory - and neither wants the third
+thing a path can be. There is deliberately no "unreadable" member: a path that
+could not be asked about is not a kind of answer, it is the absence of one.
+"""
 
 CONTENT_HASH_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 FINGERPRINT_SAMPLE_BYTES = 64 * 1024
@@ -305,16 +315,42 @@ class SourceInfo:
     acquisition_lease: AcquisitionLease | None = None
 
 
-def release_acquisition_lease(source: Any) -> None:
+def release_acquisition_lease(source: Any, *, during: BaseException | None = None) -> None:
     """Release the lease a source carries, if it carries one.
 
     Takes anything with the attribute rather than a `SourceInfo`, because the
     reader that calls this handles local sources, cache hits and test doubles
     through the same path, and none of those hold a lease.
+
+    `during` is the failure this release is cleaning up after, when there is
+    one. Cleanup that raises while an exception travels *substitutes* that
+    exception, so a lease that could not be given up turned an operator's
+    `Ctrl-C` into an `E_INTERNAL` record about a descriptor - the wrong
+    diagnosis, and the true one thrown away. With a failure named, the release
+    failure is logged instead of raised; with none, it is raised, because a
+    lease this process believes it released and did not is a **lock key** the
+    next run of the same source will wait out.
+
+    An `Exception` from the release, not a `BaseException`: a second `Ctrl-C`
+    landing inside cleanup still propagates, because swallowing an interrupt to
+    preserve an earlier one is not an improvement on losing the earlier one.
     """
     lease = getattr(source, "acquisition_lease", None)
-    if isinstance(lease, AcquisitionLease):
+    if not isinstance(lease, AcquisitionLease):
+        return
+    if during is None:
         lease.release()
+        return
+    try:
+        lease.release()
+    except Exception as release_failure:
+        _acquisition_log(
+            "lease_release_failed",
+            lock_key=lease.lock_key,
+            lock_path=str(lease.lock_path),
+            error=repr(release_failure),
+            during=type(during).__name__,
+        )
 
 
 @dataclass(frozen=True)
@@ -627,7 +663,7 @@ class LocalSourceProvider:
         if not path_text:
             raise DistillError("E_BAD_SOURCE", "source", "path is required")
         original = Path(path_text).expanduser()
-        if not original.exists() or not original.is_file():
+        if source_path_kind(original) != "file":
             raise DistillError(
                 "E_BAD_SOURCE", "source", "local video does not exist", {"path": path_text}
             )
@@ -697,6 +733,52 @@ def resolve_local_source(
     )
 
 
+def source_path_kind(path: Path) -> SourcePathKind:
+    """What is at a path a *user* named, refusing to guess when it cannot be asked.
+
+    One `stat`, following symlinks, because a symlinked source is a source (the
+    resolver warns about it and goes on) - and one, because this is on the run
+    path every single-video command takes.
+
+    Here rather than at each caller because both callers say the same thing when
+    the answer is "I may not look": `E_SOURCE_UNREADABLE`, stage `source`, the
+    path and the symbolic errno. What differs is only which kind each wanted, so
+    that is what they compare. The **output root** asks a related question and
+    keeps its own answer in `bundle_store._root_directory_exists`: that is a
+    directory Distill owns rather than one a user named, its refusal carries a
+    different code, and this module already imports that one.
+
+    Three refusals, and only one of them is "not there":
+
+    - the not-there errnos (`ENOENT`, `ENOTDIR`) are `absent`, which is what a
+      mistyped path is;
+    - a `ValueError` is `absent` too, because a path holding a NUL is one no
+      filesystem can hold and names nothing. Both `Path.exists()`
+      implementations swallow it deliberately, and a guard replacing `exists()`
+      that does not would turn an operator's typo into an internal fault;
+    - anything else - `EACCES` above all - is refused, because "does not exist"
+      about a directory this process may not search is a claim with nothing
+      behind it (D-022). `Path.exists()` cannot make that distinction and does
+      not even fail to make it consistently: it answers `False` on Python 3.14,
+      where it delegates to `os.path.exists` and swallows every `OSError`, and
+      raises `PermissionError` on 3.13.
+    """
+    try:
+        info = path.stat()
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        return "absent"
+    except OSError as exc:
+        raise DistillError(
+            "E_SOURCE_UNREADABLE",
+            "source",
+            "source path could not be read",
+            {"path": str(path), "errno": errno_name(exc)},
+        ) from exc
+    if stat.S_ISDIR(info.st_mode):
+        return "directory"
+    return "file" if stat.S_ISREG(info.st_mode) else "other"
+
+
 def validate_output_root(output_dir: str | None, *, create: bool = True) -> Path:
     """Accept an output root, or refuse it before anything is written under it.
 
@@ -713,7 +795,22 @@ def validate_output_root(output_dir: str | None, *, create: bool = True) -> Path
 
     The root is resolved first, so confinement is decided on the real path a
     symlinked argument points at rather than on the name given.
+
+    A value that is not a path *at all* is refused before any of that, as a bad
+    option rather than as a bad output directory: the other refusals here are
+    policy about a location Distill understood, and this one is an argument it
+    could not read. `--args` is a JSON document, so every tool argument arrives
+    with a type the operator chose, and `{"output_dir": 5}` reached `Path` as an
+    `int` and left as a `TypeError` - an operator's typo diagnosed as an
+    internal defect, with the option's name thrown away.
     """
+    if output_dir is not None and not isinstance(output_dir, str):
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "options",
+            "output_dir must be a path written as text",
+            {"output_dir": repr(output_dir)},
+        )
     root = Path(output_dir).expanduser() if output_dir else Path.home() / ".cache" / "distill"
     root = root.resolve()
     home = Path.home().resolve()
@@ -826,11 +923,15 @@ def youtube_fast_path_video_id(url: str) -> str | None:
     It is not, in three ways, and each one would key a lookup on a string the
     run cannot publish under:
 
-    - **A playlist is attached.** `watch?v=A&list=P` is the playlist to yt-dlp
-      unless told otherwise: `--dump-json` emits one document per entry, which
-      does not parse as one, and `canonical_youtube_id` falls back to
-      `--print id` and takes the *last* line. That URL publishes under some
-      other entry's id.
+    - **A playlist is attached.** `watch?v=A&list=P` used to be the playlist to
+      yt-dlp: `--dump-json` emitted one document per entry, which does not parse
+      as one, and `canonical_youtube_id` fell back to `--print id` and took the
+      *last* line, so the URL published under some other entry's id. Every
+      single-video invocation now carries `NO_PLAYLIST_ARG`, so the id written
+      in such a URL *is* the id a run publishes under, and the shortcut is
+      declined here on the narrower ground that widening it changes which
+      **bundle key** a URL is looked up by - a cache decision, taken
+      deliberately or not at all. Declining still costs one resolution.
     - **The id is not id-shaped.** yt-dlp's extractor matches exactly eleven
       `[0-9A-Za-z_-]` characters and ignores trailing material, so
       `watch?v=YE7VzlLtp-4x` is published under `YE7VzlLtp-4`. Reading twelve
@@ -844,12 +945,6 @@ def youtube_fast_path_video_id(url: str) -> str | None:
 
     Case is preserved, because a video id is case-sensitive and `A` and `a` are
     different videos.
-
-    The playlist form is worth resolving properly - `--no-playlist` on the
-    single-video invocations would make the URL's id authoritative for it too,
-    and fix a run that currently points one output template at every entry of a
-    playlist. That changes what a **cache miss** acquires, and remains a Phase 9
-    follow-up.
     """
     parsed = urlparse(url)
     if parsed.netloc.lower() not in YOUTUBE_HOSTS:
@@ -909,17 +1004,39 @@ def parse_youtube_url(url: str) -> str:
     return video_id
 
 
-def _ytdlp_command(extra_args: list[str], url: str) -> list[str]:
+NO_PLAYLIST_ARG = "--no-playlist"
+"""What makes a `watch?v=A&list=P` URL name the video it says it names.
+
+yt-dlp reads a `list` parameter as the thing being asked for, so without this a
+URL an operator copied out of a playlist page resolves to every entry of the
+playlist: `--dump-json` emits one document per entry, `--print id` one line per
+entry, and the download points one output template at all of them. Which entry
+the run then proceeds against is whichever landed on `source.mp4`.
+
+Every yt-dlp invocation about *one video* carries it, and the one invocation
+whose subject really is a playlist - the listing a playlist job starts with -
+does not. That is why it is a parameter here rather than a constant folded into
+the shared argv: a flag added unconditionally would make a playlist job
+enumerate one video.
+"""
+
+
+def _ytdlp_command(extra_args: list[str], url: str, *, names_one_video: bool = True) -> list[str]:
     """Build a yt-dlp argv with a stall guard and a `--` terminator.
 
     The `--` before the URL stops a value that begins with `-` from being parsed
     as a yt-dlp option (argument injection), and `--socket-timeout` lets yt-dlp
     abort a stalled connection on its own.
+
+    `names_one_video` defaults true because all but one caller is asking about a
+    single video, and the default that has to be remembered is the one that gets
+    forgotten.
     """
     return [
         "yt-dlp",
         "--socket-timeout",
         str(YTDLP_SOCKET_TIMEOUT_SEC),
+        *([NO_PLAYLIST_ARG] if names_one_video else []),
         *extra_args,
         "--",
         url,
@@ -931,6 +1048,7 @@ def _run_ytdlp(
     url: str,
     *,
     timeouts: CommandTimeouts = YTDLP_METADATA_TIMEOUTS,
+    names_one_video: bool = True,
 ) -> CommandResult:
     """Run a non-downloading yt-dlp invocation and hand back what it produced.
 
@@ -940,7 +1058,7 @@ def _run_ytdlp(
     absent or wedged still raises, since there is no answer to inspect.
     """
     return run(
-        _ytdlp_command(extra_args, url),
+        _ytdlp_command(extra_args, url, names_one_video=names_one_video),
         stage="youtube",
         total_timeout_sec=timeouts.total_sec,
         idle_timeout_sec=timeouts.idle_sec,
@@ -1386,6 +1504,8 @@ class YoutubeDownloader:
         out_template = str(staging_dir / f"{PROMOTED_MEDIA_STEM}.%(ext)s")
         command = [
             "yt-dlp",
+            # The URL names one video, whatever `list` parameter it carries.
+            NO_PLAYLIST_ARG,
             "-f",
             "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best/bv*+ba/b",
             "--newline",

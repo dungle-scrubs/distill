@@ -17,6 +17,7 @@ from .local_vision import (
     DEFAULT_LOCAL_VISION_BASE_URL,
     DEFAULT_LOCAL_VISION_MODEL,
     DEFAULT_TIMEOUT_SEC,
+    MAX_SOCKET_TIMEOUT_SEC,
     LocalVisionConfig,
     local_vision_config_from_args,
 )
@@ -85,11 +86,18 @@ class NumericDomain:
     positive one: a quantity the pipeline measures in a unit of its own has a
     floor of that unit, and a value below it is not a small request but an
     unanswerable one (R-48).
+
+    `ceiling` is the same idea from above, and it is a fact about what the thing
+    downstream can hold rather than a policy about how long an operator may
+    wait. Most options have none; the one that does is a timeout, and a timeout
+    larger than the call it is handed to can represent is not a long wait but an
+    `OverflowError` from the stdlib (R-46).
     """
 
     integral: bool = False
     admits_zero: bool = False
     floor: float = 0.0
+    ceiling: float = math.inf
 
 
 NUMERIC_OPTION_DOMAINS: dict[str, NumericDomain] = {
@@ -103,7 +111,13 @@ NUMERIC_OPTION_DOMAINS: dict[str, NumericDomain] = {
     # to names a spacing the **keyframe** schedule cannot express, and the walk
     # that fills a static stretch with it never advances (finding 7).
     "max_static_window_sec": NumericDomain(floor=CANDIDATE_TIMESTAMP_QUANTUM_SEC),
-    "local_vision_timeout_sec": NumericDomain(),
+    # The bound is the socket's, not a policy: CPython holds a timeout as
+    # nanoseconds in a signed 64-bit integer, so a finite `1e300` is as much an
+    # `OverflowError` as `inf` is. The config layer coerces such a value to the
+    # default (`_coerce_float`), which is right for a config file and wrong for
+    # an operator who typed the number, so the run path refuses it and says
+    # which option it was.
+    "local_vision_timeout_sec": NumericDomain(ceiling=MAX_SOCKET_TIMEOUT_SEC),
     # Not a `DistillOptions` field - `max_items` bounds a batch rather than a
     # bundle, so it is not part of the options hash - but it is an operator's
     # number arriving at the same boundary and it is refused the same way.
@@ -139,6 +153,8 @@ def _bad_number(name: str, value: Any, domain: NumericDomain, reason: str = "") 
         floor = f"{domain.floor} or greater"
     else:
         floor = "0 or greater" if domain.admits_zero else "greater than 0"
+    if math.isfinite(domain.ceiling):
+        floor = f"{floor} and below {domain.ceiling}"
     message = f"{name} must be {quantity} {floor}"
     return DistillError(
         "E_BAD_OPTIONS",
@@ -213,6 +229,8 @@ def validated_number(name: str, value: Any) -> int | float:
     # float could hold is still judged against its own domain here.
     if number < 0 or (number == 0 and not domain.admits_zero) or number < domain.floor:
         raise _bad_number(name, value, domain)
+    if number >= domain.ceiling:
+        raise _bad_number(name, value, domain, "larger than the call downstream can hold")
     if number == 0:
         # `-0.0` is the same quantity as `0.0` and asks for the same run, but
         # `json.dumps` writes it as `-0.0` - two **bundle keys** for one set of

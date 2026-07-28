@@ -65,6 +65,7 @@ from typing import Any, Literal
 from .bundle_store import (
     ExclusiveLock,
     LockState,
+    _bundle_log,
     atomic_write_text,
     confined_path,
     ensure_safe_directory,
@@ -301,12 +302,12 @@ class JobStore:
             return self._write(
                 JobRecord(job_id=job_id, tool=tool, status=RUNNING, updated_at=_timestamp())
             )
-        except BaseException:
+        except BaseException as failure:
             # A hold whose record was never written names a run that is not
             # happening. Distill's tools run inside a long-lived session, so a
             # descriptor kept past that point is an identifier nothing can ever
             # start again: one failed write, then `E_JOB_RUNNING` forever.
-            self._release(job_id)
+            self._release_without_replacing(job_id, during=failure)
             raise
 
     def finish(self, job_id: str, outcome: JobOutcome) -> JobRecord:
@@ -331,7 +332,7 @@ class JobStore:
                 {"job_id": job_id},
             )
         try:
-            return self._write(
+            record = self._write(
                 JobRecord(
                     job_id=job_id,
                     tool=hold.tool,
@@ -341,11 +342,17 @@ class JobStore:
                     error=outcome.error,
                 )
             )
-        finally:
+        except BaseException as failure:
             # Released whether or not the record could be written: the run is
             # over either way, and a hold outliving it is a lock nothing will
-            # come back to give up.
-            self._release(job_id)
+            # come back to give up. Never in a bare `finally`, because a release
+            # that raises there takes the failing write's place.
+            self._release_without_replacing(job_id, during=failure)
+            raise
+        # Nothing in flight, so a release failure is raised normally: it is the
+        # only report that a hold was not given up.
+        self._release(job_id)
+        return record
 
     def read(self, job_id: str) -> JobRecord | None:
         """The record for `job_id`, or `None` if there is none.
@@ -446,6 +453,41 @@ class JobStore:
         hold = self._held.pop(job_id, None)
         if hold is not None:
             hold.lock.release()
+
+    def _release_without_replacing(self, job_id: str, *, during: BaseException) -> None:
+        """Release while `during` is travelling, and never take its place.
+
+        The same rule `BundleRun._release_without_replacing` holds, for the same
+        reason: cleanup that raises during an exception *substitutes* that
+        exception for its own. Here the exception being replaced was the run's
+        real diagnosis and the replacement is a note about a descriptor - an
+        operator's `Ctrl-C` reached the CLI boundary as `E_INTERNAL`, exit 2,
+        saying an `OSError` ended the command, which is wrong twice: the run was
+        not ended by a defect, and the interrupt was not Distill's to relabel.
+
+        The release failure is not dropped, because a hold this process believes
+        it gave up and did not is a job identifier no later run can start - for
+        the life of the process, since `flock` is refused inside the holding
+        process exactly as outside it. It is recorded beside the failure it
+        declined to replace, on the lock stream the lock's own `lock_released`
+        event goes to, under the same `subject`.
+
+        `Exception`, so a `BaseException` raised *by the release* still
+        propagates - a second `Ctrl-C` landing inside cleanup, say. Swallowing
+        an interrupt in order to preserve an earlier one is not an improvement
+        on losing the earlier one. And with nothing in flight there is nothing
+        to preserve: callers use `_release` there, and a release that fails then
+        still raises.
+        """
+        try:
+            self._release(job_id)
+        except Exception as release_failure:
+            _bundle_log(
+                "lock_release_failed",
+                subject=job_id,
+                error=repr(release_failure),
+                during=type(during).__name__,
+            )
 
     def _holder_is_live(self, job_id: str) -> bool:
         """Whether a run is still live on `job_id`, asked of the lock, not a clock.

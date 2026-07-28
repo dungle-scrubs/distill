@@ -23,6 +23,7 @@ descriptors release, and a holder that tidied up after itself is not a dead one.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -34,7 +35,8 @@ from typing import Any
 
 import pytest
 
-from distill import pipeline
+from distill import bundle_store, pipeline
+from distill.bundle_store import ExclusiveLock
 from distill.errors import DistillError
 from distill.job_store import JobOutcome, JobStore
 from distill.source import SourceResolution
@@ -258,6 +260,103 @@ def test_a_directory_run_that_finds_no_directory_records_a_failure(tmp_path: Pat
     assert status["status"] == "failed"
     assert status["tool"] == "process_video_directory"
     assert status["error"]["code"] == "E_BAD_SOURCE"
+    assert status["error"]["message"] == "directory does not exist"
+
+
+def test_a_directory_run_pointed_at_a_file_finds_no_directory(tmp_path: Path) -> None:
+    """The third answer: a path that is there and is not a directory.
+
+    "No directory here" is true of a regular file, so this is reported like an
+    absent path rather than refused like an unreachable one - the batch knows
+    what it found. Pinned because it is the only assertion that separates "is a
+    directory" from "could be stat'ed".
+    """
+    root = tmp_path / "output"
+    not_a_directory = tmp_path / "videos.mp4"
+    not_a_directory.write_bytes(b"\x00")
+
+    with pytest.raises(DistillError) as failure:
+        pipeline.process_video_directory(
+            {
+                "path": str(not_a_directory),
+                "output_dir": str(root),
+                "job_id": "distill-file-directory",
+            }
+        )
+
+    assert failure.value.code == "E_BAD_SOURCE"
+    assert failure.value.message == "directory does not exist"
+    assert not_a_directory.read_bytes() == b"\x00"
+
+
+def test_a_directory_run_pointed_at_an_impossible_path_finds_no_directory(
+    tmp_path: Path,
+) -> None:
+    """A NUL in the path is refused as a path, not raised as a `ValueError`.
+
+    The fourth answer, and the one an errno split does not cover: `stat` of a
+    path holding a NUL raises `ValueError`, which is neither an `OSError` nor a
+    diagnosis. Both `Path.exists()` implementations swallow it on purpose, so a
+    guard that replaces `exists()` has to swallow it too or an operator's typo
+    becomes an internal fault.
+    """
+    root = tmp_path / "output"
+
+    with pytest.raises(DistillError) as failure:
+        pipeline.process_video_directory(
+            {
+                "path": f"{tmp_path}/a\x00b",
+                "output_dir": str(root),
+                "job_id": "distill-impossible-directory",
+            }
+        )
+
+    assert failure.value.code == "E_BAD_SOURCE"
+    assert failure.value.message == "directory does not exist"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is not refused by directory permissions")
+def test_a_directory_run_that_may_not_look_says_so_rather_than_no_such_directory(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: "directory does not exist" about a directory that may be full.
+
+    The scan opened with `Path.exists()`, which cannot tell the two refusals
+    apart - and tells them apart differently on each interpreter. On 3.14 it
+    answers `False` for a directory whose parent this user may not search, so
+    the batch reported the operator's own videos as a path that is not there; on
+    3.13 it raised `PermissionError` and the run ended as `E_INTERNAL`, a defect
+    in Distill rather than a permission the operator can grant.
+
+    The record is asserted for the same reason its neighbour asserts it: both
+    refusals happen inside `work()`, so both are failures of a run that started.
+    """
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    unreachable = sealed / "videos"
+    unreachable.mkdir()
+    root = tmp_path / "output"
+    sealed.chmod(0o000)
+    try:
+        with pytest.raises(DistillError) as failure:
+            pipeline.process_video_directory(
+                {
+                    "path": str(unreachable),
+                    "output_dir": str(root),
+                    "job_id": "distill-sealed-directory",
+                }
+            )
+    finally:
+        sealed.chmod(0o700)
+
+    assert failure.value.code == "E_SOURCE_UNREADABLE"
+    assert failure.value.stage == "source"
+    assert failure.value.details == {"path": str(unreachable), "errno": "EACCES"}
+
+    status = status_of(root, "distill-sealed-directory")
+    assert status["status"] == "failed"
+    assert status["error"]["code"] == "E_SOURCE_UNREADABLE"
+    assert status["error"]["message"] == "source path could not be read"
 
 
 def test_a_reused_job_id_does_not_survive_a_failed_acquisition(
@@ -653,6 +752,122 @@ def test_a_failed_record_write_does_not_leave_the_job_id_locked(
     assert (
         JobStore.open(root).start("distill-unwritable", "process_local_video").status == "running"
     )
+
+
+def lock_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    """The lock stream, read where a job lock's events actually land.
+
+    A job's lock is an `ExclusiveLock`, and its own `lock_released` events go to
+    the bundle store's logger under the job identifier as `subject`. A release
+    that *failed* is the same fact about the same lock, so it is read from the
+    same stream rather than from a second one invented for job records.
+    """
+    return [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == bundle_store.LOGGER.name and record.message.startswith("{")
+    ]
+
+
+def refuse_to_release(_self: ExclusiveLock) -> None:
+    """A release that cannot give the lock up - `os.close` on a bad descriptor."""
+    raise OSError("the descriptor could not be closed")
+
+
+@pytest.mark.parametrize(
+    "in_flight",
+    [
+        KeyboardInterrupt(),
+        DistillError("E_DISK_FULL", "job", "cannot write the record"),
+    ],
+    ids=["interrupt", "distill_error"],
+)
+def test_a_failure_travelling_through_finish_survives_a_release_that_fails(
+    in_flight: BaseException,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: the release's `OSError` replaces whatever `finish` was carrying.
+
+    `finish` releases the hold in a bare `finally`, and cleanup that raises
+    while an exception is travelling *substitutes* that exception for its own.
+    An operator's `Ctrl-C` therefore left the CLI boundary as `E_INTERNAL`, exit
+    2, blaming an `OSError` about a descriptor - the run was not ended by a
+    defect, and the interrupt was not Distill's to relabel. The same
+    substitution buries an ordinary `DistillError`: the diagnosis a caller can
+    act on is replaced by one it cannot.
+
+    Both halves are asserted, because declining to raise and dropping the
+    failure look identical from the caller's side: the original exception
+    reaches the caller, *and* the lock that was not given up is recorded with
+    the failure that was in flight when it happened. A hold this process
+    believes it released and did not is a job identifier nothing can start
+    again for the life of the process.
+    """
+    root = tmp_path / "output"
+    store = JobStore.open(root)
+    store.start("distill-cleanup", "process_local_video")
+    caplog.set_level(logging.DEBUG, logger=bundle_store.LOGGER.name)
+
+    def refuse_to_write(_self: JobStore, _record: Any) -> Any:
+        raise in_flight
+
+    monkeypatch.setattr(JobStore, "_write", refuse_to_write)
+    monkeypatch.setattr(ExclusiveLock, "release", refuse_to_release)
+
+    with pytest.raises(type(in_flight)) as raised:
+        store.finish("distill-cleanup", JobOutcome.success({"manifest_path": "/x.json"}))
+    assert raised.value is in_flight, "the release replaced the exception it was cleaning up after"
+
+    failures = [event for event in lock_events(caplog) if event["event"] == "lock_release_failed"]
+    assert len(failures) == 1
+    assert failures[0]["detail"]["subject"] == "distill-cleanup"
+    assert "could not be closed" in failures[0]["detail"]["error"]
+    assert failures[0]["detail"]["during"] == type(in_flight).__name__
+
+
+def test_a_failure_travelling_through_start_survives_a_release_that_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same defect at the other end: `start` releases while a failure travels.
+
+    `start` gives the hold up when the `running` record cannot be written, for
+    the reason the record-write test covers. That release is fallible too, so an
+    interrupt landing on the first write was relabelled exactly as one landing
+    on the last.
+    """
+    root = tmp_path / "output"
+    store = JobStore.open(root)
+    interrupt = KeyboardInterrupt()
+
+    def refuse_to_write(_self: JobStore, _record: Any) -> Any:
+        raise interrupt
+
+    monkeypatch.setattr(JobStore, "_write", refuse_to_write)
+    monkeypatch.setattr(ExclusiveLock, "release", refuse_to_release)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        store.start("distill-cleanup-start", "process_local_video")
+    assert raised.value is interrupt
+
+
+def test_a_release_that_fails_with_nothing_in_flight_is_still_reported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other half: with nothing travelling there is nothing to preserve.
+
+    A hold this process believes it released and did not is a job identifier no
+    later run can take, so swallowing the failure unconditionally would trade
+    one wrong diagnosis for a silent one.
+    """
+    root = tmp_path / "output"
+    store = JobStore.open(root)
+    store.start("distill-clean-exit", "process_local_video")
+    monkeypatch.setattr(ExclusiveLock, "release", refuse_to_release)
+
+    with pytest.raises(OSError, match="could not be closed"):
+        store.finish("distill-clean-exit", JobOutcome.success({"manifest_path": "/x.json"}))
 
 
 def test_a_job_outcome_must_be_terminal_and_carry_only_its_own_evidence() -> None:

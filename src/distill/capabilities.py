@@ -56,6 +56,12 @@ class ExternalTool:
 
     `absence_cost` is written as a sentence fragment so it reads correctly both
     in a rendered table and appended to a degradation warning.
+
+    `invoked_when` names every run in which the tool is actually reached, and no
+    entry here says "every run": a run that hits the cache serves the
+    **generation** already on disk and invokes nothing at all (R-49). A required
+    tool's absence is therefore fatal to the runs that have to *produce* a
+    generation, which is the whole of ADR-0002's claim and not one word more.
     """
 
     name: str
@@ -79,7 +85,7 @@ EXTERNAL_TOOLS: dict[str, ExternalTool] = {
         name="ffmpeg",
         capability="audio extraction and keyframe extraction",
         requirement=Requirement.REQUIRED,
-        invoked_when="every run",
+        invoked_when="every run that produces a generation; never for a cache hit",
         absence_cost=(
             "no audio can be extracted and no keyframe can be captured, which "
             "leaves a generation with neither a transcript nor frame artifacts "
@@ -90,7 +96,7 @@ EXTERNAL_TOOLS: dict[str, ExternalTool] = {
         name="ffprobe",
         capability="source duration probing",
         requirement=Requirement.REQUIRED,
-        invoked_when="every run",
+        invoked_when="every run that produces a generation; never for a cache hit",
         absence_cost=(
             "the source's duration cannot be read, so keyframe timestamps and "
             "the duration cap have nothing to work from and the run ends before "
@@ -101,7 +107,7 @@ EXTERNAL_TOOLS: dict[str, ExternalTool] = {
         name="yt-dlp",
         capability="YouTube source acquisition and metadata",
         requirement=Requirement.REQUIRED,
-        invoked_when="a YouTube source; never for a local file",
+        invoked_when="a YouTube source this run must acquire; never for a local file or a cache hit",
         absence_cost=(
             "the source cannot be acquired at all, so a YouTube run has nothing "
             "to process"
@@ -111,7 +117,7 @@ EXTERNAL_TOOLS: dict[str, ExternalTool] = {
         name="tesseract",
         capability="image-text extraction from keyframes",
         requirement=Requirement.OPTIONAL,
-        invoked_when="every run with OCR enabled",
+        invoked_when="every run with OCR enabled that produces a generation; never for a cache hit",
         absence_cost=(
             "keyframes contribute no extracted text, so interpretations cannot "
             "be corroborated and grounding falls back to the vision model alone; "

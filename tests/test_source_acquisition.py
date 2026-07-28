@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from ast import literal_eval
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -444,6 +445,116 @@ def test_releasing_a_lease_this_process_does_not_hold_frees_nobody(
     assert promoted_names(tmp_path) == ["source.mp4"]
     holder.kill()
     holder.wait()
+
+
+def a_lease_that_cannot_be_released(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> AcquisitionLease:
+    """A real lease whose descriptor refuses to close.
+
+    Real, because the caller under test asks `isinstance` before it releases
+    anything. What is faked is only the one operation that can fail on the way
+    out of a run.
+    """
+    lock = tmp_path / "stuck.lock"
+    lease = AcquisitionLease(
+        lock_key=LOCK_KEY,
+        lock_path=lock,
+        lock=ExclusiveLock(
+            subject=LOCK_KEY,
+            path=lock,
+            fd=os.open(lock, os.O_CREAT | os.O_RDWR, 0o600),
+        ),
+    )
+
+    def refuse_to_release() -> None:
+        raise RuntimeError("the lease descriptor could not be closed")
+
+    monkeypatch.setattr(lease.lock, "release", refuse_to_release)
+    return lease
+
+
+def test_an_interrupt_survives_a_lease_that_cannot_be_released(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST: the `finally` release replaces the `KeyboardInterrupt`.
+
+    The lease is given up at the end of the media file's read lifetime, on the
+    way out of the run whether it succeeded or not. Raising from that release
+    while an exception travels substitutes it - so an operator's `Ctrl-C`
+    arrived at the CLI boundary as `E_INTERNAL`, saying an unexpected
+    `RuntimeError` ended the command. The interrupt is what happened.
+
+    Both halves, because declining to raise and dropping the failure are
+    indistinguishable from the caller's side: the interrupt reaches the caller,
+    *and* the lease that was not given up is recorded with the failure that was
+    travelling when it happened.
+    """
+    from distill.options import DistillOptions
+    from distill.pipeline import ProcessingRun, process_resolved_source
+
+    class Source:
+        source_hash = "a" * 16
+        acquisition_lease = a_lease_that_cannot_be_released(monkeypatch, tmp_path)
+
+    def interrupt(_self: ProcessingRun) -> dict[str, Any]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ProcessingRun, "execute", interrupt)
+    caplog.set_level(logging.DEBUG, logger=distill_source.LOGGER.name)
+
+    with pytest.raises(KeyboardInterrupt):
+        process_resolved_source(
+            Source(),
+            DistillOptions(output_dir=str(tmp_path / "out")),
+        )
+
+    failures = [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.message.startswith("{") and "lease_release_failed" in record.message
+    ]
+    assert len(failures) == 1
+    assert failures[0]["detail"]["lock_key"] == LOCK_KEY
+    assert "could not be closed" in failures[0]["detail"]["error"]
+    assert failures[0]["detail"]["during"] == "KeyboardInterrupt"
+
+
+def test_a_lease_that_cannot_be_released_by_a_run_that_succeeded_is_reported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other half: with nothing in flight, a stuck lease is the only news.
+
+    A lease this process believes it released and did not is a **lock key** the
+    next run of the same source waits out for its whole budget and then fails
+    `E_LOCKED` on, so swallowing the failure everywhere would trade one wrong
+    diagnosis for a silent one.
+    """
+    from distill.options import DistillOptions
+    from distill.pipeline import ProcessingRun, process_resolved_source
+
+    class Source:
+        source_hash = "a" * 16
+        acquisition_lease = a_lease_that_cannot_be_released(monkeypatch, tmp_path)
+
+    # Recorded rather than assumed: R-36 puts the release at the *end* of the
+    # media file's read lifetime, so a release moved in front of the run would
+    # raise this same error and satisfy a test that only asserted the error.
+    ran: list[str] = []
+
+    def execute(_self: ProcessingRun) -> dict[str, Any]:
+        ran.append("execute")
+        return {"ok": True}
+
+    monkeypatch.setattr(ProcessingRun, "execute", execute)
+
+    with pytest.raises(RuntimeError, match="could not be closed"):
+        process_resolved_source(
+            Source(),
+            DistillOptions(output_dir=str(tmp_path / "out")),
+        )
+
+    assert ran == ["execute"]
 
 
 def test_each_run_stages_its_download_in_its_own_directory(
@@ -1256,3 +1367,155 @@ def test_a_manifests_recorded_duration_is_read_as_input_rather_than_fact(
     from distill.source import manifest_duration
 
     assert manifest_duration(recorded) == expected
+
+
+# A fake yt-dlp that reads a URL the way yt-dlp reads one - the `list` parameter
+# is the thing being asked for unless `--no-playlist` says otherwise - answers
+# each metadata invocation in the shape that invocation asks for, and records
+# the argv it was handed, appending so a test sees every call a run made.
+#
+# The playlist behaviour is the point. A fake that answered for the `v`
+# parameter either way would let a test assert the resolved id and still pass
+# with the flag dropped.
+FAKE_YTDLP_RECORDING_EVERY_ARGV = """
+import json, os, sys
+from urllib.parse import parse_qs, urlparse
+
+argv = sys.argv[1:]
+with open(os.environ["FAKE_YTDLP_ARGV_LOG"], "a") as handle:
+    handle.write(repr(argv) + "\\n")
+url = argv[-1]
+query = parse_qs(urlparse(url).query)
+if query.get("list") and "--no-playlist" not in argv:
+    resolved = "PLAYLISTENTRY"
+else:
+    resolved = (query.get("v") or [url.rsplit("/", 1)[-1]])[0]
+if "--dump-json" in argv:
+    sys.stdout.write(json.dumps({"id": resolved, "description": "about " + resolved}) + "\\n")
+else:
+    sys.stdout.write(resolved + "\\n")
+"""
+
+THE_VIDEO_THE_URL_NAMES = "abc12345678"
+"""An eleven-character id, because that is the only shape the fast path accepts."""
+
+
+def recorded_invocations(log: Path) -> list[list[str]]:
+    return [literal_eval(line) for line in log.read_text().splitlines() if line]
+
+
+def test_downloading_a_watch_url_acquires_the_one_video_the_url_names(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (deferred by M8.3): `watch?v=A&list=P` is the playlist to yt-dlp.
+
+    Without `--no-playlist` yt-dlp treats the `list` parameter as the thing being
+    asked for, so one output template is pointed at every entry of the playlist
+    and the run proceeds against whichever of them landed on `source.mp4`. The
+    URL names one video and the operator asked for one video.
+
+    It is also what makes the cache fast path's premise true for this URL shape:
+    `youtube_fast_path_video_id` declines a URL carrying a `list`, because the
+    id written in it was not the id the run would publish under. With the flag
+    it is.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_YTDLP_ARGV_FILE", str(argv_file))
+
+    acquired = YoutubeDownloader(tmp_path).acquire(
+        "https://www.youtube.com/watch?v=abc123&list=PLxyz",
+        LOCK_KEY,
+        ProgressReporter(),
+    )
+    acquired.lease.release()
+
+    assert "--no-playlist" in literal_eval(argv_file.read_text())
+
+
+def metadata_readers() -> dict[str, Callable[[str], str]]:
+    """Every function that asks yt-dlp about one video without downloading it.
+
+    Each is reduced to the text it recovered, so one assertion can be made of
+    all three: what came back has to be about the video the URL names. Named
+    here rather than in the parametrize list so the three are imported at call
+    time, and so the reason they are together is stated once - each builds a
+    non-downloading invocation, and each was making the same mistake about the
+    same URL shape.
+    """
+    from distill.source import canonical_youtube_id, youtube_description, youtube_metadata
+
+    return {
+        "canonical_youtube_id": canonical_youtube_id,
+        "youtube_metadata": lambda url: youtube_metadata(url).video_id,
+        "youtube_description": lambda url: youtube_description(url)[0],
+    }
+
+
+@pytest.mark.parametrize("reader", sorted(metadata_readers()))
+def test_resolving_a_watch_url_resolves_the_one_video_the_url_names(
+    reader: str,
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: the metadata calls read the playlist too.
+
+    `--dump-json` over a playlist emits one document per entry, which does not
+    parse as one; `--print id` prints one line per entry; `--print
+    %(description)s` prints somebody else's description. All three are the same
+    mistake as the download's, and a resolution that disagreed with the download
+    about which video this URL is would be worse than either.
+
+    One case per reader, because the first form of this test discussed all three
+    and drove only `canonical_youtube_id`: `--no-playlist` is added by the
+    shared command builder, so one reader passing is evidence about the builder
+    and not about the readers - and a reader that stopped going through the
+    builder would leave the claim standing with nothing under it.
+
+    The answer is asserted and not only the argv, because the argv assertion
+    alone is a claim about a flag while the name is a claim about a resolution.
+    The fake reads a `list` parameter the way yt-dlp does - as the thing being
+    asked for, unless told otherwise - so what comes back names the playlist's
+    entry rather than the URL's video whenever the flag is missing.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_RECORDING_EVERY_ARGV)
+    argv_log = tmp_path / "argv.log"
+    monkeypatch.setenv("FAKE_YTDLP_ARGV_LOG", str(argv_log))
+
+    recovered = metadata_readers()[reader](
+        f"https://www.youtube.com/watch?v={THE_VIDEO_THE_URL_NAMES}&list=PLxyz"
+    )
+
+    invocations = recorded_invocations(argv_log)
+
+    assert invocations
+    for invocation in invocations:
+        assert "--no-playlist" in invocation
+    assert THE_VIDEO_THE_URL_NAMES in recovered
+
+
+def test_listing_a_playlist_is_not_told_to_ignore_the_playlist(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The one yt-dlp call whose subject really is the playlist.
+
+    Named so the flag cannot be added to the shared command builder and left
+    there: `--no-playlist` on the listing would make a playlist job enumerate a
+    single video.
+    """
+    from distill.pipeline import youtube_playlist_urls
+
+    fake_tool("yt-dlp", FAKE_YTDLP_RECORDING_EVERY_ARGV)
+    argv_log = tmp_path / "argv.log"
+    monkeypatch.setenv("FAKE_YTDLP_ARGV_LOG", str(argv_log))
+
+    youtube_playlist_urls("https://www.youtube.com/playlist?list=PLabc", 10)
+
+    for invocation in recorded_invocations(argv_log):
+        assert "--no-playlist" not in invocation

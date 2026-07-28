@@ -189,6 +189,44 @@ def test_a_plan_deletes_nothing_on_its_own(tmp_path: Path) -> None:
     assert (bundle / "g1").is_dir()
 
 
+def test_a_plan_over_an_absent_root_considers_nothing(tmp_path: Path) -> None:
+    """The control for the refusal below: an absent root is a knowable answer."""
+    plan = BundleStore.open(tmp_path / "never-created").plan_prune(
+        PrunePolicy(keep_generations=1)
+    )
+
+    assert plan.targets == ()
+    assert plan.considered == 0
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is not refused by directory permissions")
+def test_a_plan_over_a_root_that_cannot_be_reached_is_refused(tmp_path: Path) -> None:
+    """FAILS FIRST: an empty plan for a root nobody was able to ask about.
+
+    Prune's guard asked `Path.is_dir()`, which answers `False` both for a root
+    that is not there and for one whose parent this user may not search. The
+    second answer is a guess, and an empty plan reported as "considered 0" tells
+    an operator their cache holds nothing prunable when it may hold everything.
+
+    Refused rather than skipped, because the skip machinery exists so that one
+    unreadable directory does not cost the report on every other one - and when
+    it is the root that cannot be reached there is no other one.
+    """
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    unreachable = sealed / "output"
+    sealed.chmod(0o000)
+    try:
+        with pytest.raises(DistillError) as failure:
+            BundleStore.open(unreachable).plan_prune(PrunePolicy(keep_generations=1))
+    finally:
+        sealed.chmod(0o700)
+
+    assert failure.value.code == "E_OUTPUT_ROOT_UNREADABLE"
+    assert failure.value.stage == "bundle"
+    assert failure.value.details == {"root": str(unreachable), "errno": "EACCES"}
+
+
 # --- max_age_days validation (R-03) ----------------------------------------
 
 
