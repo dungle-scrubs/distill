@@ -51,7 +51,7 @@ class WarningPayload:
     message: str
     occurrences: int = 1
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> WarningRecord:
         if not CODE_RE.match(self.code):
             raise ValueError(f"warning code must be snake_case: {self.code}")
         if self.occurrences < 1:
@@ -89,7 +89,7 @@ class DistillError(Exception):
         return json.dumps(self.to_dict(), sort_keys=True)
 
 
-def warning(stage: str, code: str, message: str, occurrences: int = 1) -> dict[str, Any]:
+def warning(stage: str, code: str, message: str, occurrences: int = 1) -> WarningRecord:
     return WarningPayload(
         stage=stage,
         code=code,
@@ -98,7 +98,7 @@ def warning(stage: str, code: str, message: str, occurrences: int = 1) -> dict[s
     ).to_dict()
 
 
-def aggregate_warnings(warnings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def aggregate_warnings(warnings: Iterable[FrozenWarningRecord]) -> list[WarningRecord]:
     """The same warnings, folded on (stage, code), each carrying its count (R-41).
 
     First appearance decides both order and message. Order because a reader
@@ -116,7 +116,7 @@ def aggregate_warnings(warnings: Iterable[Mapping[str, Any]]) -> list[dict[str, 
     mapping (a probe's, a capability's) folds with the rest rather than
     needing to be rebuilt first.
     """
-    folded: dict[tuple[str, str], dict[str, Any]] = {}
+    folded: dict[tuple[str, str], WarningRecord] = {}
     for record in warnings:
         key = (str(record.get("stage", "")), str(record.get("code", "")))
         occurrences = record.get("occurrences", 1)
