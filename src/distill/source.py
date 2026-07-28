@@ -60,6 +60,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -67,7 +68,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from .artifacts import RedactionState
@@ -79,7 +80,7 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
-from .errors import DistillError, WarningRecord, warning
+from .errors import DistillError, WarningRecord, errno_name, warning
 from .links import RelatedLink, extract_relevant_links
 from .options import DistillOptions
 from .progress import ProgressReporter
@@ -93,6 +94,15 @@ from .run_command import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+SourcePathKind = Literal["file", "directory", "other", "absent"]
+"""What a caller found at a path a user named. See `source_path_kind`.
+
+Four answers and not a boolean, because the two callers want different kinds -
+a video is a regular file, a batch is a directory - and neither wants the third
+thing a path can be. There is deliberately no "unreadable" member: a path that
+could not be asked about is not a kind of answer, it is the absence of one.
+"""
 
 CONTENT_HASH_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
 FINGERPRINT_SAMPLE_BYTES = 64 * 1024
@@ -653,7 +663,7 @@ class LocalSourceProvider:
         if not path_text:
             raise DistillError("E_BAD_SOURCE", "source", "path is required")
         original = Path(path_text).expanduser()
-        if not original.exists() or not original.is_file():
+        if source_path_kind(original) != "file":
             raise DistillError(
                 "E_BAD_SOURCE", "source", "local video does not exist", {"path": path_text}
             )
@@ -721,6 +731,52 @@ def resolve_local_source(
     return LocalSourceProvider().resolve(
         SourceRequest(path_text, options, output_root=output_root, progress=progress)
     )
+
+
+def source_path_kind(path: Path) -> SourcePathKind:
+    """What is at a path a *user* named, refusing to guess when it cannot be asked.
+
+    One `stat`, following symlinks, because a symlinked source is a source (the
+    resolver warns about it and goes on) - and one, because this is on the run
+    path every single-video command takes.
+
+    Here rather than at each caller because both callers say the same thing when
+    the answer is "I may not look": `E_SOURCE_UNREADABLE`, stage `source`, the
+    path and the symbolic errno. What differs is only which kind each wanted, so
+    that is what they compare. The **output root** asks a related question and
+    keeps its own answer in `bundle_store._root_directory_exists`: that is a
+    directory Distill owns rather than one a user named, its refusal carries a
+    different code, and this module already imports that one.
+
+    Three refusals, and only one of them is "not there":
+
+    - the not-there errnos (`ENOENT`, `ENOTDIR`) are `absent`, which is what a
+      mistyped path is;
+    - a `ValueError` is `absent` too, because a path holding a NUL is one no
+      filesystem can hold and names nothing. Both `Path.exists()`
+      implementations swallow it deliberately, and a guard replacing `exists()`
+      that does not would turn an operator's typo into an internal fault;
+    - anything else - `EACCES` above all - is refused, because "does not exist"
+      about a directory this process may not search is a claim with nothing
+      behind it (D-022). `Path.exists()` cannot make that distinction and does
+      not even fail to make it consistently: it answers `False` on Python 3.14,
+      where it delegates to `os.path.exists` and swallows every `OSError`, and
+      raises `PermissionError` on 3.13.
+    """
+    try:
+        info = path.stat()
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        return "absent"
+    except OSError as exc:
+        raise DistillError(
+            "E_SOURCE_UNREADABLE",
+            "source",
+            "source path could not be read",
+            {"path": str(path), "errno": errno_name(exc)},
+        ) from exc
+    if stat.S_ISDIR(info.st_mode):
+        return "directory"
+    return "file" if stat.S_ISREG(info.st_mode) else "other"
 
 
 def validate_output_root(output_dir: str | None, *, create: bool = True) -> Path:

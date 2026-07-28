@@ -289,6 +289,32 @@ def test_a_directory_run_pointed_at_a_file_finds_no_directory(tmp_path: Path) ->
     assert not_a_directory.read_bytes() == b"\x00"
 
 
+def test_a_directory_run_pointed_at_an_impossible_path_finds_no_directory(
+    tmp_path: Path,
+) -> None:
+    """A NUL in the path is refused as a path, not raised as a `ValueError`.
+
+    The fourth answer, and the one an errno split does not cover: `stat` of a
+    path holding a NUL raises `ValueError`, which is neither an `OSError` nor a
+    diagnosis. Both `Path.exists()` implementations swallow it on purpose, so a
+    guard that replaces `exists()` has to swallow it too or an operator's typo
+    becomes an internal fault.
+    """
+    root = tmp_path / "output"
+
+    with pytest.raises(DistillError) as failure:
+        pipeline.process_video_directory(
+            {
+                "path": f"{tmp_path}/a\x00b",
+                "output_dir": str(root),
+                "job_id": "distill-impossible-directory",
+            }
+        )
+
+    assert failure.value.code == "E_BAD_SOURCE"
+    assert failure.value.message == "directory does not exist"
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root is not refused by directory permissions")
 def test_a_directory_run_that_may_not_look_says_so_rather_than_no_such_directory(
     tmp_path: Path,
@@ -330,7 +356,7 @@ def test_a_directory_run_that_may_not_look_says_so_rather_than_no_such_directory
     status = status_of(root, "distill-sealed-directory")
     assert status["status"] == "failed"
     assert status["error"]["code"] == "E_SOURCE_UNREADABLE"
-    assert status["error"]["message"] == "directory could not be read"
+    assert status["error"]["message"] == "source path could not be read"
 
 
 def test_a_reused_job_id_does_not_survive_a_failed_acquisition(

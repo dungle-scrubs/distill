@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import stat
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -31,7 +30,7 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .cache_doctor import inspect_cache
-from .errors import DistillError, WarningRecord, aggregate_warnings, errno_name
+from .errors import DistillError, WarningRecord, aggregate_warnings
 from .frame_selection import select_keyframes
 from .job_store import JobOutcome, JobStore
 from .local_vision import (
@@ -56,6 +55,7 @@ from .source import (
     normalize_youtube_url,
     release_acquisition_lease,
     resolve_source_for_processing,
+    source_path_kind,
     validate_output_root,
 )
 
@@ -835,37 +835,6 @@ class BatchRunner:
         return results, errors
 
 
-def _is_directory(path: Path) -> bool:
-    """Whether `path` is a directory, refusing to guess when it cannot be asked.
-
-    A batch is pointed at a directory a *user* chose, so the two ways of not
-    getting one are both ordinary and they need different answers: a mistyped
-    path is corrected, and a directory this process may not reach is granted.
-    `Path.exists()` collapses them, and collapses them differently on each
-    interpreter - `False` on Python 3.14, where it delegates to `os.path.exists`
-    and swallows every `OSError`, and `PermissionError` on 3.13. So one leg told
-    an operator their own videos were not there, and the other reported their
-    directory permissions as a defect in Distill.
-
-    `stat` and split the refusals, the way `bundle_store._root_directory_exists`
-    does for the output root: the not-there errnos answer `False`, and anything
-    else is `E_SOURCE_UNREADABLE` carrying the path and the symbolic errno, so
-    "does not exist" is only ever said about a path known not to exist (D-022).
-    """
-    try:
-        info = path.stat()
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except OSError as exc:
-        raise DistillError(
-            "E_SOURCE_UNREADABLE",
-            "source",
-            "directory could not be read",
-            {"path": str(path), "errno": errno_name(exc)},
-        ) from exc
-    return stat.S_ISDIR(info.st_mode)
-
-
 def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
     options = DistillOptions.from_args(args)
     root = validate_output_root(options.output_dir)
@@ -881,7 +850,7 @@ def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
         # Inside the record, because scanning a directory is work: the path may
         # not be one, and a batch that finds nothing to do still ran.
         directory = Path(str(args.get("path", ""))).expanduser()
-        if not _is_directory(directory):
+        if source_path_kind(directory) != "directory":
             raise DistillError(
                 "E_BAD_SOURCE", "source", "directory does not exist", {"path": str(directory)}
             )
