@@ -16,6 +16,7 @@ so `--no-redact-secrets` is honoured without each stage being told separately.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -69,12 +70,13 @@ def scene_midpoint_candidates(video_path: Path, duration_sec: float) -> list[flo
 def quantized_timestamp(seconds: float, ceiling_sec: float) -> float:
     """One candidate timestamp as the schedule carries it: to the millisecond.
 
-    Never past `ceiling_sec`, even when the nearest millisecond is: rounding
-    a value that sits within half a quantum of the end of the source produced
-    a seek half a millisecond beyond it, which is a **keyframe** ffmpeg has no
-    frame for.
+    Inside `[0, ceiling_sec]` whatever it is handed, and past the ceiling never
+    - not even when the nearest millisecond is: rounding a value that sits
+    within half a quantum of the end of the source produced a seek half a
+    millisecond beyond it, which is a **keyframe** ffmpeg has no frame for. Use
+    `math.inf` for a walk the end of the source does not bound.
     """
-    point = round(min(seconds, ceiling_sec), 3)
+    point = round(min(max(seconds, 0.0), ceiling_sec), 3)
     return point if point <= ceiling_sec else round(point - CANDIDATE_TIMESTAMP_QUANTUM_SEC, 3)
 
 
@@ -114,12 +116,20 @@ def ensure_static_window_is_expressible(max_static_window_sec: float) -> None:
 
 
 def fixed_interval_candidates(duration_sec: float, interval_sec: float) -> list[float]:
+    """Sample the source every `interval_sec`, from zero, staying inside it.
+
+    The walk is unbounded rather than clamped to `duration_sec`: a step that
+    lands on or past the end of the source ends the schedule, and clamping it
+    to the end would sample there instead - a step of 90 seconds across a
+    ten-second source would produce two samples where the interval asked for
+    one.
+    """
     if duration_sec <= 0:
         return []
     interval = max(1.0, interval_sec)
     values = [0.0]
     while True:
-        current = _step_from(values[-1], interval, duration_sec)
+        current = _step_from(values[-1], interval, math.inf)
         if current is None or current >= duration_sec:
             break
         values.append(current)
@@ -141,7 +151,7 @@ def filtered_candidates(
     takes comes from `_step_from` (R-48).
     """
     ensure_static_window_is_expressible(max_static_window_sec)
-    sorted_candidates = sorted({quantized_timestamp(max(0.0, c), duration_sec) for c in candidates})
+    sorted_candidates = sorted({quantized_timestamp(c, duration_sec) for c in candidates})
     if not sorted_candidates:
         sorted_candidates = fixed_interval_candidates(duration_sec, max_static_window_sec)
         return sorted_candidates

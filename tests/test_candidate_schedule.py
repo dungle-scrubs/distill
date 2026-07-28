@@ -99,6 +99,20 @@ def test_a_step_either_advances_or_the_walk_stops() -> None:
     assert frame_selection._step_from(2e18, 90.0, 4e18) is None
 
 
+def test_the_fallback_walk_samples_the_interval_it_was_given() -> None:
+    """The schedule with no detector behind it, and the end of the source.
+
+    An interval wider than the source is one sample, not two: the end of the
+    source is where this walk stops rather than a place it is pulled back to.
+    Each sample is on the millisecond it will be sought at, so a **frame
+    artifact** records the timestamp ffmpeg was actually given.
+    """
+    assert frame_selection.fixed_interval_candidates(10.0004, 90.0) == [0.0]
+    assert frame_selection.fixed_interval_candidates(4.1, 1.0004) == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert frame_selection.fixed_interval_candidates(4.0, 1.0) == [0.0, 1.0, 2.0, 3.0]
+    assert frame_selection.fixed_interval_candidates(0.0, 1.0) == []
+
+
 # The sweep is executed, so it is bounded: a tuple whose schedule cannot
 # exceed this many entries runs, and the closed-form bound is asserted for
 # every tuple that does. Termination is the bound being finite and every step
@@ -126,14 +140,21 @@ def _swept_tuples() -> Iterator[tuple[tuple[float, ...], float, float, float]]:
     the quantum itself, a window that divides the duration, one that exactly
     equals it, and one wider than the source is long.
     """
-    durations = (QUANTUM, 0.5, 1.0, 20.0, 90.0, 7200.0)
+    # Durations and windows that are not whole milliseconds are in here on
+    # purpose: a step of 1.0004s is quantized to 1.000s, so the schedule
+    # advances by slightly less than the window it was given, and a duration of
+    # 10.0004s is a ceiling no timestamp lands on.
+    durations = (QUANTUM, 0.02, 0.5, 1.0, 4.1, 10.0004, 20.0, 90.0, 7200.0)
     for duration in durations:
         windows = {
             QUANTUM,
             2 * QUANTUM,
+            0.0014,
             1.0,
+            1.0004,
             90.0,
             duration / 1000,
+            duration / 7,
             duration / 3,
             duration / 2,
             duration,
@@ -166,10 +187,14 @@ def test_candidate_generation_terminates_for_every_validated_option_tuple() -> N
     """R-48, structurally: a finite bound, and a step that always advances.
 
     A schedule holds at most one entry per candidate the detector offered plus
-    one per `max_static_window_sec` of source, because gap filling only ever
-    moves forward and only ever toward `duration_sec`. That bound is what
-    makes the loops end; asserting it for every tuple is what proves the walk
-    has not started standing still again.
+    one per step of source, because gap filling only ever moves forward and
+    only ever toward `duration_sec`. That bound is what makes the loops end;
+    asserting it for every tuple is what proves the walk has not started
+    standing still again.
+
+    A step is the window less at most half a quantum, because quantizing can
+    round one down - a 0.0014s window advances the cursor by 0.001s. Dividing
+    by the window itself would be a bound the code is not obliged to meet.
     """
     for candidates, duration, min_interval, window in _swept_tuples():
         tuple_report = (
@@ -182,7 +207,8 @@ def test_candidate_generation_terminates_for_every_validated_option_tuple() -> N
         assert all(0.0 <= point <= duration for point in schedule), tuple_report
         for earlier, later in itertools.pairwise(schedule):
             assert later - earlier >= QUANTUM * 0.9, tuple_report
-        bound = math.ceil(duration / window) + len(set(candidates)) + 2
+        step = max(window - QUANTUM / 2, QUANTUM)
+        bound = math.ceil(duration / step) + len(set(candidates)) + 2
         assert len(schedule) <= bound, tuple_report
 
 
