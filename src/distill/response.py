@@ -23,7 +23,7 @@ from typing import Any
 
 from .artifacts import FrameArtifact, document_carries_a_reading, serialize
 from .bundle_store import BundleSnapshot
-from .errors import WarningRecord
+from .errors import WarningRecord, total_occurrences
 from .links import RelatedLink
 from .options import DistillOptions
 from .release import DISTILL_VERSION
@@ -74,7 +74,10 @@ def manifest_document(
         "options": options.public_dict(source.source_type),
         "frame_count": len(frames),
         "transcript_present": transcript_present,
-        "warning_count": len(warnings),
+        # Events, not records. `warnings` arrives folded (R-41), so its length
+        # counts distinct (stage, code) pairs - a run that timed out eighty
+        # times would publish `warning_count: 2` and read as a clean run.
+        "warning_count": total_occurrences(warnings),
         "frames": frames,
         "warnings": warnings,
     }

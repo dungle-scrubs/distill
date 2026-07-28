@@ -28,6 +28,8 @@ from distill.local_vision import (
 from distill.options import DistillOptions
 from distill.progress import ProgressReporter
 from distill.redact_secrets import redact_text
+from distill.response import manifest_document
+from distill.source import SourceInfo
 
 
 def test_a_warning_records_one_occurrence_from_the_start() -> None:
@@ -333,3 +335,62 @@ def test_two_hundred_confusable_matches_are_one_record_saying_two_hundred() -> N
     assert [(item["code"], item["occurrences"]) for item in result.warnings] == [
         ("possible_confusable_secret", 200)
     ]
+
+
+def test_the_manifests_warning_count_counts_events_and_not_records() -> None:
+    """R-41 did not get to change what `warning_count` means.
+
+    The field is named for how many warnings a run raised, and a reader who
+    sees `2` for a run that timed out eighty times has been told the run went
+    well. Folding the list made the record count a count of *kinds*, and the
+    two answers were the same number only before the fold existed.
+    """
+    document = manifest_document(
+        SourceInfo(
+            source_type="local",
+            resolved_path=Path("/tmp/video.mp4"),
+            duration_sec=1.0,
+            source_fingerprint="fingerprint",
+            source_hash="bundle-key",
+            warnings=[],
+            related_links=None,
+        ),
+        DistillOptions(),
+        transcript_present=False,
+        frames=[],
+        warnings=aggregate_warnings(
+            [
+                *[warning("local_vision", "local_vision_timeout", "timed out")] * 80,
+                *[warning("ocr", "ocr_failed", "nope")] * 3,
+            ]
+        ),
+    )
+
+    assert len(document["warnings"]) == 2
+    assert document["warning_count"] == 83
+
+
+def test_a_manifest_warning_without_a_count_still_counts_as_one() -> None:
+    """A **warning** built as a bare mapping is an event like any other.
+
+    `aggregate_warnings` already tolerates a record with no `occurrences` -
+    a probe's, a capability's - so the count over the folded list has to
+    tolerate the same shape rather than reading a missing field as zero.
+    """
+    document = manifest_document(
+        SourceInfo(
+            source_type="local",
+            resolved_path=Path("/tmp/video.mp4"),
+            duration_sec=1.0,
+            source_fingerprint="fingerprint",
+            source_hash="bundle-key",
+            warnings=[],
+            related_links=None,
+        ),
+        DistillOptions(),
+        transcript_present=False,
+        frames=[],
+        warnings=[{"stage": "capability", "code": "ffmpeg_missing", "message": "nope"}],
+    )
+
+    assert document["warning_count"] == 1

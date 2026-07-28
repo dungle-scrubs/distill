@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from .artifacts import FrameArtifact, Interpretation, document_carries_a_reading
-from .errors import DistillError, WarningRecord, aggregate_warnings, warning
+from .errors import DistillError, WarningRecord, aggregate_warnings, occurrences_of, warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
 from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
@@ -1169,12 +1169,22 @@ class FrameInterpreter:
 
         A carrier hands back warnings the **redaction** policy already folded,
         so one record can stand for four confusable matches. Counting records
-        made `debug_info` and the **manifest** disagree about the same run.
+        made `debug_info` and the **manifest** disagree about the same run, so
+        the count is read the one way `errors.occurrences_of` reads it.
+
+        Keyed on the code alone, where `aggregate_warnings` keys on (stage,
+        code) - deliberately, and worth stating because the two numbers can
+        differ. This is a debug tally for one stage's run, and the warnings
+        reaching it are the vision pass's own plus the ones a carrier raised
+        while redacting the model's words (`redaction`, `artifacts`). A code
+        that appeared under two stages is one entry here and two records in the
+        **manifest**; the total is the same either way, and it is the total
+        this field is read for.
         """
         code = warning_payload.get("code", "unknown")
-        occurrences = warning_payload.get("occurrences", 1)
-        counted = occurrences if isinstance(occurrences, int) and occurrences >= 1 else 1
-        self._warning_counts[code] = self._warning_counts.get(code, 0) + counted
+        self._warning_counts[code] = self._warning_counts.get(code, 0) + occurrences_of(
+            warning_payload
+        )
 
     def _log(self, event: str, detail: dict[str, Any]) -> None:
         if self._debug_enabled:

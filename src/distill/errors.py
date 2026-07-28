@@ -54,6 +54,11 @@ class WarningPayload:
     def to_dict(self) -> WarningRecord:
         if not CODE_RE.match(self.code):
             raise ValueError(f"warning code must be snake_case: {self.code}")
+        # Exactly `int`, not `isinstance`. `bool` is an `int` subtype, so a
+        # JSON `true` where a count belongs satisfied `>= 1` and published as
+        # the number of times something happened.
+        if type(self.occurrences) is not int:
+            raise ValueError(f"a warning count must be a whole number: {self.occurrences!r}")
         if self.occurrences < 1:
             raise ValueError(f"a warning happened at least once: {self.occurrences}")
         return asdict(self)
@@ -98,6 +103,30 @@ def warning(stage: str, code: str, message: str, occurrences: int = 1) -> Warnin
     ).to_dict()
 
 
+def occurrences_of(record: FrozenWarningRecord) -> int:
+    """How many times the thing one **warning** describes happened.
+
+    One reading of the field, because every caller that counts warnings wants
+    the same answer and each one spelling `record.get("occurrences", 1)` itself
+    is how a **manifest** and a stage's own tally came to disagree about the
+    same run. A record without the field counts as one, so a warning built as a
+    bare mapping (a probe's, a capability's) is counted rather than skipped.
+    """
+    occurrences = record.get("occurrences", 1)
+    return occurrences if type(occurrences) is int and occurrences >= 1 else 1
+
+
+def total_occurrences(warnings: Iterable[FrozenWarningRecord]) -> int:
+    """How many **warning** events a list stands for, folded or not.
+
+    Not `len`. After R-41's fold a list holds one record per (stage, code), so
+    its length counts *kinds*; a run that timed out eighty times publishes two
+    records and raised eighty-one warnings. Both numbers are worth having and
+    only one of them is what a field named for a count of warnings means.
+    """
+    return sum(occurrences_of(record) for record in warnings)
+
+
 def aggregate_warnings(warnings: Iterable[FrozenWarningRecord]) -> list[WarningRecord]:
     """The same warnings, folded on (stage, code), each carrying its count (R-41).
 
@@ -115,12 +144,23 @@ def aggregate_warnings(warnings: Iterable[FrozenWarningRecord]) -> list[WarningR
     A record without the field counts as one, so a **warning** built as a bare
     mapping (a probe's, a capability's) folds with the rest rather than
     needing to be rebuilt first.
+
+    What the fold costs, stated because a count is not a summary: everything
+    that distinguished the later records from the first one is gone. Keeping
+    the first message keeps the *first* keyframe number, the *first* field
+    name, the *first* path - so a reader of a folded record learns that eighty
+    keyframes timed out and which one timed out first, and nothing about the
+    other seventy-nine. That is deliberate and it is not the only copy. A
+    per-frame failure is also recorded on the frame itself, as the
+    **grounding** its **frame artifact** carries, and the **render** shows the
+    count beside the message so nobody reads one record as one event. What is
+    genuinely unrecoverable afterwards is the set of identifiers: nothing
+    rebuilds the list of which keyframes failed from the folded record.
     """
     folded: dict[tuple[str, str], WarningRecord] = {}
     for record in warnings:
         key = (str(record.get("stage", "")), str(record.get("code", "")))
-        occurrences = record.get("occurrences", 1)
-        count = occurrences if isinstance(occurrences, int) and occurrences >= 1 else 1
+        count = occurrences_of(record)
         first = folded.get(key)
         if first is None:
             folded[key] = {**record, "occurrences": count}
