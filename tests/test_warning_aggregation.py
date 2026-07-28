@@ -16,7 +16,7 @@ import pytest
 from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import pipeline as distill_session
-from distill.artifacts import FrameArtifact, Interpretation
+from distill.artifacts import FrameArtifact, Interpretation, RedactionState
 from distill.bundle_store import BundleRun, BundleStore
 from distill.errors import aggregate_warnings, warning
 from distill.local_vision import (
@@ -394,3 +394,100 @@ def test_a_manifest_warning_without_a_count_still_counts_as_one() -> None:
     )
 
     assert document["warning_count"] == 1
+
+
+def test_the_runs_own_fold_reaches_the_manifest_without_a_video(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The final fold, driven at `_produce_generation` rather than at ffmpeg.
+
+    `test_a_published_manifest_carries_one_record_per_stage_and_code` is the
+    only end-to-end check of this fold and it needs a real screencast, so on a
+    runner without ffmpeg it *skips* - the fold that decides what every reader
+    of a published **generation** is told goes unchecked, silently, exactly
+    where "the tests passed" is being relied on. This drives the same fold
+    with the stages faked: no video, no ffmpeg, same seam.
+    """
+    frames_written: list[FrameArtifact] = []
+
+    def fake_transcript(
+        _path: Path,
+        _scratch: Path,
+        _options: DistillOptions,
+        _progress: ProgressReporter,
+        *,
+        duration_sec: float,
+    ) -> tuple[None, list[dict[str, Any]]]:
+        return None, [warning("transcript", "no_speech_detected", "silence")]
+
+    def fake_keyframes(
+        _video: Path,
+        frames_dir: Path,
+        *_args: Any,
+        redaction: RedactionState = RedactionState.NOT_APPLIED,
+        **_kwargs: Any,
+    ) -> tuple[list[FrameArtifact], list[dict[str, Any]]]:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        for index in range(2):
+            image = frames_dir / f"frame{index}.png"
+            image.write_bytes(b"png")
+            frames_written.append(
+                FrameArtifact(
+                    index=index + 1,
+                    timestamp_sec=float(index),
+                    path=str(image),
+                    relative_path=f"frames/{image.name}",
+                    extracted_text="",
+                    redaction=redaction,
+                )
+            )
+        return list(frames_written), []
+
+    def noisy_vision(
+        frames: list[FrameArtifact],
+        _options: DistillOptions,
+        _progress: ProgressReporter,
+    ) -> tuple[list[FrameArtifact], list[dict[str, Any]]]:
+        return frames, [
+            *[warning("local_vision", "local_vision_timeout", "frame timed out")] * 80,
+            *[warning("local_vision", "frame_text_ungrounded", "nothing to read")] * 2,
+        ]
+
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcript)
+    monkeypatch.setattr(distill_session, "select_keyframes", fake_keyframes)
+    monkeypatch.setattr(distill_session, "interpret_frames_with_local_vision", noisy_vision)
+
+    video = tmp_path / "fixture.mp4"
+    video.write_bytes(b"not a video, and nothing here reads one")
+    source = SourceInfo(
+        source_type="local",
+        resolved_path=video,
+        duration_sec=2.0,
+        source_fingerprint="fingerprint",
+        source_hash="bundlekey000",
+        warnings=[warning("source", "source_metadata_missing", "no metadata")],
+        related_links=None,
+    )
+
+    response = distill_session.process_resolved_source(
+        source,
+        DistillOptions.from_args(
+            {"output_dir": str(tmp_path / "cache"), "ocr": False, "caption_frames": True}
+        ),
+        tmp_path / "cache",
+    )
+
+    manifest = json.loads(Path(response["manifest_path"]).read_text())
+    assert [(item["stage"], item["code"], item["occurrences"]) for item in manifest["warnings"]] == [
+        ("source", "source_metadata_missing", 1),
+        ("transcript", "no_speech_detected", 1),
+        ("local_vision", "local_vision_timeout", 80),
+        ("local_vision", "frame_text_ungrounded", 2),
+    ]
+    # 84 events folded into 4 records, and the field named for a count of
+    # warnings says how many happened.
+    assert manifest["warning_count"] == 84
+    # The three readers of a bundle are handed the same account of the run.
+    assert manifest["warnings"] == response["warnings"]
+    assert "occurrences: 80" in Path(response["markdown_path"]).read_text()
