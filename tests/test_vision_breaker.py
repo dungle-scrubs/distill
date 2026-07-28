@@ -135,6 +135,23 @@ def test_a_server_dying_at_keyframe_3_does_not_produce_77_further_timeouts(
     assert len(frames) == 80
 
 
+def test_a_parallel_pool_stops_too_and_hands_every_keyframe_back(tmp_path: Path) -> None:
+    """The pool submits every keyframe up front, so the breaker gates the worker.
+
+    Each task asks to be admitted when it starts running rather than when it
+    was queued, which is what makes a queue of eighty collapse the moment the
+    third failure lands. The bound is the limit plus whatever was already in
+    flight - three workers can be mid-request when the third failure returns -
+    so at most six attempts, never the forty submitted.
+    """
+    server = _Server([TIMEOUT])
+    frames, warnings = _interpreter(server, max_parallel=4).interpret(_frames(tmp_path, 40))
+
+    assert 3 <= len(server.attempts) <= 6
+    assert len(frames) == 40
+    assert [w["code"] for w in warnings].count("local_vision_transport_breaker_open") == 1
+
+
 def test_the_breaker_trips_on_the_third_consecutive_transport_failure(
     tmp_path: Path,
 ) -> None:
