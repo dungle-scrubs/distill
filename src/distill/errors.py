@@ -64,8 +64,41 @@ class WarningPayload:
         return asdict(self)
 
 
+INTERNAL_CODE = "E_INTERNAL"
+INTERNAL_STAGE = "internal"
+"""What an exception Distill never coded becomes, named once (R-46).
+
+Two surfaces convert one: the CLI's error boundary, and a batch reporting an
+item that failed. Spelling the pair out at each of them is how the CLI came to
+report `stage: "internal"` for a failure a batch reported with no stage at all.
+"""
+
+
 class DistillError(Exception):
     """Fatal error serialized as JSON text in Distill's error channel."""
+
+    @classmethod
+    def from_unexpected(cls, exc: BaseException) -> DistillError:
+        """The **fatal error** an uncoded exception becomes at a boundary.
+
+        Enough to diagnose and no more: the exception's type and its message,
+        which together identify the failure, and never its traceback. A stack is
+        what leaks Distill's internals to whoever ran the command, and it is not
+        a thing an operator can act on - the code and the stage are. The stack is
+        still reachable, by opting in: `DISTILL_TRACEBACK=1` at the CLI boundary
+        re-raises instead of converting.
+
+        The message says *unexpected*, deliberately. Every other **fatal error**
+        in Distill is a diagnosis somebody wrote; this one means nobody did, and
+        a reader who cannot tell the two apart cannot tell a bad argument from a
+        defect.
+        """
+        return cls(
+            INTERNAL_CODE,
+            INTERNAL_STAGE,
+            f"an unexpected {type(exc).__name__} ended the command",
+            {"exception": type(exc).__name__, "message": str(exc)},
+        )
 
     def __init__(
         self,

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
+from ast import literal_eval
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -1256,3 +1257,102 @@ def test_a_manifests_recorded_duration_is_read_as_input_rather_than_fact(
     from distill.source import manifest_duration
 
     assert manifest_duration(recorded) == expected
+
+
+# A fake yt-dlp that answers a `--print` invocation and records the argv it was
+# handed, appending rather than overwriting so a test can see every call a run
+# made rather than only the last one.
+FAKE_YTDLP_RECORDING_EVERY_ARGV = """
+import os, pathlib, sys
+
+argv = sys.argv[1:]
+with open(os.environ["FAKE_YTDLP_ARGV_LOG"], "a") as handle:
+    handle.write(repr(argv) + "\\n")
+sys.stdout.write(argv[-1].rsplit("=", 1)[-1].rsplit("/", 1)[-1] + "\\n")
+"""
+
+
+def recorded_invocations(log: Path) -> list[list[str]]:
+    return [literal_eval(line) for line in log.read_text().splitlines() if line]
+
+
+def test_downloading_a_watch_url_acquires_the_one_video_the_url_names(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (deferred by M8.3): `watch?v=A&list=P` is the playlist to yt-dlp.
+
+    Without `--no-playlist` yt-dlp treats the `list` parameter as the thing being
+    asked for, so one output template is pointed at every entry of the playlist
+    and the run proceeds against whichever of them landed on `source.mp4`. The
+    URL names one video and the operator asked for one video.
+
+    It is also what makes the cache fast path's premise true for this URL shape:
+    `youtube_fast_path_video_id` declines a URL carrying a `list`, because the
+    id written in it was not the id the run would publish under. With the flag
+    it is.
+    """
+    fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
+    fake_tool("ffprobe", FAKE_FFPROBE)
+    argv_file = tmp_path / "argv.txt"
+    monkeypatch.setenv("FAKE_YTDLP_ARGV_FILE", str(argv_file))
+
+    acquired = YoutubeDownloader(tmp_path).acquire(
+        "https://www.youtube.com/watch?v=abc123&list=PLxyz",
+        LOCK_KEY,
+        ProgressReporter(),
+    )
+    acquired.lease.release()
+
+    assert "--no-playlist" in literal_eval(argv_file.read_text())
+
+
+def test_resolving_a_watch_url_resolves_the_one_video_the_url_names(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: the metadata calls read the playlist too.
+
+    `--dump-json` over a playlist emits one document per entry, which does not
+    parse as one, and `--print id` prints one line per entry. Both are the same
+    mistake as the download's, and a resolution that disagreed with the download
+    about which video this URL is would be worse than either.
+    """
+    from distill.source import canonical_youtube_id
+
+    fake_tool("yt-dlp", FAKE_YTDLP_RECORDING_EVERY_ARGV)
+    argv_log = tmp_path / "argv.log"
+    monkeypatch.setenv("FAKE_YTDLP_ARGV_LOG", str(argv_log))
+
+    canonical_youtube_id("https://www.youtube.com/watch?v=abc123&list=PLxyz")
+
+    invocations = recorded_invocations(argv_log)
+
+    assert invocations
+    for invocation in invocations:
+        assert "--no-playlist" in invocation
+
+
+def test_listing_a_playlist_is_not_told_to_ignore_the_playlist(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The one yt-dlp call whose subject really is the playlist.
+
+    Named so the flag cannot be added to the shared command builder and left
+    there: `--no-playlist` on the listing would make a playlist job enumerate a
+    single video.
+    """
+    from distill.pipeline import youtube_playlist_urls
+
+    fake_tool("yt-dlp", FAKE_YTDLP_RECORDING_EVERY_ARGV)
+    argv_log = tmp_path / "argv.log"
+    monkeypatch.setenv("FAKE_YTDLP_ARGV_LOG", str(argv_log))
+
+    youtube_playlist_urls("https://www.youtube.com/playlist?list=PLabc", 10)
+
+    for invocation in recorded_invocations(argv_log):
+        assert "--no-playlist" not in invocation

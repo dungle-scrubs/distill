@@ -80,15 +80,23 @@ class ToolSpec:
 
 
 class DistillSession:
+    """One tool call, answered as an MCP-style envelope rather than by raising.
+
+    The error half is the **fatal error** record itself, field for field (R-46).
+    It used to be that record serialized into a `message` string, so every
+    reader that wanted the code had to know the message was secretly JSON and
+    parse it back out - a code and a stage that travelled the whole run as
+    structured fields, flattened at the last surface before a reader.
+    """
+
     def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         try:
             result = call_registered_tool(name, args)
             return {"result": {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]}}
         except DistillError as exc:
-            return {"error": {"message": exc.to_json_text()}}
+            return {"error": exc.to_dict()}
         except Exception as exc:
-            error = DistillError("E_INTERNAL", "internal", str(exc))
-            return {"error": {"message": error.to_json_text()}}
+            return {"error": DistillError.from_unexpected(exc).to_dict()}
 
 
 def acquire_and_process(
@@ -772,6 +780,24 @@ class BatchRunner:
     def run(
         self, process_item: Callable[[str, int], dict[str, Any]]
     ) -> tuple[list[dict], list[dict]]:
+        """Every item, and the whole **fatal error** record for each one that failed.
+
+        R-46: an item's failure is reported as the record every other surface
+        reports, code and stage included. It was flattened to `str(exc)`, so a
+        batch of twenty-five was a list of sentences - nothing could tell an
+        `E_LOCKED` item that a re-run would pick up from an `E_BAD_MEDIA` item
+        that will fail the same way forever, which is the one distinction the
+        report exists to make.
+
+        `batch_index` on the error for the same reason it is on the result: with
+        `continue_on_error` the two lists are neither the same length nor in
+        step, so position is not a handle and the index has to be carried.
+
+        An item that failed without a code is converted here rather than left
+        uncoded, on the same terms as the CLI boundary and through the same
+        mapping - a report where some entries carry a code and others do not is
+        a report a caller still has to branch on twice.
+        """
         results: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         for index, item in enumerate(self.items, start=1):
@@ -780,7 +806,8 @@ class BatchRunner:
                 result["batch_index"] = index
                 results.append(result)
             except Exception as exc:
-                errors.append({self.item_key: item, "message": str(exc)})
+                failure = exc if isinstance(exc, DistillError) else DistillError.from_unexpected(exc)
+                errors.append({self.item_key: item, "batch_index": index, **failure.to_dict()})
                 if not self.continue_on_error:
                     raise
         return results, errors
@@ -836,8 +863,12 @@ def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
     from .source import _run_ytdlp
 
     # _run_ytdlp adds `--socket-timeout`, a `--` terminator before the URL, and
-    # maps a missing/hung yt-dlp onto clean errors.
-    proc = _run_ytdlp(["--flat-playlist", "--print", "webpage_url"], url)
+    # maps a missing/hung yt-dlp onto clean errors. `names_one_video=False` is
+    # the one call in Distill whose subject really is a playlist: the default
+    # would have this enumerate a single video.
+    proc = _run_ytdlp(
+        ["--flat-playlist", "--print", "webpage_url"], url, names_one_video=False
+    )
     if proc.returncode != 0:
         raise DistillError(
             "E_YTDLP",
@@ -925,10 +956,19 @@ def _prune_policy(args: dict[str, Any]) -> PrunePolicy:
     `keep_generations=0` is finding 2's input and is refused where the policy is
     built rather than reinterpreted where it is used; `max_age_days=None` means
     no **bundle expiry** at all, which is not the same as a horizon of zero days.
+
+    Handed over unconverted, which is the whole of R-46's half here. The `int()`
+    and `float()` that used to stand in front of the policy did two wrong things
+    at once: they raised a bare `ValueError` on text no number could be made of
+    - `--args '{"max_age_days": "soon"}'` was a traceback - and where they *did*
+    convert, the policy was shown a number the caller never wrote, so its own
+    validation was judging this function's guess. The values arrive as the
+    caller sent them and `PrunePolicy` is the single place that says what a
+    retention policy may be (R-03).
     """
     return PrunePolicy(
-        keep_generations=int(args.get("keep_generations", DEFAULT_KEEP_GENERATIONS)),
-        max_age_days=float(args["max_age_days"]) if args.get("max_age_days") is not None else None,
+        keep_generations=args.get("keep_generations", DEFAULT_KEEP_GENERATIONS),
+        max_age_days=args.get("max_age_days"),
     )
 
 

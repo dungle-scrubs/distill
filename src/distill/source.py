@@ -826,11 +826,15 @@ def youtube_fast_path_video_id(url: str) -> str | None:
     It is not, in three ways, and each one would key a lookup on a string the
     run cannot publish under:
 
-    - **A playlist is attached.** `watch?v=A&list=P` is the playlist to yt-dlp
-      unless told otherwise: `--dump-json` emits one document per entry, which
-      does not parse as one, and `canonical_youtube_id` falls back to
-      `--print id` and takes the *last* line. That URL publishes under some
-      other entry's id.
+    - **A playlist is attached.** `watch?v=A&list=P` used to be the playlist to
+      yt-dlp: `--dump-json` emitted one document per entry, which does not parse
+      as one, and `canonical_youtube_id` fell back to `--print id` and took the
+      *last* line, so the URL published under some other entry's id. Every
+      single-video invocation now carries `NO_PLAYLIST_ARG`, so the id written
+      in such a URL *is* the id a run publishes under, and the shortcut is
+      declined here on the narrower ground that widening it changes which
+      **bundle key** a URL is looked up by - a cache decision, taken
+      deliberately or not at all. Declining still costs one resolution.
     - **The id is not id-shaped.** yt-dlp's extractor matches exactly eleven
       `[0-9A-Za-z_-]` characters and ignores trailing material, so
       `watch?v=YE7VzlLtp-4x` is published under `YE7VzlLtp-4`. Reading twelve
@@ -844,12 +848,6 @@ def youtube_fast_path_video_id(url: str) -> str | None:
 
     Case is preserved, because a video id is case-sensitive and `A` and `a` are
     different videos.
-
-    The playlist form is worth resolving properly - `--no-playlist` on the
-    single-video invocations would make the URL's id authoritative for it too,
-    and fix a run that currently points one output template at every entry of a
-    playlist. That changes what a **cache miss** acquires, and remains a Phase 9
-    follow-up.
     """
     parsed = urlparse(url)
     if parsed.netloc.lower() not in YOUTUBE_HOSTS:
@@ -909,17 +907,39 @@ def parse_youtube_url(url: str) -> str:
     return video_id
 
 
-def _ytdlp_command(extra_args: list[str], url: str) -> list[str]:
+NO_PLAYLIST_ARG = "--no-playlist"
+"""What makes a `watch?v=A&list=P` URL name the video it says it names.
+
+yt-dlp reads a `list` parameter as the thing being asked for, so without this a
+URL an operator copied out of a playlist page resolves to every entry of the
+playlist: `--dump-json` emits one document per entry, `--print id` one line per
+entry, and the download points one output template at all of them. Which entry
+the run then proceeds against is whichever landed on `source.mp4`.
+
+Every yt-dlp invocation about *one video* carries it, and the one invocation
+whose subject really is a playlist - the listing a playlist job starts with -
+does not. That is why it is a parameter here rather than a constant folded into
+the shared argv: a flag added unconditionally would make a playlist job
+enumerate one video.
+"""
+
+
+def _ytdlp_command(extra_args: list[str], url: str, *, names_one_video: bool = True) -> list[str]:
     """Build a yt-dlp argv with a stall guard and a `--` terminator.
 
     The `--` before the URL stops a value that begins with `-` from being parsed
     as a yt-dlp option (argument injection), and `--socket-timeout` lets yt-dlp
     abort a stalled connection on its own.
+
+    `names_one_video` defaults true because all but one caller is asking about a
+    single video, and the default that has to be remembered is the one that gets
+    forgotten.
     """
     return [
         "yt-dlp",
         "--socket-timeout",
         str(YTDLP_SOCKET_TIMEOUT_SEC),
+        *([NO_PLAYLIST_ARG] if names_one_video else []),
         *extra_args,
         "--",
         url,
@@ -931,6 +951,7 @@ def _run_ytdlp(
     url: str,
     *,
     timeouts: CommandTimeouts = YTDLP_METADATA_TIMEOUTS,
+    names_one_video: bool = True,
 ) -> CommandResult:
     """Run a non-downloading yt-dlp invocation and hand back what it produced.
 
@@ -940,7 +961,7 @@ def _run_ytdlp(
     absent or wedged still raises, since there is no answer to inspect.
     """
     return run(
-        _ytdlp_command(extra_args, url),
+        _ytdlp_command(extra_args, url, names_one_video=names_one_video),
         stage="youtube",
         total_timeout_sec=timeouts.total_sec,
         idle_timeout_sec=timeouts.idle_sec,
@@ -1386,6 +1407,8 @@ class YoutubeDownloader:
         out_template = str(staging_dir / f"{PROMOTED_MEDIA_STEM}.%(ext)s")
         command = [
             "yt-dlp",
+            # The URL names one video, whatever `list` parameter it carries.
+            NO_PLAYLIST_ARG,
             "-f",
             "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best/bv*+ba/b",
             "--newline",

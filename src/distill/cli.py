@@ -1,4 +1,4 @@
-"""Command line interface for Distill.
+"""Command line interface for Distill, and the error boundary around it.
 
 This is a signed module (ADR-0003). It writes nothing into a bundle itself, but
 it decides which parsed values reach `DistillOptions`, and every manifest
@@ -6,14 +6,23 @@ records the resulting option set - including `output_dir`, `force_reprocess`,
 and `resume_partial`, which are deliberately *not* part of the bundle key.
 Changing what this module forwards can therefore change manifest content at an
 unchanged bundle key, which is the stale hit the signature exists to catch.
+
+It also owns Distill's outermost error boundary (R-46). Every way a command can
+end badly leaves here as one shape - the **fatal error** record as JSON on
+stderr, exit code 2 - so an operator scripting Distill has one thing to parse
+and one code to branch on. Before that, only `DistillError` was converted and
+everything else left as a Python traceback with exit 1 (finding 14): an exit
+code that says nothing, a stack that names Distill's internals, and no code or
+stage to key on.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-from typing import Any
+from typing import Any, NoReturn
 
 from .errors import DistillError
 from .options import OPTION_SPECS, PROCESSING_OPTION_NAMES
@@ -55,6 +64,56 @@ def _args_payload(args: argparse.Namespace, keys: tuple[str, ...]) -> dict[str, 
 
 def _print_json(payload: Any) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+TRACEBACK_ENV = "DISTILL_TRACEBACK"
+"""Set to `1` to have the boundary re-raise instead of converting.
+
+The escape hatch exists because the boundary's whole value - one line, no stack
+- is the wrong trade for the one person who has to fix what it names. It is opt
+-in rather than a flag so it can be turned on around a command already written,
+and it is off by default because a traceback is not a contract.
+"""
+
+
+def _fail(error: dict[str, Any]) -> NoReturn:
+    """End the command on `error`, the one way any command ends badly.
+
+    stderr, so a caller piping stdout to `jq` gets either a result or nothing
+    rather than a result-shaped error. Exit 2, which is also what argparse uses
+    for a usage error: both mean "this command produced no output", and an
+    operator branching on non-zero does not have to know which kind it was.
+    """
+    print(json.dumps(error, sort_keys=True), file=sys.stderr)
+    raise SystemExit(2)
+
+
+def _tool_args(raw: str) -> dict[str, Any]:
+    """The `--args` document, or `E_BAD_ARGUMENT` saying why it is not one.
+
+    `E_BAD_ARGUMENT` and not `E_INTERNAL`: an operator who mistyped a JSON
+    literal has not found a defect in Distill, and the catch-all's "an
+    unexpected error" would send them looking for one. A document that parses
+    but is not an object is the same mistake seen a moment later - it reached
+    the tool as a list and died on `.get` - so it gets the same answer here.
+    """
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        raise DistillError(
+            "E_BAD_ARGUMENT",
+            "cli",
+            "--args must be a JSON object",
+            {"error": str(exc)},
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise DistillError(
+            "E_BAD_ARGUMENT",
+            "cli",
+            "--args must be a JSON object",
+            {"received": type(parsed).__name__},
+        )
+    return parsed
 
 
 PROCESSING_KEYS = (
@@ -169,6 +228,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Dispatch one command, and convert every way it can fail (R-46).
+
+    Parsing is outside the boundary on purpose. Argparse answers a typo with a
+    usage message and `SystemExit(2)`, which is the contract for an operator
+    error and better than any error object could be - the usage message says
+    what the accepted spellings are, and a JSON record would not. The boundary
+    covers what happens *after* a command was named.
+
+    `Exception`, not `BaseException`. `SystemExit` is the parser's answer and
+    `_fail`'s own; `KeyboardInterrupt` is the operator interrupting their own
+    command, which is not a failure to diagnose and not Distill's to relabel.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -222,11 +293,22 @@ def main(argv: list[str] | None = None) -> None:
             payload = _args_payload(args, LOCAL_VISION_DIAGNOSTIC_KEYS)
             _print_json(local_vision_diagnostics(payload))
         elif args.command == "call-tool":
-            response = DistillSession().call_tool(args.tool, json.loads(args.args))
+            response = DistillSession().call_tool(args.tool, _tool_args(args.args))
+            # The session speaks the MCP envelope, where a failure is a result
+            # with an `error` in it. A CLI does not: R-46 is one exit code and
+            # one record, so an envelope carrying an error ends the command the
+            # way every other failure does rather than printing success-shaped
+            # JSON and exiting 0.
+            error = response.get("error")
+            if isinstance(error, dict):
+                _fail(error)
             _print_json(response)
     except DistillError as exc:
-        print(exc.to_json_text(), file=sys.stderr)
-        raise SystemExit(2) from exc
+        _fail(exc.to_dict())
+    except Exception as exc:
+        if os.environ.get(TRACEBACK_ENV) == "1":
+            raise
+        _fail(DistillError.from_unexpected(exc).to_dict())
 
 
 if __name__ == "__main__":

@@ -41,11 +41,46 @@ def test_warning_shape_and_code_validation() -> None:
         warning("ocr", "ocr_failed", "never happened", occurrences=0)
 
 
-def test_session_error_channel_contains_json_text() -> None:
+def test_the_session_error_channel_carries_the_code_and_stage_as_fields() -> None:
+    """R-46 changed the envelope: the error half *is* the **fatal error** record.
+
+    Classified *defect* under R-46 - the old assertion recovered the code and
+    the stage by `json.loads`-ing them back out of a `message` string, which is
+    the flattening R-46 forbids. Every reader wanting the code had to know the
+    message was secretly JSON, and a reader that did not know saw one opaque
+    sentence.
+    """
     result = DistillSession().call_tool("missing", {})
-    payload = json.loads(result["error"]["message"])
-    assert payload["code"] == "E_UNKNOWN_TOOL"
-    assert payload["stage"] == "protocol"
+    assert result["error"] == {
+        "code": "E_UNKNOWN_TOOL",
+        "stage": "protocol",
+        "message": "Unknown tool: missing",
+        "details": {},
+    }
+
+
+def test_an_uncoded_failure_reaches_the_session_channel_as_one_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The catch-all's mapping, asked of the surface a caller reads.
+
+    The type and message identify the failure; the record shape is the same one
+    a coded failure gets, so nothing downstream branches on which kind it was
+    before it can read the code.
+    """
+
+    def fault(_name: str, _args: dict[str, object]) -> dict[str, object]:
+        raise RuntimeError("a fault three modules down")
+
+    monkeypatch.setattr("distill.pipeline.call_registered_tool", fault)
+    result = DistillSession().call_tool("cache_doctor", {})
+
+    assert result["error"]["code"] == "E_INTERNAL"
+    assert result["error"]["stage"] == "internal"
+    assert result["error"]["details"] == {
+        "exception": "RuntimeError",
+        "message": "a fault three modules down",
+    }
 
 
 def test_a_count_that_is_not_a_number_is_refused_including_a_boolean() -> None:

@@ -114,28 +114,51 @@ def test_get_job_status_dispatch_missing_job_is_error(
     assert payload["stage"] == "job"
 
 
-def test_call_tool_dispatch_wraps_unknown_tool(
+def test_call_tool_dispatch_reports_an_unknown_tool_as_a_fatal_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # call-tool routes through DistillSession.call_tool, which converts a
-    # DistillError (E_UNKNOWN_TOOL) into an {"error": ...} JSON result rather
-    # than exiting non-zero.
-    code, out, _ = _run(["call-tool", "does_not_exist", "--args", "{}"], capsys)
-    assert code is None
-    payload = json.loads(out)
-    assert "error" in payload
-    assert "E_UNKNOWN_TOOL" in payload["error"]["message"]
+    """R-46: `call-tool` is a command, so a failed call is a failed command.
+
+    Classified *defect* under R-46 - the old test pinned the `DistillError`
+    being swallowed into a stdout `{"error": ...}` envelope with exit 0, so a
+    script calling Distill through `call-tool` saw success for every failure and
+    had to inspect the payload to find out otherwise. The session still speaks
+    the envelope, which is its contract; the CLI does not.
+    """
+    with pytest.raises(SystemExit) as exc_info:
+        main(["call-tool", "does_not_exist", "--args", "{}"])
+    assert exc_info.value.code == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    payload = json.loads(output.err)
+    assert payload["code"] == "E_UNKNOWN_TOOL"
+    assert payload["stage"] == "protocol"
 
 
-def test_call_tool_dispatch_runs_list_tools_via_session(
+def test_call_tool_dispatch_refuses_a_job_id_outside_the_domain(
+    tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # get_job_status is a registered tool; calling it for a missing job returns
-    # an error envelope (not a process exit) through the session wrapper.
-    code, out, _ = _run(["call-tool", "get_job_status", "--args", '{"job_id": ""}'], capsys)
-    assert code is None
-    payload = json.loads(out)
-    assert "result" in payload or "error" in payload
+    """R-18: an empty identifier names no **job record**, so it is refused.
+
+    Classified *defect* under R-18 - the old assertion was
+    `"result" in payload or "error" in payload`, which every possible outcome
+    satisfies, over an empty `job_id` that R-18 makes a bounded-domain
+    rejection. Both halves are pinned now: which answer, and through which exit.
+    """
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "call-tool",
+                "get_job_status",
+                "--args",
+                json.dumps({"job_id": "", "output_dir": str(tmp_path)}),
+            ]
+        )
+    assert exc_info.value.code == 2
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["code"] == "E_BAD_JOB_ID"
+    assert payload["stage"] == "job"
 
 
 def test_local_vision_diagnostics_dispatch_runs_with_every_override(
