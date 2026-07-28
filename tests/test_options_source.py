@@ -43,9 +43,11 @@ from distill.source import (
     source_hash,
     validate_output_root,
     youtube_description,
+    youtube_fast_path_video_id,
     youtube_lock_key,
     youtube_metadata,
     youtube_source_info,
+    youtube_url_names_one_video,
 )
 
 
@@ -339,6 +341,66 @@ def test_youtube_url_parsing_and_lock_key() -> None:
     with pytest.raises(DistillError, match="https://www.youtube.com/feed/trending"):
         parse_youtube_url("https://www.youtube.com/feed/trending")
     assert youtube_lock_key("abc123") == hashlib.sha256(b"abc123").hexdigest()
+
+
+VALID_ID = "YE7VzlLtp-4"
+"""Eleven characters of `[0-9A-Za-z_-]`, which is the whole shape yt-dlp matches."""
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        pytest.param(f"https://www.youtube.com/watch?v={VALID_ID}", VALID_ID, id="watch"),
+        pytest.param(f"https://youtu.be/{VALID_ID}", VALID_ID, id="youtu.be"),
+        pytest.param(f"https://m.youtube.com/shorts/{VALID_ID}", VALID_ID, id="shorts"),
+        pytest.param(f"https://www.youtube.com/live/{VALID_ID}", VALID_ID, id="live"),
+        pytest.param(f"https://www.youtube.com/embed/{VALID_ID}", VALID_ID, id="embed"),
+        pytest.param(f"https://www.youtube.com/v/{VALID_ID}", VALID_ID, id="v"),
+        pytest.param(
+            f"https://www.youtube.com/watch?v={VALID_ID}&feature=share",
+            VALID_ID,
+            id="an_unrelated_query_param_is_not_trailing_junk",
+        ),
+        pytest.param(
+            "https://www.youtube.com/watch?v=Ye7vZLltP-4", "Ye7vZLltP-4", id="case_is_preserved"
+        ),
+        pytest.param(
+            f"https://www.youtube.com/watch?v={VALID_ID}x", None, id="twelve_characters"
+        ),
+        pytest.param(
+            "https://www.youtube.com/watch?v=YE7VzlLtp", None, id="nine_characters"
+        ),
+        pytest.param("https://www.youtube.com/watch?v=YE7VzlLtp-", None, id="ten_characters"),
+        pytest.param(f"https://youtu.be/{VALID_ID}/more", None, id="a_segment_after_the_id"),
+        pytest.param(
+            f"https://www.youtube.com/watch?v={VALID_ID}&v=aaaaaaaaaaa",
+            None,
+            id="duplicate_v_params",
+        ),
+        pytest.param(
+            f"https://www.youtube.com/watch?v={VALID_ID}&list=PL1", None, id="a_playlist_attached"
+        ),
+        pytest.param("https://www.youtube.com/playlist?list=PL1", None, id="no_video_id_at_all"),
+        pytest.param(f"https://example.com/watch?v={VALID_ID}", None, id="not_a_youtube_host"),
+    ],
+)
+def test_the_cache_fast_path_only_reads_an_id_yt_dlp_would_report(
+    url: str, expected: str | None
+) -> None:
+    """The URL fast path trusts an id only where yt-dlp would resolve the same one.
+
+    yt-dlp's extractor matches exactly eleven `[0-9A-Za-z_-]` characters and
+    ignores what follows, so `watch?v=YE7VzlLtp-4x` is published under
+    `YE7VzlLtp-4`. Keying a lookup on the twelve-character value names a
+    **bundle** nothing ever wrote: a false **cache miss**, and with yt-dlp
+    uninstalled an `E_MISSING_TOOL` raised over data that is on disk.
+
+    Declining is the whole answer - the run then resolves the id the way it
+    always did. Truncating to eleven characters here would be reimplementing
+    another tool's parser against its own output.
+    """
+    assert youtube_fast_path_video_id(url) == expected
+    assert youtube_url_names_one_video(url) is (expected is not None)
 
 
 def test_normalize_youtube_url_strips_timestamp() -> None:

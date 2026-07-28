@@ -43,7 +43,13 @@ from distill.errors import DistillError
 from distill.options import DistillOptions
 from distill.source import local_fingerprint, source_hash
 
-VIDEO_ID = "cachedvideo1"
+VIDEO_ID = "cachedvideo"
+"""Eleven characters, because that is the only shape the fast path reads.
+
+yt-dlp's extractor matches exactly `[0-9A-Za-z_-]{11}`, so an id of any other
+length is a value the URL fast path declines - and a fixture that used one would
+be exercising the decline in every test rather than the lookup.
+"""
 URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
 
 
@@ -341,6 +347,77 @@ def test_a_local_manifest_duration_over_the_cap_is_refused_rather_than_served(
 
     assert failure.value.code == "E_DURATION_CAP"
     assert failure.value.details["duration_sec"] == 12.5
+
+
+def test_a_url_naming_two_video_ids_is_not_served_from_the_first_ones_bundle(
+    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    tmp_path: Path,
+) -> None:
+    """The playlist refusal, generalized: the fast path reads an id or declines.
+
+    `watch?v=A&v=B` carries two ids and yt-dlp picks one of them; `parse_qs`
+    picks the first, which is a different question with the same shape of
+    answer. Reading `A` off it served `A`'s **bundle** for a URL this Distill
+    resolves to `B` - a cache hit for a bundle the same command cannot make,
+    which is exactly what `youtube_url_names_one_video` exists to prevent for
+    the playlist form.
+
+    So the fast path declines, the run resolves the id the way it always did,
+    and with yt-dlp uninstalled that is fatal for this URL form rather than
+    quietly answered from the wrong bundle.
+    """
+    two_ids = f"{URL}&v=otherid1234"
+    args = youtube_args(tmp_path, url=two_ids)
+    options = DistillOptions.from_args(args)
+    bundle_key = source_hash(
+        hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
+    )
+    write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")
+
+    with pytest.raises(DistillError) as failure:
+        distill_session.process_youtube_video(dict(args))
+
+    assert failure.value.code == "E_MISSING_TOOL"
+    assert failure.value.details["tool"] == "yt-dlp"
+
+
+def test_a_video_id_the_url_padded_is_not_a_bundle_key_of_its_own(
+    fake_tool: Callable[[str, str], Path],
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    """A twelve-character `v=` value keys nothing, so it must not be looked up.
+
+    yt-dlp matches eleven characters and ignores the rest, so this URL is
+    published under `VIDEO_ID` - the bundle written here. The fast path can only
+    have keyed the lookup on the twelve-character value, which nothing has ever
+    written, so it declines and the resolution finds the bundle under the id
+    yt-dlp reports. The **source** is still never downloaded, which is what the
+    boundary shows.
+    """
+    a_producing_path(fake_tool, youtube=False)
+    # The real extractor matches eleven characters and ignores the twelfth, so
+    # the fake reports what yt-dlp would rather than echoing the URL back.
+    fake_tool(
+        "yt-dlp",
+        FAKE_YTDLP_METADATA_AND_DOWNLOAD.replace(
+            'argv[-1].rsplit("=", 1)[-1].rsplit("/", 1)[-1]', repr(VIDEO_ID)
+        ),
+    )
+    padded = f"https://www.youtube.com/watch?v={VIDEO_ID}x"
+    args = youtube_args(tmp_path, url=padded)
+    options = DistillOptions.from_args(args)
+    bundle_key = source_hash(
+        hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
+    )
+    write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")
+
+    with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
+        served = distill_session.process_youtube_video(dict(args))
+
+    assert served["cached"] is True
+    assert served["source_hash"] == bundle_key
+    assert downloads_invoked(caplog) == []
 
 
 def test_a_manifest_recording_a_boolean_duration_is_a_miss_not_a_one_second_hit(

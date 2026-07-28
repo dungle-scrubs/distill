@@ -796,31 +796,84 @@ def ensure_youtube_host(url: str) -> None:
         raise DistillError("E_BAD_URL", "youtube", "only YouTube URLs are supported", {"url": url})
 
 
-def youtube_url_names_one_video(url: str) -> bool:
-    """Whether the URL's own video id is the id yt-dlp will resolve for it.
+YOUTUBE_VIDEO_ID_PATTERN = re.compile(r"[0-9A-Za-z_-]{11}")
+"""The id shape yt-dlp's YouTube extractor matches, and nothing wider.
 
-    It is, for every form that names a video and nothing else. It is not for a
-    video-plus-playlist URL (`watch?v=A&list=P`), which yt-dlp treats as the
-    playlist unless told otherwise: `--dump-json` then emits one document per
-    entry, which does not parse as one document, and `canonical_youtube_id`
-    falls back to `--print id` and takes the *last* line. So that URL resolves,
-    downloads and publishes under some other entry's id, and the id written in
-    `v=` is not the identity of the **bundle** the run produces.
+Eleven characters of `[0-9A-Za-z_-]`, which is what the extractor's own regex
+takes and what every published video id is. It is here because the **bundle
+key** read off a URL has to be the key the run would publish under: yt-dlp
+matches those eleven characters and ignores whatever follows, so a longer value
+in `v=` names a video yt-dlp will report a *different* id for.
+"""
 
-    Which makes this the boundary of the R-49 reorder rather than a detail of
-    it. Reading a **bundle key** off the URL is only sound where the URL's id is
-    the id a run would have published under; where it is not, the cache is asked
-    the question it was always asked, after resolution, and yt-dlp is needed to
-    ask it. Serving a bundle keyed by `A` for a URL this Distill would publish
-    under `B` would be a cache hit for a bundle the same URL cannot produce.
+
+def youtube_fast_path_video_id(url: str) -> str | None:
+    """The id a **bundle** may be looked up by without asking yt-dlp, or `None`.
+
+    `None` is not a refusal of the URL - it declines the shortcut, and the run
+    resolves the id the way it always did. So this answers one question only:
+    is the id written in this URL certainly the id yt-dlp resolves for it?
+
+    It is not, in three ways, and each one would key a lookup on a string the
+    run cannot publish under:
+
+    - **A playlist is attached.** `watch?v=A&list=P` is the playlist to yt-dlp
+      unless told otherwise: `--dump-json` emits one document per entry, which
+      does not parse as one, and `canonical_youtube_id` falls back to
+      `--print id` and takes the *last* line. That URL publishes under some
+      other entry's id.
+    - **The id is not id-shaped.** yt-dlp's extractor matches exactly eleven
+      `[0-9A-Za-z_-]` characters and ignores trailing material, so
+      `watch?v=YE7VzlLtp-4x` is published under `YE7VzlLtp-4`. Reading twelve
+      characters off the URL keys a **bundle** nothing ever wrote - a false
+      **cache miss**, and with yt-dlp uninstalled an `E_MISSING_TOOL` over data
+      that is on disk. Truncating to eleven instead would be guessing at
+      another tool's parser; declining costs one resolution.
+    - **The URL names more than one.** `watch?v=A&v=B`, or a path with segments
+      after the id. Which one yt-dlp picks is its business, not something to
+      infer here.
+
+    Case is preserved, because a video id is case-sensitive and `A` and `a` are
+    different videos.
 
     The playlist form is worth resolving properly - `--no-playlist` on the
     single-video invocations would make the URL's id authoritative for it too,
     and fix a run that currently points one output template at every entry of a
-    playlist. That changes what a **cache miss** acquires, which is not this
-    milestone's to change.
+    playlist. That changes what a **cache miss** acquires, and remains a Phase 9
+    follow-up.
     """
-    return "list" not in parse_qs(urlparse(url).query)
+    parsed = urlparse(url)
+    if parsed.netloc.lower() not in YOUTUBE_HOSTS:
+        return None
+    query = parse_qs(parsed.query)
+    if "list" in query:
+        return None
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if parsed.netloc.lower() == "youtu.be":
+        candidates = segments[:1] if len(segments) == 1 else []
+    elif any(parsed.path.startswith(prefix) for prefix in ("/shorts/", "/embed/", "/live/", "/v/")):
+        candidates = segments[1:2] if len(segments) == 2 else []
+    else:
+        candidates = query.get("v", [])
+    if len(candidates) != 1 or not YOUTUBE_VIDEO_ID_PATTERN.fullmatch(candidates[0]):
+        return None
+    return candidates[0]
+
+
+def youtube_url_names_one_video(url: str) -> bool:
+    """Whether the URL's own video id is the id yt-dlp will resolve for it.
+
+    The boundary of the R-49 reorder rather than a detail of it. Reading a
+    **bundle key** off the URL is only sound where the URL's id is the id a run
+    would have published under; where it is not, the cache is asked the question
+    it was always asked, after resolution, and yt-dlp is needed to ask it.
+    Serving a bundle keyed by `A` for a URL this Distill would publish under `B`
+    would be a cache hit for a bundle the same URL cannot produce.
+
+    `youtube_fast_path_video_id` is the decision; this is the same answer as a
+    question.
+    """
+    return youtube_fast_path_video_id(url) is not None
 
 
 def parse_youtube_url(url: str) -> str:
@@ -1441,12 +1494,13 @@ class YouTubeSourceProvider:
         """Describe a source from a servable bundle, or `None` if there is none.
 
         Two ids can name one video: the one written in the URL, and the one
-        yt-dlp reports. For every ordinary watch URL they are the same string,
-        which is why the URL's own id is tried first - it costs nothing, and a
-        cache hit found that way needs no tool at all (R-49). Only when it
-        misses is yt-dlp asked for the canonical id and the lookup repeated, so
-        a bundle keyed by an id the URL does not carry is still found, exactly
-        as it was before.
+        yt-dlp reports. For an ordinary watch URL carrying an id-shaped value
+        they are the same string, which is why the URL's own id is tried first -
+        it costs nothing, and a cache hit found that way needs no tool at all
+        (R-49). `youtube_fast_path_video_id` decides whether this URL is one of
+        those. Otherwise, and whenever the first lookup misses, yt-dlp is asked
+        for the canonical id and the lookup repeated, so a bundle keyed by an id
+        the URL does not carry is still found, exactly as it was before.
 
         The **fingerprint** is the same function of the same video id either
         way. Nothing here derives identity a second way; what changed is only
@@ -1454,8 +1508,9 @@ class YouTubeSourceProvider:
         """
         if metadata is not None:
             return self.cached_for_video_id(request, metadata.video_id)
-        if youtube_url_names_one_video(request.value):
-            served = self.cached_for_video_id(request, parse_youtube_url(request.value))
+        url_video_id = youtube_fast_path_video_id(request.value)
+        if url_video_id is not None:
+            served = self.cached_for_video_id(request, url_video_id)
             if served is not None:
                 return served
         return self.cached_for_video_id(request, canonical_youtube_id(request.value))
@@ -1669,9 +1724,10 @@ class SourceResolver:
         root = validate_output_root(options.output_dir)
         url = normalize_youtube_url(value)
         # Rejects non-YouTube hosts (and option-injection values) before yt-dlp
-        # runs, and now also yields the id the cache is asked about: the URL
-        # carries one, so nothing has to be resolved to look a **bundle** up.
-        url_video_id = parse_youtube_url(url)
+        # runs. What it returns is the value written in the URL, which is not on
+        # its own enough to key a **bundle** by - `youtube_fast_path_video_id`
+        # decides that below.
+        parse_youtube_url(url)
         request = SourceRequest(
             url,
             options,
@@ -1686,18 +1742,21 @@ class SourceResolver:
         # could not proceed over a bundle already on disk.
         #
         # Only where the URL's id is the id this run would publish under, which
-        # `youtube_url_names_one_video` decides. A URL that names a playlist as
-        # well as a video is resolved the way it always was.
-        if youtube_url_names_one_video(url):
-            served = self._served_from_cache(request, url_video_id)
+        # `youtube_fast_path_video_id` decides. A URL that names a playlist as
+        # well as a video, or carries a value yt-dlp's extractor would not match
+        # whole, is resolved the way it always was.
+        fast_path_video_id = youtube_fast_path_video_id(url)
+        if fast_path_video_id is not None:
+            served = self._served_from_cache(request, fast_path_video_id)
             if served is not None:
                 return served
         metadata = youtube_metadata(url)
-        # The URL's id is what yt-dlp reports for every ordinary watch URL, so
-        # this second lookup normally cannot hit. It is here for the case where
-        # it can: a bundle keyed by a resolved id the URL does not carry was
-        # found before this reorder, and must still be.
-        if metadata.video_id != url_video_id:
+        # The resolved id is what the cache was always asked about, before the
+        # reorder put a lookup in front of it. It is skipped only when the fast
+        # path already asked this exact question and missed - so a URL the fast
+        # path declined is looked up here, which is the behavior that predates
+        # the reorder rather than a second chance added by it.
+        if metadata.video_id != fast_path_video_id:
             served = self._served_from_cache(request, metadata.video_id)
             if served is not None:
                 return served
