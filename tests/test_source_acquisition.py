@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 from fake_tools import (
     FAKE_FFPROBE,
+    FAKE_FFPROBE_NAN_DURATION,
     FAKE_FFPROBE_NO_DURATION,
     FAKE_YTDLP_CLOBBERING,
     FAKE_YTDLP_DOWNLOAD,
@@ -1168,3 +1169,90 @@ def test_a_batch_item_gives_up_on_the_lock_key_after_its_own_budget(
     assert clock.now == pytest.approx(BATCH_ITEM_LOCK_WAIT_SEC)
     assert promoted_names(root) == []
     held.release()
+
+
+def test_a_source_claiming_an_unusable_duration_is_refused() -> None:
+    """FAILS FIRST (finding 18, R-47): a NaN duration passed every guard downstream.
+
+    The number arrives from ffprobe, so it is data rather than operator error,
+    and it is refused the way the acquisition path refuses media it cannot use:
+    `E_BAD_MEDIA` at the stage that resolved it, not `E_BAD_OPTIONS`. NaN is
+    the one that matters most - it clears `duration > max_duration_sec`, clears
+    `duration <= 0`, and then poisons every window and interval computed from
+    it - but zero, negative and infinite durations are equally unrunnable.
+
+    The rejected value travels as text because the error is published as JSON
+    and a bare NaN is not JSON any strict reader will parse.
+    """
+    from distill.source import ensure_duration_allowed
+
+    for bad in (float("nan"), float("inf"), 0.0, -1.0):
+        with pytest.raises(DistillError) as exc:
+            ensure_duration_allowed(bad, 7200.0)
+        assert exc.value.code == "E_BAD_MEDIA"
+        assert exc.value.stage == "source"
+        assert exc.value.details["duration_sec"] == repr(bad)
+        json.dumps(exc.value.to_dict(), allow_nan=False)
+
+    # A usable duration still passes, and one over the cap is still the cap's
+    # error rather than this one.
+    ensure_duration_allowed(12.5, 7200.0)
+    with pytest.raises(DistillError) as capped:
+        ensure_duration_allowed(7200.5, 7200.0)
+    assert capped.value.code == "E_DURATION_CAP"
+
+
+def test_a_container_reporting_a_nan_duration_is_not_promoted(
+    fake_tool: Callable[[str, str], Path],
+    tmp_path: Path,
+) -> None:
+    """R-47: 'no playable duration' has to include the duration that is not a number.
+
+    `duration_sec <= 0` is false for NaN, so a container whose header claims one
+    passed the promotion check and became the media every later stage read.
+    """
+    fake_tool("ffprobe", FAKE_FFPROBE_NAN_DURATION)
+    media = tmp_path / "source.mp4"
+    media.write_bytes(b"video")
+
+    with pytest.raises(DistillError) as exc:
+        distill_source.validate_media_file(media)
+
+    assert exc.value.code == "E_BAD_MEDIA"
+    assert "duration" in exc.value.message
+
+
+@pytest.mark.parametrize(
+    ("recorded", "expected"),
+    [
+        pytest.param({}, None, id="no_duration_field"),
+        pytest.param({"duration_sec": None}, None, id="null"),
+        pytest.param({"duration_sec": "12.5"}, None, id="string"),
+        pytest.param({"duration_sec": True}, None, id="true"),
+        pytest.param({"duration_sec": 0}, None, id="zero"),
+        pytest.param({"duration_sec": -1}, None, id="negative"),
+        pytest.param({"duration_sec": float("nan")}, None, id="nan"),
+        pytest.param({"duration_sec": float("inf")}, None, id="inf"),
+        pytest.param({"duration_sec": 10**400}, None, id="401_digit_integer"),
+        pytest.param({"duration_sec": 12.5}, 12.5, id="a_usable_duration"),
+    ],
+)
+def test_a_manifests_recorded_duration_is_read_as_input_rather_than_fact(
+    recorded: dict[str, object],
+    expected: float | None,
+) -> None:
+    """Every shape a **manifest**'s `duration_sec` can arrive in, and what it means.
+
+    A manifest is a document another process wrote, so this is the one place
+    that decides what counts as a duration a cache hit may reuse - and each
+    branch was reachable only through a whole cached run, so deleting the
+    `bool` guard or the non-finite test left the suite green.
+
+    The 401-digit integer is the shape the function did not survive: JSON has
+    no integer ceiling, `float()` on one raises `OverflowError`, and that
+    escaped as a bare stdlib exception from a resolution that should have
+    reported a **cache miss**.
+    """
+    from distill.source import manifest_duration
+
+    assert manifest_duration(recorded) == expected

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 from uuid import uuid4
 
 from .errors import DistillError
+from .frame_selection import CANDIDATE_TIMESTAMP_QUANTUM_SEC
 from .local_vision import (
     DEFAULT_LOCAL_VISION_BACKEND,
     DEFAULT_LOCAL_VISION_BASE_URL,
@@ -65,6 +67,165 @@ OPTION_SPECS: tuple[OptionSpec, ...] = (
     OptionSpec("resume_partial", True, bool, boolean=True, cache_key=False),
 )
 OPTION_DEFAULTS = {spec.name: spec.default for spec in OPTION_SPECS}
+
+
+@dataclass(frozen=True)
+class NumericDomain:
+    """The values one numeric option may take (R-03, R-47).
+
+    Every numeric option is a quantity of something a run needs at least some
+    of - frames, seconds, items - so the floor is zero for all of them and the
+    only questions left are whether zero itself is a policy and whether the
+    quantity is counted or measured. `admits_zero` answers the first,
+    `integral` the second. Nothing here is infinite or unknown: a NaN limit
+    cannot fire at all and an infinite one is an unbounded run reporting a
+    bound.
+
+    `floor` is for the option whose smallest usable value is not the smallest
+    positive one: a quantity the pipeline measures in a unit of its own has a
+    floor of that unit, and a value below it is not a small request but an
+    unanswerable one (R-48).
+    """
+
+    integral: bool = False
+    admits_zero: bool = False
+    floor: float = 0.0
+
+
+NUMERIC_OPTION_DOMAINS: dict[str, NumericDomain] = {
+    "max_keyframes": NumericDomain(integral=True),
+    # Zero is a spacing policy, not a broken one: it means no gap is required
+    # between two keyframes. It is the only numeric option zero means something
+    # to, which is why the domain is per option rather than one global floor.
+    "min_interval_sec": NumericDomain(admits_zero=True),
+    "max_duration_sec": NumericDomain(),
+    # A window narrower than the millisecond a candidate timestamp is rounded
+    # to names a spacing the **keyframe** schedule cannot express, and the walk
+    # that fills a static stretch with it never advances (finding 7).
+    "max_static_window_sec": NumericDomain(floor=CANDIDATE_TIMESTAMP_QUANTUM_SEC),
+    "local_vision_timeout_sec": NumericDomain(),
+    # Not a `DistillOptions` field - `max_items` bounds a batch rather than a
+    # bundle, so it is not part of the options hash - but it is an operator's
+    # number arriving at the same boundary and it is refused the same way.
+    "max_items": NumericDomain(integral=True),
+}
+"""Every numeric option a run is configured with, and the values each admits.
+
+A table rather than a check per call site, because the check that is written
+where a value is *used* is the one that is missing at the second use: the
+duration cap was validated in `from_args` and the batch limit nowhere, and
+`max_items=-1` became a slice taken from the wrong end.
+
+Retention's numbers - `keep_generations` and `max_age_days` - are not here.
+They belong to `PrunePolicy`, which validates them where the policy is built
+(R-03) and reports them at the `prune` stage rather than as run options.
+"""
+
+
+EXACT_INTEGER_FLOAT_LIMIT = 2**53
+"""From here up, a float no longer names one integer, so it cannot carry a count.
+
+`float` steps in twos past 2**53: `9007199254740993.0` *is* `9007199254740992.0`
+before anything here sees it, and the two are then indistinguishable. So the
+limit itself is refused along with everything above it - admitting it would
+admit a value that may have been written as one greater. An integer arriving as
+an `int` or as a decimal string is exact either way, and is kept exact.
+"""
+
+
+def _bad_number(name: str, value: Any, domain: NumericDomain, reason: str = "") -> DistillError:
+    quantity = "a whole number" if domain.integral else "a finite number"
+    if domain.floor:
+        floor = f"{domain.floor} or greater"
+    else:
+        floor = "0 or greater" if domain.admits_zero else "greater than 0"
+    message = f"{name} must be {quantity} {floor}"
+    return DistillError(
+        "E_BAD_OPTIONS",
+        "options",
+        f"{message} ({reason})" if reason else message,
+        # `repr`, because the value that provoked this may be a NaN, and a
+        # fatal error is published as JSON that a strict reader has to parse.
+        {name: repr(value)},
+    )
+
+
+def _integral_value(name: str, value: int | float | str, domain: NumericDomain) -> int:
+    """A counted option as the whole number it names, with no float in between.
+
+    `int` first, and exactly: a count is a count, and `int` has no ceiling in
+    Python, so `--max-keyframes 9007199254740993` is that number rather than the
+    even one nearest it. A decimal string spelling an integer is read the same
+    way, for the same reason.
+
+    Only what is left goes through `float`, and then it has to name a whole
+    number *and* be small enough for a float to name only that one. `int(2.7)`
+    answered 2 and `float(9007199254740993)` answers 9007199254740992; both are
+    an operator's number rewritten, which is what this validation exists to
+    remove.
+    """
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        raise _bad_number(name, value, domain) from None
+    if not math.isfinite(number) or number != int(number):
+        raise _bad_number(name, value, domain)
+    if abs(number) >= EXACT_INTEGER_FLOAT_LIMIT:
+        raise _bad_number(name, value, domain, "a float this large does not name one whole number")
+    return int(number)
+
+
+def validated_number(name: str, value: Any) -> int | float:
+    """The value `name` may take, or `E_BAD_OPTIONS` naming what was wrong.
+
+    Rejection happens here, at the boundary, because a number that is refused
+    is still attached to the option it came from; three stages later a NaN is
+    just a comparison that answers no. Booleans are refused for the reason
+    `PrunePolicy` refuses them - `True` meaning 1 is a coincidence rather than
+    an instruction - and a value that is not a number at all is refused as the
+    same option error rather than escaping as a `ValueError` or, for a number
+    too large for a float, as an `OverflowError`.
+
+    It does not decide what any option *means*; `NUMERIC_OPTION_DOMAINS` owns
+    that, and an option missing from it is a programming error, not an input.
+    """
+    domain = NUMERIC_OPTION_DOMAINS[name]
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        raise _bad_number(name, value, domain)
+    number: int | float
+    if domain.integral:
+        number = _integral_value(name, value, domain)
+    else:
+        try:
+            number = float(value)
+        except (ValueError, OverflowError):
+            raise _bad_number(name, value, domain) from None
+        if not math.isfinite(number):
+            raise _bad_number(name, value, domain)
+    # An `int` compares against these exactly however large it is, so a count no
+    # float could hold is still judged against its own domain here.
+    if number < 0 or (number == 0 and not domain.admits_zero) or number < domain.floor:
+        raise _bad_number(name, value, domain)
+    if number == 0:
+        # `-0.0` is the same quantity as `0.0` and asks for the same run, but
+        # `json.dumps` writes it as `-0.0` - two **bundle keys** for one set of
+        # processing choices.
+        return 0 if domain.integral else 0.0
+    return number
+
+
+def validated_count(name: str, value: Any) -> int:
+    """`validated_number` for an option counted in whole units, typed as one."""
+    return int(validated_number(name, value))
+
+
 CACHE_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.cache_key)
 PROCESSING_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.name != "cache_mode")
 LOCAL_VISION_OPTION_NAMES = (
@@ -140,6 +301,10 @@ class DistillOptions:
             raw_value = args.get(spec.name, default)
             if spec.boolean:
                 values[spec.name] = _coerce_bool(raw_value, bool(default))
+            elif spec.name in NUMERIC_OPTION_DOMAINS:
+                # Before the `None` branch below: `None` is a legitimate value
+                # for `output_dir` and an unusable one for a quantity.
+                values[spec.name] = validated_number(spec.name, raw_value)
             elif raw_value is None:
                 values[spec.name] = None
             else:
@@ -163,7 +328,14 @@ class DistillOptions:
             local_vision_backend=local_vision.backend,
             local_vision_model=local_vision.model,
             local_vision_base_url=local_vision.base_url,
-            local_vision_timeout_sec=local_vision.timeout_sec,
+            # The raw argument when the caller supplied one, because the config
+            # layer's coercion answers an unusable number with the default -
+            # reasonable for a config file, and silence where an operator just
+            # named a timeout on the command line.
+            local_vision_timeout_sec=validated_number(
+                "local_vision_timeout_sec",
+                args.get("local_vision_timeout_sec", local_vision.timeout_sec),
+            ),
             local_vision_allow_remote_endpoint=local_vision.allow_remote_endpoint,
             job_id=str(values["job_id"] or f"distill-{uuid4().hex}"),
             resume_partial=values["resume_partial"],
@@ -175,16 +347,9 @@ class DistillOptions:
                 "cache_mode must be 'fingerprint' or 'content'",
                 {"cache_mode": options.cache_mode},
             )
-        if options.max_keyframes < 1:
-            raise DistillError("E_BAD_OPTIONS", "options", "max_keyframes must be positive")
-        if options.min_interval_sec < 0:
-            raise DistillError("E_BAD_OPTIONS", "options", "min_interval_sec must be >= 0")
-        if options.max_duration_sec <= 0:
-            raise DistillError("E_BAD_OPTIONS", "options", "max_duration_sec must be positive")
-        if options.max_static_window_sec <= 0:
-            raise DistillError(
-                "E_BAD_OPTIONS", "options", "max_static_window_sec must be positive"
-            )
+        # Every numeric floor is `NUMERIC_OPTION_DOMAINS`, applied above as the
+        # value is read. A check here would run after construction, which is
+        # after `local_vision_config_from_args` has already spent the value.
         if options.local_vision_backend != "rapid-mlx":
             raise DistillError(
                 "E_BAD_OPTIONS",

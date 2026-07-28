@@ -40,7 +40,7 @@ from .local_vision import (
     try_interpret_image,
 )
 from .ocr import ocr_frames
-from .options import DistillOptions
+from .options import DistillOptions, validated_count
 from .progress import (
     TERMINAL_PROGRESS_STATUSES,
     OverallProgressAggregator,
@@ -789,7 +789,7 @@ class BatchRunner:
 def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
     options = DistillOptions.from_args(args)
     root = validate_output_root(options.output_dir)
-    max_items = int(args.get("max_items", 50))
+    max_items = validated_count("max_items", args.get("max_items", 50))
     recursive = bool(args.get("recursive", False))
     continue_on_error = bool_arg(args.get("continue_on_error"), True)
 
@@ -867,7 +867,7 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
     options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
     root = validate_output_root(options.output_dir)
     playlist_root = root / "playlists" / playlist_folder_name(url)
-    max_items = int(args.get("max_items", 25))
+    max_items = validated_count("max_items", args.get("max_items", 25))
     continue_on_error = bool_arg(args.get("continue_on_error"), True)
 
     def process_item(video_url: str, index: int) -> dict[str, Any]:
