@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import struct
 import urllib.error
 import zlib
@@ -17,6 +18,7 @@ from distill.grounding import UNGROUNDED
 from distill.local_vision import (
     DEFAULT_LOCAL_VISION_BASE_URL,
     DEFAULT_LOCAL_VISION_MODEL,
+    DEFAULT_TIMEOUT_SEC,
     FrameInterpreter,
     LocalVisionConfig,
     LocalVisionProbe,
@@ -337,6 +339,55 @@ def test_local_vision_diagnostics_describe_rapid_mlx(
     assert "127.0.0.1:8000" in diagnostics["rapid_mlx_note"]
     assert diagnostics["probe"]["backend"] == "rapid-mlx"
     assert "release_warning" not in diagnostics
+
+
+def _a_port_nothing_is_listening_on() -> int:
+    """A loopback port bound and released, so connecting to it is refused at once."""
+    with socket.socket() as bound:
+        bound.bind(("127.0.0.1", 0))
+        return int(bound.getsockname()[1])
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(float("-inf"), id="-inf"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(True, id="true"),
+    ],
+)
+def test_a_vision_timeout_no_socket_can_take_is_answered_by_the_default(
+    supplied: object,
+) -> None:
+    """`--local-vision-timeout-sec inf` ended in an uncaught OverflowError.
+
+    `_coerce_float` is the config layer's door, and its whole contract is to
+    answer an unusable number with the default rather than refuse it - which is
+    what a config *file* should do. It admitted `inf` because `inf > 0`, so the
+    number travelled all the way into `socket.settimeout` and came back as
+    `OverflowError: timestamp out of range for platform time_t` - a traceback
+    from the stdlib, on a command whose entire job is to report a diagnosis.
+
+    `nan` and `true` are the same door: a NaN timeout is a comparison that
+    always answers no, and a config file saying `"timeout_sec": true` is not a
+    one-second timeout. The run path refuses all four outright
+    (`DistillOptions.from_args` validates the raw argument); this path is the
+    one that coerces, and coercing has to reach a number a socket can take.
+
+    The probe is aimed at a port nothing is listening on, so what comes back is
+    the typed unavailability every other unreachable endpoint produces.
+    """
+    diagnostics = local_vision_diagnostics(
+        {
+            "local_vision_timeout_sec": supplied,
+            "local_vision_base_url": f"http://127.0.0.1:{_a_port_nothing_is_listening_on()}/v1",
+        }
+    )
+
+    assert diagnostics["config"]["timeout_sec"] == DEFAULT_TIMEOUT_SEC
+    assert diagnostics["probe"]["available"] is False
+    assert diagnostics["probe"]["code"] == "local_vision_rapid_mlx_unavailable"
 
 
 def test_interpret_image_returns_structured_result(tmp_path: Path) -> None:

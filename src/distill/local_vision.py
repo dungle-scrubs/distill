@@ -36,6 +36,7 @@ import http.client
 import ipaddress
 import json
 import logging
+import math
 import os
 import socket
 import threading
@@ -559,11 +560,29 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 
 
 def _coerce_float(value: Any, default: float) -> float:
+    """A configured number, or the default when what arrived is not one.
+
+    Coercion rather than refusal is this layer's contract - a config file that
+    names an unusable timeout should not stop a run - but what it coerces *to*
+    has to be a number the thing downstream can take. `inf` cleared the `> 0`
+    test and reached `socket.settimeout`, which answered with an uncaught
+    `OverflowError` from the stdlib; `nan` clears nothing and would have
+    disabled the timeout by always comparing false. Both are unusable in the
+    same way a string is, so both get the default.
+
+    `bool` is refused for the reason `manifest_duration` refuses it: `True` is
+    an `int` in Python, and a config file saying `"timeout_sec": true` is not a
+    one-second timeout.
+    """
+    if isinstance(value, bool):
+        return default
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
-    return parsed if parsed > 0 else default
+    if not math.isfinite(parsed) or parsed <= 0:
+        return default
+    return parsed
 
 
 def _merged_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
