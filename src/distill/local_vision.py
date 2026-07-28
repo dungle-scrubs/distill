@@ -1131,6 +1131,7 @@ class FrameInterpreter:
             verbatim_text=reading.verbatim_text,
             text_confidence=reading.text_confidence,
             has_interpretation=reading.has_interpretation,
+            carries_a_reading=reading.carries_a_reading,
         )
         carried, carrier_warnings = frame.with_interpretation(
             reading, grounding=assessment.public_dict()

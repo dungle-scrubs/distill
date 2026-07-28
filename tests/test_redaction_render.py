@@ -361,6 +361,7 @@ def graded(*, ocr_text: str, reading: Interpretation) -> FrameArtifact:
             verbatim_text=reading.verbatim_text,
             text_confidence=reading.text_confidence,
             has_interpretation=reading.has_interpretation,
+            carries_a_reading=reading.carries_a_reading,
         ).public_dict(),
     )
     return frame
@@ -394,6 +395,44 @@ def test_a_lone_confident_reader_still_gets_the_low_confidence_marker() -> None:
     assert "```untrusted-text\nWhat a software factory needs Agent Runtimes Orchestration\n```" in (
         markdown
     )
+
+
+def test_a_description_of_an_unreadable_frame_reaches_the_reader_marked() -> None:
+    """The render seam of the same finding: a summary-only reading is banner-ed.
+
+    The model was told to leave `verbatim_text` empty when it cannot read the
+    frame; it described the slide anyway, quoting figures nothing corroborates.
+    Rendered unmarked, that paragraph reads exactly like text two readers
+    agreed on - which is the one thing the banner exists to prevent.
+    """
+    frame = graded(
+        ocr_text="",
+        reading=Interpretation(
+            visual_summary="A slide titled 'Q3 revenue: $4.2M, up 340% YoY' with a bar chart",
+            text_confidence="none",
+        ),
+    )
+
+    markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
+
+    assert "⚠ Low-confidence frame" in markdown
+    assert "treat the interpretation below as unverified" in markdown
+    # The reading is marked, not withheld.
+    assert "Q3 revenue" in markdown
+
+
+def test_a_frame_nobody_said_anything_about_is_rendered_without_a_banner() -> None:
+    """The other direction: nothing was claimed, so there is nothing to warn about.
+
+    A frame carrying no reading and no OCR text is a photo or a blank slide.
+    Marking it would put the banner on every such frame and make it mean
+    nothing, so the fix cannot be "mark whatever has no verbatim text".
+    """
+    frame = graded(ocr_text="", reading=Interpretation(text_confidence="none"))
+
+    markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
+
+    assert "Low-confidence frame" not in markdown
 
 
 def test_a_corroborated_frame_omits_the_marker_and_shows_verbatim() -> None:

@@ -1,6 +1,24 @@
 from __future__ import annotations
 
+from distill.artifacts import Interpretation
 from distill.grounding import CORROBORATED, SELF_REPORT, UNGROUNDED, WEAK, assess_grounding
+
+
+def _graded(*, ocr_text: str, reading: Interpretation):
+    """The assessment the pipeline makes for a reading, asked the way it asks.
+
+    The same four values `local_vision._interpreted` passes, read off the
+    reading rather than written out here: what these tests are about is which
+    readings get which level, and a hand-written `has_interpretation` makes
+    that a question about the boolean the test chose.
+    """
+    return assess_grounding(
+        ocr_text=ocr_text,
+        verbatim_text=reading.verbatim_text,
+        text_confidence=reading.text_confidence,
+        has_interpretation=reading.has_interpretation,
+        carries_a_reading=reading.carries_a_reading,
+    )
 
 
 def test_matching_ocr_and_vision_text_is_corroborated() -> None:
@@ -9,6 +27,7 @@ def test_matching_ocr_and_vision_text_is_corroborated() -> None:
         verbatim_text="We're closer than you think state machines durable execution gates",
         text_confidence="high",
         has_interpretation=True,
+        carries_a_reading=True,
     )
 
     assert assessment.level == CORROBORATED
@@ -23,6 +42,7 @@ def test_confident_interpretation_with_no_readable_text_is_ungrounded() -> None:
         verbatim_text="",
         text_confidence="none",
         has_interpretation=True,
+        carries_a_reading=True,
     )
 
     assert assessment.level == UNGROUNDED
@@ -32,15 +52,19 @@ def test_confident_interpretation_with_no_readable_text_is_ungrounded() -> None:
 def test_a_textless_frame_without_an_interpretation_is_not_marked() -> None:
     # Both readers were asked and both recovered nothing, which is agreement,
     # and no interpretation was made over it - there is no claim here to mark.
+    # This is the one case the no-on-screen-text reason is reserved for, so the
+    # reason is asserted too: a frame the model described is not this frame.
     assessment = assess_grounding(
         ocr_text="",
         verbatim_text="",
         text_confidence="none",
         has_interpretation=False,
+        carries_a_reading=False,
     )
 
     assert assessment.level == CORROBORATED
     assert assessment.is_low_confidence is False
+    assert assessment.reason == "no on-screen text present"
 
 
 def test_disagreeing_readers_are_weak() -> None:
@@ -49,6 +73,7 @@ def test_disagreeing_readers_are_weak() -> None:
         verbatim_text="generative machine learning models",
         text_confidence="high",
         has_interpretation=True,
+        carries_a_reading=True,
     )
 
     assert assessment.level == WEAK
@@ -61,6 +86,7 @@ def test_short_vision_text_uncorroborated_by_empty_ocr_is_weak() -> None:
         verbatim_text="some heading",  # too short to trust on its own
         text_confidence="medium",
         has_interpretation=True,
+        carries_a_reading=True,
     )
 
     assert assessment.level == WEAK
@@ -83,6 +109,7 @@ def test_a_confident_lone_reader_is_not_given_the_level_two_agreeing_readers_get
         verbatim_text="What a software factory needs Agent Runtimes Orchestration",
         text_confidence="high",
         has_interpretation=True,
+        carries_a_reading=True,
     )
 
     lone_reader = assess_grounding(
@@ -90,6 +117,7 @@ def test_a_confident_lone_reader_is_not_given_the_level_two_agreeing_readers_get
         verbatim_text="What a software factory needs Agent Runtimes Orchestration",
         text_confidence="high",
         has_interpretation=True,
+        carries_a_reading=True,
     )
 
     assert corroborated.level == CORROBORATED
@@ -97,3 +125,106 @@ def test_a_confident_lone_reader_is_not_given_the_level_two_agreeing_readers_get
     assert lone_reader.level != corroborated.level
     assert lone_reader.level == SELF_REPORT
     assert lone_reader.is_low_confidence is True
+
+
+def test_a_lone_readers_description_of_an_unreadable_frame_is_marked() -> None:
+    """The shape the prompt itself asks for when the text cannot be read.
+
+    Told to leave `verbatim_text` empty and set `text_confidence` to none when
+    a frame is unreadable, a model that describes the slide anyway comes back
+    with nothing but `visual_summary`. Neither reader recovered a word, and the
+    frame is emphatically not textless - a claim was made about it - so the one
+    answer this must not give is the unmarked one that says no text is present.
+    """
+    reading = Interpretation(
+        visual_summary="A slide titled 'Q3 revenue: $4.2M, up 340% YoY' with a bar chart",
+        text_confidence="none",
+        backend="rapid-mlx",
+        model="m",
+    )
+
+    assessment = _graded(ocr_text="", reading=reading)
+
+    assert reading.carries_a_reading is True
+    assert assessment.is_low_confidence is True
+    assert assessment.level != CORROBORATED
+    assert "no on-screen text present" not in assessment.reason
+
+
+def test_a_reading_admitting_it_cannot_read_the_frame_is_not_called_textless() -> None:
+    """A reading whose own `uncertainty` says the frame is unreadable.
+
+    The metadata fields describe a reading rather than being one, so this
+    payload's substance is its `visual_summary` alone - the same shape as
+    above, arriving with the model's own admission attached. The reason must
+    not tell an operator no text is present: the model just said it could not
+    read the text that is.
+    """
+    reading = Interpretation(
+        visual_summary="Chart of revenue by quarter",
+        uncertainty="cannot read the axis labels",
+        text_confidence="none",
+        backend="rapid-mlx",
+        model="m",
+    )
+
+    assessment = _graded(ocr_text="", reading=reading)
+
+    assert assessment.is_low_confidence is True
+    assert "no on-screen text present" not in assessment.reason
+
+
+def test_a_reading_is_only_a_description_when_visual_summary_carries_it() -> None:
+    """`has_interpretation` and `carries_a_reading` cannot answer differently.
+
+    Both are "is there a reading here" asked of the same object, and they
+    disagreed: `has_interpretation` looked at two fields where
+    `SUBSTANTIVE_FIELDS` names four. A description of the frame is something
+    the model said about it, whichever field it landed in.
+    """
+    summary_only = Interpretation(visual_summary="A dark slide with a bar chart")
+    elements_only = Interpretation(detected_elements=("axis", "legend"))
+    blank_elements = Interpretation(detected_elements=("", "  "))
+    transcription_only = Interpretation(verbatim_text="Q3 revenue")
+
+    assert summary_only.has_interpretation is True
+    assert elements_only.has_interpretation is True
+    # Whitespace is as empty as absent, the way a reading judges it.
+    assert blank_elements.has_interpretation is False
+    assert blank_elements.carries_a_reading is False
+    # Transcribing text is reading the frame, not describing it - and it is
+    # already the signal `verbatim_text` carries into the assessment.
+    assert transcription_only.has_interpretation is False
+    assert transcription_only.carries_a_reading is True
+
+
+def test_a_transcription_that_tokenizes_to_nothing_is_still_something_the_model_said() -> None:
+    """The other route to a reading no token survives: symbols, not words.
+
+    A frame showing `€ $ ¥` transcribes to text the tokenizer discards, so both
+    readers come back empty and nothing was described on top of it - the same
+    inputs as a blank slide, from a model that did read something. It is one
+    reader's word and nothing else, which is what SELF_REPORT names, and it is
+    not the frame the no-on-screen-text reason is reserved for.
+    """
+    reading = Interpretation(verbatim_text="€ $ ¥", text_confidence="low")
+
+    assessment = _graded(ocr_text="", reading=reading)
+
+    assert reading.carries_a_reading is True
+    assert reading.has_interpretation is False
+    assert assessment.level == SELF_REPORT
+    assert assessment.is_low_confidence is True
+
+
+def test_a_reading_that_said_nothing_at_all_still_reaches_the_unmarked_answer() -> None:
+    """The over-correction guard: an empty reading is still a textless frame.
+
+    `test_a_textless_frame_without_an_interpretation_is_not_marked` states the
+    same claim against the booleans; this states it from the reading they are
+    read off, so "mark whatever has no verbatim text" cannot pass.
+    """
+    reading = Interpretation(text_confidence="none")
+
+    assert reading.carries_a_reading is False
+    assert _graded(ocr_text="", reading=reading).level == CORROBORATED

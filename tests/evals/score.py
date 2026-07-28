@@ -149,6 +149,7 @@ def evaluate(
                     verbatim_text=result.verbatim_text,
                     text_confidence=result.text_confidence,
                     has_interpretation=result.has_interpretation,
+                    carries_a_reading=result.carries_a_reading,
                 )
                 flagged = assessment.is_low_confidence
             else:

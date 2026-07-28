@@ -120,6 +120,7 @@ def assess_grounding(
     verbatim_text: str,
     text_confidence: str,
     has_interpretation: bool,
+    carries_a_reading: bool,
 ) -> GroundingAssessment:
     """Compare OCR and vision-transcribed text to grade interpretation support.
 
@@ -132,6 +133,15 @@ def assess_grounding(
     Only agreement between the two readers returns ``CORROBORATED``. A lone
     reading, substantive and confident, returns ``SELF_REPORT``: this function
     grades support, and the support for a lone reading is the reading (R-42).
+
+    Three signals about the reading, not one, because "was anything said about
+    this frame" and "was anything said *beyond* transcribing it" are different
+    questions and only one of them was being asked. `verbatim_text` is what the
+    model transcribed, `has_interpretation` whether it described the frame on
+    top of that, and `carries_a_reading` whether it said anything at all - the
+    last is what tells a genuinely textless frame apart from one the model
+    described without being able to read it, and grading those the same was how
+    a description of an unreadable slide came back corroborated.
     """
     ocr_tokens = _tokens(ocr_text)
     vision_tokens = _tokens(verbatim_text)
@@ -181,8 +191,22 @@ def assess_grounding(
         return GroundingAssessment(
             WEAK, None, "no readable text available to corroborate the interpretation"
         )
+    if carries_a_reading:
+        # Nothing was described and no token survived tokenizing, yet the model
+        # did put something in a substantive field. One reader spoke and
+        # nothing supports it, which is what SELF_REPORT names.
+        return GroundingAssessment(
+            SELF_REPORT,
+            None,
+            "vision model's own reading only; OCR returned nothing to corroborate it",
+        )
     # Both readers were asked, both recovered nothing, and nothing claims
     # otherwise: a photo, a face, a blank slide. That is the two readers
     # agreeing on what the frame holds, and there is no interpretation over it
     # for a marker to warn about - so it is not low confidence.
+    #
+    # Reserved for that case alone. A model that described the frame while
+    # reading no text off it has claimed something, and this sentence would be
+    # false about the frame as well as unmarked - the level no render marks
+    # given to the reading most in need of marking.
     return GroundingAssessment(CORROBORATED, None, "no on-screen text present")

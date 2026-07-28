@@ -506,6 +506,19 @@ class Interpretation:
         "verbatim_text",
     )
 
+    DESCRIPTIVE_FIELDS: ClassVar[tuple[str, ...]] = tuple(
+        name for name in SUBSTANTIVE_FIELDS if name != "verbatim_text"
+    )
+    """`SUBSTANTIVE_FIELDS` minus the one that transcribes rather than describes.
+
+    Every field here says something *about* the frame; `verbatim_text` echoes
+    what was on it. **Grounding** already receives the transcription as its own
+    argument, so this is what is left for `has_interpretation` to answer - and
+    it is derived from `SUBSTANTIVE_FIELDS` rather than listed a second time,
+    because the two answers to "is there a reading" diverging is what let a
+    summary-only reading be graded as a textless frame.
+    """
+
     visual_summary: str = ""
     detected_elements: tuple[str, ...] = ()
     interpretation: str = ""
@@ -526,8 +539,20 @@ class Interpretation:
 
     @property
     def has_interpretation(self) -> bool:
-        """Whether the model said anything about the frame beyond reading it."""
-        return bool(self.interpretation.strip() or self.detected_elements)
+        """Whether the model said anything about the frame beyond reading it.
+
+        Asked of `DESCRIPTIVE_FIELDS` and judged by the same emptiness rule
+        `document_carries_a_reading` uses, so this and `carries_a_reading`
+        cannot answer differently about the same reading. They did: this
+        counted two fields where `SUBSTANTIVE_FIELDS` names four, so a reading
+        holding nothing but a `visual_summary` - the shape the prompt asks for
+        when the on-screen text cannot be read - reached **grounding** as
+        though the model had said nothing, and was graded a textless frame.
+        """
+        document = self.document()
+        return any(
+            _substantive_text(name, document.get(name)) for name in self.DESCRIPTIVE_FIELDS
+        )
 
     @property
     def carries_a_reading(self) -> bool:
