@@ -96,6 +96,12 @@ def test_cli_accepts_rapid_mlx_local_vision_options() -> None:
 
 
 def test_local_vision_diagnostics_cli_accepts_all_overrides() -> None:
+    """Every key `main` reads for this command is a flag the subparser registers.
+
+    "All overrides" is the claim, so the list is asserted against the one
+    `cli.main` actually forwards rather than against a list written out here:
+    a key added there and not here is exactly the crash this covers (D-022).
+    """
     from distill.cli import build_parser
 
     args = build_parser().parse_args(
@@ -110,6 +116,7 @@ def test_local_vision_diagnostics_cli_accepts_all_overrides() -> None:
             "http://127.0.0.1:8000/v1",
             "--local-vision-timeout-sec",
             "45",
+            "--local-vision-allow-remote-endpoint",
         ]
     )
 
@@ -118,6 +125,12 @@ def test_local_vision_diagnostics_cli_accepts_all_overrides() -> None:
     assert args.local_vision_model == "mlx-community/Qwen3-VL-8B-Instruct-8bit"
     assert args.local_vision_base_url == "http://127.0.0.1:8000/v1"
     assert args.local_vision_timeout_sec == 45.0
+    assert args.local_vision_allow_remote_endpoint is True
+
+    from distill.cli import LOCAL_VISION_DIAGNOSTIC_KEYS
+
+    for key in LOCAL_VISION_DIAGNOSTIC_KEYS:
+        assert hasattr(args, key), f"main() reads {key} but the subparser never registers it"
 
 
 def test_timeout_diagnostics_report_configured_and_effective_timeout() -> None:

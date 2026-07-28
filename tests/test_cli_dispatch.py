@@ -138,6 +138,55 @@ def test_call_tool_dispatch_runs_list_tools_via_session(
     assert "result" in payload or "error" in payload
 
 
+def test_local_vision_diagnostics_dispatch_runs_with_every_override(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The command runs, rather than only parsing (D-022).
+
+    `test_local_vision_diagnostics_cli_accepts_all_overrides` stops at the
+    parser, so a key `main` reads that the subparser never registered parsed
+    fine and died on dispatch. This drives the whole command with the probe
+    stubbed, which is the only part of it that wants a server.
+    """
+    from distill.local_vision import LocalVisionProbe
+
+    monkeypatch.setattr(
+        "distill.pipeline.probe_local_vision",
+        lambda config: LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="",
+            message="",
+            detail={},
+        ),
+    )
+    code, out, _ = _run(
+        [
+            "local-vision-diagnostics",
+            "--caption-frames",
+            "--local-vision-backend",
+            "rapid-mlx",
+            "--local-vision-model",
+            "mlx-community/Qwen3-VL-8B-Instruct-8bit",
+            "--local-vision-base-url",
+            "http://10.0.0.5:8000/v1",
+            "--local-vision-timeout-sec",
+            "45",
+            "--local-vision-allow-remote-endpoint",
+        ],
+        capsys,
+    )
+    assert code is None
+    payload = json.loads(out)
+    # The opt-out reached the config rather than only the namespace: without it
+    # a non-loopback base_url is a fatal E_BAD_OPTIONS before any probe runs.
+    assert payload["config"]["base_url"] == "http://10.0.0.5:8000/v1"
+    assert payload["probe"]["available"] is True
+
+
 def test_main_propagates_distill_error_to_stderr(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
