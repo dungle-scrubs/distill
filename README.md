@@ -31,22 +31,29 @@ uv add "distill-video @ git+https://github.com/dungle-scrubs/distill.git"
 
 ### System dependencies
 
-Install these with your package manager (e.g. [Homebrew](https://brew.sh) on macOS):
+Install these with your platform's package manager. Distill names what it needs
+and never installs it for you:
 
 | Tool | Capability | Class | Install |
 | --- | --- | --- | --- |
-| `ffmpeg` | audio extraction and keyframe extraction | required | `brew install ffmpeg` |
-| `ffprobe` | source duration probing | required | `brew install ffmpeg` |
-| `yt-dlp` | YouTube source acquisition and metadata | required | `brew install yt-dlp` |
-| `tesseract` | image-text extraction from keyframes | optional | `brew install tesseract` |
+| `ffmpeg` | audio extraction and keyframe extraction | required | your platform's package manager |
+| `ffprobe` | source duration probing | required | ships with `ffmpeg` |
+| `yt-dlp` | YouTube source acquisition and metadata | required | `uv tool install yt-dlp` |
+| `tesseract` | image-text extraction from keyframes | optional | your platform's package manager |
 | `rapid-mlx[vision]` | local vision server (see below) | optional | `pip install 'rapid-mlx[vision]'` |
 
 The class decides what an absent tool costs. An **optional** one degrades: the
 run records a warning naming what is missing and continues, so no vision server
 means OCR-only captions and no tesseract means vision-only captions. A
-**required** one is fatal: the run stops immediately, naming the tool and what
-its absence costs, rather than doing the work and producing a bundle with
-nothing in it. Per tool, an absence costs:
+**required** one is fatal: a run that has to *produce* a **generation** stops
+immediately, naming the tool and what its absence costs, rather than doing the
+work and producing a bundle with nothing in it.
+
+Both classes are about a run that does the work. A run that hits the cache does
+none of it - it serves the **generation** already on disk and invokes no
+external tool at all - so a cached YouTube bundle is servable with `yt-dlp`
+absent and a cached local bundle with `ffprobe` absent. Per tool, an absence
+costs:
 
 | Tool | Class | What its absence costs |
 | --- | --- | --- |
@@ -56,7 +63,7 @@ nothing in it. Per tool, an absence costs:
 | `tesseract` | optional | keyframes contribute no extracted text, so interpretations cannot be corroborated and grounding falls back to the vision model alone; the transcript, keyframes and render are unaffected |
 
 Distill never installs any of them - an absent optional tool is a warning, not a
-`brew install` Distill runs on your behalf. `src/distill/capabilities.py` holds
+package manager Distill runs on your behalf. `src/distill/capabilities.py` holds
 the table both tables above state in prose: every external tool Distill runs is
 listed with the class and the absence cost that table records, and the test
 suite fails if they disagree. The vision server is not a tool Distill runs, so
@@ -82,8 +89,9 @@ distill cleanup-cache --keep-generations 3 --dry-run
 ## Output layout
 
 Output lands under `~/.cache/distill` by default; override the root with
-`--output-dir`. Each run publishes one **generation** into the **bundle** that
-its **bundle key** names:
+`--output-dir`. A run that does the work publishes one **generation** into the
+**bundle** that its **bundle key** names; a run that hits the cache publishes
+nothing and serves the generation already there:
 
 ```
 ~/.cache/distill/
@@ -157,6 +165,26 @@ on stdout. An argument the parser rejects is argparse's usage message, also exit
 Python traceback instead of being converted; it is a debugging aid, not a
 contract.
 
+Two endings are deliberately not that shape, because neither is a failure to
+diagnose. `Ctrl-C` ends the command with Python's own `KeyboardInterrupt`
+traceback and exit 130 - the operator stopped their own command. A caller that
+stops reading stdout (`distill … | head`) ends it at exit 141, the conventional
+128 + `SIGPIPE`, with nothing on stderr.
+
+**stderr carries two kinds of record.** A processing run reports progress there
+as it goes - one NDJSON record per event, each carrying `"type":
+"distill.progress"`. The fatal error record has no `type` field and is the last
+record Distill writes, so a failing run's stderr is read a line at a time and
+the record without a `type` is the failure; parsing the whole stream as one
+document fails at the first newline. Lines that are not JSON at all come from
+libraries Distill imports rather than from Distill.
+
+**"Nothing on stdout" means nothing was written there, not that a write can be
+taken back.** A failing command fails before it prints a result, so stdout stays
+empty. The exception is a caller who closes the pipe part-way through one:
+those bytes have already left, Distill exits 141, and no guarantee about
+stdout's contents survives a descriptor the caller broke.
+
 | Command | Purpose |
 | --- | --- |
 | `process-local-video PATH` | Process one local video file into a bundle. |
@@ -170,7 +198,7 @@ contract.
 | `timeout-diagnostics` | Show the configured vs. effective timeout (assumption A-004). |
 | `timeout-probe PROBE_MS` | Sleep for a bounded timeout probe; long probes require `DISTILL_ENABLE_LONG_TIMEOUT_PROBE=1`. |
 | `local-vision-diagnostics` | Probe the local Rapid-MLX vision server and print the resolved config. Flags: `--caption-frames/--no-caption-frames`, `--local-vision-backend`, `--local-vision-model`, `--local-vision-base-url`, `--local-vision-timeout-sec`, `--local-vision-allow-remote-endpoint/--no-local-vision-allow-remote-endpoint`. |
-| `call-tool TOOL [--args JSON]` | Call any registered tool by its MCP-style name with a JSON arguments object. |
+| `call-tool TOOL [--args JSON]` | Call any registered tool by its MCP-style name with a JSON arguments object. Prints the MCP envelope, so the tool's own JSON is the string at `.result.content[0].text` rather than the printed document itself. |
 
 The processing commands (`process-local-video`, `process-youtube-video`,
 `process-youtube-playlist`) share these options: `--whisper-model`,
@@ -193,10 +221,14 @@ expressed; and `--local-vision-timeout-sec` has a ceiling of what a socket
 timeout can hold. `--max-keyframes` and `--max-items` are counts, so a negative
 one is refused rather than read as a slice from the end.
 
-A batch run (`process-video-directory`, `process-youtube-playlist`) reports each
-failed item as the whole error record - `code`, `stage`, `message`, `details` -
-plus the `batch_index` it failed at, so an item that a re-run would pick up can
-be told from one that will fail the same way forever.
+A batch run (`process-video-directory`, `process-youtube-playlist`) that
+continues past a failed item - the default, `--continue-on-error` - reports each
+one as the whole error record: `code`, `stage`, `message`, `details`, plus the
+`batch_index` it failed at, so an item that a re-run would pick up can be told
+from one that will fail the same way forever. With `--no-continue-on-error`
+there is no such report: the first item's error ends the batch and is raised as
+the run's own fatal error, so it reaches you as the error object on stderr,
+naming no item and no index.
 
 ### Upgrading a cache written by 0.1.0
 

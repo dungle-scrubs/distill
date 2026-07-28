@@ -9,8 +9,24 @@ python died", and the stack names Distill's internals to whoever ran the
 command.
 
 What the boundary owes, stated once because every test here is one half of it:
-the **fatal error** record (`code`, `stage`, `message`, `details`) as JSON on
-stderr, exit code 2, and no traceback text on either stream.
+for an exception a command raised, the **fatal error** record (`code`, `stage`,
+`message`, `details`) as JSON on stderr, exit code 2, and no traceback text on
+either stream.
+
+*An exception a command raised*, and not every way a command can end. Three
+endings are deliberately outside that shape, and each is covered here as what it
+is rather than as a gap: an argument the parser rejects is argparse's usage
+message and exit 2; `Ctrl-C` is `KeyboardInterrupt`, which leaves with the
+interpreter's own traceback and exit 130 because the operator ended their own
+command; and a caller that stops reading stdout gets exit 141, because nothing
+failed.
+
+Nor is stderr the record and nothing else. A processing run writes NDJSON
+**progress** records there as it goes, so the record is the last thing Distill
+writes rather than the whole stream -
+`test_a_failing_run_leaves_the_error_record_as_the_last_line_of_stderr` is the
+one test here that drives a command emitting progress, and `error_object` below
+is usable by the others only because the commands they drive emit none.
 
 R-46's other half is at the bottom of this file. A batch reports each item that
 failed, and it flattened every failure to `str(exc)` - so a **fatal error** that
@@ -731,6 +747,73 @@ def test_the_error_object_names_the_exception_without_printing_its_stack(
     assert payload["details"]["exception"] == "ZeroDivisionError"
     assert "division by zero" in payload["details"]["message"]
     assert "File \"" not in json.dumps(payload)
+
+
+def test_a_failing_run_leaves_the_error_record_as_the_last_line_of_stderr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The error channel is shared with the progress stream, and that is the contract.
+
+    Every other test in this file drives a command that emits no progress, so
+    each one could read the whole of stderr as the record. A processing command
+    cannot: progress is NDJSON on stderr from the first mechanism onward, so by
+    the time a stage fails the error record is the *last* line of a stream, not
+    the whole of it. A caller told only "the error object is on stderr" would
+    `json.loads` the lot and fail on the first newline.
+
+    What separates them is a field. Every progress record carries
+    `type: distill.progress`; the **fatal error** record carries `code`,
+    `stage`, `message` and `details` and no `type` at all, so the two are told
+    apart by shape - and the record is the last thing Distill writes, so a
+    caller wanting only the failure can take it from the end.
+
+    Distill's own lines, and not every line: an imported library writes to
+    stderr when it feels like it (on this platform `av` emits a dyld class
+    warning), which is why the claim is about the records Distill writes rather
+    than about the bytes on the descriptor.
+    """
+    from test_local_integration import fake_transcribe, make_short_screencast
+
+    from distill import pipeline as distill_pipeline
+
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+
+    def fail_at_the_render(*_args: object, **_kwargs: object) -> Any:
+        raise DistillError("E_BAD_RENDER", "render", "the render could not be written")
+
+    # Transcription is faked because a real one loads a model; keyframe
+    # selection is real, because it is the stage whose progress this test is
+    # about. The failure is put after it, which is where a real one lands.
+    monkeypatch.setattr(distill_pipeline, "transcribe_with_imports", fake_transcribe)
+    monkeypatch.setattr(distill_pipeline, "render_markdown", fail_at_the_render)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [
+                "process-local-video",
+                str(video),
+                "--output-dir",
+                str(tmp_path / "cache"),
+                "--no-ocr",
+                "--no-caption-frames",
+            ]
+        )
+
+    assert exit_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    records = [
+        json.loads(line)
+        for line in captured.err.splitlines()
+        if line.startswith("{") and line.rstrip().endswith("}")
+    ]
+
+    assert len(records) > 1, "the command emitted no progress, so it proves nothing"
+    assert all(record["type"] == "distill.progress" for record in records[:-1])
+    assert "type" not in records[-1]
+    assert records[-1]["code"] == "E_BAD_RENDER"
+    assert set(records[-1]) >= FATAL_ERROR_FIELDS
 
 
 def test_a_distill_error_still_reaches_stderr_unchanged(

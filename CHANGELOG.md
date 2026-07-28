@@ -15,8 +15,9 @@ stay readable where the format allows and are otherwise reprocessed.
 
 - **Distill installs nothing.** A missing `tesseract` used to make Distill run
   `brew install tesseract` on the user's behalf. It now records a warning and
-  the run continues without image-text extraction. Homebrew is a documented way
-  to install the system dependencies; it is never something Distill invokes.
+  the run continues without image-text extraction. Installing the system
+  dependencies is the operator's to do, by whatever means they choose; Distill
+  names what is missing and never invokes a package manager.
 - **Every external tool is classified optional or required, and the two behave
   differently.** A missing optional capability (`tesseract`, the vision server)
   degrades the bundle with a warning and the run continues; a missing required
@@ -31,9 +32,12 @@ stay readable where the format allows and are otherwise reprocessed.
   `DISTILL_TRACEBACK=1` re-raises with the traceback for debugging.
 - **Batch item errors carry the whole record.** `process-video-directory` and
   `process-youtube-playlist` reported a failed item as `{item_key, message}`.
-  Each error now carries `code`, `stage`, `message`, `details` and its
-  `batch_index`; the flattened `message`-only shape is gone, as is the
-  `DistillSession` envelope that hid the record inside a message string.
+  A batch that continues past a failure - the default - now reports each one
+  with `code`, `stage`, `message`, `details` and its `batch_index`; the
+  flattened `message`-only shape is gone, as is the `DistillSession` envelope
+  that hid the record inside a message string. `--no-continue-on-error` is
+  unchanged and produces no such report: the first item's error ends the batch
+  and is raised as the run's own fatal error, naming no item and no index.
 - **Numeric options are validated rather than taken as written.** Each has a
   domain, and a value outside it is refused with `E_BAD_OPTIONS` naming the
   option. The domain is a finite quantity above zero, with three exceptions:
@@ -79,6 +83,16 @@ stay readable where the format allows and are otherwise reprocessed.
 - **A YouTube watch URL carrying a `list` parameter acquires the one video the
   URL names.** yt-dlp reads such a URL as the playlist, so `watch?v=A&list=P`
   resolved and downloaded every entry of `P`.
+- **The `grounded` grounding level is gone, split into `corroborated` and
+  `self_report`.** One word named two different things: two readers
+  independently recovering the same text from a keyframe, and one reader
+  vouching for its own reading. Only the first is evidence, and only
+  `corroborated` is now treated as anything but low confidence - the render
+  marks a `self_report` reading as unconfirmed. A consumer of a frame artifact's
+  `grounding.level`, or of a render, that branches on `"grounded"` matches
+  nothing and will go on matching nothing: it must test for `"corroborated"`,
+  and decide for itself what to do with `"self_report"`. The other two levels,
+  `weak` and `ungrounded`, are unchanged.
 
 ### Added
 
@@ -94,8 +108,6 @@ stay readable where the format allows and are otherwise reprocessed.
   transport failures the run degrades to OCR-only for the remainder and records
   one warning with the failure count, instead of waiting out a timeout per
   remaining keyframe.
-- A distinct grounding level for a single reader vouching for itself, separate
-  from two readers independently agreeing, and shown as such in the render.
 
 ### Changed
 
@@ -110,9 +122,12 @@ stay readable where the format allows and are otherwise reprocessed.
   pattern matching over recovered text: it reduces what leaks into a bundle and
   does not make one safe to publish.
 - Concurrency between runs on one bundle key is now the kernel's, via a lock
-  held for the run's duration. A second run waits and then fails `E_LOCKED` -
-  5 seconds for a batch item, 300 seconds for a single-source run - rather than
-  stealing a lock whose heartbeat looked stale.
+  held for the run's duration. A second run waits for the holder - up to
+  5 seconds for a batch item, 300 seconds for a single-source run - and fails
+  `E_LOCKED` only if the lock is still held when that budget runs out. A waiter
+  that gets in proceeds, and one that arrives after the holder published is
+  served that bundle instead of redoing the work. Nothing steals a lock whose
+  heartbeat looked stale.
 - A run that fails records a terminal failure in its job record; a record left
   `running` is reported as abandoned rather than read as complete.
 - Every external process runs through one path that reads both pipes and kills

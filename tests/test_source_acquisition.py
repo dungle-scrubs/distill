@@ -1342,16 +1342,20 @@ def test_a_manifests_recorded_duration_is_read_as_input_rather_than_fact(
     assert manifest_duration(recorded) == expected
 
 
-# A fake yt-dlp that answers a `--print` invocation and records the argv it was
-# handed, appending rather than overwriting so a test can see every call a run
-# made rather than only the last one.
+# A fake yt-dlp that answers each metadata invocation in the shape that
+# invocation asks for, and records the argv it was handed - appending rather
+# than overwriting, so a test sees every call a run made and not only the last.
 FAKE_YTDLP_RECORDING_EVERY_ARGV = """
-import os, pathlib, sys
+import json, os, sys
 
 argv = sys.argv[1:]
 with open(os.environ["FAKE_YTDLP_ARGV_LOG"], "a") as handle:
     handle.write(repr(argv) + "\\n")
-sys.stdout.write(argv[-1].rsplit("=", 1)[-1].rsplit("/", 1)[-1] + "\\n")
+tail = argv[-1].rsplit("=", 1)[-1].rsplit("/", 1)[-1]
+if "--dump-json" in argv:
+    sys.stdout.write(json.dumps({"id": tail, "title": "a video", "description": ""}) + "\\n")
+else:
+    sys.stdout.write(tail + "\\n")
 """
 
 
@@ -1391,7 +1395,26 @@ def test_downloading_a_watch_url_acquires_the_one_video_the_url_names(
     assert "--no-playlist" in literal_eval(argv_file.read_text())
 
 
+def metadata_readers() -> dict[str, Callable[[str], object]]:
+    """Every function that asks yt-dlp about one video without downloading it.
+
+    Named here rather than in the parametrize list so the three are imported at
+    call time, and so the reason they are together is stated once: each builds a
+    non-downloading invocation, and each was making the same mistake about the
+    same URL shape.
+    """
+    from distill.source import canonical_youtube_id, youtube_description, youtube_metadata
+
+    return {
+        "canonical_youtube_id": canonical_youtube_id,
+        "youtube_metadata": youtube_metadata,
+        "youtube_description": youtube_description,
+    }
+
+
+@pytest.mark.parametrize("reader", sorted(metadata_readers()))
 def test_resolving_a_watch_url_resolves_the_one_video_the_url_names(
+    reader: str,
     fake_tool: Callable[[str, str], Path],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1399,17 +1422,22 @@ def test_resolving_a_watch_url_resolves_the_one_video_the_url_names(
     """FAILS FIRST: the metadata calls read the playlist too.
 
     `--dump-json` over a playlist emits one document per entry, which does not
-    parse as one, and `--print id` prints one line per entry. Both are the same
+    parse as one; `--print id` prints one line per entry; `--print
+    %(description)s` prints somebody else's description. All three are the same
     mistake as the download's, and a resolution that disagreed with the download
     about which video this URL is would be worse than either.
-    """
-    from distill.source import canonical_youtube_id
 
+    One case per reader, because the first form of this test discussed all three
+    and drove only `canonical_youtube_id`: `--no-playlist` is added by the
+    shared command builder, so one reader passing is evidence about the builder
+    and not about the readers - and a reader that stopped going through the
+    builder would leave the claim standing with nothing under it.
+    """
     fake_tool("yt-dlp", FAKE_YTDLP_RECORDING_EVERY_ARGV)
     argv_log = tmp_path / "argv.log"
     monkeypatch.setenv("FAKE_YTDLP_ARGV_LOG", str(argv_log))
 
-    canonical_youtube_id("https://www.youtube.com/watch?v=abc123&list=PLxyz")
+    metadata_readers()[reader]("https://www.youtube.com/watch?v=abc123&list=PLxyz")
 
     invocations = recorded_invocations(argv_log)
 

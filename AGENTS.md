@@ -11,6 +11,12 @@ two disagree. Per ADR-0002 the class decides the consequence: an absent
 bundle, and the run continues - while an absent **required capability** is a
 **fatal error** that ends the run before it does the work.
 
+"Before it does the work" is the scope, and it matters: a run that hits the
+cache does no work and invokes no external tool at all (M8.3, R-49). A required
+capability is fatal to a run that has to *produce* a **generation**; a **bundle**
+already on disk is servable with `yt-dlp` or `ffprobe` missing, and the tests
+that hold that are in `tests/test_cache_before_capability.py`.
+
 | Tool | Capability | Class | What its absence costs |
 | --- | --- | --- | --- |
 | `ffmpeg` | audio extraction and keyframe extraction | required | no audio can be extracted and no keyframe can be captured, which leaves a generation with neither a transcript nor frame artifacts and no usable bundle to publish |
@@ -23,9 +29,14 @@ absence costs rather than deciding for itself, so no site can quietly degrade a
 required capability. Distill installs nothing: an absent optional tool is a
 warning, never a package manager Distill runs on the user's behalf.
 
-The vision server is not a tool Distill runs, so it is not in that table. Its
-absence degrades the same way tesseract's does - OCR-only output, one warning -
-and the local-vision tests are what hold that.
+The vision server is not a tool Distill runs, so it is not in that table. It is
+optional in the same *sense* - one **warning**, and the run continues - and the
+two absences cost opposite things, which "degrades the same way tesseract's
+does" got backwards. Without the vision server a **keyframe** is described by
+whatever `tesseract` extracted from it: OCR-only output. Without `tesseract` a
+keyframe is described by the vision model alone, so an interpretation has
+nothing to corroborate it and **grounding** falls back to a single reader. The
+local-vision tests hold the first; the row above states the second.
 
 ## Local vision: Rapid-MLX, direct
 
