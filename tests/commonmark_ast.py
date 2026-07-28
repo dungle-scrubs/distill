@@ -1,10 +1,12 @@
 """A **render** read by a real CommonMark parser, not by a scanner of our own.
 
-This module owns the answer to "what does a reader actually get?" for the two
-things `emit.link_label` and `emit.link_destination` have to be true of: where a
-link points, and what its label says. It answers by parsing the render with
+This module owns the answer to "what does a reader actually get?" - where a link
+points and what its label says, which is what `emit.link_label` and
+`emit.link_destination` have to be true of, and which regions a reader treats as
+code rather than as document structure. It answers by parsing the render with
 `markdown-it-py` in CommonMark mode and reporting the resulting token stream -
-destinations as the parser resolved them, label text as the parser decoded it.
+destinations as the parser resolved them, label text as the parser decoded it,
+code blocks with the reader's own closing rule rather than a stricter one.
 
 Why not the scanner this replaced. `tests/test_render_delimiting.py` used to
 find links by walking the text and undoing backslash escapes, and it could only
@@ -24,9 +26,11 @@ neighbours are left encoded, which is `mdurl`'s own default and the reason a
 destination that *carried* `%2F` still round-trips.
 
 What this module does not own. It does not know what a render should say, which
-regions are **extracted text**, or where a fence belongs: `untrusted_blocks` owns
-the fence and the structure outside it, and the tests own the claims. It reports
-what a reader saw and nothing about whether that was right.
+regions are **extracted text**, or which fences Distill was entitled to open: it
+reports the blocks a reader resolved, whoever opened them, and `untrusted_blocks`
+is what asks whether the *render* opened, tagged and explicitly closed one. The
+tests own the claims; this module reports what a reader saw and nothing about
+whether that was right.
 
 One property worth naming because assertions here rely on it: content inside a
 fenced block is not parsed as inline content, so a payload that wrote `[a](b)`
@@ -48,6 +52,18 @@ READER = MarkdownIt("commonmark")
 render is written in and the smallest one a downstream reader is likely to use."""
 
 LinkKind = Literal["inline", "autolink", "image"]
+
+
+@dataclass(frozen=True)
+class CodeBlock:
+    """One code block as a reader resolved it: its info string and its content.
+
+    `content` is the text the reader treats as code rather than as document
+    structure, which is the question a delimiter exists to settle.
+    """
+
+    info: str
+    content: str
 
 
 @dataclass(frozen=True)
@@ -152,6 +168,23 @@ def autolinks(markdown: str) -> list[str]:
     inside a label wins, and the destination the render chose is dropped.
     """
     return [link.destination for link in links(markdown) if link.kind == "autolink"]
+
+
+def code_blocks(markdown: str) -> list[CodeBlock]:
+    """Every code block a CommonMark reader resolves, in document order.
+
+    The reader's own closing rule, including the one `untrusted_blocks` declines
+    to follow: a fence nothing ever closes runs to the end of the document, and
+    everything it swallowed is code. That is what makes "the helper is stricter
+    than a reader, and stricter in the direction that reports an escape rather
+    than hiding one" a claim a test can check instead of a sentence in a
+    docstring.
+    """
+    return [
+        CodeBlock(info=token.info.strip(), content=token.content)
+        for token in READER.parse(markdown)
+        if token.type in ("fence", "code_block")
+    ]
 
 
 def raw_html(markdown: str) -> list[str]:

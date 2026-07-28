@@ -9,11 +9,16 @@ the frame showed rather than as instruction (R-28).
 
 Delimiting is a mitigation and not a guarantee. A sufficiently persuasive
 payload may still influence the model; what these tests check is that extracted
-text cannot *stop being quoted* - that it cannot close the block holding it and
-appear among Distill's own instruction lines - and that the prompt says on what
-terms the image and the block are to be read. Raising the cost of a payload and
-making its provenance legible is all this buys, and no test here claims more
+text did not *stop being quoted* - that it did not close the block holding it
+and appear among Distill's own instruction lines - and that the prompt says on
+what terms the image and the block are to be read. Raising the cost of a payload
+and making its provenance legible is all this buys, and no test here claims more
 (D-022).
+
+The block checks run through `untrusted_blocks`, which is a conservative
+validator of explicit closure rather than a CommonMark parser: it counts a block
+only where Distill opened, tagged and closed one, which is stricter than a
+reader in the direction that reports an escape rather than hiding one.
 """
 
 from __future__ import annotations

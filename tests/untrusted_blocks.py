@@ -1,4 +1,4 @@
-"""Reading text the way a downstream reader does, to ask where a payload landed.
+"""Checking that Distill closed the block it opened, and where a payload landed.
 
 Shared by the tests that check the **untrusted-data boundary** wherever Distill
 puts one: a **render** written to be fed to an LLM agent, and the prompt sent to
@@ -7,21 +7,34 @@ the fence `distill.emit` chooses, and both are asking the same question - did
 the payload stay inside the block, or did it become something the surrounding
 text vouches for?
 
-The assertions built on this are structural rather than textual on purpose.
-`_scan` closes a fence only the way a CommonMark reader closes one, so a test
-passes because the payload is *inside* a block that reader recognizes, not
-because the text happened to contain a string. `outside_fences` is the other
-half: everything a reader sees as structure, where a payload's sentinel turning
-up is the finding whatever else was got right.
+The assertions built on this are structural rather than textual on purpose: a
+test passes because the payload is *inside* a block, not because the text
+happened to contain a string. `outside_fences` is the other half - everything
+this scanner does not count as a block - where a payload's sentinel turning up
+is the finding whatever else was got right.
 
-This module owns the parser and the two fixtures every such test needs - an
-adversarial payload, and the assertion pairing "it is inside a block" with "it
-did not escape one". It does not own what a render or a prompt should say; those
-belong to the tests that assert them.
+What `_scan` is. It is **not a CommonMark parser**, and no test built on it may
+be read as one that was checked by a reader. It is a conservative validator of
+*explicit closure*: a region counts as quoted only where the render opened a
+fence, tagged it `untrusted-text`, and wrote a closing fence for it. Where
+CommonMark is more forgiving - it ends an unclosed fence at the end of the
+containing block or the document, and calls everything swallowed on the way
+code - this scanner is deliberately stricter and calls the unclosed region
+structure. That divergence is the whole of the difference, it is in the
+direction that reports an escape rather than hiding one, and
+`tests/test_untrusted_blocks.py` holds it against `markdown-it-py` so this
+paragraph is a comparison rather than a claim about itself. A test needing the
+reader's own answer asks `commonmark_ast`, which is a parser this suite does
+not own.
+
+This module owns the closure check and the two fixtures every such test needs -
+an adversarial payload, and the assertion pairing "it is inside a block" with
+"it did not escape one". It does not own what a render or a prompt should say;
+those belong to the tests that assert them.
 
 Delimiting is a mitigation and not a guarantee (D-022). A sufficiently
 persuasive payload may still influence a downstream model; what these helpers
-can check is that a payload cannot *stop being quoted*, and nothing built on
+can check is that a payload did not *stop being quoted*, and nothing built on
 them claims more.
 """
 
@@ -40,7 +53,12 @@ FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,})[ \t]*$")
 
 @dataclass(frozen=True)
 class FencedBlock:
-    """One fenced block as a CommonMark reader sees it: its info string and body."""
+    """One block the render opened, tagged and closed: its info string and body.
+
+    A reader would resolve the same block from the same text; what a reader
+    would *also* resolve, and this does not report, is a block whose closing
+    fence never arrived.
+    """
 
     info: str
     body: str
@@ -48,20 +66,25 @@ class FencedBlock:
 
 
 def _scan(text: str) -> tuple[list[FencedBlock], list[str]]:
-    """Split `text` into the blocks Distill opened and everything else.
+    """Split `text` into the blocks Distill explicitly closed and everything else.
 
-    A block counts only when Distill opened it, tagged it, and closed it. Two
+    A validator of explicit closure and not a CommonMark parser. A block counts
+    only when Distill opened it, tagged it, and wrote its closing fence. Two
     failures would otherwise hide themselves from this check:
 
     A fence the *content* opened is not a delimiter, it is a payload that got
     loose - an undelimited line beginning with three backticks swallows the
-    rest of the document, and a parser that honoured it would call that quoted.
+    rest of the document, and honouring it would call that quoted.
 
-    A block that was never closed is not a block either. Its "body" would run
-    to the end of the text, so every later payload would appear to be inside
-    it, and an assertion that the payload is delimited would pass because the
-    delimiter failed. Unclosed lines go back to the structure they are in fact
-    part of.
+    A block that was never closed is not counted either, and this is where the
+    strictness is deliberate. CommonMark closes such a block at the end of the
+    containing block or the document and calls its contents code; scored that
+    way, an unclosed block's "body" would run to the end of the text, every
+    later payload would appear to be inside it, and an assertion that the
+    payload is delimited would pass because the delimiter failed. Unclosed
+    lines go back to the structure they are in fact part of, so a missing
+    closer is reported as an escape. A reader would be more forgiving than
+    that; a test asking what a reader resolved asks `commonmark_ast`.
 
     Within a block the closing rule is CommonMark's own - a run of backticks at
     least as long as the opener, carrying no info string - because that is what
@@ -70,8 +93,8 @@ def _scan(text: str) -> tuple[list[FencedBlock], list[str]]:
     Lines are split on CR, LF and CRLF, which is CommonMark's own definition of
     a line ending. Splitting on LF alone leaves a lone CR inside a line, so a
     payload carrying `\\r```\\r` would close its block to a real reader while
-    this parser saw one unbroken line and called the payload quoted - the
-    parser would be hiding the escape it exists to find. `emit.delimit`
+    this scanner saw one unbroken line and called the payload quoted - the
+    scanner would be hiding the escape it exists to find. `emit.delimit`
     normalizes line endings for the same reason, at the other end of the same
     problem.
     """
@@ -106,16 +129,19 @@ def _scan(text: str) -> tuple[list[FencedBlock], list[str]]:
 
 
 def fenced_blocks(text: str) -> list[FencedBlock]:
-    """Every block Distill opened and tagged as **extracted text**."""
+    """Every block Distill opened, tagged as **extracted text** and closed."""
     return _scan(text)[0]
 
 
 def outside_fences(text: str) -> str:
-    """Everything in `text` a reader treats as Distill's own words.
+    """Everything in `text` this scanner will not vouch for as quoted.
 
-    The complement of `fenced_blocks`. Text found here is text Distill is
-    presenting as its own - document structure in a render, instruction in a
-    prompt.
+    The complement of `fenced_blocks`, and read as text Distill is presenting
+    as its own - document structure in a render, instruction in a prompt. It is
+    a superset of what a reader would treat that way, by exactly the unclosed
+    block `_scan` refuses to count: text that lands here has not been shown to
+    be quoted, which is the question, rather than shown to be read as
+    instruction.
     """
     return "\n".join(_scan(text)[1])
 

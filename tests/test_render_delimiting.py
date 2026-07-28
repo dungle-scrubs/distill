@@ -2,22 +2,25 @@
 
 A render is written to be fed to an LLM agent, and every word of extracted text
 in it was chosen by whoever produced the **source**. It is therefore
-attacker-controlled input to a downstream model, and the boundary is what keeps
-it data rather than instruction (R-24 through R-27, finding 5, RV-5).
+attacker-controlled input to a downstream model, and the boundary is what marks
+it as quoted data and reduces the chance of it being read as Distill's own
+instructions (R-24 through R-27, finding 5, RV-5).
 
 The boundary is a mitigation and not a guarantee. A sufficiently persuasive
 payload may still influence a model that reads the render; what these tests
-check is that a payload cannot *stop being quoted* - that it cannot close the
+check is that a payload did not *stop being quoted* - that it did not close the
 fence it is in, retarget the link it labels, or emit a heading, a bullet or an
 instruction line the document structure vouches for. Raising the cost of a
 payload and making its provenance legible is all this buys, and no test here
 claims more (D-022).
 
-The assertions are structural rather than textual on purpose: `untrusted_blocks`
-parses the render the way a CommonMark reader does, so a test passes because the
-payload is *inside* a block that reader recognizes, not because the render
-happened to contain a string, and `outside_fences` is everything a reader sees
-as document structure instead.
+The assertions are structural rather than textual on purpose. `untrusted_blocks`
+is a conservative validator of explicit closure rather than a CommonMark parser,
+so a test passes because the payload is inside a block the render opened, tagged
+and closed, not because the render happened to contain a string; `outside_fences`
+is everything it will not vouch for as quoted. Where a test needs the answer a
+reader actually resolves - which is the question R-27 asks of a link - it asks
+`commonmark_ast`, which parses with `markdown-it-py`.
 """
 
 from __future__ import annotations
