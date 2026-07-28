@@ -139,7 +139,7 @@ from .artifacts import (
     serialize,
 )
 from .emit import EMITTER
-from .errors import DistillError
+from .errors import DistillError, errno_name
 
 LOGGER = logging.getLogger(__name__)
 
@@ -512,7 +512,6 @@ class ExclusiveLock:
                 os.close(fd)
             if exc.errno in _LOCK_HELD_ERRNOS:
                 return None
-            reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
             raise DistillError(
                 "E_LOCK_UNSUPPORTED",
                 stage,
@@ -520,7 +519,7 @@ class ExclusiveLock:
                 {
                     "subject": subject,
                     "lock_path": str(path),
-                    "errno": reported or str(exc.errno),
+                    "errno": errno_name(exc),
                 },
             ) from exc
         except BaseException:
@@ -568,7 +567,6 @@ class ExclusiveLock:
         except OSError as exc:
             if exc.errno in _LOCK_HELD_ERRNOS:
                 return
-            reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
             raise DistillError(
                 "E_LOCK_UNSUPPORTED",
                 stage,
@@ -576,7 +574,7 @@ class ExclusiveLock:
                 {
                     "subject": subject,
                     "lock_path": str(directory),
-                    "errno": reported or str(exc.errno),
+                    "errno": errno_name(exc),
                 },
             ) from exc
         else:
@@ -1355,7 +1353,7 @@ class BundleStore:
             # proved and a user may have taken away. One target Distill cannot
             # remove must not cost the report on every target it did - the
             # command that deletes is the one that most has to say what it did.
-            return PruneResult(target, "skipped", f"removal failed: {_errno_name(exc)}")
+            return PruneResult(target, "skipped", f"removal failed: {errno_name(exc)}")
         return PruneResult(target, "deleted", target.reason)
 
     def survey(self) -> StoreSurvey:
@@ -1445,7 +1443,7 @@ class BundleStore:
                 scan.considered += 1
                 scan.skipped.append(
                     DirectorySkip(
-                        child, "unreadable", f"entry could not be read: {_errno_name(exc)}"
+                        child, "unreadable", f"entry could not be read: {errno_name(exc)}"
                     )
                 )
                 continue
@@ -1882,11 +1880,6 @@ def _skip_reason(verdict: MarkerVerdict) -> str:
     return verdict.reason
 
 
-def _errno_name(exc: OSError) -> str:
-    """The symbolic errno of a refusal, for a reason a user can act on."""
-    return (errno.errorcode.get(exc.errno, "") if exc.errno is not None else "") or str(exc.errno)
-
-
 def _file_state(path: Path) -> FileState:
     """What is at `path`: an ordinary file, something else, or nothing.
 
@@ -1942,7 +1935,7 @@ def _root_directory_exists(root: Path) -> bool:
             "E_OUTPUT_ROOT_UNREADABLE",
             "bundle",
             "output root could not be read",
-            {"root": str(root), "errno": _errno_name(exc)},
+            {"root": str(root), "errno": errno_name(exc)},
         ) from exc
     return stat.S_ISDIR(info.st_mode)
 
@@ -1980,7 +1973,7 @@ def _listing(directory: Path) -> tuple[list[Path], str | None]:
     try:
         return sorted(directory.iterdir()), None
     except OSError as exc:
-        return [], f"directory could not be listed: {_errno_name(exc)}"
+        return [], f"directory could not be listed: {errno_name(exc)}"
 
 
 def prune_lock_path(bundle_root: Path) -> Path:
@@ -2216,7 +2209,7 @@ def read_marker(directory: Path) -> MarkerVerdict:
     except OSError as exc:
         return MarkerVerdict(
             kind="unreadable",
-            reason=f"directory could not be read: {_errno_name(exc)}",
+            reason=f"directory could not be read: {errno_name(exc)}",
         )
 
     for name, state in (
@@ -2539,7 +2532,7 @@ def read_stage_result(
     try:
         state = _file_state(path)
     except OSError as exc:
-        _reject_stage_result(name, bundle_key, f"unstattable: {_errno_name(exc)}")
+        _reject_stage_result(name, bundle_key, f"unstattable: {errno_name(exc)}")
         return None
     if state == "absent":
         return None
@@ -2742,7 +2735,7 @@ def write_stage_result(
         # A full disk, a read-only mount, a file this process may not write:
         # scratch that cannot be recorded, on the same terms as a target that
         # was never usable. The run has the payload in hand either way.
-        _unrecordable_stage_result(name, bundle_key, f"write_refused: {_errno_name(exc)}")
+        _unrecordable_stage_result(name, bundle_key, f"write_refused: {errno_name(exc)}")
 
 
 def _recordable_stage_result(
@@ -2772,7 +2765,7 @@ def _recordable_stage_result(
         _unrecordable_stage_result(stage, bundle_key, f"path_refused: {exc.code}")
         return False
     except OSError as exc:
-        _unrecordable_stage_result(stage, bundle_key, f"unstattable: {_errno_name(exc)}")
+        _unrecordable_stage_result(stage, bundle_key, f"unstattable: {errno_name(exc)}")
         return False
     if state == "irregular":
         _unrecordable_stage_result(stage, bundle_key, "not_a_regular_file")
@@ -2951,7 +2944,7 @@ def _require_render(paths: BundlePaths) -> None:
         state = _file_state(render)
     except OSError as exc:
         state = "absent"
-        LOGGER.debug("render state unreadable: %s", _errno_name(exc))
+        LOGGER.debug("render state unreadable: %s", errno_name(exc))
     if state != "regular":
         raise DistillError(
             "E_INCOMPLETE_GENERATION",

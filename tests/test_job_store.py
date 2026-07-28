@@ -260,6 +260,77 @@ def test_a_directory_run_that_finds_no_directory_records_a_failure(tmp_path: Pat
     assert status["status"] == "failed"
     assert status["tool"] == "process_video_directory"
     assert status["error"]["code"] == "E_BAD_SOURCE"
+    assert status["error"]["message"] == "directory does not exist"
+
+
+def test_a_directory_run_pointed_at_a_file_finds_no_directory(tmp_path: Path) -> None:
+    """The third answer: a path that is there and is not a directory.
+
+    "No directory here" is true of a regular file, so this is reported like an
+    absent path rather than refused like an unreachable one - the batch knows
+    what it found. Pinned because it is the only assertion that separates "is a
+    directory" from "could be stat'ed".
+    """
+    root = tmp_path / "output"
+    not_a_directory = tmp_path / "videos.mp4"
+    not_a_directory.write_bytes(b"\x00")
+
+    with pytest.raises(DistillError) as failure:
+        pipeline.process_video_directory(
+            {
+                "path": str(not_a_directory),
+                "output_dir": str(root),
+                "job_id": "distill-file-directory",
+            }
+        )
+
+    assert failure.value.code == "E_BAD_SOURCE"
+    assert failure.value.message == "directory does not exist"
+    assert not_a_directory.read_bytes() == b"\x00"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root is not refused by directory permissions")
+def test_a_directory_run_that_may_not_look_says_so_rather_than_no_such_directory(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: "directory does not exist" about a directory that may be full.
+
+    The scan opened with `Path.exists()`, which cannot tell the two refusals
+    apart - and tells them apart differently on each interpreter. On 3.14 it
+    answers `False` for a directory whose parent this user may not search, so
+    the batch reported the operator's own videos as a path that is not there; on
+    3.13 it raised `PermissionError` and the run ended as `E_INTERNAL`, a defect
+    in Distill rather than a permission the operator can grant.
+
+    The record is asserted for the same reason its neighbour asserts it: both
+    refusals happen inside `work()`, so both are failures of a run that started.
+    """
+    sealed = tmp_path / "sealed"
+    sealed.mkdir()
+    unreachable = sealed / "videos"
+    unreachable.mkdir()
+    root = tmp_path / "output"
+    sealed.chmod(0o000)
+    try:
+        with pytest.raises(DistillError) as failure:
+            pipeline.process_video_directory(
+                {
+                    "path": str(unreachable),
+                    "output_dir": str(root),
+                    "job_id": "distill-sealed-directory",
+                }
+            )
+    finally:
+        sealed.chmod(0o700)
+
+    assert failure.value.code == "E_SOURCE_UNREADABLE"
+    assert failure.value.stage == "source"
+    assert failure.value.details == {"path": str(unreachable), "errno": "EACCES"}
+
+    status = status_of(root, "distill-sealed-directory")
+    assert status["status"] == "failed"
+    assert status["error"]["code"] == "E_SOURCE_UNREADABLE"
+    assert status["error"]["message"] == "directory could not be read"
 
 
 def test_a_reused_job_id_does_not_survive_a_failed_acquisition(

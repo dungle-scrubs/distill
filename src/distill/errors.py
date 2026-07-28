@@ -13,6 +13,7 @@ says what folding means.
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import re
@@ -116,6 +117,19 @@ def json_safe_details(details: Mapping[str, Any]) -> dict[str, Any]:
     """A `details` mapping every JSON reader can parse. See `_json_safe`."""
     coerced = _json_safe(details)
     return coerced if isinstance(coerced, dict) else {"details": coerced}
+
+
+def errno_name(exc: OSError) -> str:
+    """The symbolic errno of a refusal, for a reason a user can act on.
+
+    Here because how a refusal is *named in a record* is this module's question,
+    and three modules were answering it: `EACCES` in a prune skip, in an emitter
+    log line and in a source diagnosis has to be the same spelling, or an
+    operator grepping their logs for one of them misses the others. A numeric
+    fallback rather than a blank, because an errno this platform has no name for
+    is still the only handle on what the kernel refused.
+    """
+    return (errno.errorcode.get(exc.errno, "") if exc.errno is not None else "") or str(exc.errno)
 
 WarningRecord = dict[str, Any]
 """One **warning** as it travels: a stage, a code, a message, and a count.
