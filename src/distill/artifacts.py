@@ -39,7 +39,7 @@ from functools import cache
 from types import MappingProxyType, NoneType, UnionType
 from typing import Any, ClassVar, Union, get_args, get_origin, get_type_hints
 
-from .errors import DistillError, warning
+from .errors import DistillError, FrozenWarningRecord, WarningRecord, warning
 from .redact_secrets import redact_text
 
 # R-58 / D-045: each individual extracted-text field is capped, and no aggregate
@@ -133,7 +133,7 @@ class _PolicyText:
         return cls(text)
 
 
-def _cap_extracted_text(text: _PolicyText, *, path: str, warnings: list[Mapping[str, str]]) -> str:
+def _cap_extracted_text(text: _PolicyText, *, path: str, warnings: list[FrozenWarningRecord]) -> str:
     """Return `text` within the per-field cap, recording a **warning** if it was cut.
 
     The budget is bytes, because KiB is a byte unit and a character is not a
@@ -162,11 +162,11 @@ def _cap_extracted_text(text: _PolicyText, *, path: str, warnings: list[Mapping[
     return truncated
 
 
-def _frozen_warning(payload: Mapping[str, str]) -> Mapping[str, str]:
+def _frozen_warning(payload: FrozenWarningRecord) -> FrozenWarningRecord:
     return MappingProxyType(dict(payload))
 
 
-def _redact(text: str, *, warnings: list[Mapping[str, str]]) -> _PolicyText:
+def _redact(text: str, *, warnings: list[FrozenWarningRecord]) -> _PolicyText:
     """Return `text` with secret-shaped values replaced, keeping the policy's warnings.
 
     Every string in an extracted-text region goes through this, every time,
@@ -214,7 +214,7 @@ def _freeze(
     value: Any,
     *,
     path: str,
-    warnings: list[Mapping[str, str]],
+    warnings: list[FrozenWarningRecord],
     cap: bool,
     redact: bool,
 ) -> Any:
@@ -392,7 +392,7 @@ class Carrier(ABC):
     EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = ()
 
     redaction: RedactionState = RedactionState.NOT_APPLIED
-    warnings: tuple[Mapping[str, str], ...] = ()
+    warnings: tuple[FrozenWarningRecord, ...] = ()
 
     def __post_init__(self) -> None:
         # A region named here that is not a field would read as "capped" and
@@ -423,7 +423,7 @@ class Carrier(ABC):
         # and the alternative - dropping warnings a producer deliberately
         # attached - loses a **degradation** nobody would then be told about.
         apply_policy = self.redaction is not RedactionState.DISABLED
-        collected: list[Mapping[str, str]] = []
+        collected: list[FrozenWarningRecord] = []
         for field in dataclasses.fields(self):
             if field.name in {"warnings", "redaction"}:
                 continue
@@ -450,7 +450,7 @@ class Carrier(ABC):
             (*(_frozen_warning(item) for item in self.warnings), *collected),
         )
 
-    def _raised_since(self, previous: Carrier) -> list[dict[str, str]]:
+    def _raised_since(self, previous: Carrier) -> list[WarningRecord]:
         """The **warnings** this carrier's construction added to the inherited ones.
 
         A carrier built from another one carries its predecessor's warnings
@@ -490,6 +490,33 @@ class Interpretation:
     It is not a carrier: it holds no policy state and never reaches a writer on
     its own. The frame artifact it belongs to is what makes it durable, and
     that is where the policy runs (D-019).
+
+    `SUBSTANTIVE_FIELDS` names the fields that carry what the model saw, as
+    opposed to the ones that describe the reading (`frame_kind`,
+    `text_confidence`, `uncertainty`) or the backend that produced it. It lives
+    here for the reason the field names do: the module that fills a reading in
+    decides whether a response was a reading at all (R-39), and it should not
+    have to restate which fields that question is about.
+    """
+
+    SUBSTANTIVE_FIELDS: ClassVar[tuple[str, ...]] = (
+        "visual_summary",
+        "detected_elements",
+        "interpretation",
+        "verbatim_text",
+    )
+
+    DESCRIPTIVE_FIELDS: ClassVar[tuple[str, ...]] = tuple(
+        name for name in SUBSTANTIVE_FIELDS if name != "verbatim_text"
+    )
+    """`SUBSTANTIVE_FIELDS` minus the one that transcribes rather than describes.
+
+    Every field here says something *about* the frame; `verbatim_text` echoes
+    what was on it. **Grounding** already receives the transcription as its own
+    argument, so this is what is left for `has_interpretation` to answer - and
+    it is derived from `SUBSTANTIVE_FIELDS` rather than listed a second time,
+    because the two answers to "is there a reading" diverging is what let a
+    summary-only reading be graded as a textless frame.
     """
 
     visual_summary: str = ""
@@ -512,8 +539,22 @@ class Interpretation:
 
     @property
     def has_interpretation(self) -> bool:
-        """Whether the model said anything about the frame beyond reading it."""
-        return bool(self.interpretation.strip() or self.detected_elements)
+        """Whether the model said anything about the frame beyond reading it.
+
+        Asked of `DESCRIPTIVE_FIELDS` and judged by the same emptiness rule
+        `document_carries_a_reading` uses, so this and `carries_a_reading`
+        cannot answer differently about the same reading. They did: this
+        counted two fields where `SUBSTANTIVE_FIELDS` names four, so a reading
+        holding nothing but a `visual_summary` - the shape the prompt asks for
+        when the on-screen text cannot be read - reached **grounding** as
+        though the model had said nothing, and was graded a textless frame.
+        """
+        return any(_substantive_text(name, getattr(self, name)) for name in self.DESCRIPTIVE_FIELDS)
+
+    @property
+    def carries_a_reading(self) -> bool:
+        """Whether this says anything about the **keyframe** at all (R-39)."""
+        return document_carries_a_reading(self.document())
 
     def document(self) -> dict[str, Any]:
         """This reading as the plain mapping a **frame artifact** carries."""
@@ -536,9 +577,63 @@ class Interpretation:
             return None
         fields = {field.name for field in dataclasses.fields(cls)}
         values = {key: value for key, value in document.items() if key in fields}
-        elements = values.get("detected_elements", ())
-        values["detected_elements"] = tuple(str(item) for item in elements)
+        values["detected_elements"] = _declared_elements(values.get("detected_elements"))
         return cls(**values)
+
+
+def document_carries_a_reading(document: Mapping[str, Any] | None) -> bool:
+    """Whether a mapping says anything about the **keyframe** (R-39).
+
+    True when at least one of `Interpretation.SUBSTANTIVE_FIELDS` holds text.
+    Emptiness is judged the way a reading judges it - stripped - so a mapping
+    whose substantive fields are all blank, whitespace, or an empty list is as
+    empty as `{}`, and so is one holding nothing but the metadata that
+    describes a reading.
+
+    A field counts only in the shape it is declared with. Anything else is a
+    value `Interpretation` would drop or mangle rather than read: a
+    `detected_elements` of `"axis"` is not a list and becomes no elements at
+    all, and one of `[{"label": "axis"}]` would become the single element
+    `"{'label': 'axis'}"`.
+
+    A question about a mapping rather than about an `Interpretation`, because
+    both callers have one and only one of them can afford to build a reading:
+    `local_vision` asks it of what a model returned before there is a reading
+    to ask, and `response` asks it of a **manifest** a **cache** hit read back,
+    which is a document that may not rebuild at all. It is a function rather
+    than a method for the reason the field names are here: the answer must not
+    differ between the module that fills a reading in and the module that
+    counts them.
+    """
+    if not isinstance(document, Mapping):
+        return False
+    return any(
+        _substantive_text(name, document.get(name)) for name in Interpretation.SUBSTANTIVE_FIELDS
+    )
+
+
+def _declared_elements(value: Any) -> tuple[str, ...]:
+    """`detected_elements` from a document, in the one shape the field is declared with.
+
+    A sequence of strings, and nothing else: anything else is dropped rather
+    than coerced. Stated once because both readers of the field ask it, and
+    they answered differently - `document_carries_a_reading` refused a
+    `detected_elements` of `"axis"` as the wrong shape, while `from_document`
+    iterated the string and rebuilt a reading displaying `a`, `x`, `i`, `s` as
+    four elements the model never detected. A **resume** or a **cache** hit is
+    where that mattered: those are the documents another run wrote.
+    """
+    if not isinstance(value, list | tuple):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
+
+
+def _substantive_text(name: str, value: Any) -> str:
+    """The text one substantive field would contribute to a reading, if any."""
+    if name == "detected_elements":
+        # The one substantive field declared as a sequence of strings.
+        return "".join(item.strip() for item in _declared_elements(value))
+    return value.strip() if isinstance(value, str) else ""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -585,7 +680,7 @@ class FrameArtifact(Carrier):
         """
         return Interpretation.from_document(self.interpretation)
 
-    def with_extracted_text(self, text: str) -> tuple[FrameArtifact, list[dict[str, str]]]:
+    def with_extracted_text(self, text: str) -> tuple[FrameArtifact, list[WarningRecord]]:
         """The same frame carrying what the image-text reader recovered from it.
 
         Returns the **warnings** the new frame's construction raised as well as
@@ -602,7 +697,7 @@ class FrameArtifact(Carrier):
         reading: Interpretation | None,
         *,
         grounding: Mapping[str, Any] | None = None,
-    ) -> tuple[FrameArtifact, list[dict[str, str]]]:
+    ) -> tuple[FrameArtifact, list[WarningRecord]]:
         """The same frame carrying a vision reading and Distill's assessment of it.
 
         Both together, because a **grounding** is an assessment *of* an
@@ -710,9 +805,7 @@ class Transcript(Carrier):
     language_probability: float = 0.0
 
     @classmethod
-    def from_document(
-        cls, document: Mapping[str, Any], *, redaction: RedactionState
-    ) -> Transcript:
+    def from_document(cls, document: Mapping[str, Any], *, redaction: RedactionState) -> Transcript:
         """Rebuild a transcript from a document a **stage result** recorded.
 
         The resume route, on the same terms as `FrameArtifact.from_document`,

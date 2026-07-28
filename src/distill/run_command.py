@@ -93,7 +93,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from .errors import DistillError, warning
+from .errors import DistillError, WarningRecord, warning
 
 LOGGER = logging.getLogger(__name__)
 
@@ -212,7 +212,7 @@ class CommandResult:
     stdout_truncated: bool
     stderr_truncated: bool
     duration_sec: float
-    warnings: tuple[dict[str, str], ...] = ()
+    warnings: tuple[WarningRecord, ...] = ()
 
     @property
     def truncated(self) -> bool:
@@ -315,7 +315,7 @@ def run_json(
     total_timeout_sec: float,
     idle_timeout_sec: float = DEFAULT_IDLE_TIMEOUT_SEC,
     **options: Any,
-) -> tuple[Any, tuple[dict[str, str], ...]]:
+) -> tuple[Any, tuple[WarningRecord, ...]]:
     """Run `argv`, parse its stdout as JSON, and return it with any **warnings**.
 
     The warnings are `CommandResult.warnings` - truncated capture (R-33). They

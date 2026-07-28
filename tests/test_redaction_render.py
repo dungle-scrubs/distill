@@ -7,6 +7,7 @@ import pytest
 from distill import ocr
 from distill.artifacts import FrameArtifact, Interpretation, RedactionState, Transcript
 from distill.errors import DistillError
+from distill.grounding import assess_grounding
 from distill.progress import ProgressReporter
 from distill.redact_secrets import redact_text
 from distill.render import frames_are_useless, render_markdown, transcript_is_empty
@@ -160,18 +161,28 @@ def test_ordinary_words_ending_in_a_suffix_are_not_redacted() -> None:
         assert result.redaction_count == 0, text
 
 
-def test_possible_secret_warnings_are_capped_with_aggregate_warning() -> None:
-    text = " ".join(["ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef"] * 4)
-    result = redact_text(text, max_possible_secret_warnings=2)
+def test_four_confusable_secrets_are_one_warning_that_says_four() -> None:
+    """R-41 replaces the cap this test was named for.
 
-    assert [item["code"] for item in result.warnings] == [
-        "possible_confusable_secret",
-        "possible_confusable_secret",
-        "possible_secret_warnings_truncated",
+    Classified *defect*: the old contract emitted one record per match up to a
+    cap, then a second record saying how many records it had suppressed - a
+    **warning** about Distill's own bookkeeping, and a reader who wanted the
+    real number had to add the two together. Folding on stage and code says it
+    once and says it exactly, so the cap and its truncation record are gone.
+    """
+    text = " ".join(["ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef"] * 4)
+    result = redact_text(text)
+
+    assert result.warnings == [
+        {
+            "stage": "redaction",
+            "code": "possible_confusable_secret",
+            "message": (
+                "OCR text contained a secret-like value after confusable normalization"
+            ),
+            "occurrences": 4,
+        }
     ]
-    assert result.warnings[-1]["message"] == (
-        "2 additional possible-secret warnings were truncated"
-    )
 
 
 def test_render_interleaves_frame_and_transcript() -> None:
@@ -333,11 +344,108 @@ def test_low_confidence_frame_renders_warning_marker_and_verbatim_block() -> Non
     assert "Text confidence:\n\n```untrusted-text\nnone\n```" in markdown
 
 
-def test_grounded_frame_omits_warning_marker_and_shows_verbatim() -> None:
-    frame, _warnings = keyframe(
-        extracted_text="We're closer than you think"
-    ).with_interpretation(
-        Interpretation(
+def graded(*, ocr_text: str, reading: Interpretation) -> FrameArtifact:
+    """A **frame artifact** carrying the **grounding** the pipeline would assess for it.
+
+    The two marker tests below go through `assess_grounding` rather than
+    hand-writing a level, because what they are about is which readings the
+    render marks - and a hand-written level makes that a question about the
+    string the test chose instead of about the reading. It is the same call
+    `local_vision._interpreted` makes, in the same order: grounding is assessed
+    against what the model returned, and the carrier redacts on the way in.
+    """
+    frame, _warnings = keyframe(extracted_text=ocr_text).with_interpretation(
+        reading,
+        grounding=assess_grounding(
+            ocr_text=ocr_text,
+            verbatim_text=reading.verbatim_text,
+            text_confidence=reading.text_confidence,
+            has_interpretation=reading.has_interpretation,
+            carries_a_reading=reading.carries_a_reading,
+        ).public_dict(),
+    )
+    return frame
+
+
+def test_a_lone_confident_reader_still_gets_the_low_confidence_marker() -> None:
+    """R-42: the render does not suppress the marker on a reader's own say-so.
+
+    OCR recovered nothing, so the only evidence for this slide's text is the
+    model's report of having read it. The reading is still shown - it may well
+    be right - but it is shown under the banner, because a reader given it
+    unmarked would have no way to tell it from text two readers agreed on.
+    """
+    frame = graded(
+        ocr_text="",
+        reading=Interpretation(
+            visual_summary="A dark slide",
+            detected_elements=("title",),
+            interpretation="The slide lists what a software factory needs.",
+            uncertainty="Low",
+            verbatim_text="What a software factory needs Agent Runtimes Orchestration",
+            text_confidence="high",
+        ),
+    )
+
+    markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
+
+    assert "⚠ Low-confidence frame (self_report)" in markdown
+    assert "treat the interpretation below as unverified" in markdown
+    # The reading is marked, not withheld.
+    assert "```untrusted-text\nWhat a software factory needs Agent Runtimes Orchestration\n```" in (
+        markdown
+    )
+
+
+def test_a_description_of_an_unreadable_frame_reaches_the_reader_marked() -> None:
+    """The render seam of the same finding: a summary-only reading is banner-ed.
+
+    The model was told to leave `verbatim_text` empty when it cannot read the
+    frame; it described the slide anyway, quoting figures nothing corroborates.
+    Rendered unmarked, that paragraph reads exactly like text two readers
+    agreed on - which is the one thing the banner exists to prevent.
+    """
+    frame = graded(
+        ocr_text="",
+        reading=Interpretation(
+            visual_summary="A slide titled 'Q3 revenue: $4.2M, up 340% YoY' with a bar chart",
+            text_confidence="none",
+        ),
+    )
+
+    markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
+
+    assert "⚠ Low-confidence frame" in markdown
+    assert "treat the interpretation below as unverified" in markdown
+    # The reading is marked, not withheld.
+    assert "Q3 revenue" in markdown
+
+
+def test_a_frame_nobody_said_anything_about_is_rendered_without_a_banner() -> None:
+    """The other direction: nothing was claimed, so there is nothing to warn about.
+
+    A frame carrying no reading and no OCR text is a photo or a blank slide.
+    Marking it would put the banner on every such frame and make it mean
+    nothing, so the fix cannot be "mark whatever has no verbatim text".
+    """
+    frame = graded(ocr_text="", reading=Interpretation(text_confidence="none"))
+
+    markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
+
+    assert "Low-confidence frame" not in markdown
+
+
+def test_a_corroborated_frame_omits_the_marker_and_shows_verbatim() -> None:
+    """The other direction of R-42: genuine agreement is still not marked.
+
+    Two readers independently recovered the same text, which is what
+    **corroborated** means and the one thing that earns an unmarked reading.
+    Marking this one too would answer the finding by making the banner say
+    nothing.
+    """
+    frame = graded(
+        ocr_text="We're closer than you think",
+        reading=Interpretation(
             visual_summary="A title slide",
             detected_elements=("title",),
             interpretation="Closing slide.",
@@ -345,11 +453,6 @@ def test_grounded_frame_omits_warning_marker_and_shows_verbatim() -> None:
             verbatim_text="We're closer than you think",
             text_confidence="high",
         ),
-        grounding={
-            "level": "grounded",
-            "text_overlap": 1.0,
-            "reason": "OCR corroborates the transcribed text",
-        },
     )
     markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
 

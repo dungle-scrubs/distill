@@ -248,11 +248,15 @@ def test_caption_frames_degrades_to_ocr_only_when_rapid_mlx_unavailable(
     )
 
     assert response["frames"]
-    assert response["warnings"][-1] == {
-        "stage": "local_vision",
-        "code": "local_vision_rapid_mlx_unavailable",
-        "message": "Rapid-MLX unavailable in test",
-    }
+    # Re-pinned by field rather than by whole-record equality: R-41 added the
+    # occurrence count to every warning record, and the **degradation** this
+    # test is about (R-34 - the vision target is absent, the run continues with
+    # OCR-only output) is what the fields say.
+    degradation = response["warnings"][-1]
+    assert degradation["stage"] == "local_vision"
+    assert degradation["code"] == "local_vision_rapid_mlx_unavailable"
+    assert degradation["message"] == "Rapid-MLX unavailable in test"
+    assert degradation["occurrences"] == 1
 
 
 def test_caption_frames_store_visual_interpretation_without_changing_ocr(

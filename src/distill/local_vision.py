@@ -20,25 +20,36 @@ HTTP API. The server is assumed to already be running (``rapid-mlx serve
 chat-completion requests to ``<base_url>/chat/completions``. Distill does not
 manage the server lifecycle, and it has no dependency on any other local
 runtime shim.
+
+It does own where that client is allowed to talk and how much it will listen to
+(R-43, R-44): the scheme, the loopback rule and its opt-out, the refusal to
+follow a redirect, and the 32 MiB bound on a response body. That policy lives
+here rather than in a transport module of its own because there is one client
+and one endpoint (ADR-0001), and a rule kept next to the requests it governs
+cannot be reached around by adding a caller.
 """
 
 from __future__ import annotations
 
 import base64
 import http.client
+import ipaddress
 import json
 import logging
 import os
+import socket
+import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
-from .artifacts import FrameArtifact, Interpretation
-from .errors import warning
+from .artifacts import FrameArtifact, Interpretation, document_carries_a_reading
+from .errors import DistillError, WarningRecord, aggregate_warnings, occurrences_of, warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
 from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
@@ -56,13 +67,45 @@ DEBUG_ENV = "DISTILL_LOCAL_VISION_DEBUG"
 # Cap on in-flight vision requests. Rapid-MLX batches internally, so Distill
 # keeps a small fixed pool rather than fanning out unbounded. 1 == serial.
 DEFAULT_MAX_PARALLEL = 1
+# Consecutive transport failures after which the run stops attempting keyframes
+# (R-40). Three, because one is noise and two is a coincidence.
+CONSECUTIVE_TRANSPORT_FAILURE_LIMIT = 3
+# The failures that say something about the transport rather than about the
+# answer: nothing arrived. A refused or reset connection reaches the caller as
+# the unavailable code, a deadline as the timeout code.
+TRANSPORT_FAILURE_CODES = frozenset(
+    {
+        "local_vision_timeout",
+        "local_vision_rapid_mlx_unavailable",
+    }
+)
+# Failures that arrived *as a response*: the transport carried them, so they are
+# evidence it works. A success is the other member of this class and needs no
+# code. Everything else (an unreadable image file, a cancelled run) happened on
+# this side of the wire and says nothing either way.
+DELIVERED_RESPONSE_CODES = frozenset({"local_vision_malformed_response"})
+BREAKER_WARNING_CODE = "local_vision_transport_breaker_open"
+ENDPOINT_REJECTED_CODE = "local_vision_endpoint_rejected"
 FRAME_READ_FAILURE_CODES = frozenset(
     {
         "local_vision_malformed_response",
         "local_vision_timeout",
         "local_vision_image_read_failed",
+        ENDPOINT_REJECTED_CODE,
     }
 )
+# R-43. The two schemes the OpenAI-compatible API is served over; anything else
+# names a different protocol, and a vision endpoint is not a file or a gopher
+# hole no matter who wrote the config.
+ALLOWED_ENDPOINT_SCHEMES = frozenset({"http", "https"})
+DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
+# R-44. A chat-completion envelope is kilobytes; 32 MiB is orders of magnitude
+# past any real one, and past it the read stops rather than the process growing
+# to whatever the far end decided to send.
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# An HTTP error body is quoted into a message, never parsed, and the quote is
+# 200 characters. This is how much of one is worth reading to produce it.
+ERROR_BODY_PREVIEW_BYTES = 2048
 LOGGER = logging.getLogger(__name__)
 
 
@@ -73,6 +116,13 @@ class LocalVisionConfig:
     base_url: str = DEFAULT_LOCAL_VISION_BASE_URL
     timeout_sec: float = DEFAULT_TIMEOUT_SEC
     caption_frames: bool = True
+    allow_remote_endpoint: bool = False
+    """R-43's opt-out, and only that: it permits a `base_url` off loopback.
+
+    It does not widen the scheme, re-enable redirects, or lift the response
+    cap. Those hold wherever the endpoint is, because they are about what the
+    client will do with an answer rather than about whose answer it is.
+    """
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -88,12 +138,8 @@ class LocalVisionProbe:
     message: str
     detail: dict[str, Any]
 
-    def warning(self) -> dict[str, str]:
-        return {
-            "stage": "local_vision",
-            "code": self.code,
-            "message": self.message,
-        }
+    def warning(self) -> dict[str, Any]:
+        return warning("local_vision", self.code, self.message)
 
 
 class LocalVisionFailure(Exception):
@@ -103,16 +149,33 @@ class LocalVisionFailure(Exception):
         self.message = message
         self.detail = detail or {}
 
-    def warning(self) -> dict[str, str]:
-        return {
-            "stage": "local_vision",
-            "code": self.code,
-            "message": self.message,
-        }
+    def warning(self) -> dict[str, Any]:
+        return warning("local_vision", self.code, self.message)
+
+
+class EndpointRejected(LocalVisionFailure):
+    """R-43: the endpoint the client was about to speak to is not allowed.
+
+    A `LocalVisionFailure` and not a separate hierarchy, because to every
+    caller it is the same event as a timeout: no reading came back and the run
+    continues on OCR-only output. It carries a `reason` so the log and the
+    **warning** both say *which* rule refused, not merely that one did.
+    """
+
+    def __init__(self, reason: str, message: str, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(ENDPOINT_REJECTED_CODE, message, {"reason": reason, **(detail or {})})
+        self.reason = reason
 
 
 ProbeLocalVision = Callable[[LocalVisionConfig], LocalVisionProbe]
-TryInterpretImage = Callable[..., tuple["Interpretation | None", "dict[str, str] | None"]]
+AddressResolver = Callable[[str, int], list[str]]
+"""Host and port to the addresses they resolve to, for the loopback check.
+
+Injectable because a test that asked the machine's resolver would be asserting
+against `/etc/hosts`, and because D-029's rebind - the same name answering
+differently twice - has no other seam to arrive through.
+"""
+TryInterpretImage = Callable[..., tuple["Interpretation | None", "WarningRecord | None"]]
 
 
 @dataclass(frozen=True)
@@ -127,10 +190,158 @@ class _FrameOutcome:
     index: int
     frame: FrameArtifact
     interpreted: bool
-    warnings: list[dict[str, str]]
+    warnings: list[WarningRecord]
     path: str
     has_extracted_text: bool
+    # The code of the read/transport failure this frame's attempt ended in, or
+    # `None` if a response arrived. Not "the first warning": a frame that was
+    # read successfully can still warn about **grounding**, and the breaker
+    # must not read that as the transport having failed.
     warning_code: str | None
+    # The breaker state change this frame's outcome caused, if any. Carried
+    # rather than logged where it happened so the ordered consumer emits it in
+    # frame order even when the pool ran the frames out of order.
+    breaker_transition: dict[str, Any] | None = None
+
+
+class _TransportBreaker:
+    """One run's consecutive-transport-failure count, and the state it decides.
+
+    Owns the count, the open/closed state, and the record of what tripped it:
+    which attempt, which **keyframe**, which code. It is asked `admit()` before
+    every attempt and told `record()` after every one, and those two calls are
+    the whole interface.
+
+    It does not own what a skipped keyframe becomes - the caller hands the
+    **frame artifact** back untouched, which is the OCR-only **degradation**
+    ADR-0002 asks for - and it does not own the **warning**: it supplies the
+    counts, `summary_warning` phrases them. It never closes again either. A
+    half-open probe would be a fourth timeout to learn what three already
+    said, and a server that died mid-run is not coming back inside the run.
+
+    Which failures count is a distinction, not a list: a **transport** failure
+    means nothing arrived, so the run has no evidence the server is there. A
+    malformed body arrived, so it is evidence the transport works and resets
+    the count - a wrong server and a dead server are different findings, and
+    only one of them is worth stopping for. Failures on this side of the wire
+    (an unreadable image, a cancellation) neither count nor reset.
+
+    Thread-safe because the pool may attempt keyframes concurrently, and with
+    ``max_parallel > 1`` "consecutive" means consecutive in *completion* order
+    rather than keyframe order. That is the only order that exists there - the
+    keyframes were in flight together - and the consequence is worth stating: a
+    fast success landing between two slow timeouts resets a count that keyframe
+    order would have kept climbing, so a partly-working server takes longer to
+    give up on than a dead one. A dead one returns no successes at all, which
+    is the case this exists for. Attempts already dispatched when it opens
+    still run, and ``DEFAULT_MAX_PARALLEL`` is 1, so the ordinary run has one
+    order.
+    """
+
+    def __init__(self, limit: int = CONSECUTIVE_TRANSPORT_FAILURE_LIMIT) -> None:
+        self._limit = max(int(limit), 1)
+        self._lock = threading.Lock()
+        self._consecutive = 0
+        self._attempts = 0
+        self._transport_failures = 0
+        self._skipped = 0
+        self._opened: dict[str, Any] | None = None
+
+    @property
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._opened is not None
+
+    def admit(self) -> bool:
+        """Whether a **keyframe** may be attempted, counting the skip when not."""
+        with self._lock:
+            if self._opened is None:
+                return True
+            self._skipped += 1
+            return False
+
+    def record(self, *, frame_number: int, code: str | None) -> dict[str, Any] | None:
+        """Fold one attempt's outcome in; the state transition it caused, or `None`."""
+        with self._lock:
+            self._attempts += 1
+            if self._opened is not None:
+                # An attempt that passed admission before the trip returns
+                # after it. Nothing it says is a state change, because the
+                # breaker does not close: reporting one would put a reset in
+                # the log of a run still skipping every remaining keyframe, and
+                # zero the count that explains why.
+                if code in TRANSPORT_FAILURE_CODES:
+                    self._transport_failures += 1
+                return None
+            if code in TRANSPORT_FAILURE_CODES:
+                self._consecutive += 1
+                self._transport_failures += 1
+                if self._consecutive < self._limit:
+                    return None
+                self._opened = {
+                    "state": "open",
+                    "consecutive_failures": self._consecutive,
+                    "limit": self._limit,
+                    "attempt": self._attempts,
+                    "frame": frame_number,
+                    "code": code,
+                }
+                return dict(self._opened)
+            if code is not None and code not in DELIVERED_RESPONSE_CODES:
+                return None
+            cleared, self._consecutive = self._consecutive, 0
+            if not cleared:
+                return None
+            return {
+                "state": "closed",
+                "cleared_failures": cleared,
+                "attempt": self._attempts,
+                "frame": frame_number,
+            }
+
+    def summary_warning(self, frame_count: int) -> WarningRecord | None:
+        """The one **warning** R-40 asks for, or `None` if it cost nothing.
+
+        One record for every keyframe the run gave up on, carrying the count
+        that tripped it and the count that cost - which is the whole point of
+        the breaker: 77 timeouts said this once each.
+
+        `None` when the breaker held *and* when it opened without refusing a
+        keyframe - a trip on the last one, where the failures that tripped it
+        already have their own warnings and there is nothing left to give up
+        on. A record there would report a **degradation** that did not happen,
+        in a sentence saying zero keyframes were affected.
+
+        The count is of keyframes *not attempted*, and says so. "Continue with
+        OCR-only output" describes them and also describes the ones that failed
+        before the trip, which are not in this number - so a reader adding the
+        sentence up got a different run than the one that happened.
+        """
+        with self._lock:
+            opened = self._opened
+            skipped = self._skipped
+        if opened is None or not skipped:
+            return None
+        return warning(
+            "local_vision",
+            BREAKER_WARNING_CODE,
+            f"local vision stopped after {opened['consecutive_failures']} consecutive "
+            f"transport failures ({opened['code']}) at keyframe {opened['frame']}; "
+            f"{skipped} of {frame_count} keyframes were not attempted and continue "
+            "with OCR-only output.",
+        )
+
+    def state(self) -> dict[str, Any]:
+        """What the breaker saw, for `debug_info`."""
+        with self._lock:
+            return {
+                "open": self._opened is not None,
+                "limit": self._limit,
+                "consecutive_failures": self._consecutive,
+                "transport_failures": self._transport_failures,
+                "skipped_keyframes": self._skipped,
+                "opened_by": None if self._opened is None else dict(self._opened),
+            }
 
 
 # Injectable HTTP entry points. Production uses urllib against the running
@@ -156,6 +367,171 @@ def _boundary_log(event: str, detail: dict[str, Any]) -> None:
             sort_keys=True,
         )
     )
+
+
+def _reject_endpoint(reason: str, message: str, **detail: Any) -> NoReturn:
+    """Refuse an endpoint, saying why, in the log and in the exception alike.
+
+    Every rejection *this module makes* goes through here, so the
+    observability is a property of the rule rather than of whoever wrote the
+    call site: there is one event, it always carries the reason, and no new
+    rule can forget to emit it.
+
+    Not every refusal is one of this module's. urllib turns a 3xx it cannot
+    act on into an `HTTPError` before `_RedirectsAreRejected` sees it, so a
+    redirect with no `Location`, or one naming a scheme urllib will not open,
+    ends the request without an `endpoint_rejected` event. Nothing is followed
+    in either case - which is why the fix there was the message an operator
+    gets, not a handler override to route the refusal back through here.
+    """
+    _boundary_log("endpoint_rejected", {"reason": reason, **detail})
+    raise EndpointRejected(reason, message, detail)
+
+
+def _resolve_addresses(host: str, port: int) -> list[str]:
+    """The addresses `host` answers with - without a lookup when it is one.
+
+    An address literal is already the answer, so the common configuration
+    (`http://127.0.0.1:8000/v1`) never consults a resolver at all.
+    """
+    try:
+        return [str(ipaddress.ip_address(host))]
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        _reject_endpoint(
+            "unresolvable",
+            f"Local vision endpoint host '{host}' does not resolve; "
+            "continuing with OCR-only output.",
+            host=host,
+            error=str(exc),
+        )
+    return [str(info[4][0]) for info in infos]
+
+
+def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str, int]:
+    """R-43's static half: what can be decided about `url` without asking anyone.
+
+    The scheme, the presence of a host, and - when the host is written as an
+    address - whether that address is loopback. A host written as a *name*
+    cannot be settled here without a lookup, so it is settled per request
+    instead (D-029); this is the check a config can be rejected by, not the
+    authoritative one.
+    """
+    try:
+        # All three raise on a malformed authority, at different moments: a
+        # bracket that never closes stops `urlsplit` itself, a port out of
+        # range is only noticed when `parts.port` is read. Splitting first and
+        # guarding only the reads left the earlier one escaping as
+        # `ValueError("Invalid IPv6 URL")` - a traceback out of the CLI about
+        # something an operator typed in a config file. A rejection saying so
+        # is the answer they can act on.
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme
+        host, configured_port = parts.hostname, parts.port
+    except ValueError as exc:
+        _reject_endpoint(
+            "unparsable_url",
+            f"Local vision endpoint '{url}' is not a usable URL: {exc}",
+            url=url,
+        )
+    if scheme not in ALLOWED_ENDPOINT_SCHEMES:
+        _reject_endpoint(
+            "scheme",
+            f"Local vision endpoint scheme '{scheme}' is not allowed; "
+            f"use {' or '.join(sorted(ALLOWED_ENDPOINT_SCHEMES))}.",
+            url=url,
+            scheme=scheme,
+        )
+    if not host:
+        _reject_endpoint("host_missing", f"Local vision endpoint '{url}' names no host.", url=url)
+    port = configured_port or DEFAULT_SCHEME_PORTS[scheme]
+    if not allow_remote_endpoint:
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_loopback:
+            _reject_endpoint(
+                "non_loopback_host",
+                f"Local vision endpoint host '{host}' is not loopback; set "
+                "local_vision_allow_remote_endpoint to reach one deliberately.",
+                url=url,
+                host=host,
+            )
+    return host, port
+
+
+def _check_resolved_address(
+    host: str,
+    port: int,
+    *,
+    allow_remote_endpoint: bool,
+    resolver: AddressResolver | None = None,
+) -> list[str]:
+    """R-43's authoritative half: every address `host` resolves to is loopback.
+
+    Every address, not the first: a name answering with both 127.0.0.1 and a
+    link-local address is a name that can steer the very next connection off
+    loopback, and which of its answers gets connected to is not this function's
+    to know.
+    """
+    if allow_remote_endpoint:
+        return []
+    addresses = (resolver or _resolve_addresses)(host, port)
+    if not addresses:
+        _reject_endpoint(
+            "unresolvable",
+            f"Local vision endpoint host '{host}' resolved to no address.",
+            host=host,
+        )
+    for address in addresses:
+        try:
+            resolved = ipaddress.ip_address(address)
+        except ValueError:
+            # A resolver that answered with something that is not an address
+            # (a scoped `fe80::1%en0`, a name, anything) has not been shown to
+            # be loopback, and unproven is refused rather than assumed.
+            _reject_endpoint(
+                "unparsable_address",
+                f"Local vision endpoint host '{host}' resolved to '{address}', "
+                "which is not an address.",
+                host=host,
+                address=address,
+            )
+        if not resolved.is_loopback:
+            _reject_endpoint(
+                "non_loopback_address",
+                f"Local vision endpoint host '{host}' resolves to {address}, which is not "
+                "loopback; set local_vision_allow_remote_endpoint to reach one deliberately.",
+                host=host,
+                address=address,
+            )
+    return addresses
+
+
+def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
+    """The same config, once its `base_url` is one Distill will speak to.
+
+    A rejected endpoint is a **fatal error** here rather than a **warning**:
+    unlike a server that is merely down, nothing about the run will make this
+    address allowed, and silently degrading to OCR-only would hide that the
+    operator's configuration was ignored.
+    """
+    try:
+        _checked_endpoint_url(
+            config.base_url, allow_remote_endpoint=config.allow_remote_endpoint
+        )
+    except EndpointRejected as exc:
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            exc.message,
+            {"base_url": config.base_url, **exc.detail},
+        ) from exc
+    return config
 
 
 def config_dir() -> Path:
@@ -190,7 +566,13 @@ def _coerce_float(value: Any, default: float) -> float:
     return parsed if parsed > 0 else default
 
 
-def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
+def _merged_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
+    """The configuration files, folded together, not yet validated.
+
+    Unvalidated on purpose: the endpoint that matters is the one the run will
+    use, and a per-call override is allowed to rescue a file that names a
+    forbidden one. Only the settled config is checked.
+    """
     root = (base_dir or config_dir()).expanduser()
     config = LocalVisionConfig()
     for filename in CONFIG_FILENAMES:
@@ -202,11 +584,15 @@ def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
     return config
 
 
+def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
+    return _with_validated_endpoint(_merged_local_vision_config(base_dir))
+
+
 def local_vision_config_from_args(
     args: dict[str, Any],
     base_dir: Path | None = None,
 ) -> LocalVisionConfig:
-    config = load_local_vision_config(base_dir)
+    config = _merged_local_vision_config(base_dir)
     overrides: dict[str, Any] = {}
     if "caption_frames" in args:
         overrides["caption_frames"] = _coerce_bool(
@@ -222,7 +608,11 @@ def local_vision_config_from_args(
         overrides["timeout_sec"] = _coerce_float(
             args.get("local_vision_timeout_sec"), config.timeout_sec
         )
-    return _config_from_payload(overrides, config)
+    if "local_vision_allow_remote_endpoint" in args:
+        overrides["allow_remote_endpoint"] = _coerce_bool(
+            args.get("local_vision_allow_remote_endpoint"), config.allow_remote_endpoint
+        )
+    return _with_validated_endpoint(_config_from_payload(overrides, config))
 
 
 def _config_from_payload(
@@ -240,6 +630,10 @@ def _config_from_payload(
         caption_frames=_coerce_bool(
             payload.get("caption_frames", base.caption_frames),
             base.caption_frames,
+        ),
+        allow_remote_endpoint=_coerce_bool(
+            payload.get("allow_remote_endpoint", base.allow_remote_endpoint),
+            base.allow_remote_endpoint,
         ),
     )
 
@@ -272,7 +666,22 @@ def probe_rapid_mlx_availability(
     """
     models_url = _models_url(config.base_url)
     try:
-        payload = _http_get_json(requestor, models_url, config.timeout_sec)
+        payload = _http_get_json(
+            requestor,
+            models_url,
+            config.timeout_sec,
+            allow_remote_endpoint=config.allow_remote_endpoint,
+        )
+    except EndpointRejected as exc:
+        return LocalVisionProbe(
+            available=False,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code=exc.code,
+            message=f"{exc.message} Continuing with OCR-only output.",
+            detail={**exc.detail, "url": models_url},
+        )
     except TimeoutError as exc:
         return LocalVisionProbe(
             available=False,
@@ -374,7 +783,7 @@ def try_interpret_image(
     prompt: str,
     *,
     prompt_profile: str = "technical",
-) -> tuple[Interpretation | None, dict[str, str] | None]:
+) -> tuple[Interpretation | None, WarningRecord | None]:
     try:
         return interpret_image(config, image_path, prompt, prompt_profile=prompt_profile), None
     except KeyboardInterrupt:
@@ -393,7 +802,7 @@ def try_interpret_image_after_probe(
     prompt: str,
     *,
     prompt_profile: str = "technical",
-) -> tuple[Interpretation | None, dict[str, str] | None]:
+) -> tuple[Interpretation | None, WarningRecord | None]:
     try:
         return (
             interpret_image_after_probe(
@@ -428,10 +837,11 @@ class FrameInterpreter:
     _max_parallel: int = 1
     _warning_counts: dict[str, int] = field(default_factory=dict)
     _trace_events: list[dict[str, Any]] = field(default_factory=list)
+    _breaker: _TransportBreaker = field(default_factory=_TransportBreaker)
 
     def interpret(
         self, frames: list[FrameArtifact]
-    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+    ) -> tuple[list[FrameArtifact], list[WarningRecord]]:
         self._reset_run(frames)
         self._log("interpret.start", {"frames": len(frames), "backend": self.config.backend})
         probe = self.probe(self.config)
@@ -448,7 +858,7 @@ class FrameInterpreter:
             self._log("interpret.unavailable", {"code": probe.code})
             return frames, [probe_warning]
 
-        warnings: list[dict[str, str]] = []
+        warnings: list[WarningRecord] = []
         interpreted_frames = frames
         try:
             if not frames:
@@ -468,15 +878,21 @@ class FrameInterpreter:
             interpreted_frames = self._interpret_frames(resolved, frames, warnings)
             if self.progress:
                 self.progress.complete("local_vision", detail={"frames": len(frames)})
+            # R-41 where the vision pass is done producing warnings: eighty
+            # keyframes failing the same way is one finding with a count on it,
+            # not eighty records of the same sentence. `_warning_counts` still
+            # has the unfolded tally for `debug_info`.
+            folded = aggregate_warnings(warnings)
             self._log(
                 "interpret.complete",
                 {
                     "frames": len(interpreted_frames),
                     "interpreted_frames": self._interpreted_count,
-                    "warnings": len(warnings),
+                    "warnings": len(folded),
+                    "warning_occurrences": sum(item["occurrences"] for item in folded),
                 },
             )
-            return interpreted_frames, warnings
+            return interpreted_frames, folded
         finally:
             # Nothing to release: Rapid-MLX manages its own lifecycle. The
             # finally block stays so the run-state semantics read the same as
@@ -497,7 +913,7 @@ class FrameInterpreter:
         self,
         config: LocalVisionConfig,
         frames: list[FrameArtifact],
-        warnings: list[dict[str, str]],
+        warnings: list[WarningRecord],
     ) -> list[FrameArtifact]:
         """Interpret every frame, capping concurrency at the admission limit.
 
@@ -523,7 +939,14 @@ class FrameInterpreter:
                 ):
                     ordered[outcome.index] = outcome
             outcomes = [outcome for outcome in ordered if outcome is not None]
-        return self._merge_outcomes(outcomes, warnings)
+        interpreted = self._merge_outcomes(outcomes, warnings)
+        breaker_warning = self._breaker.summary_warning(frame_count)
+        if breaker_warning is not None:
+            # Last, so it reads as the account of the run rather than as one
+            # more per-frame failure: the frames it speaks for are above it.
+            warnings.append(breaker_warning)
+            self._record_warning(breaker_warning)
+        return interpreted
 
     def _interpret_one(
         self,
@@ -533,13 +956,25 @@ class FrameInterpreter:
         frame_count: int,
     ) -> _FrameOutcome:
         self._ensure_frame_invariants(index, frame, frame_count)
-        local_warnings: list[dict[str, str]] = []
-        interpreted_frame, was_interpreted = self._interpret_frame(
+        if not self._breaker.admit():
+            # R-40's **degradation**: the keyframe is not attempted and not
+            # warned about on its own - the breaker's single warning speaks for
+            # all of them - and it is handed back carrying the **extracted
+            # text** OCR already read, which is what OCR-only means.
+            return _FrameOutcome(
+                index=index,
+                frame=frame,
+                interpreted=False,
+                warnings=[],
+                path=frame.path,
+                has_extracted_text=bool(frame.extracted_text.strip()),
+                warning_code=None,
+            )
+        local_warnings: list[WarningRecord] = []
+        interpreted_frame, was_interpreted, read_code = self._interpret_frame(
             config, index, frame, frame_count, local_warnings
         )
-        # The first frame warning (if any) is the read/transport warning surfaced
-        # by _try_interpret_frame; trailing ones are grounding and carrier warnings.
-        warning_code = local_warnings[0].get("code") if local_warnings else None
+        transition = self._breaker.record(frame_number=index + 1, code=read_code)
         return _FrameOutcome(
             index=index,
             frame=interpreted_frame,
@@ -547,13 +982,14 @@ class FrameInterpreter:
             warnings=local_warnings,
             path=frame.path,
             has_extracted_text=bool(frame.extracted_text.strip()),
-            warning_code=warning_code,
+            warning_code=read_code,
+            breaker_transition=transition,
         )
 
     def _merge_outcomes(
         self,
         outcomes: list[_FrameOutcome],
-        warnings: list[dict[str, str]],
+        warnings: list[WarningRecord],
     ) -> list[FrameArtifact]:
         frame_count = len(outcomes)
         frames: list[FrameArtifact] = []
@@ -569,6 +1005,12 @@ class FrameInterpreter:
             frames.append(outcome.frame)
             if outcome.interpreted:
                 self._interpreted_count += 1
+            if outcome.breaker_transition is not None:
+                transition = outcome.breaker_transition
+                self._log(
+                    "breaker.open" if transition["state"] == "open" else "breaker.reset",
+                    transition,
+                )
             for frame_warning in outcome.warnings:
                 warnings.append(frame_warning)
                 self._record_warning(frame_warning)
@@ -604,6 +1046,7 @@ class FrameInterpreter:
             "interpreted_count": self._interpreted_count,
             "max_parallel": self._max_parallel,
             "warning_counts": dict(sorted(self._warning_counts.items())),
+            "breaker": self._breaker.state(),
             "trace_events": list(self._trace_events),
         }
 
@@ -617,12 +1060,16 @@ class FrameInterpreter:
         index: int,
         frame: FrameArtifact,
         frame_count: int,
-        warnings: list[dict[str, str]],
-    ) -> tuple[FrameArtifact, bool]:
+        warnings: list[WarningRecord],
+    ) -> tuple[FrameArtifact, bool, str | None]:
         """Interpret a single frame without mutating shared interpreter state.
 
         Appends any frame warnings to the supplied (per-frame) ``warnings`` list
-        and returns the interpreted frame plus whether a result was produced.
+        and returns the interpreted frame, whether a result was produced, and the
+        code of the read failure it ended in (``None`` when a response arrived).
+        That third value is the breaker's evidence and is returned rather than
+        recovered from the warning list, because the warning list also holds
+        **grounding** warnings a *successful* read produced.
         Trace events, progress updates, and counters are emitted by the caller in
         frame order so the parallel path stays deterministic and thread-safe.
 
@@ -642,20 +1089,46 @@ class FrameInterpreter:
         )
         if frame_warning:
             warnings.append(frame_warning)
+        read_code = frame_warning.get("code") if frame_warning else None
+        if result is not None and not result.carries_a_reading:
+            # R-39 where a reading arrives by any route: the transport path
+            # rejects an empty payload as malformed, and a reading that reached
+            # here saying nothing is the same non-answer one step later. It is
+            # not attached and it is not counted, so a run cannot report a
+            # frame as interpreted on the strength of an empty object.
+            #
+            # And it leaves by the same door, because it is the same finding: a
+            # reading dropped silently left `read_code` unset, so no warning was
+            # raised, no **grounding** was attached, and the breaker read the
+            # attempt as a success. From every seam the frame was
+            # indistinguishable from one the model read and had nothing to
+            # remark on - which is the claim R-39 exists to refuse. Malformed
+            # rather than a transport code: the response arrived, so it is
+            # evidence the transport works and must reset the breaker's tally
+            # rather than count toward it.
+            result = None
+            read_code = "local_vision_malformed_response"
+            warnings.append(
+                warning(
+                    "local_vision",
+                    read_code,
+                    f"frame {frame.index or index + 1} interpretation carried no reading",
+                )
+            )
         if result:
-            return self._interpreted(frame, result, index, warnings), True
-        if frame_warning and frame_warning.get("code") in FRAME_READ_FAILURE_CODES:
+            return self._interpreted(frame, result, index, warnings), True, read_code
+        if read_code in FRAME_READ_FAILURE_CODES:
             unusable = GroundingAssessment(
                 UNGROUNDED,
                 None,
-                f"vision model produced no usable output ({frame_warning.get('code')})",
+                f"vision model produced no usable output ({read_code})",
             )
             carried, carrier_warnings = frame.with_interpretation(
                 None, grounding=unusable.public_dict()
             )
             warnings.extend(carrier_warnings)
-            return carried, False
-        return frame, False
+            return carried, False, read_code
+        return frame, False, read_code
 
     def _try_interpret_frame(
         self,
@@ -664,7 +1137,7 @@ class FrameInterpreter:
         prompt: str,
         *,
         prompt_profile: str,
-    ) -> tuple[Interpretation | None, dict[str, str] | None]:
+    ) -> tuple[Interpretation | None, WarningRecord | None]:
         if self.try_interpret is try_interpret_image:
             return try_interpret_image_after_probe(
                 config,
@@ -684,7 +1157,7 @@ class FrameInterpreter:
         frame: FrameArtifact,
         reading: Interpretation,
         index: int,
-        warnings: list[dict[str, str]],
+        warnings: list[WarningRecord],
     ) -> FrameArtifact:
         """The frame carrying the model's reading and Distill's grounding of it.
 
@@ -700,6 +1173,7 @@ class FrameInterpreter:
             verbatim_text=reading.verbatim_text,
             text_confidence=reading.text_confidence,
             has_interpretation=reading.has_interpretation,
+            carries_a_reading=reading.carries_a_reading,
         )
         carried, carrier_warnings = frame.with_interpretation(
             reading, grounding=assessment.public_dict()
@@ -723,10 +1197,32 @@ class FrameInterpreter:
         self._max_parallel = 1
         self._warning_counts = {}
         self._trace_events = []
+        # A breaker is a fact about one run: an interpreter reused for a second
+        # run starts closed, or a server that recovered between runs would
+        # never be spoken to again.
+        self._breaker = _TransportBreaker()
 
-    def _record_warning(self, warning_payload: dict[str, str]) -> None:
+    def _record_warning(self, warning_payload: WarningRecord) -> None:
+        """Tally one **warning** by what it says happened, not by being one record.
+
+        A carrier hands back warnings the **redaction** policy already folded,
+        so one record can stand for four confusable matches. Counting records
+        made `debug_info` and the **manifest** disagree about the same run, so
+        the count is read the one way `errors.occurrences_of` reads it.
+
+        Keyed on the code alone, where `aggregate_warnings` keys on (stage,
+        code) - deliberately, and worth stating because the two numbers can
+        differ. This is a debug tally for one stage's run, and the warnings
+        reaching it are the vision pass's own plus the ones a carrier raised
+        while redacting the model's words (`redaction`, `artifacts`). A code
+        that appeared under two stages is one entry here and two records in the
+        **manifest**; the total is the same either way, and it is the total
+        this field is read for.
+        """
         code = warning_payload.get("code", "unknown")
-        self._warning_counts[code] = self._warning_counts.get(code, 0) + 1
+        self._warning_counts[code] = self._warning_counts.get(code, 0) + occurrences_of(
+            warning_payload
+        )
 
     def _log(self, event: str, detail: dict[str, Any]) -> None:
         if self._debug_enabled:
@@ -789,7 +1285,13 @@ def _interpret_with_rapid_mlx(
     last_preview = ""
     for _attempt in range(DEFAULT_MAX_ATTEMPTS):
         try:
-            envelope = _http_post_json(requestor, completions_url, body, config.timeout_sec)
+            envelope = _http_post_json(
+                requestor,
+                completions_url,
+                body,
+                config.timeout_sec,
+                allow_remote_endpoint=config.allow_remote_endpoint,
+            )
         except TimeoutError as exc:
             raise LocalVisionFailure(
                 "local_vision_timeout",
@@ -867,11 +1369,19 @@ def _http_get_json(
     requestor: HttpRequestor | None,
     url: str,
     timeout_sec: float,
+    *,
+    allow_remote_endpoint: bool = False,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="GET", url=url, timeout=timeout_sec)
     else:
-        payload = _urlopen_json("GET", url, body=None, timeout_sec=timeout_sec)
+        payload = _urlopen_json(
+            "GET",
+            url,
+            body=None,
+            timeout_sec=timeout_sec,
+            allow_remote_endpoint=allow_remote_endpoint,
+        )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
     return payload
@@ -882,17 +1392,102 @@ def _http_post_json(
     url: str,
     body: dict[str, Any],
     timeout_sec: float,
+    *,
+    allow_remote_endpoint: bool = False,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="POST", url=url, body=body, timeout=timeout_sec)
     else:
-        payload = _urlopen_json("POST", url, body=body, timeout_sec=timeout_sec)
+        payload = _urlopen_json(
+            "POST",
+            url,
+            body=body,
+            timeout_sec=timeout_sec,
+            allow_remote_endpoint=allow_remote_endpoint,
+        )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
     return payload
 
 
-def _urlopen_json(method: str, url: str, body: dict[str, Any] | None, timeout_sec: float) -> Any:
+class _RedirectsAreRejected(urllib.request.HTTPRedirectHandler):
+    """R-43 (RV-7): a 3xx ends the request instead of starting another one.
+
+    Validating an endpoint and then following wherever it points validates
+    nothing - the second request is to an address no rule ever saw. Refusing
+    outright, rather than re-validating the target, is the smaller rule: the
+    only endpoint Distill talks to is the one the operator configured.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,  # noqa: ARG002 - urllib's signature; the body is not read
+        code: int,
+        msg: str,
+        headers: Any,  # noqa: ARG002 - urllib's signature; no header is trusted
+        newurl: str,
+    ) -> NoReturn:
+        _reject_endpoint(
+            "redirect",
+            f"Local vision endpoint answered {code} {msg} redirecting to another "
+            "address; redirects are not followed.",
+            url=req.full_url,
+            status=code,
+            location=newurl,
+        )
+
+
+def _build_opener(*handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
+    """The vision client's opener: the default chain, minus two of its habits.
+
+    Redirects are not followed, and no proxy is consulted. An empty
+    `ProxyHandler` rather than the default one because the default reads
+    `HTTP_PROXY` from the environment: a validated loopback endpoint would
+    still be dialled through whatever that names, which sends the **keyframe**
+    to a host no rule here ever saw. The endpoint is local by rule, so there is
+    nothing for a proxy to do.
+
+    Built by a function so a test can put a fake transport under the *same*
+    chain production uses, instead of asserting against a chain it assembled
+    itself.
+    """
+    return urllib.request.build_opener(
+        _RedirectsAreRejected, urllib.request.ProxyHandler({}), *handlers
+    )
+
+
+_OPENER = _build_opener()
+
+
+def _urlopen_json(
+    method: str,
+    url: str,
+    body: dict[str, Any] | None,
+    timeout_sec: float,
+    *,
+    allow_remote_endpoint: bool = False,
+    resolver: AddressResolver | None = None,
+) -> Any:
+    """One request to the vision endpoint, validated before and bounded after.
+
+    The address is resolved and checked here, on every request, rather than
+    once when the config was read (D-029): a name that answered with 127.0.0.1
+    while the config was being validated is free to answer with something else
+    by the time the **keyframe** is posted, and only the check standing between
+    the resolution and the connection sees that.
+
+    What that does not close, stated so nobody reads it as more: the connection
+    resolves the name again, so a name that changes its answer between this
+    check and that connect is not caught. Closing it means connecting to the
+    address this function validated rather than to the name, which is a socket
+    Distill would have to open itself. The bound here is per request, which is
+    what D-029 asks for; it is not per packet.
+    """
+    host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
+    _check_resolved_address(
+        host, port, allow_remote_endpoint=allow_remote_endpoint, resolver=resolver
+    )
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -904,12 +1499,43 @@ def _urlopen_json(method: str, url: str, body: dict[str, Any] | None, timeout_se
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
-            raw = response.read().decode("utf-8")
+        with _OPENER.open(request, timeout=timeout_sec) as response:
+            # One byte past the cap, so a body that is exactly at it still
+            # arrives and a body over it is recognisable without being read.
+            # The header is not consulted: a Content-Length is the sender's
+            # claim about the sender, and R-44 is a bound on this process.
+            payload = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(payload) > MAX_RESPONSE_BYTES:
+            # A delivered response, in M7.2's sense: it arrived, so it is
+            # evidence the transport works and must not count toward the
+            # breaker's consecutive-failure tally. It is unusable for the same
+            # reason a truncated body is - hence malformed, not unavailable.
+            raise RuntimeError(
+                f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap"
+            )
+        raw = payload.decode("utf-8")
     except urllib.error.HTTPError as exc:
         # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so
-        # the probe/interpret paths can map them onto warning codes.
-        detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+        # the probe/interpret paths can map them onto warning codes. Bounded
+        # like any other body (R-44), and tighter: only a preview of it is ever
+        # used, so reading a gigabyte to quote 200 characters of it is a cost
+        # with no reader.
+        detail = (
+            exc.read(ERROR_BODY_PREVIEW_BYTES).decode("utf-8", errors="replace")
+            if hasattr(exc, "read")
+            else ""
+        )
+        if 300 <= exc.code < 400:
+            # A redirect this module never got to refuse: urllib turns a 3xx it
+            # cannot act on - no `Location`, or one naming a scheme it will not
+            # open - into an `HTTPError` before `_RedirectsAreRejected` is
+            # consulted. A 3xx carries no body, so quoting one leaves an
+            # operator with `HTTP 302 from …: ` and nothing to act on. Nothing
+            # is followed either way; only the message was the mystery.
+            raise RuntimeError(
+                f"HTTP {exc.code} from {url}: the endpoint answered a redirect that could not "
+                "be followed, and redirects are not followed in any case"
+            ) from exc
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail[:200]}") from exc
     except http.client.IncompleteRead as exc:
         # A server that closes the connection mid-body (crash/restart) yields a
@@ -926,6 +1552,12 @@ def _result_from_payload(
     config: LocalVisionConfig,
     prompt_profile: str,
 ) -> Interpretation:
+    """The reading a payload `parse_interpretation_json` accepted describes.
+
+    Every field is optional here because the payload has already been checked
+    for one that is not (R-39): what is missing from a validated payload is a
+    field the model left out, not an answer that said nothing.
+    """
     elements = interpreted.get("detected_elements", [])
     if not isinstance(elements, list):
         elements = []
@@ -954,6 +1586,15 @@ def _normalize_text_confidence(value: Any) -> str:
 
 
 def parse_interpretation_json(raw_response: str) -> dict[str, Any] | None:
+    """The model's answer as an interpretation payload, or `None` if it is not one.
+
+    `None` means malformed, and covers three things the caller handles
+    identically: text that is not JSON, JSON that is not an object, and an
+    object that carries no reading (R-39). The third is why this is not a bare
+    parser - a server that is up and answers `{}` for every keyframe parses
+    perfectly, and counting that as an interpretation is what makes a dead
+    model look like a working one.
+    """
     stripped = raw_response.strip()
     if stripped.startswith("```"):
         lines = stripped.splitlines()
@@ -966,7 +1607,9 @@ def parse_interpretation_json(raw_response: str) -> dict[str, Any] | None:
         parsed = json.loads(stripped)
     except json.JSONDecodeError:
         parsed = _extract_first_json_object(stripped)
-    return parsed if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict) or not document_carries_a_reading(parsed):
+        return None
+    return parsed
 
 
 def _extract_first_json_object(text: str) -> dict[str, Any] | None:

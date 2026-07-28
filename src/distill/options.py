@@ -73,6 +73,7 @@ LOCAL_VISION_OPTION_NAMES = (
     "local_vision_model",
     "local_vision_base_url",
     "local_vision_timeout_sec",
+    "local_vision_allow_remote_endpoint",
 )
 
 
@@ -126,6 +127,7 @@ class DistillOptions:
     local_vision_model: str = DEFAULT_LOCAL_VISION_MODEL
     local_vision_base_url: str = DEFAULT_LOCAL_VISION_BASE_URL
     local_vision_timeout_sec: float = DEFAULT_TIMEOUT_SEC
+    local_vision_allow_remote_endpoint: bool = False
     job_id: str = ""
     resume_partial: bool = True
 
@@ -162,6 +164,7 @@ class DistillOptions:
             local_vision_model=local_vision.model,
             local_vision_base_url=local_vision.base_url,
             local_vision_timeout_sec=local_vision.timeout_sec,
+            local_vision_allow_remote_endpoint=local_vision.allow_remote_endpoint,
             job_id=str(values["job_id"] or f"distill-{uuid4().hex}"),
             resume_partial=values["resume_partial"],
         )
@@ -198,6 +201,7 @@ class DistillOptions:
             base_url=self.local_vision_base_url,
             timeout_sec=self.local_vision_timeout_sec,
             caption_frames=self.caption_frames,
+            allow_remote_endpoint=self.local_vision_allow_remote_endpoint,
         )
 
     def transcription_config(self) -> TranscriptionConfig:

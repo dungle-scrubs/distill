@@ -237,8 +237,9 @@ def test_the_banner_names_a_level_only_when_it_is_one() -> None:
     """A `level` this codebase does not define is not repeated as though it were one.
 
     `GroundingAssessment.from_document` passes an unrecognized level through
-    deliberately - anything but `grounded` reads as low confidence - so the
-    banner says low confidence for it without quoting the string back.
+    deliberately - anything outside `NOT_LOW_CONFIDENCE` reads as low
+    confidence - so the banner says low confidence for it without quoting the
+    string back.
     """
     frame, _warnings = keyframe().with_interpretation(
         read(visual_summary="A dark slide"),

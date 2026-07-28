@@ -13,6 +13,7 @@ from untrusted_blocks import SENTINEL, assert_delimited, attack
 
 from distill.artifacts import FrameArtifact, Interpretation
 from distill.errors import DistillError
+from distill.grounding import UNGROUNDED
 from distill.local_vision import (
     DEFAULT_LOCAL_VISION_BASE_URL,
     DEFAULT_LOCAL_VISION_MODEL,
@@ -493,7 +494,7 @@ def test_interpret_image_malformed_response_returns_warning(
     # valid JSON, so both retry attempts are exhausted -> malformed response.
     monkeypatch.setattr(
         "distill.local_vision._urlopen_json",
-        lambda method, url, body=None, timeout_sec=30.0: (
+        lambda method, url, body=None, timeout_sec=30.0, **_: (
             _models_body(DEFAULT_MODEL)
             if url.rstrip("/").endswith("/models")
             else _chat_envelope("definitely not json")
@@ -519,6 +520,266 @@ def test_interpretation_parser_accepts_fenced_or_prefaced_json() -> None:
 
     assert parse_interpretation_json(f"```json\n{json.dumps(payload)}\n```") == payload
     assert parse_interpretation_json(f"Here is the result:\n{json.dumps(payload)}") == payload
+
+
+def test_an_empty_object_is_rejected_rather_than_counted_as_an_interpretation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """R-39: `{}` is a malformed response, not a reading of the keyframe.
+
+    A server that is up and answers `{}` for every **keyframe** is otherwise
+    indistinguishable from a working one: the parser hands back a dict, the
+    interpret path builds an all-empty **interpretation** from it, and the run
+    reports a reading it does not have.
+    """
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    monkeypatch.setattr(
+        "distill.local_vision._urlopen_json",
+        lambda method, url, body=None, timeout_sec=30.0, **_: (
+            _models_body(DEFAULT_MODEL)
+            if url.rstrip("/").endswith("/models")
+            else _chat_envelope("{}")
+        ),
+    )
+
+    assert parse_interpretation_json("{}") is None
+    assert parse_interpretation_json("Here is the result:\n{}") is None
+
+    result, warning = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert warning is not None
+    assert warning["code"] == "local_vision_malformed_response"
+
+
+def test_a_payload_needs_one_non_empty_substantive_field(tmp_path: Path) -> None:
+    """R-39: metadata is not content, and whitespace is not content.
+
+    Each field that carries what the model saw admits the payload on its own;
+    a payload holding only the fields that describe a reading - its kind, its
+    confidence, its hedge - describes nothing, and neither does one whose
+    substantive fields are blank, whitespace, or an empty list.
+    """
+    for field_name, value in (
+        ("visual_summary", "A line chart"),
+        ("interpretation", "Values rise over time."),
+        ("detected_elements", ["axis"]),
+        ("verbatim_text", "Quarterly revenue"),
+    ):
+        assert parse_interpretation_json(json.dumps({field_name: value})) == {field_name: value}
+
+    metadata_only = {
+        "frame_kind": "slide",
+        "text_confidence": "high",
+        "uncertainty": "The axis labels are small.",
+    }
+    assert parse_interpretation_json(json.dumps(metadata_only)) is None
+
+    blank = {
+        "visual_summary": "   ",
+        "interpretation": "",
+        "detected_elements": ["", "  \t"],
+        "verbatim_text": "\n",
+        "frame_kind": "slide",
+        "text_confidence": "high",
+    }
+    assert parse_interpretation_json(json.dumps(blank)) is None
+
+    # A substantive field of the wrong type carries nothing either.
+    assert parse_interpretation_json(json.dumps({"detected_elements": "axis"})) is None
+    assert parse_interpretation_json(json.dumps({"visual_summary": {}})) is None
+
+
+def test_the_response_summary_does_not_claim_an_empty_interpretation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """R-39: the run's own count of readings excludes the ones that are empty.
+
+    Two **keyframes**, one answered with a reading and one answered `{}`. The
+    interpreted count is what a caller reads to know how much of the run the
+    vision pass actually covered, so it must say one.
+    """
+    for index in range(2):
+        (tmp_path / f"frame{index}.png").write_bytes(b"png")
+
+    def fake_urlopen(
+        method: str,
+        url: str,
+        body: Any = None,
+        timeout_sec: float = 30.0,
+        **_: Any,
+    ) -> Any:
+        if url.rstrip("/").endswith("/models"):
+            return _models_body(DEFAULT_MODEL)
+        text = next(
+            part["text"] for part in body["messages"][0]["content"] if part.get("type") == "text"
+        )
+        content = _frame_json(verbatim_text="frame0", text_confidence="high")
+        return _chat_envelope(content if "frame0" in text else "{}")
+
+    monkeypatch.setattr("distill.local_vision._urlopen_json", fake_urlopen)
+
+    interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe, debug=True)
+    frames, warnings = interpreter.interpret(
+        [
+            _frame(index + 1, tmp_path / f"frame{index}.png", extracted_text=f"frame{index}")
+            for index in range(2)
+        ]
+    )
+
+    debug_info = interpreter.debug_info()
+    assert debug_info["interpreted_count"] == 1
+    assert debug_info["warning_counts"]["local_vision_malformed_response"] == 1
+    assert frames[0].reading is not None
+    assert frames[1].reading is None
+    assert [w["code"] for w in warnings] == ["local_vision_malformed_response"]
+    complete = next(
+        event for event in debug_info["trace_events"] if event["event"] == "interpret.complete"
+    )
+    assert complete["detail"]["interpreted_frames"] == 1
+
+
+def test_a_reading_that_says_nothing_is_neither_carried_nor_counted(tmp_path: Path) -> None:
+    """R-39 one step past the parser, where a reading arrives already built.
+
+    The transport path rejects an empty payload, but the interpreter counted a
+    frame as interpreted whenever a reading object came back at all. An
+    `Interpretation` holding nothing but its backend is the same non-answer with
+    a dataclass around it, and a **frame artifact** that carried it would make
+    `render` announce a visual interpretation with nothing under the heading.
+
+    It is the *same* non-answer, so it takes the same route out: the
+    malformed-response **warning**, the `UNGROUNDED` assessment saying the
+    model produced no usable output, and a breaker that counts it as a
+    delivered response. Dropping it silently left a frame whose reading was
+    discarded looking, from every seam, exactly like a frame the vision pass
+    read successfully and had nothing to remark on.
+    """
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+
+    def empty_reading(
+        config: LocalVisionConfig,
+        image_path: Path,
+        _prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[Interpretation, None]:
+        return (
+            Interpretation(
+                backend=config.backend,
+                model=config.model,
+                prompt_profile=prompt_profile,
+                frame_kind="slide",
+                text_confidence="high",
+                uncertainty="   ",
+            ),
+            None,
+        )
+
+    interpreter = FrameInterpreter(
+        LocalVisionConfig(), probe=_available_probe, try_interpret=empty_reading
+    )
+
+    frames, warnings = interpreter.interpret([_frame(1, image, extracted_text="Hello")])
+
+    assert frames[0].reading is None
+    assert [w["code"] for w in warnings] == ["local_vision_malformed_response"]
+    assert interpreter.debug_info()["interpreted_count"] == 0
+    # The frame says why it has no reading, rather than looking like a frame
+    # that had nothing to say.
+    assert frames[0].grounding is not None
+    assert frames[0].grounding["level"] == UNGROUNDED
+    assert "no usable output" in frames[0].grounding["reason"]
+    # A response arrived, so the breaker takes it as evidence the transport
+    # works: it is not a consecutive transport failure and it clears the tally.
+    assert interpreter.debug_info()["breaker"]["transport_failures"] == 0
+
+
+def test_a_truncated_json_body_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """R-39: a body that stops mid-value is malformed at either layer.
+
+    A server killed mid-write truncates the HTTP body; a model that runs out of
+    output budget truncates the JSON it was asked for. Both must reach the
+    malformed-response **warning** and neither may raise or be counted.
+    """
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    truncated = '{"visual_summary": "A line ch'
+
+    assert parse_interpretation_json(truncated) is None
+
+    monkeypatch.setattr(
+        "distill.local_vision._urlopen_json",
+        lambda method, url, body=None, timeout_sec=30.0, **_: (
+            _models_body(DEFAULT_MODEL)
+            if url.rstrip("/").endswith("/models")
+            else _chat_envelope(truncated)
+        ),
+    )
+
+    result, warning = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert warning is not None
+    assert warning["code"] == "local_vision_malformed_response"
+
+    # The same shape one layer down: the HTTP body itself ends mid-value, so no
+    # envelope is ever parsed. The stub above has to come off first, or the real
+    # decode this half is about never runs.
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        "distill.local_vision._OPENER",
+        _FakeOpener(b'{"choices": [{"message": {"content": "'),
+    )
+
+    body_result, body_warning = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert body_result is None
+    assert body_warning is not None
+    assert body_warning["code"] == "local_vision_malformed_response"
+
+
+class _FakeHttpResponse:
+    """The minimum of an ``http.client.HTTPResponse`` that ``_urlopen_json`` uses."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> _FakeHttpResponse:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self._payload if size < 0 else self._payload[:size]
+
+
+class _FakeOpener:
+    """Stands in for the vision client's opener, serving one canned response.
+
+    The opener and not ``urllib.request.urlopen``: the client opens through its
+    own opener now, the one built without redirect following (R-43).
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def open(self, request: Any, timeout: float | None = None) -> _FakeHttpResponse:
+        return _FakeHttpResponse(self._payload)
 
 
 def test_interpret_image_cancel_returns_warning(
@@ -617,7 +878,12 @@ def test_frame_interpreter_debug_info_tracks_run_state(tmp_path: Path) -> None:
         },
         {
             "event": "interpret.complete",
-            "detail": {"frames": 1, "interpreted_frames": 1, "warnings": 0},
+            "detail": {
+                "frames": 1,
+                "interpreted_frames": 1,
+                "warnings": 0,
+                "warning_occurrences": 0,
+            },
         },
     ]
 
@@ -763,11 +1029,15 @@ def test_frame_interpreter_records_unavailable_probe_warning() -> None:
     frames, warnings = interpreter.interpret([unreached])
 
     assert frames == [unreached]
+    # Classified *defect* against R-41: the record now carries its occurrence
+    # count, and the probe's warning is built by the one builder every other
+    # warning goes through rather than assembled as a bare mapping beside it.
     assert warnings == [
         {
             "stage": "local_vision",
             "code": "local_vision_rapid_mlx_unavailable",
             "message": "missing",
+            "occurrences": 1,
         }
     ]
     assert interpreter.debug_info()["warning_counts"] == {

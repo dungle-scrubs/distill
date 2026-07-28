@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
-from .errors import DistillError, warning
+from .errors import DistillError, WarningRecord, warning
 from .progress import ProgressCounter, ProgressReporter
 from .run_command import CommandTimeouts, stream
 
@@ -123,7 +123,7 @@ def extract_audio(
     audio_path: Path,
     progress: ProgressReporter | None = None,
     duration_sec: float | None = None,
-) -> tuple[bool, list[dict[str, str]]]:
+) -> tuple[bool, list[WarningRecord]]:
     """Extract the audio track, reporting whether it landed and what it cost.
 
     Two answers rather than one warning, because they are independent: a
@@ -222,8 +222,8 @@ def transcribe_audio(
     vad_filter: bool,
     progress: ProgressCounter | ProgressReporter | None = None,
     adapter: WhisperAdapter | None = None,
-) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
-    warnings: list[dict[str, str]] = []
+) -> tuple[dict[str, Any] | None, list[WarningRecord]]:
+    warnings: list[WarningRecord] = []
     if adapter is None:
         try:
             adapter = FasterWhisperAdapter(model_name)
@@ -298,7 +298,7 @@ def transcribe_audio(
         return None, [warning("transcript", "whisper_failed", f"Whisper failed: {exc}")]
 
 
-def vad_drop_warnings(info: Any, vad_filter: bool) -> list[dict[str, str]]:
+def vad_drop_warnings(info: Any, vad_filter: bool) -> list[WarningRecord]:
     if not vad_filter:
         return []
     duration = float(getattr(info, "duration", 0.0) or 0.0)
@@ -333,7 +333,7 @@ def transcribe_video(
     vad_filter: bool,
     progress: ProgressCounter | ProgressReporter | None = None,
     duration_sec: float | None = None,
-) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+) -> tuple[dict[str, Any] | None, list[WarningRecord]]:
     audio_path = work_dir / "audio.wav"
     extracted, audio_warnings = extract_audio(
         video_path,

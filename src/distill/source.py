@@ -59,7 +59,7 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
-from .errors import DistillError, warning
+from .errors import DistillError, WarningRecord, warning
 from .links import RelatedLink, extract_relevant_links
 from .options import DistillOptions
 from .progress import ProgressReporter
@@ -194,7 +194,7 @@ class AcquisitionLease:
     lock_key: str
     lock_path: Path
     lock: ExclusiveLock
-    warnings: list[dict[str, str]] = field(default_factory=list)
+    warnings: list[WarningRecord] = field(default_factory=list)
 
     @property
     def released(self) -> bool:
@@ -259,7 +259,7 @@ class AcquiredSource:
 
     path: Path
     lease: AcquisitionLease
-    warnings: list[dict[str, str]] = field(default_factory=list)
+    warnings: list[WarningRecord] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -269,7 +269,7 @@ class SourceInfo:
     duration_sec: float
     source_fingerprint: str
     source_hash: str
-    warnings: list[dict[str, str]]
+    warnings: list[WarningRecord]
     youtube_video_id: str | None = None
     youtube_lock_key: str | None = None
     related_links: list[RelatedLink] | None = None
@@ -327,7 +327,7 @@ class SourceResolution:
 class YouTubeMetadata:
     video_id: str
     description: str
-    warnings: list[dict[str, str]]
+    warnings: list[WarningRecord]
 
 
 class YouTubeDownloaderProtocol(Protocol):
@@ -339,7 +339,7 @@ class YouTubeDownloaderProtocol(Protocol):
     ) -> AcquiredSource: ...
 
 
-def probe_duration(path: Path) -> tuple[float, list[dict[str, str]]]:
+def probe_duration(path: Path) -> tuple[float, list[WarningRecord]]:
     """The source's duration, with any **warning** the probe itself recorded.
 
     The warnings are truncated capture (R-33). They are returned rather than
@@ -513,7 +513,7 @@ class LocalSourceProvider:
                 "E_BAD_SOURCE", "source", "local video does not exist", {"path": path_text}
             )
         resolved = original.resolve()
-        warnings: list[dict[str, str]] = []
+        warnings: list[WarningRecord] = []
         if resolved != original.absolute():
             warnings.append(
                 warning(
@@ -716,7 +716,7 @@ def _run_ytdlp(
     )
 
 
-def _metadata_unavailable() -> dict[str, str]:
+def _metadata_unavailable() -> WarningRecord:
     return warning(
         "youtube",
         "metadata_unavailable",
@@ -724,7 +724,7 @@ def _metadata_unavailable() -> dict[str, str]:
     )
 
 
-def youtube_description(url: str) -> tuple[str, list[dict[str, str]]]:
+def youtube_description(url: str) -> tuple[str, list[WarningRecord]]:
     try:
         proc = _run_ytdlp(["--skip-download", "--print", "%(description)s"], url)
     except DistillError as exc:
@@ -904,7 +904,7 @@ def _probed_duration_sec(probe: Any) -> float:
         return 0.0
 
 
-def validate_media_file(path: Path) -> list[dict[str, str]]:
+def validate_media_file(path: Path) -> list[WarningRecord]:
     """Confirm a staged file is the media Distill asked for, before promoting it.
 
     A **fatal error**, not a **degradation** (ADR-0002): the media file is the
@@ -1201,7 +1201,7 @@ class YoutubeDownloader:
         self,
         lock_key: str,
         lock: Path,
-    ) -> tuple[AcquisitionLease | None, list[dict[str, str]]]:
+    ) -> tuple[AcquisitionLease | None, list[WarningRecord]]:
         """Poll for the lease within this run's wait budget.
 
         The budget is the only thing that ends the wait: a lock is held until
@@ -1214,7 +1214,7 @@ class YoutubeDownloader:
         which is the window the check exists to close.
         """
         started = time.monotonic()
-        warnings: list[dict[str, str]] = []
+        warnings: list[WarningRecord] = []
         while True:
             confined_path(lock, self.output_root)
             lease = AcquisitionLease.take(lock_key, lock)

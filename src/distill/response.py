@@ -21,8 +21,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from .artifacts import FrameArtifact, serialize
+from .artifacts import FrameArtifact, document_carries_a_reading, serialize
 from .bundle_store import BundleSnapshot
+from .errors import WarningRecord, total_occurrences
 from .links import RelatedLink
 from .options import DistillOptions
 from .release import DISTILL_VERSION
@@ -36,7 +37,7 @@ def manifest_document(
     *,
     transcript_present: bool,
     frames: list[dict[str, Any]],
-    warnings: list[dict[str, str]],
+    warnings: list[WarningRecord],
 ) -> dict[str, Any]:
     """The **manifest** content for one published **generation**.
 
@@ -73,7 +74,10 @@ def manifest_document(
         "options": options.public_dict(source.source_type),
         "frame_count": len(frames),
         "transcript_present": transcript_present,
-        "warning_count": len(warnings),
+        # Events, not records. `warnings` arrives folded (R-41), so its length
+        # counts distinct (stage, code) pairs - a run that timed out eighty
+        # times would publish `warning_count: 2` and read as a clean run.
+        "warning_count": total_occurrences(warnings),
         "frames": frames,
         "warnings": warnings,
     }
@@ -148,7 +152,7 @@ def run_response(
     source: SourceInfo,
     frames: list[dict[str, Any]],
     transcript_present: bool,
-    warnings: list[dict[str, str]],
+    warnings: list[WarningRecord],
     cached: bool,
     progress: dict[str, Any] | None = None,
     job_id: str | None = None,
@@ -162,8 +166,12 @@ def run_response(
     a fresh run got from `response_frames` and a cache hit read out of the
     **manifest** the previous run wrote.
     """
+    # Counted on what a reading says, not on a key being present (R-39): a
+    # **manifest** written before an empty response was rejected, or by a server
+    # answering `{}`, carries interpretations that interpret nothing, and this
+    # sentence is where a caller would be told they exist.
     visual_count = sum(
-        1 for frame in frames if isinstance(frame.get("visual_interpretation"), dict)
+        1 for frame in frames if document_carries_a_reading(frame.get("visual_interpretation"))
     )
     summary = f"Processed {source.duration_sec:.1f}s video with {len(frames)} keyframes"
     if visual_count:

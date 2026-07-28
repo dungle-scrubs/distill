@@ -39,21 +39,27 @@ from typing import Any
 
 from .artifacts import Carrier, FrameArtifact, Interpretation, Transcript, serialize
 from .emit import EMITTER
-from .errors import DistillError
-from .grounding import GROUNDED, UNGROUNDED, WEAK, GroundingAssessment
+from .errors import DistillError, WarningRecord
+from .grounding import CORROBORATED, SELF_REPORT, UNGROUNDED, WEAK, GroundingAssessment
 from .links import RelatedLink
 
 MIN_TRANSCRIPT_CHARS = 3
 
-GROUNDING_LEVELS = frozenset({GROUNDED, WEAK, UNGROUNDED})
+GROUNDING_LEVELS = frozenset({CORROBORATED, SELF_REPORT, WEAK, UNGROUNDED})
 """The levels this document is willing to print as a level.
 
 `GroundingAssessment.from_document` passes an unrecognized level through on
-purpose - anything that is not `grounded` reads as low confidence, which is the
-answer that does not vouch for text nobody checked - so what arrives here is not
-guaranteed to be one of `grounding.py`'s words. The banner still says low
-confidence for it; it just does not repeat the string as though it named a
-level.
+purpose - anything outside `grounding.NOT_LOW_CONFIDENCE` reads as low
+confidence, which is the answer that does not vouch for text nobody checked - so
+what arrives here is not guaranteed to be one of `grounding.py`'s words. The
+banner still says low confidence for it; it just does not repeat the string as
+though it named a level.
+
+Every level `grounding.py` defines is listed, `CORROBORATED` included, so this
+set is "the words that name a level" and not "the words that mark a frame".
+Whether a level is marked at all is one question and it is asked once, of the
+assessment, in `_low_confidence_lines` - a second copy of that judgement here
+would be a level that could stop being marked by being left off a list.
 """
 
 UNTRUSTED_DATA_PREAMBLE = (
@@ -149,7 +155,7 @@ def render_markdown(
     duration_sec: float,
     transcript: Transcript | None,
     frames: list[FrameArtifact],
-    warnings: list[dict[str, str]],
+    warnings: list[WarningRecord],
     related_links: list[RelatedLink] | None = None,
 ) -> str:
     _require_redaction_policy(
@@ -305,11 +311,16 @@ def _frame_lines(frame: FrameArtifact) -> list[str]:
 
 
 def _low_confidence_lines(assessment: GroundingAssessment | None, caveat: str) -> list[str]:
-    """The banner a **grounding** that is not grounded puts above a reading.
+    """The banner a low-confidence **grounding** puts above a reading.
 
-    Absent for a grounded frame, and absent for a frame nobody assessed: a
-    banner that appeared whenever the assessment was missing would report low
-    confidence for every frame produced before the vision pass ran.
+    Absent for a **corroborated** frame, and absent for a frame nobody
+    assessed: a banner that appeared whenever the assessment was missing would
+    report low confidence for every frame produced before the vision pass ran.
+
+    Which levels earn it is not restated here. The assessment is asked, so
+    `SELF_REPORT` was marked the moment `grounding.py` declared it a level
+    outside `NOT_LOW_CONFIDENCE` - a list of marked levels kept here would have
+    let the new level arrive unmarked by being an entry nobody added (R-42).
 
     Distill's own voice, so it is not delimited: a **grounding** is Distill's
     assessment of a reading, and its level and reason are literals in

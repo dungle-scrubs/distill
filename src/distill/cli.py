@@ -38,7 +38,7 @@ def _add_common_processing_options(parser: argparse.ArgumentParser) -> None:
             parser.add_argument(flag, type=spec.caster)
         elif key == "local_vision_timeout_sec":
             parser.add_argument(flag, type=float)
-        elif key == "caption_frames":
+        elif key in {"caption_frames", "local_vision_allow_remote_endpoint"}:
             parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=None)
         else:
             parser.add_argument(flag)
@@ -64,7 +64,24 @@ PROCESSING_KEYS = (
     "local_vision_model",
     "local_vision_base_url",
     "local_vision_timeout_sec",
+    "local_vision_allow_remote_endpoint",
 )
+
+LOCAL_VISION_DIAGNOSTIC_KEYS = (
+    "caption_frames",
+    "local_vision_backend",
+    "local_vision_model",
+    "local_vision_base_url",
+    "local_vision_timeout_sec",
+    "local_vision_allow_remote_endpoint",
+)
+"""What `local-vision-diagnostics` forwards, named once so the parser can be checked.
+
+`_args_payload` reads these off the namespace with a bare `getattr`, so a key
+here that the subparser never registered is an `AttributeError` on every
+invocation of the command rather than a missing option. Stating the list gives
+a test something to hold both halves against.
+"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
     vision.add_argument("--local-vision-model")
     vision.add_argument("--local-vision-base-url")
     vision.add_argument("--local-vision-timeout-sec", type=float)
+    vision.add_argument(
+        "--local-vision-allow-remote-endpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
 
     raw = subcommands.add_parser(
         "call-tool", help="Call a package tool by MCP-style name and JSON args"
@@ -197,16 +219,7 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "timeout-probe":
             _print_json(run_timeout_probe(args.probe_ms))
         elif args.command == "local-vision-diagnostics":
-            payload = _args_payload(
-                args,
-                (
-                    "caption_frames",
-                    "local_vision_backend",
-                    "local_vision_model",
-                    "local_vision_base_url",
-                    "local_vision_timeout_sec",
-                ),
-            )
+            payload = _args_payload(args, LOCAL_VISION_DIAGNOSTIC_KEYS)
             _print_json(local_vision_diagnostics(payload))
         elif args.command == "call-tool":
             response = DistillSession().call_tool(args.tool, json.loads(args.args))

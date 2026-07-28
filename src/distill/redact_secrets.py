@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .errors import warning
+from .errors import WarningRecord, warning
 
 CONFUSABLES = str.maketrans(
     {
@@ -118,7 +118,7 @@ TUTORIAL_PLACEHOLDERS = {
 @dataclass(frozen=True)
 class RedactionResult:
     text: str
-    warnings: list[dict[str, str]]
+    warnings: list[WarningRecord]
     redaction_count: int
 
 
@@ -126,8 +126,8 @@ def normalize_confusables(text: str) -> str:
     return text.translate(CONFUSABLES)
 
 
-def redact_text(text: str, max_possible_secret_warnings: int = 10) -> RedactionResult:
-    warnings: list[dict[str, str]] = []
+def redact_text(text: str) -> RedactionResult:
+    warnings: list[WarningRecord] = []
     redacted = text
     count = 0
 
@@ -164,22 +164,22 @@ def redact_text(text: str, max_possible_secret_warnings: int = 10) -> RedactionR
                 if original_slice and original_slice in redacted:
                     count += redacted.count(original_slice)
                     redacted = redacted.replace(original_slice, "[REDACTED]")
-        capped = possible_matches[:max_possible_secret_warnings]
-        for _match in capped:
+        if possible_matches:
+            # R-41: one record per match would bury a **manifest**, which is
+            # what the old cap was for - it emitted ten and then a second
+            # **warning** saying how many it had suppressed, so a reader who
+            # wanted the real number had to add two records together. One
+            # record says it once and says it exactly, so there is nothing left
+            # to cap. Counted rather than accumulated and folded afterwards:
+            # how many matches there are is decided by text Distill did not
+            # write, and a record per match is a list held in memory whether or
+            # not it is the list anybody sees.
             warnings.append(
                 warning(
                     "redaction",
                     "possible_confusable_secret",
                     "OCR text contained a secret-like value after confusable normalization",
-                )
-            )
-        if len(possible_matches) > len(capped):
-            truncated = len(possible_matches) - len(capped)
-            warnings.append(
-                warning(
-                    "redaction",
-                    "possible_secret_warnings_truncated",
-                    f"{truncated} additional possible-secret warnings were truncated",
+                    occurrences=len(possible_matches),
                 )
             )
 
