@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .emit import EMITTER
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -532,8 +534,15 @@ def main() -> None:
         payload = build_measurement(items)
     text = json.dumps(payload, indent=2)
     if args.output:
-        args.output.expanduser().parent.mkdir(parents=True, exist_ok=True)
-        args.output.expanduser().write_text(text + "\n")
+        # Through the emitter like every other durable write, though nothing
+        # here is bundle content: the harness is where a second way to put text
+        # on disk would be least noticed, and an operator's `--output` is worth
+        # `O_NOFOLLOW` for the same reason a bundle path is. The import that
+        # buys this makes the harness a module rather than a loose script, so
+        # it is run as `python -m distill.measure`.
+        output = args.output.expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        EMITTER.emit(output, text + "\n")
     print(text)
 
 

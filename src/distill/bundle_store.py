@@ -63,7 +63,10 @@ directory is an **orphan generation** prune can reclaim.
 Atomicity is scoped, not universal (D-033): the **manifest** and job records are
 read by other processes and are written by atomic replace, while **stage
 results** are written into a **staging directory** held under the run lock,
-which nothing else may read, and are ordinary writes.
+which nothing else may read, and are ordinary writes. Which discipline a target
+gets is decided here; performing either is `emit.TextEmitter`'s, so that "how
+many places make text durable?" has an answer other than "however many modules
+call `write_text`" (R-22).
 
 Nothing durable is written from a document a caller assembled: a **transcript**
 and a **stage result** are handed in as carriers and serialized here, because
@@ -109,7 +112,6 @@ from __future__ import annotations
 
 import errno
 import fcntl
-import itertools
 import json
 import logging
 import math
@@ -132,6 +134,7 @@ from .artifacts import (
     is_path_field,
     serialize,
 )
+from .emit import EMITTER
 from .errors import DistillError
 
 LOGGER = logging.getLogger(__name__)
@@ -197,11 +200,6 @@ versions would be the beginning of a migration path that nothing needs and that
 nothing could test against a schema that does not exist yet.
 """
 
-ATOMIC_TEMP_SUFFIX = ".tmp"
-
-_TEMP_COUNTER = itertools.count()
-"""Distinguishes two atomic writes to one path from inside a single process,
-which a pid alone does not."""
 
 STAGE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 """The bounded domain a stage name must fall in, matched in full.
@@ -1705,8 +1703,7 @@ class BundleRun:
         redirect the write out of the bundle (S1).
         """
         ensure_safe_directory(self.paths.markdown, self.paths.root, create_leaf=False)
-        self.paths.markdown.write_text(markdown)
-        return self.paths.markdown
+        return EMITTER.emit(self.paths.markdown, markdown)
 
     def write_transcript(self, transcript: Transcript) -> Path:
         """Write the **transcript** into the staging directory, on the same terms.
@@ -1719,8 +1716,9 @@ class BundleRun:
         """
         ensure_safe_directory(self.paths.transcript, self.paths.root, create_leaf=False)
         document = serialize(transcript)
-        self.paths.transcript.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
-        return self.paths.transcript
+        return EMITTER.emit(
+            self.paths.transcript, json.dumps(document, indent=2, sort_keys=True) + "\n"
+        )
 
     def write_stage(
         self,
@@ -2077,7 +2075,8 @@ def write_ownership_marker(directory: Path, bundle_key: str) -> Path:
     """
     marker = directory / OWNERSHIP_MARKER_NAME
     ensure_safe_directory(marker, directory, create_leaf=False)
-    marker.write_text(
+    return EMITTER.emit(
+        marker,
         json.dumps(
             {
                 "bundle_key": bundle_key,
@@ -2086,9 +2085,8 @@ def write_ownership_marker(directory: Path, bundle_key: str) -> Path:
             },
             sort_keys=True,
         )
-        + "\n"
+        + "\n",
     )
-    return marker
 
 
 def read_marker(directory: Path) -> MarkerVerdict:
@@ -2355,77 +2353,28 @@ def ensure_safe_directory(path: Path, root: Path, *, create_leaf: bool = True) -
 
 
 def atomic_write_text(path: Path, text: str, *, root: Path) -> None:
-    """Write `text` so a concurrent reader sees the old bytes or the new ones.
+    """Confine `path` under `root`, then emit `text` atomically into it.
 
-    The one durable-write helper for state another process may read (R-14,
-    D-033): the manifest, the job records, and anything later joining them.
-    Writing in place is readable half-written, and for a **manifest** that means
-    a directory that is briefly not a **bundle** - the marker is the file.
+    The pairing every caller of durable shared state wants: the manifest, the
+    job records, the playlist summary, and anything later joining them. Two
+    questions, answered by their owners - whether Distill may write here at all,
+    which is `ensure_safe_directory`'s and this module's, and how the bytes get
+    there without a reader ever seeing half of them, which is the emitter's
+    (R-14, D-033).
 
-    Both the target and the temporary file are checked against `root`, so
-    neither can be redirected by a symlink pre-created at either name (R-16).
-    The temporary sits beside the target because a replace has to stay on one
-    filesystem to be atomic at all.
-
-    The temporary name is unique per writer, which is what makes the property
-    hold under concurrency rather than only in a single process. A shared name
-    is worse than no temporary at all: a second writer truncating it while the
-    first replaces it publishes a half-written file *onto the target*, which is
-    exactly the torn read the replace exists to prevent. A writer that dies
-    mid-write therefore leaves its own temporary behind. It is never mistaken
-    for a marker, which is matched by name, and it is reclaimed only when the
-    whole bundle is - **expiry** takes a bundle entire, while **retention** acts
-    on **generations** and never on a loose file at the bundle root (finding
+    The temporary is the emitter's to name, and the check above already covers
+    it: it is created in the target's own directory, so its ancestors are the
+    ancestors just walked, and its final component is opened `O_NOFOLLOW` - a
+    link pre-created at the name is refused by the kernel at the moment of use,
+    which is stronger than the lexical check that used to be asked of it and
+    then go stale before the open (R-16). It is never mistaken for a marker,
+    which is matched by name, and it is reclaimed only when the whole bundle is
+    - **expiry** takes a bundle entire, while **retention** acts on
+    **generations** and never on a loose file at the bundle root (finding
     7-opus).
-
-    Atomic against another process is not the same as atomic against power, and
-    for a **manifest** the difference is severe: a directory entry that reaches
-    the disk ahead of the bytes it names leaves a zero-length marker, which is
-    an `invalid` bundle - unservable, and a directory the walk will not descend
-    into, so the generations under it are unreclaimable too (finding 9-opus).
-    The content is therefore flushed before the replace and the directory entry
-    after it: two barriers, because they are two different things reaching the
-    disk.
     """
     ensure_safe_directory(path, root, create_leaf=False)
-    unique = f"{os.getpid()}.{next(_TEMP_COUNTER)}"
-    temporary = path.with_name(f"{path.name}.{unique}{ATOMIC_TEMP_SUFFIX}")
-    ensure_safe_directory(temporary, root, create_leaf=False)
-    try:
-        with temporary.open("w") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    _fsync_directory(path.parent)
-
-
-def _fsync_directory(directory: Path) -> None:
-    """Make a rename durable, not just visible.
-
-    The replace publishes a directory entry, and an entry is as much in cache as
-    a file's bytes are. Flushed here rather than by the writer above, because
-    what has to survive is the directory's state and not the file's.
-
-    A refusal is logged and not raised: the bytes are already visible to every
-    reader by this point, so a filesystem that will not flush a directory
-    (`EINVAL` on some of them) leaves a durability gap and not a failed write,
-    and ending the run over it would cost the caller the write it just made.
-    """
-    try:
-        fd = os.open(directory, os.O_RDONLY)
-    except OSError as exc:
-        LOGGER.debug("directory not open-able for fsync: %s", _errno_name(exc))
-        return
-    try:
-        os.fsync(fd)
-    except OSError as exc:
-        LOGGER.debug("directory fsync refused: %s", _errno_name(exc))
-    finally:
-        os.close(fd)
+    EMITTER.emit_atomically(path, text)
 
 
 def write_manifest(bundle_root: Path, manifest: dict[str, Any]) -> Path:
@@ -2688,7 +2637,7 @@ def write_stage_result(
     if not _recordable_stage_result(path, root=root, stage=name, bundle_key=bundle_key):
         return
     try:
-        _write_regular_file(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+        EMITTER.emit(path, json.dumps(document, indent=2, sort_keys=True) + "\n")
     except OSError as exc:
         # A full disk, a read-only mount, a file this process may not write:
         # scratch that cannot be recorded, on the same terms as a target that
@@ -2708,10 +2657,13 @@ def _recordable_stage_result(
       stays under the bundle root and no component of it is a symlink (R-16);
     - what is already there, which is `lstat`'s. A regular file is overwritten
       and an absent one is created; a directory, a socket or a fifo is not a
-      stage result and never becomes one by being written to. A fifo is the
-      reason this is asked rather than left to the write: opening one for
-      writing blocks until a reader appears, so a run would hang rather than
-      fail, which is the worse of the two failures the finding describes.
+      stage result and never becomes one by being written to.
+
+    Asked here rather than left to the emitter, which refuses all three anyway,
+    because a refusal has to say *why* to be worth anything: the run carries on
+    without its scratch either way, and an operator looking at a bundle key that
+    never resumes needs `not_a_regular_file` in the log and not an errno the
+    write happened to produce (R-57).
     """
     try:
         ensure_safe_directory(path, root, create_leaf=False)
@@ -2728,34 +2680,18 @@ def _recordable_stage_result(
     return True
 
 
-def _write_regular_file(path: Path, text: str) -> None:
-    """Write `text` at `path`, refusing anything but a regular file at the open.
-
-    `_recordable_stage_result` asks what is there and this refuses to be
-    redirected by what is there *now*: between an `lstat` and an `open` a path
-    can be replaced, and the check is the half that goes out of date. `O_NOFOLLOW`
-    is R-16 decided by the kernel at the moment of use, so a link swapped in
-    after the check fails with `ELOOP` rather than being written through.
-
-    `O_NONBLOCK` covers the one file kind that would not fail: a fifo with no
-    reader answers `ENXIO` instead of waiting for one, so the failure mode is an
-    errno rather than a run hanging under its own lock.
-
-    Both surface as `OSError`, which the caller already treats as scratch that
-    could not be recorded.
-    """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK
-    with os.fdopen(os.open(path, flags, 0o644), "w", encoding="utf-8") as handle:
-        handle.write(text)
-
-
 def _read_regular_file(path: Path) -> str:
-    """Read `path` on the same terms, refusing to be redirected at the open.
+    """Read `path` refusing to be redirected at the open, as the emitter writes it.
 
-    The read half of the same window: a **stage result** is what is at the name,
-    and `O_NOFOLLOW` is what makes that true of the bytes rather than of a check
-    that ran first. `O_NONBLOCK` so a fifo swapped in cannot make the read wait
-    for a writer.
+    The read half of the window `TextEmitter.emit` covers on the way out: a
+    **stage result** is what is at the name, and `O_NOFOLLOW` is what makes that
+    true of the bytes rather than of a check that ran first, which is exactly
+    what `_recordable_stage_result` cannot be - between an `lstat` and an `open`
+    a path can be replaced. `O_NONBLOCK` so a fifo swapped in cannot make the
+    read wait for a writer.
+
+    Here rather than in `emit`, because reading a stage result is this module's
+    question about its own scratch, and the emitter owns emission.
     """
     with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as handle:
         return handle.read()
