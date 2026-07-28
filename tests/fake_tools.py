@@ -42,6 +42,27 @@ for line in [
     sys.stdout.flush()
 """
 
+# A fake yt-dlp that answers every invocation a YouTube run makes of it: the
+# `--dump-json` metadata document, the `--print` id, and the download itself. The
+# real tool is one binary doing all three, so a test about "is yt-dlp needed at
+# all" needs one fake that cannot be needed for only part of it. The video id it
+# reports is the one in the URL, which is what the real tool reports too.
+FAKE_YTDLP_METADATA_AND_DOWNLOAD = """
+import json, pathlib, sys
+
+argv = sys.argv[1:]
+video_id = argv[-1].rsplit("=", 1)[-1].rsplit("/", 1)[-1]
+if "--dump-json" in argv:
+    sys.stdout.write(json.dumps({"id": video_id, "description": ""}))
+elif "-o" not in argv:
+    sys.stdout.write(video_id + "\\n")
+else:
+    template = argv[argv.index("-o") + 1]
+    media = pathlib.Path(template.replace("%(ext)s", "mp4"))
+    media.parent.mkdir(parents=True, exist_ok=True)
+    media.write_bytes(b"video")
+"""
+
 FAKE_YTDLP_FAILING = """
 import sys
 
@@ -159,6 +180,22 @@ size = target.stat().st_size if target.exists() else 0
 payload = {"streams": streams, "format": {"duration": "12.5" if size else "0"}}
 sys.stdout.write(json.dumps(payload))
 """
+
+# A fake ffmpeg that writes a real, if minimal, PNG where it was told to. The
+# image has to be openable: a keyframe whose pHash cannot be computed still
+# becomes a **frame artifact**, but it records a `phash_failed` **warning**, and
+# a test about something else should not be publishing one.
+FAKE_FFMPEG_WRITES_A_REAL_PNG = """
+import base64, pathlib, sys
+
+pathlib.Path(sys.argv[-1]).write_bytes(
+    base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQ"
+        "DwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    )
+)
+"""
+
 
 def fake_ffprobe_flooding_stderr(cap_bytes: int) -> str:
     """A working ffprobe that also floods stderr past run_command's capture cap.

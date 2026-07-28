@@ -4,6 +4,16 @@ This module owns local path resolution, duration probing, safe output root
 validation, YouTube id lookup, the acquisition of a remote **source**, disk
 checks, and **source fingerprints**.
 
+The cache is consulted before any capability is demanded (R-49). A tool that
+exists only to *produce* a **bundle** - yt-dlp to acquire a remote source,
+ffprobe to read a duration - is not a tool a run needs in order to *serve* one
+that is already published, so resolution derives the **bundle key** from inputs
+it already has (the video id in the URL; the local file's own bytes) and asks
+the store first. Identity is unchanged by this: the same fingerprint functions
+are fed from cache-safe inputs, so a bundle an earlier Distill wrote is still
+found. A miss is where the capability rules apply, unweakened - an absent
+**required capability** is still a **fatal error** (ADR-0002).
+
 Acquiring a remote source is staging, validation and promotion, in that order
 (R-35). The download lands in a staging directory unique to the run; the media
 file it produced is selected deterministically (R-37) and validated as the
@@ -522,7 +532,76 @@ def source_hash(source_fingerprint: str, opts_hash: str) -> str:
     return hashlib.sha256(f"{source_fingerprint}:{opts_hash}".encode()).hexdigest()
 
 
+def manifest_duration(manifest: Mapping[str, Any]) -> float | None:
+    """The duration a **manifest** records, if it records a usable one.
+
+    A manifest is a document another process wrote, so the number in it is input
+    rather than a fact: `None` covers a missing field, a field that is not a
+    number, and one that is a number no source can have. Every caller that
+    reuses a published duration asks here, so "what makes a recorded duration
+    usable" has one answer rather than one per cache path.
+
+    `bool` is refused explicitly, because `True` is an `int` in Python and a
+    manifest saying `"duration_sec": true` is not a one-second video.
+    """
+    duration = manifest.get("duration_sec")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        return None
+    duration = float(duration)
+    if not math.isfinite(duration) or duration <= 0:
+        return None
+    return duration
+
+
+def servable_duration(output_root: Path, bundle_key: str) -> float | None:
+    """The duration of the **bundle** `bundle_key` names, if it is servable.
+
+    The question a cache lookup asks before it decides a tool need not run, and
+    it is `BundleStore.load_active` that answers it for the reason
+    `YouTubeSourceProvider.cached` gives: a **manifest** naming a **generation**
+    retention deleted is a promise rather than evidence (D-041).
+
+    The duration is what makes this worth asking. A run that serves an **active
+    generation** produces nothing and reads no media, so the only thing the
+    probe still supplied was a number the manifest already records - and the
+    **options hash** contains `max_duration_sec`, so a bundle found under this
+    **bundle key** was published by a run that already accepted that duration
+    against this cap (R-47). Re-probing to re-decide a settled question is
+    exactly the tool a cache hit should not need (R-49).
+    """
+    snapshot = BundleStore.open(output_root).load_active(bundle_key)
+    if snapshot is None:
+        return None
+    return manifest_duration(snapshot.manifest)
+
+
 class LocalSourceProvider:
+    """Resolve one local **source**: its path, its fingerprint, its duration.
+
+    The order is the requirement (R-49). A local **source fingerprint** is the
+    file's size, mtime and sampled bytes - or every byte, in `content` mode -
+    and the **options hash** is the run's options plus the **pipeline version**.
+    Neither reads anything ffprobe knows, so the **bundle key** is computable
+    with no probe at all, in every cache mode: the enumeration of option
+    combinations that genuinely need probed metadata to *find* a bundle is
+    empty. What needed the probe was the duration, and a servable bundle already
+    records one.
+
+    So the fingerprint is computed first and the cache is asked next; ffprobe is
+    run only when this run has to produce a **generation**. It does not decide
+    whether that generation gets produced - `BundleStore.begin` re-asks under
+    the run lock, and its answer is the one that counts.
+
+    One cost moved, and it is worth naming rather than discovering. The duration
+    cap used to fire before the file was hashed; it now fires after. In the
+    default `fingerprint` mode that is 576 KiB of reading either way. In
+    `content` mode a source over `max_duration_sec` is hashed in full - up to
+    the 5 GB `local_fingerprint` refuses past - before `E_DURATION_CAP` is
+    raised. There is no ordering that avoids this: the **bundle key** is a
+    function of the fingerprint, so the cache cannot be asked before the
+    fingerprint exists, and asking the cache first is the requirement.
+    """
+
     def resolve(self, request: SourceRequest) -> SourceInfo:
         path_text = request.value
         options = request.options
@@ -544,31 +623,60 @@ class LocalSourceProvider:
                     f"source path resolved to {resolved}",
                 )
             )
-        if progress:
-            progress.update("duration_probe", status="running")
-        duration, probe_warnings = probe_duration(resolved)
-        warnings.extend(probe_warnings)
-        if progress:
-            progress.complete("duration_probe", detail={"duration_sec": duration})
-        ensure_duration_allowed(duration, options.max_duration_sec)
         fingerprint = local_fingerprint(resolved, options.cache_mode, progress)
-        opts_hash = options.opts_hash("local")
+        bundle_key = source_hash(fingerprint, options.opts_hash("local"))
+        duration = self._served_duration(request, bundle_key)
+        if duration is None:
+            if progress:
+                progress.update("duration_probe", status="running")
+            duration, probe_warnings = probe_duration(resolved)
+            warnings.extend(probe_warnings)
+            if progress:
+                progress.complete("duration_probe", detail={"duration_sec": duration})
+            ensure_duration_allowed(duration, options.max_duration_sec)
+        else:
+            # The cap is re-applied to the number the manifest gave, not assumed
+            # from the **bundle key**. `max_duration_sec` is in the **options
+            # hash**, so a manifest under this key was published by a run that
+            # accepted its duration - but a manifest is a document another
+            # process wrote, and R-23's premise is that its claims are input
+            # rather than facts. The probe is what a cache hit does not need;
+            # the operator's policy is not.
+            ensure_duration_allowed(duration, options.max_duration_sec)
+            if progress:
+                progress.skip_cached("duration_probe", detail={"source": "cached_manifest"})
         return SourceInfo(
             source_type="local",
             resolved_path=resolved,
             duration_sec=duration,
             source_fingerprint=fingerprint,
-            source_hash=source_hash(fingerprint, opts_hash),
+            source_hash=bundle_key,
             warnings=warnings,
         )
+
+    def _served_duration(self, request: SourceRequest, bundle_key: str) -> float | None:
+        """The published duration this run may reuse, or `None` to probe.
+
+        `None` for a caller that named no **output root**, because there is no
+        store to ask; `None` for `force_reprocess`, because that run is going to
+        produce a **generation** whatever is on disk and producing one needs a
+        duration read from the media rather than from a manifest it is about to
+        replace.
+        """
+        if request.output_root is None or request.options.force_reprocess:
+            return None
+        return servable_duration(request.output_root, bundle_key)
 
 
 def resolve_local_source(
     path_text: str,
     options: DistillOptions,
     progress: ProgressReporter | None = None,
+    output_root: Path | None = None,
 ) -> SourceInfo:
-    return LocalSourceProvider().resolve(SourceRequest(path_text, options, progress=progress))
+    return LocalSourceProvider().resolve(
+        SourceRequest(path_text, options, output_root=output_root, progress=progress)
+    )
 
 
 def validate_output_root(output_dir: str | None, *, create: bool = True) -> Path:
@@ -677,6 +785,33 @@ def ensure_youtube_host(url: str) -> None:
     """
     if urlparse(url).netloc.lower() not in YOUTUBE_HOSTS:
         raise DistillError("E_BAD_URL", "youtube", "only YouTube URLs are supported", {"url": url})
+
+
+def youtube_url_names_one_video(url: str) -> bool:
+    """Whether the URL's own video id is the id yt-dlp will resolve for it.
+
+    It is, for every form that names a video and nothing else. It is not for a
+    video-plus-playlist URL (`watch?v=A&list=P`), which yt-dlp treats as the
+    playlist unless told otherwise: `--dump-json` then emits one document per
+    entry, which does not parse as one document, and `canonical_youtube_id`
+    falls back to `--print id` and takes the *last* line. So that URL resolves,
+    downloads and publishes under some other entry's id, and the id written in
+    `v=` is not the identity of the **bundle** the run produces.
+
+    Which makes this the boundary of the R-49 reorder rather than a detail of
+    it. Reading a **bundle key** off the URL is only sound where the URL's id is
+    the id a run would have published under; where it is not, the cache is asked
+    the question it was always asked, after resolution, and yt-dlp is needed to
+    ask it. Serving a bundle keyed by `A` for a URL this Distill would publish
+    under `B` would be a cache hit for a bundle the same URL cannot produce.
+
+    The playlist form is worth resolving properly - `--no-playlist` on the
+    single-video invocations would make the URL's id authoritative for it too,
+    and fix a run that currently points one output template at every entry of a
+    playlist. That changes what a **cache miss** acquires, which is not this
+    milestone's to change.
+    """
+    return "list" not in parse_qs(urlparse(url).query)
 
 
 def parse_youtube_url(url: str) -> str:
@@ -1296,6 +1431,29 @@ class YouTubeSourceProvider:
     ) -> SourceInfo | None:
         """Describe a source from a servable bundle, or `None` if there is none.
 
+        Two ids can name one video: the one written in the URL, and the one
+        yt-dlp reports. For every ordinary watch URL they are the same string,
+        which is why the URL's own id is tried first - it costs nothing, and a
+        cache hit found that way needs no tool at all (R-49). Only when it
+        misses is yt-dlp asked for the canonical id and the lookup repeated, so
+        a bundle keyed by an id the URL does not carry is still found, exactly
+        as it was before.
+
+        The **fingerprint** is the same function of the same video id either
+        way. Nothing here derives identity a second way; what changed is only
+        which cache-safe input it is fed.
+        """
+        if metadata is not None:
+            return self.cached_for_video_id(request, metadata.video_id)
+        if youtube_url_names_one_video(request.value):
+            served = self.cached_for_video_id(request, parse_youtube_url(request.value))
+            if served is not None:
+                return served
+        return self.cached_for_video_id(request, canonical_youtube_id(request.value))
+
+    def cached_for_video_id(self, request: SourceRequest, video_id: str) -> SourceInfo | None:
+        """The servable **bundle** one video id names, or `None` for a miss.
+
         The question is "can this download be skipped?", and the only answer
         that justifies skipping it is a **bundle** whose **active generation**
         is on disk (R-04). `BundleStore.load_active` is what proves that, so it
@@ -1306,21 +1464,20 @@ class YouTubeSourceProvider:
         """
         if request.output_root is None:
             raise DistillError("E_BAD_OUTPUT_DIR", "youtube", "output_root is required")
-        video_id = metadata.video_id if metadata is not None else canonical_youtube_id(request.value)
         fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
         sh = source_hash(fingerprint, request.options.opts_hash("youtube"))
         snapshot = BundleStore.open(request.output_root).load_active(sh)
         if snapshot is None:
             return None
         manifest = snapshot.manifest
-        duration = manifest.get("duration_sec")
+        duration = manifest_duration(manifest)
         resolved_path = manifest.get("source_resolved_path")
-        if not isinstance(duration, (int, float)) or not isinstance(resolved_path, str):
+        if duration is None or not isinstance(resolved_path, str):
             return None
         return SourceInfo(
             source_type="youtube",
             resolved_path=Path(resolved_path),
-            duration_sec=float(duration),
+            duration_sec=duration,
             source_fingerprint=fingerprint,
             source_hash=sh,
             warnings=[],
@@ -1420,8 +1577,11 @@ class SourceResolver:
         path_text: str,
         options: DistillOptions,
         progress: ProgressReporter | None = None,
+        output_root: Path | None = None,
     ) -> SourceInfo:
-        return self.local.resolve(SourceRequest(path_text, options, progress=progress))
+        return self.local.resolve(
+            SourceRequest(path_text, options, output_root=output_root, progress=progress)
+        )
 
     def cached_youtube_source(
         self,
@@ -1468,9 +1628,15 @@ class SourceResolver:
         lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
     ) -> SourceResolution:
         if source_type == "local":
+            # The root is validated here, not only in the pipeline, because the
+            # local resolution now asks the store whether a **bundle** for this
+            # source is already servable - and it cannot ask without knowing
+            # which store. It is the same path the caller validated, under the
+            # same policy, so nothing new is created or accepted (R-15).
+            local_root = validate_output_root(options.output_dir)
             return SourceResolution(
-                self.local_source(value, options, progress=progress),
-                output_root=None,
+                self.local_source(value, options, progress=progress, output_root=local_root),
+                output_root=local_root,
                 progress=progress,
             )
         if source_type != "youtube":
@@ -1483,21 +1649,39 @@ class SourceResolver:
 
         root = validate_output_root(options.output_dir)
         url = normalize_youtube_url(value)
-        # Reject non-YouTube hosts (and option-injection values) before yt-dlp runs.
-        parse_youtube_url(url)
+        # Rejects non-YouTube hosts (and option-injection values) before yt-dlp
+        # runs, and now also yields the id the cache is asked about: the URL
+        # carries one, so nothing has to be resolved to look a **bundle** up.
+        url_video_id = parse_youtube_url(url)
+        request = SourceRequest(
+            url,
+            options,
+            output_root=root,
+            progress=progress,
+            lock_wait_sec=lock_wait_sec,
+        )
+
+        # The cache before the capability (R-49, finding 22). yt-dlp exists to
+        # acquire a **source**; a run that serves an **active generation**
+        # acquires nothing, so demanding the tool first told a user their run
+        # could not proceed over a bundle already on disk.
+        #
+        # Only where the URL's id is the id this run would publish under, which
+        # `youtube_url_names_one_video` decides. A URL that names a playlist as
+        # well as a video is resolved the way it always was.
+        if youtube_url_names_one_video(url):
+            served = self._served_from_cache(request, url_video_id)
+            if served is not None:
+                return served
         metadata = youtube_metadata(url)
-        if not options.force_reprocess:
-            cached = self.cached_youtube_source(url, options, root, metadata=metadata)
-            if cached is not None:
-                if progress:
-                    progress.skip_cached(
-                        "youtube_download",
-                        detail={
-                            "source": "cached_manifest",
-                            "video_id": cached.youtube_video_id,
-                        },
-                    )
-                return SourceResolution(cached, output_root=root, progress=progress)
+        # The URL's id is what yt-dlp reports for every ordinary watch URL, so
+        # this second lookup normally cannot hit. It is here for the case where
+        # it can: a bundle keyed by a resolved id the URL does not carry was
+        # found before this reorder, and must still be.
+        if metadata.video_id != url_video_id:
+            served = self._served_from_cache(request, metadata.video_id)
+            if served is not None:
+                return served
         return SourceResolution(
             self.youtube_source(
                 url,
@@ -1511,6 +1695,27 @@ class SourceResolver:
             output_root=root,
             progress=progress,
         )
+
+    def _served_from_cache(
+        self, request: SourceRequest, video_id: str
+    ) -> SourceResolution | None:
+        """This run's resolution if `video_id` names a servable bundle, else `None`.
+
+        `force_reprocess` never consults the cache: that run is going to produce
+        a **generation** whatever is on disk, so a hit would only let it skip
+        the acquisition it is about to need.
+        """
+        if request.options.force_reprocess:
+            return None
+        cached = self.youtube.cached_for_video_id(request, video_id)
+        if cached is None:
+            return None
+        if request.progress:
+            request.progress.skip_cached(
+                "youtube_download",
+                detail={"source": "cached_manifest", "video_id": cached.youtube_video_id},
+            )
+        return SourceResolution(cached, output_root=request.output_root, progress=request.progress)
 
 
 def cached_youtube_source(
