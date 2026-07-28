@@ -400,20 +400,16 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
     instead (D-029); this is the check a config can be rejected by, not the
     authoritative one.
     """
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme not in ALLOWED_ENDPOINT_SCHEMES:
-        _reject_endpoint(
-            "scheme",
-            f"Local vision endpoint scheme '{parts.scheme}' is not allowed; "
-            f"use {' or '.join(sorted(ALLOWED_ENDPOINT_SCHEMES))}.",
-            url=url,
-            scheme=parts.scheme,
-        )
     try:
-        # Both raise on a malformed authority - a port out of range, a bracket
-        # that never closes - and a rejection saying so is the answer a caller
-        # can act on. An unhandled `ValueError` here would reach the CLI as a
-        # traceback about something typed in a config file.
+        # All three raise on a malformed authority, at different moments: a
+        # bracket that never closes stops `urlsplit` itself, a port out of
+        # range is only noticed when `parts.port` is read. Splitting first and
+        # guarding only the reads left the earlier one escaping as
+        # `ValueError("Invalid IPv6 URL")` - a traceback out of the CLI about
+        # something an operator typed in a config file. A rejection saying so
+        # is the answer they can act on.
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme
         host, configured_port = parts.hostname, parts.port
     except ValueError as exc:
         _reject_endpoint(
@@ -421,9 +417,17 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
             f"Local vision endpoint '{url}' is not a usable URL: {exc}",
             url=url,
         )
+    if scheme not in ALLOWED_ENDPOINT_SCHEMES:
+        _reject_endpoint(
+            "scheme",
+            f"Local vision endpoint scheme '{scheme}' is not allowed; "
+            f"use {' or '.join(sorted(ALLOWED_ENDPOINT_SCHEMES))}.",
+            url=url,
+            scheme=scheme,
+        )
     if not host:
         _reject_endpoint("host_missing", f"Local vision endpoint '{url}' names no host.", url=url)
-    port = configured_port or DEFAULT_SCHEME_PORTS[parts.scheme]
+    port = configured_port or DEFAULT_SCHEME_PORTS[scheme]
     if not allow_remote_endpoint:
         try:
             address = ipaddress.ip_address(host)

@@ -286,6 +286,52 @@ def test_the_resolved_address_is_checked_on_every_request(
     assert transport.requested == [named_url]
 
 
+def test_the_scheme_is_re_checked_on_the_request_not_only_on_the_config() -> None:
+    """R-43: the per-request check is the static one too, not just the resolved one.
+
+    The resolved tier cannot carry this on its own. `urllib`'s default handler
+    chain - which `_build_opener` keeps, minus redirects and proxies - still
+    holds the File, FTP and Data handlers, and a `file://` URL has an empty
+    host that resolves to loopback, so a request validated only by address
+    would open `/etc/passwd` and hand it back as the endpoint's answer.
+    """
+    with pytest.raises(LocalVisionFailure) as caught:
+        _urlopen_json("GET", "file:///etc/passwd", None, 5.0)
+
+    assert caught.value.detail["reason"] == "scheme"
+
+
+def test_every_address_a_name_answers_with_is_checked_not_only_the_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-029: one answer, two addresses, and the second one is off loopback.
+
+    A name is free to answer with a list, and which entry the connect picks is
+    not this check's to know - so a name answering with both 127.0.0.1 and the
+    cloud metadata address can steer the very next connection off loopback
+    while passing any check that stops at the first entry. The rejection has to
+    name the address that caused it, because "this name resolves somewhere it
+    should not" is not an answer an operator can act on.
+    """
+    named_url = "http://vision.test:8000/v1/models"
+    transport = _FakeTransport({named_url: _json_response(named_url, {"data": []})})
+    monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+
+    with pytest.raises(LocalVisionFailure) as caught:
+        _urlopen_json(
+            "GET",
+            named_url,
+            None,
+            5.0,
+            resolver=lambda host, port: ["127.0.0.1", "169.254.169.254"],
+        )
+
+    assert caught.value.detail["reason"] == "non_loopback_address"
+    assert caught.value.detail["address"] == "169.254.169.254"
+    # Refused before the request, not after it.
+    assert transport.requested == []
+
+
 def test_a_response_body_beyond_the_cap_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -405,10 +451,18 @@ def test_an_unusable_endpoint_is_refused_rather_than_raising_a_bare_value_error(
     reach the caller as an exception from the parsing library, because that is
     the shape no caller in this module handles.
     """
+    # A port out of range: `urlsplit` accepts the string and `parts.port`
+    # raises when it is read.
     with pytest.raises(DistillError, match="not a usable URL"):
         local_vision_config_from_args(
             {"local_vision_base_url": "http://127.0.0.1:99999/v1"}, tmp_path
         )
+
+    # A bracket that never closes: `urlsplit` itself raises, before there is a
+    # `parts` to read anything off. Same typo class, same operator, and the
+    # docstring above claims both - so both are asserted.
+    with pytest.raises(DistillError, match="not a usable URL"):
+        local_vision_config_from_args({"local_vision_base_url": "http://[::1:8000/v1"}, tmp_path)
 
     with pytest.raises(LocalVisionFailure) as caught:
         _urlopen_json(
