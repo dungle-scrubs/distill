@@ -493,7 +493,7 @@ def test_interpret_image_malformed_response_returns_warning(
     # valid JSON, so both retry attempts are exhausted -> malformed response.
     monkeypatch.setattr(
         "distill.local_vision._urlopen_json",
-        lambda method, url, body=None, timeout_sec=30.0: (
+        lambda method, url, body=None, timeout_sec=30.0, **_: (
             _models_body(DEFAULT_MODEL)
             if url.rstrip("/").endswith("/models")
             else _chat_envelope("definitely not json")
@@ -536,7 +536,7 @@ def test_an_empty_object_is_rejected_rather_than_counted_as_an_interpretation(
     image.write_bytes(b"png")
     monkeypatch.setattr(
         "distill.local_vision._urlopen_json",
-        lambda method, url, body=None, timeout_sec=30.0: (
+        lambda method, url, body=None, timeout_sec=30.0, **_: (
             _models_body(DEFAULT_MODEL)
             if url.rstrip("/").endswith("/models")
             else _chat_envelope("{}")
@@ -606,7 +606,13 @@ def test_the_response_summary_does_not_claim_an_empty_interpretation(
     for index in range(2):
         (tmp_path / f"frame{index}.png").write_bytes(b"png")
 
-    def fake_urlopen(method: str, url: str, body: Any = None, timeout_sec: float = 30.0) -> Any:
+    def fake_urlopen(
+        method: str,
+        url: str,
+        body: Any = None,
+        timeout_sec: float = 30.0,
+        **_: Any,
+    ) -> Any:
         if url.rstrip("/").endswith("/models"):
             return _models_body(DEFAULT_MODEL)
         text = next(
@@ -697,7 +703,7 @@ def test_a_truncated_json_body_is_rejected(
 
     monkeypatch.setattr(
         "distill.local_vision._urlopen_json",
-        lambda method, url, body=None, timeout_sec=30.0: (
+        lambda method, url, body=None, timeout_sec=30.0, **_: (
             _models_body(DEFAULT_MODEL)
             if url.rstrip("/").endswith("/models")
             else _chat_envelope(truncated)
@@ -717,10 +723,8 @@ def test_a_truncated_json_body_is_rejected(
     # decode this half is about never runs.
     monkeypatch.undo()
     monkeypatch.setattr(
-        "urllib.request.urlopen",
-        lambda request, timeout=None: _FakeHttpResponse(
-            b'{"choices": [{"message": {"content": "'
-        ),
+        "distill.local_vision._OPENER",
+        _FakeOpener(b'{"choices": [{"message": {"content": "'),
     )
 
     body_result, body_warning = try_interpret_image(
@@ -744,8 +748,22 @@ class _FakeHttpResponse:
     def __exit__(self, *exc_info: object) -> None:
         return None
 
-    def read(self) -> bytes:
-        return self._payload
+    def read(self, size: int = -1) -> bytes:
+        return self._payload if size < 0 else self._payload[:size]
+
+
+class _FakeOpener:
+    """Stands in for the vision client's opener, serving one canned response.
+
+    The opener and not ``urllib.request.urlopen``: the client opens through its
+    own opener now, the one built without redirect following (R-43).
+    """
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def open(self, request: Any, timeout: float | None = None) -> _FakeHttpResponse:
+        return _FakeHttpResponse(self._payload)
 
 
 def test_interpret_image_cancel_returns_warning(

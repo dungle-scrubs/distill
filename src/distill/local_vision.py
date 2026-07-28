@@ -20,26 +20,36 @@ HTTP API. The server is assumed to already be running (``rapid-mlx serve
 chat-completion requests to ``<base_url>/chat/completions``. Distill does not
 manage the server lifecycle, and it has no dependency on any other local
 runtime shim.
+
+It does own where that client is allowed to talk and how much it will listen to
+(R-43, R-44): the scheme, the loopback rule and its opt-out, the refusal to
+follow a redirect, and the 32 MiB bound on a response body. That policy lives
+here rather than in a transport module of its own because there is one client
+and one endpoint (ADR-0001), and a rule kept next to the requests it governs
+cannot be reached around by adding a caller.
 """
 
 from __future__ import annotations
 
 import base64
 import http.client
+import ipaddress
 import json
 import logging
 import os
+import socket
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .artifacts import FrameArtifact, Interpretation, document_carries_a_reading
-from .errors import WarningRecord, aggregate_warnings, warning
+from .errors import DistillError, WarningRecord, aggregate_warnings, warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
 from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
@@ -75,13 +85,27 @@ TRANSPORT_FAILURE_CODES = frozenset(
 # this side of the wire and says nothing either way.
 DELIVERED_RESPONSE_CODES = frozenset({"local_vision_malformed_response"})
 BREAKER_WARNING_CODE = "local_vision_transport_breaker_open"
+ENDPOINT_REJECTED_CODE = "local_vision_endpoint_rejected"
 FRAME_READ_FAILURE_CODES = frozenset(
     {
         "local_vision_malformed_response",
         "local_vision_timeout",
         "local_vision_image_read_failed",
+        ENDPOINT_REJECTED_CODE,
     }
 )
+# R-43. The two schemes the OpenAI-compatible API is served over; anything else
+# names a different protocol, and a vision endpoint is not a file or a gopher
+# hole no matter who wrote the config.
+ALLOWED_ENDPOINT_SCHEMES = frozenset({"http", "https"})
+DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
+# R-44. A chat-completion envelope is kilobytes; 32 MiB is orders of magnitude
+# past any real one, and past it the read stops rather than the process growing
+# to whatever the far end decided to send.
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+# An HTTP error body is quoted into a message, never parsed, and the quote is
+# 200 characters. This is how much of one is worth reading to produce it.
+ERROR_BODY_PREVIEW_BYTES = 2048
 LOGGER = logging.getLogger(__name__)
 
 
@@ -92,6 +116,13 @@ class LocalVisionConfig:
     base_url: str = DEFAULT_LOCAL_VISION_BASE_URL
     timeout_sec: float = DEFAULT_TIMEOUT_SEC
     caption_frames: bool = True
+    allow_remote_endpoint: bool = False
+    """R-43's opt-out, and only that: it permits a `base_url` off loopback.
+
+    It does not widen the scheme, re-enable redirects, or lift the response
+    cap. Those hold wherever the endpoint is, because they are about what the
+    client will do with an answer rather than about whose answer it is.
+    """
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -122,7 +153,28 @@ class LocalVisionFailure(Exception):
         return warning("local_vision", self.code, self.message)
 
 
+class EndpointRejected(LocalVisionFailure):
+    """R-43: the endpoint the client was about to speak to is not allowed.
+
+    A `LocalVisionFailure` and not a separate hierarchy, because to every
+    caller it is the same event as a timeout: no reading came back and the run
+    continues on OCR-only output. It carries a `reason` so the log and the
+    **warning** both say *which* rule refused, not merely that one did.
+    """
+
+    def __init__(self, reason: str, message: str, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(ENDPOINT_REJECTED_CODE, message, {"reason": reason, **(detail or {})})
+        self.reason = reason
+
+
 ProbeLocalVision = Callable[[LocalVisionConfig], LocalVisionProbe]
+AddressResolver = Callable[[str, int], list[str]]
+"""Host and port to the addresses they resolve to, for the loopback check.
+
+Injectable because a test that asked the machine's resolver would be asserting
+against `/etc/hosts`, and because D-029's rebind - the same name answering
+differently twice - has no other seam to arrive through.
+"""
 TryInterpretImage = Callable[..., tuple["Interpretation | None", "WarningRecord | None"]]
 
 
@@ -305,6 +357,159 @@ def _boundary_log(event: str, detail: dict[str, Any]) -> None:
     )
 
 
+def _reject_endpoint(reason: str, message: str, **detail: Any) -> NoReturn:
+    """Refuse an endpoint, saying why, in the log and in the exception alike.
+
+    Every rejection goes through here so the observability is a property of
+    the rule rather than of whoever wrote the call site: there is one event,
+    it always carries the reason, and no new rule can forget to emit it.
+    """
+    _boundary_log("endpoint_rejected", {"reason": reason, **detail})
+    raise EndpointRejected(reason, message, detail)
+
+
+def _resolve_addresses(host: str, port: int) -> list[str]:
+    """The addresses `host` answers with - without a lookup when it is one.
+
+    An address literal is already the answer, so the common configuration
+    (`http://127.0.0.1:8000/v1`) never consults a resolver at all.
+    """
+    try:
+        return [str(ipaddress.ip_address(host))]
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        _reject_endpoint(
+            "unresolvable",
+            f"Local vision endpoint host '{host}' does not resolve; "
+            "continuing with OCR-only output.",
+            host=host,
+            error=str(exc),
+        )
+    return [str(info[4][0]) for info in infos]
+
+
+def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str, int]:
+    """R-43's static half: what can be decided about `url` without asking anyone.
+
+    The scheme, the presence of a host, and - when the host is written as an
+    address - whether that address is loopback. A host written as a *name*
+    cannot be settled here without a lookup, so it is settled per request
+    instead (D-029); this is the check a config can be rejected by, not the
+    authoritative one.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ALLOWED_ENDPOINT_SCHEMES:
+        _reject_endpoint(
+            "scheme",
+            f"Local vision endpoint scheme '{parts.scheme}' is not allowed; "
+            f"use {' or '.join(sorted(ALLOWED_ENDPOINT_SCHEMES))}.",
+            url=url,
+            scheme=parts.scheme,
+        )
+    try:
+        # Both raise on a malformed authority - a port out of range, a bracket
+        # that never closes - and a rejection saying so is the answer a caller
+        # can act on. An unhandled `ValueError` here would reach the CLI as a
+        # traceback about something typed in a config file.
+        host, configured_port = parts.hostname, parts.port
+    except ValueError as exc:
+        _reject_endpoint(
+            "unparsable_url",
+            f"Local vision endpoint '{url}' is not a usable URL: {exc}",
+            url=url,
+        )
+    if not host:
+        _reject_endpoint("host_missing", f"Local vision endpoint '{url}' names no host.", url=url)
+    port = configured_port or DEFAULT_SCHEME_PORTS[parts.scheme]
+    if not allow_remote_endpoint:
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_loopback:
+            _reject_endpoint(
+                "non_loopback_host",
+                f"Local vision endpoint host '{host}' is not loopback; set "
+                "local_vision_allow_remote_endpoint to reach one deliberately.",
+                url=url,
+                host=host,
+            )
+    return host, port
+
+
+def _check_resolved_address(
+    host: str,
+    port: int,
+    *,
+    allow_remote_endpoint: bool,
+    resolver: AddressResolver | None = None,
+) -> list[str]:
+    """R-43's authoritative half: every address `host` resolves to is loopback.
+
+    Every address, not the first: a name answering with both 127.0.0.1 and a
+    link-local address is a name that can steer the very next connection off
+    loopback, and which of its answers gets connected to is not this function's
+    to know.
+    """
+    if allow_remote_endpoint:
+        return []
+    addresses = (resolver or _resolve_addresses)(host, port)
+    if not addresses:
+        _reject_endpoint(
+            "unresolvable",
+            f"Local vision endpoint host '{host}' resolved to no address.",
+            host=host,
+        )
+    for address in addresses:
+        try:
+            resolved = ipaddress.ip_address(address)
+        except ValueError:
+            # A resolver that answered with something that is not an address
+            # (a scoped `fe80::1%en0`, a name, anything) has not been shown to
+            # be loopback, and unproven is refused rather than assumed.
+            _reject_endpoint(
+                "unparsable_address",
+                f"Local vision endpoint host '{host}' resolved to '{address}', "
+                "which is not an address.",
+                host=host,
+                address=address,
+            )
+        if not resolved.is_loopback:
+            _reject_endpoint(
+                "non_loopback_address",
+                f"Local vision endpoint host '{host}' resolves to {address}, which is not "
+                "loopback; set local_vision_allow_remote_endpoint to reach one deliberately.",
+                host=host,
+                address=address,
+            )
+    return addresses
+
+
+def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
+    """The same config, once its `base_url` is one Distill will speak to.
+
+    A rejected endpoint is a **fatal error** here rather than a **warning**:
+    unlike a server that is merely down, nothing about the run will make this
+    address allowed, and silently degrading to OCR-only would hide that the
+    operator's configuration was ignored.
+    """
+    try:
+        _checked_endpoint_url(
+            config.base_url, allow_remote_endpoint=config.allow_remote_endpoint
+        )
+    except EndpointRejected as exc:
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            exc.message,
+            {"base_url": config.base_url, **exc.detail},
+        ) from exc
+    return config
+
+
 def config_dir() -> Path:
     return Path(os.environ.get("DISTILL_CONFIG_DIR", Path.home() / ".distill")).expanduser()
 
@@ -337,7 +542,13 @@ def _coerce_float(value: Any, default: float) -> float:
     return parsed if parsed > 0 else default
 
 
-def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
+def _merged_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
+    """The configuration files, folded together, not yet validated.
+
+    Unvalidated on purpose: the endpoint that matters is the one the run will
+    use, and a per-call override is allowed to rescue a file that names a
+    forbidden one. Only the settled config is checked.
+    """
     root = (base_dir or config_dir()).expanduser()
     config = LocalVisionConfig()
     for filename in CONFIG_FILENAMES:
@@ -349,11 +560,15 @@ def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
     return config
 
 
+def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
+    return _with_validated_endpoint(_merged_local_vision_config(base_dir))
+
+
 def local_vision_config_from_args(
     args: dict[str, Any],
     base_dir: Path | None = None,
 ) -> LocalVisionConfig:
-    config = load_local_vision_config(base_dir)
+    config = _merged_local_vision_config(base_dir)
     overrides: dict[str, Any] = {}
     if "caption_frames" in args:
         overrides["caption_frames"] = _coerce_bool(
@@ -369,7 +584,11 @@ def local_vision_config_from_args(
         overrides["timeout_sec"] = _coerce_float(
             args.get("local_vision_timeout_sec"), config.timeout_sec
         )
-    return _config_from_payload(overrides, config)
+    if "local_vision_allow_remote_endpoint" in args:
+        overrides["allow_remote_endpoint"] = _coerce_bool(
+            args.get("local_vision_allow_remote_endpoint"), config.allow_remote_endpoint
+        )
+    return _with_validated_endpoint(_config_from_payload(overrides, config))
 
 
 def _config_from_payload(
@@ -387,6 +606,10 @@ def _config_from_payload(
         caption_frames=_coerce_bool(
             payload.get("caption_frames", base.caption_frames),
             base.caption_frames,
+        ),
+        allow_remote_endpoint=_coerce_bool(
+            payload.get("allow_remote_endpoint", base.allow_remote_endpoint),
+            base.allow_remote_endpoint,
         ),
     )
 
@@ -419,7 +642,22 @@ def probe_rapid_mlx_availability(
     """
     models_url = _models_url(config.base_url)
     try:
-        payload = _http_get_json(requestor, models_url, config.timeout_sec)
+        payload = _http_get_json(
+            requestor,
+            models_url,
+            config.timeout_sec,
+            allow_remote_endpoint=config.allow_remote_endpoint,
+        )
+    except EndpointRejected as exc:
+        return LocalVisionProbe(
+            available=False,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code=exc.code,
+            message=f"{exc.message} Continuing with OCR-only output.",
+            detail={**exc.detail, "url": models_url},
+        )
     except TimeoutError as exc:
         return LocalVisionProbe(
             available=False,
@@ -994,7 +1232,13 @@ def _interpret_with_rapid_mlx(
     last_preview = ""
     for _attempt in range(DEFAULT_MAX_ATTEMPTS):
         try:
-            envelope = _http_post_json(requestor, completions_url, body, config.timeout_sec)
+            envelope = _http_post_json(
+                requestor,
+                completions_url,
+                body,
+                config.timeout_sec,
+                allow_remote_endpoint=config.allow_remote_endpoint,
+            )
         except TimeoutError as exc:
             raise LocalVisionFailure(
                 "local_vision_timeout",
@@ -1072,11 +1316,19 @@ def _http_get_json(
     requestor: HttpRequestor | None,
     url: str,
     timeout_sec: float,
+    *,
+    allow_remote_endpoint: bool = False,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="GET", url=url, timeout=timeout_sec)
     else:
-        payload = _urlopen_json("GET", url, body=None, timeout_sec=timeout_sec)
+        payload = _urlopen_json(
+            "GET",
+            url,
+            body=None,
+            timeout_sec=timeout_sec,
+            allow_remote_endpoint=allow_remote_endpoint,
+        )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
     return payload
@@ -1087,17 +1339,102 @@ def _http_post_json(
     url: str,
     body: dict[str, Any],
     timeout_sec: float,
+    *,
+    allow_remote_endpoint: bool = False,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="POST", url=url, body=body, timeout=timeout_sec)
     else:
-        payload = _urlopen_json("POST", url, body=body, timeout_sec=timeout_sec)
+        payload = _urlopen_json(
+            "POST",
+            url,
+            body=body,
+            timeout_sec=timeout_sec,
+            allow_remote_endpoint=allow_remote_endpoint,
+        )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
     return payload
 
 
-def _urlopen_json(method: str, url: str, body: dict[str, Any] | None, timeout_sec: float) -> Any:
+class _RedirectsAreRejected(urllib.request.HTTPRedirectHandler):
+    """R-43 (RV-7): a 3xx ends the request instead of starting another one.
+
+    Validating an endpoint and then following wherever it points validates
+    nothing - the second request is to an address no rule ever saw. Refusing
+    outright, rather than re-validating the target, is the smaller rule: the
+    only endpoint Distill talks to is the one the operator configured.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,  # noqa: ARG002 - urllib's signature; the body is not read
+        code: int,
+        msg: str,
+        headers: Any,  # noqa: ARG002 - urllib's signature; no header is trusted
+        newurl: str,
+    ) -> NoReturn:
+        _reject_endpoint(
+            "redirect",
+            f"Local vision endpoint answered {code} {msg} redirecting to another "
+            "address; redirects are not followed.",
+            url=req.full_url,
+            status=code,
+            location=newurl,
+        )
+
+
+def _build_opener(*handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
+    """The vision client's opener: the default chain, minus two of its habits.
+
+    Redirects are not followed, and no proxy is consulted. An empty
+    `ProxyHandler` rather than the default one because the default reads
+    `HTTP_PROXY` from the environment: a validated loopback endpoint would
+    still be dialled through whatever that names, which sends the **keyframe**
+    to a host no rule here ever saw. The endpoint is local by rule, so there is
+    nothing for a proxy to do.
+
+    Built by a function so a test can put a fake transport under the *same*
+    chain production uses, instead of asserting against a chain it assembled
+    itself.
+    """
+    return urllib.request.build_opener(
+        _RedirectsAreRejected, urllib.request.ProxyHandler({}), *handlers
+    )
+
+
+_OPENER = _build_opener()
+
+
+def _urlopen_json(
+    method: str,
+    url: str,
+    body: dict[str, Any] | None,
+    timeout_sec: float,
+    *,
+    allow_remote_endpoint: bool = False,
+    resolver: AddressResolver | None = None,
+) -> Any:
+    """One request to the vision endpoint, validated before and bounded after.
+
+    The address is resolved and checked here, on every request, rather than
+    once when the config was read (D-029): a name that answered with 127.0.0.1
+    while the config was being validated is free to answer with something else
+    by the time the **keyframe** is posted, and only the check standing between
+    the resolution and the connection sees that.
+
+    What that does not close, stated so nobody reads it as more: the connection
+    resolves the name again, so a name that changes its answer between this
+    check and that connect is not caught. Closing it means connecting to the
+    address this function validated rather than to the name, which is a socket
+    Distill would have to open itself. The bound here is per request, which is
+    what D-029 asks for; it is not per packet.
+    """
+    host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
+    _check_resolved_address(
+        host, port, allow_remote_endpoint=allow_remote_endpoint, resolver=resolver
+    )
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         url,
@@ -1109,12 +1446,32 @@ def _urlopen_json(method: str, url: str, body: dict[str, Any] | None, timeout_se
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
-            raw = response.read().decode("utf-8")
+        with _OPENER.open(request, timeout=timeout_sec) as response:
+            # One byte past the cap, so a body that is exactly at it still
+            # arrives and a body over it is recognisable without being read.
+            # The header is not consulted: a Content-Length is the sender's
+            # claim about the sender, and R-44 is a bound on this process.
+            payload = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(payload) > MAX_RESPONSE_BYTES:
+            # A delivered response, in M7.2's sense: it arrived, so it is
+            # evidence the transport works and must not count toward the
+            # breaker's consecutive-failure tally. It is unusable for the same
+            # reason a truncated body is - hence malformed, not unavailable.
+            raise RuntimeError(
+                f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap"
+            )
+        raw = payload.decode("utf-8")
     except urllib.error.HTTPError as exc:
         # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so
-        # the probe/interpret paths can map them onto warning codes.
-        detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+        # the probe/interpret paths can map them onto warning codes. Bounded
+        # like any other body (R-44), and tighter: only a preview of it is ever
+        # used, so reading a gigabyte to quote 200 characters of it is a cost
+        # with no reader.
+        detail = (
+            exc.read(ERROR_BODY_PREVIEW_BYTES).decode("utf-8", errors="replace")
+            if hasattr(exc, "read")
+            else ""
+        )
         raise RuntimeError(f"HTTP {exc.code} from {url}: {detail[:200]}") from exc
     except http.client.IncompleteRead as exc:
         # A server that closes the connection mid-body (crash/restart) yields a

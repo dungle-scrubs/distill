@@ -38,7 +38,7 @@ def _add_common_processing_options(parser: argparse.ArgumentParser) -> None:
             parser.add_argument(flag, type=spec.caster)
         elif key == "local_vision_timeout_sec":
             parser.add_argument(flag, type=float)
-        elif key == "caption_frames":
+        elif key in {"caption_frames", "local_vision_allow_remote_endpoint"}:
             parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=None)
         else:
             parser.add_argument(flag)
@@ -64,6 +64,7 @@ PROCESSING_KEYS = (
     "local_vision_model",
     "local_vision_base_url",
     "local_vision_timeout_sec",
+    "local_vision_allow_remote_endpoint",
 )
 
 
@@ -205,6 +206,7 @@ def main(argv: list[str] | None = None) -> None:
                     "local_vision_model",
                     "local_vision_base_url",
                     "local_vision_timeout_sec",
+                    "local_vision_allow_remote_endpoint",
                 ),
             )
             _print_json(local_vision_diagnostics(payload))
