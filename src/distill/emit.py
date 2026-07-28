@@ -133,6 +133,43 @@ destination the label's author chose. `[` is the same construct opened one
 level in, a backtick opens a code span that swallows the `]` that would have
 closed the label, `<` opens an autolink, and `\\` is escaped first so that
 every other escape below means what it says.
+
+`&` is not here because a backslash is the wrong tool for it: an ampersand
+opens nothing, it *rewrites* - see `AMPERSAND_REFERENCE`.
+"""
+
+AMPERSAND_REFERENCE = "&amp;"
+"""How a literal ampersand is written, in a label and in a destination alike.
+
+CommonMark resolves **entity and numeric character references** in both halves
+of a link, so an ampersand is the one character that changes its neighbours
+rather than closing a construct. Left alone, `&copy;` is six characters a reader
+turns into one: a label reading `©` that the **source** never wrote, and - the
+part that matters - a destination `?q=&copy;` that resolves to `?q=%C2%A9`, and
+`a&amp;b` that resolves to `a&b`. That is the retarget R-27 exists to stop,
+reached through a reference instead of through a bracket, and `&#41;` reaches it
+with a `)`.
+
+An entity rather than `\\&`, because a destination is where this has to hold and
+the plain form of one may not carry a backslash (`_PLAIN_DESTINATION_RE`).
+`&amp;` is what an ampersand is written as in every other markup a reader knows,
+and it survives both halves under one rule.
+"""
+
+_LABEL_LINE_ENDING_REFERENCES = {"\n": "&#10;", "\r": "&#13;"}
+"""A line ending in a label, written so the reader gets the character back.
+
+A label is one line of a document, so the line ending cannot stay a line ending:
+a real one lands the rest of the label at the document's own indentation, where
+`# PWNED` is a heading the render appears to have written. But a *numeric
+character reference* is not a line ending in the source - the parser has already
+decided where the line ends by the time it resolves one - and it is a line
+ending to the reader. So the label stays one line and the text survives.
+
+This replaces writing a visible `\\n`, which lost the character twice over: a
+reader got a backslash and a letter, and a label that carried a literal
+backslash-then-`n` was written exactly the same way, so two different sources
+arrived as one string nobody could tell apart.
 """
 
 _DESTINATION_ENCODED_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -254,26 +291,44 @@ class TextEmitter:
     def link_label(self, text: str) -> str:
         """`text` escaped so it cannot end the link label holding it (R-27).
 
-        Lossless: every escape is a backslash before the character it escapes,
-        and a backslash is escaped first, so a reader recovers exactly the text
-        the **source** carried. A line ending becomes a visible `\\n` because a
-        link label is one line of a document - a real newline in one ends the
-        bullet the link sits in, whether or not it also ends the label.
+        Lossless, in the one sense that can be checked: a CommonMark reader
+        resolving this label arrives at exactly the characters the **source**
+        carried, line endings included. That is a claim about the reader's
+        output and not about these bytes - a backslash, an entity and a numeric
+        character reference are all longer written than read - and it is the
+        claim that matters, because the reader is who the label is for.
+        `tests/test_render_delimiting.py` asserts it against a real parser
+        rather than against a scanner of the suite's own, which is what let the
+        ampersand through in the first place.
+
+        Three rules, one per way a character stops meaning itself. A character
+        that would *open or close* a construct is escaped with a backslash. An
+        ampersand, which rewrites rather than opens, is written as the reference
+        for an ampersand. A line ending, which cannot survive as a character
+        without ending the document line the link sits on, is written as the
+        reference for that character.
         """
         escaped: list[str] = []
         for character in text:
             if character in _LABEL_ESCAPED_CHARACTERS:
                 escaped.append(f"\\{character}")
-            elif character == "\n":
-                escaped.append("\\n")
-            elif character == "\r":
-                escaped.append("\\r")
+            elif character == "&":
+                escaped.append(AMPERSAND_REFERENCE)
+            elif character in _LABEL_LINE_ENDING_REFERENCES:
+                escaped.append(_LABEL_LINE_ENDING_REFERENCES[character])
             else:
                 escaped.append(character)
         return "".join(escaped)
 
     def link_destination(self, url: str) -> str:
-        """`url` written so it cannot end the `(...)` holding it (R-27).
+        """`url` written so it resolves to itself and nothing else (R-27).
+
+        Two different things can go wrong with a destination and they need
+        different answers. It can *end* the `(...)` holding it, which angle
+        brackets and a backslash escape settle. And it can be *rewritten* by
+        what it carries, which only escaping the ampersand settles - brackets
+        do not stop a reference resolving, so both halves of the rule run
+        whichever form the destination takes.
 
         Angle brackets when the destination needs them and not otherwise, which
         is a rule rather than a preference: a destination carrying nothing that
@@ -282,8 +337,14 @@ class TextEmitter:
         sake of a case it is not in. Everything else is wrapped, its own
         brackets and backslashes escaped, and its control characters
         percent-encoded so no line ending survives inside the brackets.
+
+        Lossless in the same sense the label is, with one step more of the
+        reader's own machinery to undo: a parser percent-encodes a destination
+        on the way in, so what comes back is the URL after that encoding is
+        reversed. A space arrives as `%20` and a line ending as `%0A`, which is
+        what a URL does with them anyway.
         """
-        destination = url.strip()
+        destination = url.strip().replace("&", AMPERSAND_REFERENCE)
         if _PLAIN_DESTINATION_RE.fullmatch(destination):
             return destination
         escaped = (

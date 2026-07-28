@@ -26,6 +26,7 @@ import re
 from typing import Any
 
 import pytest
+from commonmark_ast import autolinks, destinations, inline_text, links, raw_html
 from untrusted_blocks import (
     SENTINEL,
     assert_delimited,
@@ -202,10 +203,12 @@ def test_the_low_confidence_banner_is_bounded_to_one_line() -> None:
     claim about that module rather than a property of this text.
 
     Two lines hold the banner to one line and they are not the same claim. The
-    escape is what makes a line ending unable to end the line, and it is what
-    this asserts first. Collapsing the whitespace is what keeps the result a
-    sentence rather than a string of visible `\\n`, and that is asserted as
-    itself - a reason nobody can read is a banner that has stopped reporting.
+    escape is what makes a line ending unable to end the *document* line, and it
+    is what this asserts first. Collapsing the whitespace is what keeps the
+    result a sentence, and that is asserted through a reader - the escape
+    preserves the line ending rather than destroying it (R-27), so a banner that
+    stopped collapsing would still occupy one line of the render while reading
+    as several. A reason nobody can read is a banner that has stopped reporting.
     """
     frame, _warnings = keyframe().with_interpretation(
         read(visual_summary="A dark slide"),
@@ -224,7 +227,7 @@ def test_the_low_confidence_banner_is_bounded_to_one_line() -> None:
     assert not any(
         line.lstrip().startswith("# grounding") for line in outside_fences(markdown).split("\n")
     )
-    assert "\\n" not in banner
+    assert "\n" not in inline_text(banner)
 
 
 def test_the_banner_names_a_level_only_when_it_is_one() -> None:
@@ -261,7 +264,7 @@ def test_the_banner_cannot_open_a_construct_from_its_reason() -> None:
     labelling Distill's words as the source's, and it is lossless, so the
     reason still reads as what it said.
     """
-    reason = f"unreadable: see [docs]({ATTACKER_URL}), <{ATTACKER_URL}>, <b>read this</b>"
+    reason = f"unreadable: see [docs]({ATTACKER_URL}), <{ATTACKER_URL}>, <b>read this &amp; that</b>"
     frame, _warnings = keyframe().with_interpretation(
         read(visual_summary="A dark slide"),
         grounding={"level": "ungrounded", "text_overlap": None, "reason": reason},
@@ -273,8 +276,8 @@ def test_the_banner_cannot_open_a_construct_from_its_reason() -> None:
 
     assert destinations(markdown) == [FRAME_IMAGE]
     assert autolinks(markdown) == []
-    assert "<b>" not in banner
-    assert reason in _unescape(banner)
+    assert raw_html(markdown) == []
+    assert reason in inline_text(banner)
 
 
 # --- R-26: the transcript ---------------------------------------------------
@@ -385,109 +388,9 @@ ATTACKER_URL = "https://attacker.example/evil"
 FRAME_IMAGE = "frames/frame_0001.png"
 
 
-def _unescape(text: str) -> str:
-    out: list[str] = []
-    index = 0
-    while index < len(text):
-        if text[index] == "\\" and index + 1 < len(text):
-            out.append(text[index + 1])
-            index += 2
-            continue
-        out.append(text[index])
-        index += 1
-    return "".join(out)
-
-
-def inline_links(markdown: str) -> list[tuple[str, str]]:
-    """Every `[label](destination)` a CommonMark reader finds, label unescaped.
-
-    A scanner rather than a regex because the whole question is which brackets
-    a reader treats as structure: a backslash-escaped `]` does not close a
-    label, and a destination in angle brackets ends at its `>` and nowhere
-    else. Reading the render the same way a reader does is the only way to
-    check that a payload did not *become* a link.
-    """
-    text = outside_fences(markdown)
-    links: list[tuple[str, str]] = []
-    index = 0
-    while index < len(text):
-        character = text[index]
-        if character == "\\":
-            index += 2
-            continue
-        if character != "[":
-            index += 1
-            continue
-        cursor = index + 1
-        label_start = cursor
-        while cursor < len(text) and text[cursor] != "]":
-            cursor += 2 if text[cursor] == "\\" else 1
-        if cursor >= len(text) or cursor + 1 >= len(text) or text[cursor + 1] != "(":
-            index += 1
-            continue
-        label = text[label_start:cursor]
-        cursor += 2
-        if cursor < len(text) and text[cursor] == "<":
-            cursor += 1
-            start = cursor
-            while cursor < len(text) and text[cursor] != ">":
-                cursor += 2 if text[cursor] == "\\" else 1
-            destination = _unescape(text[start:cursor])
-            cursor += 1
-        else:
-            start = cursor
-            depth = 0
-            while cursor < len(text) and not (text[cursor] == ")" and depth == 0):
-                if text[cursor] == "\\":
-                    cursor += 2
-                    continue
-                if text[cursor] == "(":
-                    depth += 1
-                elif text[cursor] == ")":
-                    depth -= 1
-                cursor += 1
-            destination = _unescape(text[start:cursor])
-        links.append((_unescape(label), destination))
-        index = cursor + 1
-    return links
-
-
-def destinations(markdown: str) -> list[str]:
-    return [destination for _label, destination in inline_links(markdown)]
-
-
-_WRAPPED_DESTINATION_RE = re.compile(r"\]\(<(?:\\.|[^>\\])*>\)", re.DOTALL)
-_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.\-]{1,31}:[^<>\x00-\x20]*>")
-
-
-def autolinks(markdown: str) -> list[str]:
-    """Every `<scheme:...>` a reader turns into a live link of its own.
-
-    `inline_links` is blind to this shape, and a label is the one place it
-    matters: a link may not hold another link, so an autolink inside a label
-    wins and the destination the render chose is dropped. A test that asked
-    `inline_links` alone would report the render's own destination and call
-    the label harmless.
-
-    A destination the render wrapped in angle brackets is not an autolink - it
-    is the `(...)` half of a link `inline_links` has already accounted for - so
-    the wrapped form is removed before the search. Backslash-escaped text is
-    stepped over, because an escaped `<` opens nothing.
-    """
-    text = _WRAPPED_DESTINATION_RE.sub("]()", outside_fences(markdown))
-    found: list[str] = []
-    index = 0
-    while index < len(text):
-        if text[index] == "\\":
-            index += 2
-            continue
-        match = _AUTOLINK_RE.match(text, index)
-        if match is None:
-            index += 1
-            continue
-        found.append(match.group()[1:-1])
-        index = match.end()
-    return found
+def link_halves(markdown: str) -> list[tuple[str, str]]:
+    """Every link a reader resolves, as `(what it says, where it points)`."""
+    return [(found.text, found.destination) for found in links(markdown)]
 
 
 def outside_links(text: str) -> str:
@@ -528,7 +431,69 @@ def test_a_link_label_cannot_retarget_the_link(hostile: str) -> None:
 
     assert destinations(markdown) == ["https://github.com/example/repo", FRAME_IMAGE]
     assert autolinks(markdown) == []
-    assert (hostile, "https://github.com/example/repo") in inline_links(markdown)
+    assert (hostile, "https://github.com/example/repo") in link_halves(markdown)
+
+
+@pytest.mark.parametrize(
+    ("label", "url"),
+    [
+        ("&copy;", "https://ok.example/?q=&copy;"),
+        ("a&amp;b", "https://ok.example/a&amp;b"),
+        ("&#35; not a heading", "https://ok.example/a&#41;b"),
+        ("&notanentity;", "https://ok.example/?a=1&b=2"),
+    ],
+    ids=["named", "amp", "numeric", "unterminated"],
+)
+def test_an_entity_reference_in_a_link_cannot_change_what_it_says_or_where_it_goes(
+    label: str, url: str
+) -> None:
+    """CommonMark decodes entity references, in a label and in a destination alike.
+
+    The backslash escapes cover every character that could *close* a construct
+    and none that can be *rewritten* inside one. `&copy;` is six characters a
+    reader turns into one, so a label read as something the source never wrote
+    and, worse, a destination read as somewhere the source never pointed:
+    `?q=&copy;` resolves to `?q=%C2%A9`, and `a&amp;b` to `a&b`. That is the
+    same retarget R-27 exists to stop, reached through an entity rather than
+    through a bracket - the destination is changed by what it carries.
+    """
+    markdown = render(related_links=[link(label=label, url=url)])
+
+    assert link_halves(markdown) == [(label, url), ("Frame 1", FRAME_IMAGE)]
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
+def test_a_link_label_holding_a_line_ending_is_read_back_as_that_line_ending(
+    ending: str,
+) -> None:
+    """The label is escaped rather than fenced, and R-27 calls that lossless.
+
+    Writing a line ending as the two visible characters `\\n` is not lossless:
+    a reader gets a backslash and a letter, and a label that carried a literal
+    backslash followed by `n` is written the same way, so two different sources
+    become one string nobody can tell apart. A numeric character reference is
+    the way out - `&#10;` is not a line ending in the source, so the label is
+    still one line and cannot open a heading, and it *is* a line ending to the
+    reader, so the text comes back whole.
+    """
+    label = f"first{ending}second"
+    markdown = render(related_links=[link(label=label)])
+
+    assert link_halves(markdown)[0] == (label, "https://github.com/example/repo")
+
+
+def test_a_label_of_backslash_n_and_a_label_of_a_newline_stay_different_texts() -> None:
+    """Two sources a reader must not be shown as one.
+
+    The collision is the whole of why the visible `\\n` was lossy: it is what
+    an escaped newline looked like *and* what an escaped backslash-then-`n`
+    looked like.
+    """
+    literal = render(related_links=[link(label="first\\nsecond")])
+    ending = render(related_links=[link(label="first\nsecond")])
+
+    assert link_halves(literal)[0][0] == "first\\nsecond"
+    assert link_halves(ending)[0][0] == "first\nsecond"
 
 
 @pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
@@ -579,6 +544,31 @@ def test_a_destination_holding_a_markdown_construct_is_wrapped() -> None:
 
     assert f"](<{hostile}>)" in markdown
     assert destinations(markdown) == [hostile, FRAME_IMAGE]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://ok.example/a b?q=&copy;",
+        "https://ok.example/a`b`]end?q=1&amp;r=2",
+        "https://ok.example/a) [pwn](https://attacker.example/evil?q=&copy;",
+        "https://ok.example/a%2Fb?q=100%&r=&#41;",
+    ],
+    ids=["space", "construct", "terminator", "already-encoded"],
+)
+def test_a_wrapped_destination_still_resolves_to_the_url_the_carrier_held(url: str) -> None:
+    """Angle brackets stop a destination ending its `(...)`; they do not stop decoding.
+
+    An entity reference is decoded inside `<...>` exactly as it is outside, so
+    the wrap is no reason to skip the escape. Asserted through a reader rather
+    than by looking at the render text, because the reader is the one that
+    normalizes: a space becomes `%20`, a line ending `%0A`, and what has to be
+    true is that undoing that normalization gives back the URL and not
+    something the URL contained.
+    """
+    markdown = render(related_links=[link(url=url)])
+
+    assert destinations(markdown) == [url, FRAME_IMAGE]
 
 
 def test_an_ordinary_link_is_left_readable() -> None:

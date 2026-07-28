@@ -324,7 +324,12 @@ def _low_confidence_lines(assessment: GroundingAssessment | None, caveat: str) -
 
     Escaping and not a fence, because the sentence is Distill's: a block would
     label Distill's own assessment as **extracted text**. The escape is
-    lossless, so the reason still reads as what it said.
+    lossless in the reader's terms (see `emit.link_label`), so the reason still
+    reads as what it said.
+
+    `_one_line` runs first and is the half that is *not* lossless. It is
+    deliberate: a line ending survives the escape, so without the collapse the
+    banner would occupy one line of the render while reading as several.
     """
     if assessment is None or not assessment.is_low_confidence:
         return []
@@ -337,8 +342,10 @@ def _one_line(text: str) -> str:
     """`text` with every run of whitespace, line endings included, made a space.
 
     Legibility rather than safety, now that the banner's reason is escaped: the
-    escape is what stops a line ending from ending the line, and this is what
-    keeps the result a sentence instead of a run of visible `\\n`.
+    escape is what stops a line ending from ending the *document* line, and this
+    is what keeps the result a sentence. The escape preserves the line ending
+    rather than removing it, so a reader given the reason uncollapsed would read
+    a banner broken across lines it does not occupy.
     """
     return " ".join(text.split())
 
