@@ -17,6 +17,7 @@ from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import pipeline as distill_session
 from distill.artifacts import FrameArtifact
+from distill.bundle_store import BundleRun, BundleStore
 from distill.errors import aggregate_warnings, warning
 from distill.local_vision import (
     FrameInterpreter,
@@ -129,6 +130,35 @@ def test_a_record_that_never_carried_a_count_is_counted_as_one() -> None:
     assert aggregated == [
         {"stage": "ocr", "code": "ocr_failed", "message": "nope", "occurrences": 2}
     ]
+
+
+def test_a_count_survives_the_stage_result_a_resume_reads_it_out_of(
+    tmp_path: Path,
+) -> None:
+    """The count is a number on disk, and the run that resumes folds it again.
+
+    A **stage result** is written as JSON and read back by a later run, which
+    then folds every stage's warnings a second time. Two things have to hold
+    for a resumed run to publish the same **manifest** as an uninterrupted one:
+    the count must survive serialization as a number rather than as the string
+    a permissive encoder would make of it, and the second fold must add it
+    rather than reset it to one - a resumed 80-keyframe run would otherwise
+    report three timeouts as one.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    run = BundleStore.open(root).begin("b0a1c2d3")
+    assert isinstance(run, BundleRun)
+    folded = warning("local_vision", "local_vision_timeout", "frame 3 timed out", occurrences=3)
+
+    run.write_stage("local_vision", {"frames": [], "warnings": [folded]})
+    recorded = run.read_stage("local_vision")
+
+    assert recorded is not None
+    assert recorded["warnings"] == [folded]
+    assert recorded["warnings"][0]["occurrences"] == 3
+    assert not isinstance(recorded["warnings"][0]["occurrences"], str)
+    assert aggregate_warnings(recorded["warnings"])[0]["occurrences"] == 3
 
 
 def _available_probe(config: LocalVisionConfig) -> LocalVisionProbe:
