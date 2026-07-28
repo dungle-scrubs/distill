@@ -12,25 +12,60 @@ The structural check below is what keeps that claim true. It parses every module
 under `src/distill/` and fails when a call that makes text durable appears
 outside `ALLOWED_WRITERS`.
 
-What it detects, by form:
+What it detects is an *enumerated* set of call shapes, matched as they are
+written. The set is exactly this, and the list is closed:
 
-- `path.write_text(...)` and `path.write_bytes(...)`
-- `open(..., "w")`, `path.open("a")`, `os.fdopen(fd, "w")` - any call in the
-  `open` family carrying a mode-shaped string that asks to write, wherever in
-  the call it sits
+- `path.write_text(...)` and `path.write_bytes(...)`, on any receiver
+- `open(..., "w")`, `path.open("a")`, `gzip.open(path, "wt")`, `os.fdopen(fd,
+  "w")` - any call named `open` or `fdopen` carrying a mode-shaped string that
+  asks to write, wherever in the call it sits
 - `os.open(..., os.O_WRONLY | ...)` and `os.write(...)` - the descriptor form
   the emitter itself is built from, so a copy of it lands somewhere this check
   looks. `os.open` is read from the flags *as written*: a call passing them in
   a variable is an aliased writer, and blind spot 1 has it
-- `json.dump(...)`, which writes through a file object it is handed
+- `json.dump(...)`, spelled on the name `json`, which writes through a file
+  object it is handed
 
-What it does not detect. Three blind spots, named because a check whose limits
-go unstated is a check that gets trusted past them (spike A-004):
+What it does not detect - stated first and plainest, because a check whose
+limits go unstated is a check that gets trusted past them (spike A-004):
+
+**Any durable-write shape outside that set.** Not by a judgement that it does
+not matter; the check simply has no rule that names it. Written literally,
+unaliased, in a module under `src/distill/`, every one of these puts something
+on disk and leaves this check silent:
+
+    os.pwrite(fd, text.encode(), 0)        os.writev(fd, [text.encode()])
+    shutil.copyfile(src, dst)              shutil.copyfileobj(reader, writer)
+    tempfile.NamedTemporaryFile(delete=False)
+    print(text, file=handle)               pickle.dump(document, handle)
+    os.symlink(target, name)
+
+Those eight are named because they are the ones a reader is likeliest to assume
+are covered, not because they complete anything: the complement of an
+enumerated set is not enumerable. `mmap`, `zipfile.ZipFile(..., "w")`,
+`csv.writer`, a subprocess with a redirect and whatever the standard library
+grows next are all outside it too, and the list of matched shapes will always
+trail. `test_the_shapes_documented_as_undetected_are_undetected` holds this
+paragraph to the code, so widening the check is welcome and fails there until
+this paragraph is corrected in the same change.
+
+Widening it *instead* of saying this was weighed and refused, on the evidence
+of the package as it stands. `print(..., file=handle)` cannot be told from
+`print(..., file=sys.stderr)` by an AST check, and Distill writes two of the
+latter (`cli.py`, `pipeline.py`); adding the shape buys detection of a form
+nobody here writes and costs two licence entries for calls that put nothing on
+disk. That is how this mechanism dies - the licence list fills with entries
+licensing non-writers and stops being a list of durable writers - and R-22
+bounds the promise to a contributor following the codebase's patterns, which
+these four forms are and `pickle`, `shutil.copyfile` and `os.pwrite` are not.
+
+Then three further blind spots, which are routes rather than shapes:
 
 1. **Aliased writers.** The check matches the call as it is written. `from json
    import dump` then `dump(document, handle)`, or `writer = path.write_text`
    then `writer(text)`, or `getattr(path, "write_" + "text")` are durable writes
-   this check walks straight past.
+   this check walks straight past. A different module spelling the same
+   function - `simplejson.dump`, or a vendored `dump` - is the same miss.
 2. **Writes through a helper in another module.** A module calling
    `bundle_store.atomic_write_text` writes durably and is not flagged. That is
    correct today - the helper reaches the emitter - but the check cannot tell
@@ -52,8 +87,8 @@ emitter is made of and two that write no text at all.
 So: this catches a contributor following the codebase's patterns, which is the
 way the emitter is most likely to be bypassed and the only way this check
 promises to catch. It does not prevent deliberate circumvention - anyone who
-means to bypass the emitter can, by any of the three routes above - and it is
-not a security control (D-022).
+means to bypass the emitter can, by any of the routes above, or by one line of
+a shape the set does not name - and it is not a security control (D-022).
 """
 
 from __future__ import annotations
@@ -361,6 +396,37 @@ def test_reads_and_lookalikes_are_not_reported_as_writes(source: str) -> None:
     The cost of a false positive here is not noise, it is the allowlist filling
     with entries that license nothing, at which point the licence list stops
     being a list of durable writers.
+    """
+    assert find_durable_writes(source, "somewhere.py") == ()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def save(fd, text):\n    os.pwrite(fd, text.encode(), 0)\n",
+        "def save(fd, text):\n    os.writev(fd, [text.encode()])\n",
+        "def save(src, dst):\n    shutil.copyfile(src, dst)\n",
+        "def save(reader, writer):\n    shutil.copyfileobj(reader, writer)\n",
+        "def save():\n    return tempfile.NamedTemporaryFile(delete=False)\n",
+        "def save(text, handle):\n    print(text, file=handle)\n",
+        "def save(document, handle):\n    pickle.dump(document, handle)\n",
+        "def save(target, name):\n    os.symlink(target, name)\n",
+    ],
+)
+def test_the_shapes_documented_as_undetected_are_undetected(source: str) -> None:
+    """The module docstring's statement of what escapes this check is true of it.
+
+    Every one of these puts something durable on disk, written plainly and
+    unaliased, in a module this check parses - and none is reported, because the
+    check recognises an enumerated set of call shapes and these are not in it.
+    The docstring says exactly that and names exactly these; this test is what
+    stops the two from drifting apart, which is the whole failure the statement
+    exists to prevent (D-022, R-22).
+
+    So it is not a bar on widening the check. Adding one of these shapes to
+    `_write_form` is welcome and will fail here, at which point the docstring is
+    corrected in the same change - the one thing that must not happen is the set
+    moving while the paragraph a reader trusts stays where it was.
     """
     assert find_durable_writes(source, "somewhere.py") == ()
 
