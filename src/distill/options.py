@@ -123,12 +123,13 @@ They belong to `PrunePolicy`, which validates them where the policy is built
 
 
 EXACT_INTEGER_FLOAT_LIMIT = 2**53
-"""Above this, a float no longer names one integer, so it cannot carry a count.
+"""From here up, a float no longer names one integer, so it cannot carry a count.
 
 `float` steps in twos past 2**53: `9007199254740993.0` *is* `9007199254740992.0`
-before anything here sees it. An integer arriving as an `int` or as a decimal
-string is exact and is kept exact; one arriving as a float above this limit is
-refused rather than published as a number the operator did not name.
+before anything here sees it, and the two are then indistinguishable. So the
+limit itself is refused along with everything above it - admitting it would
+admit a value that may have been written as one greater. An integer arriving as
+an `int` or as a decimal string is exact either way, and is kept exact.
 """
 
 
@@ -176,7 +177,7 @@ def _integral_value(name: str, value: int | float | str, domain: NumericDomain) 
         raise _bad_number(name, value, domain) from None
     if not math.isfinite(number) or number != int(number):
         raise _bad_number(name, value, domain)
-    if abs(number) > EXACT_INTEGER_FLOAT_LIMIT:
+    if abs(number) >= EXACT_INTEGER_FLOAT_LIMIT:
         raise _bad_number(name, value, domain, "a float this large does not name one whole number")
     return int(number)
 

@@ -355,16 +355,17 @@ def test_a_url_naming_two_video_ids_is_not_served_from_the_first_ones_bundle(
 ) -> None:
     """The playlist refusal, generalized: the fast path reads an id or declines.
 
-    `watch?v=A&v=B` carries two ids and yt-dlp picks one of them; `parse_qs`
-    picks the first, which is a different question with the same shape of
-    answer. Reading `A` off it served `A`'s **bundle** for a URL this Distill
-    resolves to `B` - a cache hit for a bundle the same command cannot make,
-    which is exactly what `youtube_url_names_one_video` exists to prevent for
-    the playlist form.
+    `watch?v=A&v=B` carries two ids. Which one yt-dlp resolves is a question
+    about yt-dlp's parser, and the fast path answered it by reading whichever
+    `parse_qs` returns first - so it served `A`'s **bundle** for a URL whose
+    identity it had guessed at. Guessing right costs nothing and guessing wrong
+    is a cache hit for a bundle the same command cannot make, which is what
+    `youtube_url_names_one_video` exists to prevent for the playlist form.
 
     So the fast path declines, the run resolves the id the way it always did,
-    and with yt-dlp uninstalled that is fatal for this URL form rather than
-    quietly answered from the wrong bundle.
+    and with yt-dlp uninstalled that is fatal for this URL form. The cost is
+    real and is the point: a URL that names one video unambiguously is served
+    from cache, and one that does not is resolved rather than guessed at.
     """
     two_ids = f"{URL}&v=otherid1234"
     args = youtube_args(tmp_path, url=two_ids)
@@ -386,14 +387,22 @@ def test_a_video_id_the_url_padded_is_not_a_bundle_key_of_its_own(
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
 ) -> None:
-    """A twelve-character `v=` value keys nothing, so it must not be looked up.
+    """Declining the fast path must not cost the **cache hit** behind it.
 
     yt-dlp matches eleven characters and ignores the rest, so this URL is
-    published under `VIDEO_ID` - the bundle written here. The fast path can only
-    have keyed the lookup on the twelve-character value, which nothing has ever
-    written, so it declines and the resolution finds the bundle under the id
-    yt-dlp reports. The **source** is still never downloaded, which is what the
-    boundary shows.
+    published under `VIDEO_ID` - the bundle written here. The fast path declines
+    the twelve-character value, and what this holds is what has to be true
+    *after* it declines: the post-resolution lookup still runs, so the bundle is
+    found and the **source** is never downloaded.
+
+    That lookup is skipped when the fast path already asked its exact question,
+    and a condition written against the URL's own id rather than the fast path's
+    would skip it here - resolving the id, downloading the video, and only then
+    hitting the cache under the run lock, having paid the whole cost R-49 exists
+    to avoid. It does not hold anything about the twelve-character key not being
+    tried; nothing observable distinguishes a lookup that missed from one that
+    never happened, and the matrix in `test_options_source.py` is where that is
+    pinned.
     """
     a_producing_path(fake_tool, youtube=False)
     # The real extractor matches eleven characters and ignores the twelfth, so

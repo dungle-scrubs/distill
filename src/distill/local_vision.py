@@ -559,6 +559,18 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     return default
 
 
+MAX_SOCKET_TIMEOUT_SEC = 2**63 / 1e9
+"""The largest timeout `socket.settimeout` can hold, in seconds (~292 years).
+
+CPython stores a timeout as nanoseconds in a signed 64-bit integer, so this is
+where the representable range ends and `OverflowError: timestamp out of range
+for platform time_t` begins. It is a fact about the call downstream rather than
+a policy about how long a probe may wait: `inf` is not the only number a socket
+cannot take, and a door that coerces has to land inside the range or it has not
+coerced anything.
+"""
+
+
 def _coerce_float(value: Any, default: float) -> float:
     """A configured number, or the default when what arrived is not one.
 
@@ -566,9 +578,11 @@ def _coerce_float(value: Any, default: float) -> float:
     names an unusable timeout should not stop a run - but what it coerces *to*
     has to be a number the thing downstream can take. `inf` cleared the `> 0`
     test and reached `socket.settimeout`, which answered with an uncaught
-    `OverflowError` from the stdlib; `nan` clears nothing and would have
-    disabled the timeout by always comparing false. Both are unusable in the
-    same way a string is, so both get the default.
+    `OverflowError` from the stdlib; so does any finite value past
+    `MAX_SOCKET_TIMEOUT_SEC`, which is why the bound is the socket's and not
+    just `math.isfinite`. `nan` clears nothing and would have disabled the
+    timeout by always comparing false. All of them are unusable in the way a
+    string is, so all of them get the default.
 
     `bool` is refused for the reason `manifest_duration` refuses it: `True` is
     an `int` in Python, and a config file saying `"timeout_sec": true` is not a
@@ -580,7 +594,7 @@ def _coerce_float(value: Any, default: float) -> float:
         parsed = float(value)
     except (TypeError, ValueError, OverflowError):
         return default
-    if not math.isfinite(parsed) or parsed <= 0:
+    if not math.isfinite(parsed) or parsed <= 0 or parsed >= MAX_SOCKET_TIMEOUT_SEC:
         return default
     return parsed
 

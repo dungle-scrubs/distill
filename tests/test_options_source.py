@@ -948,7 +948,8 @@ def test_a_counted_option_is_validated_without_being_rewritten() -> None:
     A decimal string is read as the integer it spells for the same reason. A
     float cannot be: `9007199254740993.0` is already 9007199254740992.0 by the
     time it reaches here, so honouring it would be publishing a number nobody
-    typed. Above the range where a float names one integer, a float is refused.
+    typed - and 9007199254740992.0 is refused with it, because at that point the
+    two are the same float and admitting it admits the one above.
     """
     beyond_float = 9007199254740993
 
@@ -963,10 +964,11 @@ def test_a_counted_option_is_validated_without_being_rewritten() -> None:
         ]
     ) == str(beyond_float)
 
-    with pytest.raises(DistillError) as beyond_precision:
-        DistillOptions.from_args({"max_keyframes": 1e300})
-    assert beyond_precision.value.code == "E_BAD_OPTIONS"
-    assert "max_keyframes" in beyond_precision.value.message
+    for ambiguous in (1e300, float(2**53), float(beyond_float)):
+        with pytest.raises(DistillError) as beyond_precision:
+            DistillOptions.from_args({"max_keyframes": ambiguous})
+        assert beyond_precision.value.code == "E_BAD_OPTIONS", ambiguous
+        assert "max_keyframes" in beyond_precision.value.message, ambiguous
 
 
 def test_a_numeric_option_too_large_for_a_float_is_an_option_error() -> None:

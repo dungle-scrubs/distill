@@ -355,6 +355,7 @@ def _a_port_nothing_is_listening_on() -> int:
         pytest.param(float("-inf"), id="-inf"),
         pytest.param(float("nan"), id="nan"),
         pytest.param(True, id="true"),
+        pytest.param(1e300, id="finite_but_past_what_a_socket_holds"),
     ],
 )
 def test_a_vision_timeout_no_socket_can_take_is_answered_by_the_default(
@@ -369,11 +370,16 @@ def test_a_vision_timeout_no_socket_can_take_is_answered_by_the_default(
     `OverflowError: timestamp out of range for platform time_t` - a traceback
     from the stdlib, on a command whose entire job is to report a diagnosis.
 
-    `nan` and `true` are the same door: a NaN timeout is a comparison that
-    always answers no, and a config file saying `"timeout_sec": true` is not a
-    one-second timeout. The run path refuses all four outright
-    (`DistillOptions.from_args` validates the raw argument); this path is the
-    one that coerces, and coercing has to reach a number a socket can take.
+    `inf` is not the only number a socket cannot take, which is why the bound
+    here is the socket's own: a timeout is nanoseconds in a signed 64-bit
+    integer, so `1e300` is finite, positive, and just as much an
+    `OverflowError`. `nan` and `true` are the same door from the other side: a
+    NaN timeout is a comparison that always answers no, and a config file saying
+    `"timeout_sec": true` is not a one-second timeout. `DistillOptions.from_args`
+    refuses the non-finite three outright, because the run path validates the
+    raw argument rather than coercing it; `1e300` it still admits, and that is
+    an uncaught traceback M9.1 owns rather than something this door can fix for
+    it. This door coerces, and coercing has to reach a number a socket can take.
 
     The probe is aimed at a port nothing is listening on, so what comes back is
     the typed unavailability every other unreachable endpoint produces.
