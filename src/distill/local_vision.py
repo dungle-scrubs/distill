@@ -123,7 +123,7 @@ class LocalVisionFailure(Exception):
 
 
 ProbeLocalVision = Callable[[LocalVisionConfig], LocalVisionProbe]
-TryInterpretImage = Callable[..., tuple["Interpretation | None", "dict[str, str] | None"]]
+TryInterpretImage = Callable[..., tuple["Interpretation | None", "WarningRecord | None"]]
 
 
 @dataclass(frozen=True)
@@ -505,7 +505,7 @@ def try_interpret_image(
     prompt: str,
     *,
     prompt_profile: str = "technical",
-) -> tuple[Interpretation | None, dict[str, str] | None]:
+) -> tuple[Interpretation | None, WarningRecord | None]:
     try:
         return interpret_image(config, image_path, prompt, prompt_profile=prompt_profile), None
     except KeyboardInterrupt:
@@ -524,7 +524,7 @@ def try_interpret_image_after_probe(
     prompt: str,
     *,
     prompt_profile: str = "technical",
-) -> tuple[Interpretation | None, dict[str, str] | None]:
+) -> tuple[Interpretation | None, WarningRecord | None]:
     try:
         return (
             interpret_image_after_probe(
@@ -563,7 +563,7 @@ class FrameInterpreter:
 
     def interpret(
         self, frames: list[FrameArtifact]
-    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+    ) -> tuple[list[FrameArtifact], list[WarningRecord]]:
         self._reset_run(frames)
         self._log("interpret.start", {"frames": len(frames), "backend": self.config.backend})
         probe = self.probe(self.config)
@@ -841,7 +841,7 @@ class FrameInterpreter:
         prompt: str,
         *,
         prompt_profile: str,
-    ) -> tuple[Interpretation | None, dict[str, str] | None]:
+    ) -> tuple[Interpretation | None, WarningRecord | None]:
         if self.try_interpret is try_interpret_image:
             return try_interpret_image_after_probe(
                 config,

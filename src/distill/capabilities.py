@@ -173,7 +173,7 @@ def missing_tool_error(
 
 def missing_tool_consequence(
     stage: str, tool_name: str, *, cause: DistillError | None = None
-) -> dict[str, str]:
+) -> WarningRecord:
     """What an absent `tool_name` costs this run, decided by the table.
 
     The single entry point for a call site that has just caught

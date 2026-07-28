@@ -39,7 +39,7 @@ from functools import cache
 from types import MappingProxyType, NoneType, UnionType
 from typing import Any, ClassVar, Union, get_args, get_origin, get_type_hints
 
-from .errors import DistillError, FrozenWarningRecord, warning
+from .errors import DistillError, FrozenWarningRecord, WarningRecord, warning
 from .redact_secrets import redact_text
 
 # R-58 / D-045: each individual extracted-text field is capped, and no aggregate
@@ -450,7 +450,7 @@ class Carrier(ABC):
             (*(_frozen_warning(item) for item in self.warnings), *collected),
         )
 
-    def _raised_since(self, previous: Carrier) -> list[dict[str, str]]:
+    def _raised_since(self, previous: Carrier) -> list[WarningRecord]:
         """The **warnings** this carrier's construction added to the inherited ones.
 
         A carrier built from another one carries its predecessor's warnings
@@ -645,7 +645,7 @@ class FrameArtifact(Carrier):
         """
         return Interpretation.from_document(self.interpretation)
 
-    def with_extracted_text(self, text: str) -> tuple[FrameArtifact, list[dict[str, str]]]:
+    def with_extracted_text(self, text: str) -> tuple[FrameArtifact, list[WarningRecord]]:
         """The same frame carrying what the image-text reader recovered from it.
 
         Returns the **warnings** the new frame's construction raised as well as
@@ -662,7 +662,7 @@ class FrameArtifact(Carrier):
         reading: Interpretation | None,
         *,
         grounding: Mapping[str, Any] | None = None,
-    ) -> tuple[FrameArtifact, list[dict[str, str]]]:
+    ) -> tuple[FrameArtifact, list[WarningRecord]]:
         """The same frame carrying a vision reading and Distill's assessment of it.
 
         Both together, because a **grounding** is an assessment *of* an

@@ -339,7 +339,7 @@ class YouTubeDownloaderProtocol(Protocol):
     ) -> AcquiredSource: ...
 
 
-def probe_duration(path: Path) -> tuple[float, list[dict[str, str]]]:
+def probe_duration(path: Path) -> tuple[float, list[WarningRecord]]:
     """The source's duration, with any **warning** the probe itself recorded.
 
     The warnings are truncated capture (R-33). They are returned rather than
@@ -716,7 +716,7 @@ def _run_ytdlp(
     )
 
 
-def _metadata_unavailable() -> dict[str, str]:
+def _metadata_unavailable() -> WarningRecord:
     return warning(
         "youtube",
         "metadata_unavailable",
@@ -724,7 +724,7 @@ def _metadata_unavailable() -> dict[str, str]:
     )
 
 
-def youtube_description(url: str) -> tuple[str, list[dict[str, str]]]:
+def youtube_description(url: str) -> tuple[str, list[WarningRecord]]:
     try:
         proc = _run_ytdlp(["--skip-download", "--print", "%(description)s"], url)
     except DistillError as exc:
@@ -904,7 +904,7 @@ def _probed_duration_sec(probe: Any) -> float:
         return 0.0
 
 
-def validate_media_file(path: Path) -> list[dict[str, str]]:
+def validate_media_file(path: Path) -> list[WarningRecord]:
     """Confirm a staged file is the media Distill asked for, before promoting it.
 
     A **fatal error**, not a **degradation** (ADR-0002): the media file is the
@@ -1201,7 +1201,7 @@ class YoutubeDownloader:
         self,
         lock_key: str,
         lock: Path,
-    ) -> tuple[AcquisitionLease | None, list[dict[str, str]]]:
+    ) -> tuple[AcquisitionLease | None, list[WarningRecord]]:
         """Poll for the lease within this run's wait budget.
 
         The budget is the only thing that ends the wait: a lock is held until

@@ -1002,7 +1002,7 @@ def transcribe_with_imports(
     options: DistillOptions,
     progress: ProgressCounter | ProgressReporter,
     duration_sec: float,
-) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+) -> tuple[dict[str, Any] | None, list[WarningRecord]]:
     # No default: SourceInfo.duration_sec is always present, and omitting it here
     # would silently disable ffmpeg -progress instead of failing loudly.
     from .transcript import transcribe_video
@@ -1022,7 +1022,7 @@ def interpret_frames_with_local_vision(
     frames: list[FrameArtifact],
     options: DistillOptions,
     progress: ProgressReporter | None = None,
-) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+) -> tuple[list[FrameArtifact], list[WarningRecord]]:
     """Interpret every frame, under the **redaction** policy the frames carry.
 
     The interpreter is told nothing about redaction. `--no-redact-secrets` is

@@ -315,7 +315,7 @@ def run_json(
     total_timeout_sec: float,
     idle_timeout_sec: float = DEFAULT_IDLE_TIMEOUT_SEC,
     **options: Any,
-) -> tuple[Any, tuple[dict[str, str], ...]]:
+) -> tuple[Any, tuple[WarningRecord, ...]]:
     """Run `argv`, parse its stdout as JSON, and return it with any **warnings**.
 
     The warnings are `CommandResult.warnings` - truncated capture (R-33). They

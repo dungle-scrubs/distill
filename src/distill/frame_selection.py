@@ -95,7 +95,7 @@ def filtered_candidates(
 
 def extract_frame(
     video_path: Path, timestamp_sec: float, output_path: Path
-) -> tuple[bool, list[dict[str, str]]]:
+) -> tuple[bool, list[WarningRecord]]:
     """Grab one frame, reporting whether it landed and what the attempt cost.
 
     Two answers rather than one warning, because they are independent: an
@@ -171,7 +171,7 @@ def select_keyframes(
     max_static_window_sec: float,
     progress: ProgressCounter | ProgressReporter | None = None,
     redaction: RedactionState = RedactionState.NOT_APPLIED,
-) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+) -> tuple[list[FrameArtifact], list[WarningRecord]]:
     """Choose the **keyframes** worth interpreting and produce one artifact each.
 
     `redaction` is the run's policy and is recorded on every artifact this

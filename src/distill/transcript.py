@@ -123,7 +123,7 @@ def extract_audio(
     audio_path: Path,
     progress: ProgressReporter | None = None,
     duration_sec: float | None = None,
-) -> tuple[bool, list[dict[str, str]]]:
+) -> tuple[bool, list[WarningRecord]]:
     """Extract the audio track, reporting whether it landed and what it cost.
 
     Two answers rather than one warning, because they are independent: a
@@ -222,7 +222,7 @@ def transcribe_audio(
     vad_filter: bool,
     progress: ProgressCounter | ProgressReporter | None = None,
     adapter: WhisperAdapter | None = None,
-) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+) -> tuple[dict[str, Any] | None, list[WarningRecord]]:
     warnings: list[WarningRecord] = []
     if adapter is None:
         try:
@@ -333,7 +333,7 @@ def transcribe_video(
     vad_filter: bool,
     progress: ProgressCounter | ProgressReporter | None = None,
     duration_sec: float | None = None,
-) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+) -> tuple[dict[str, Any] | None, list[WarningRecord]]:
     audio_path = work_dir / "audio.wav"
     extracted, audio_warnings = extract_audio(
         video_path,

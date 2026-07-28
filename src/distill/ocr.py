@@ -84,7 +84,7 @@ def find_tesseract_command() -> str | None:
     return None
 
 
-def ensure_tesseract_available() -> dict[str, str] | None:
+def ensure_tesseract_available() -> WarningRecord | None:
     """Report whether tesseract is present, without ever installing it.
 
     Per R-34 Distill installs nothing on a user's machine: no package manager
@@ -103,7 +103,7 @@ def ocr_frame(
     language: str,
     tesseract_cmd: str | None = None,
     preprocess: bool = True,
-) -> tuple[str, list[dict[str, str]]]:
+) -> tuple[str, list[WarningRecord]]:
     """Read one keyframe's **extracted text**, with every **warning** it cost.
 
     Returns the text and the warnings together rather than a single warning,
@@ -145,7 +145,7 @@ def _read_text(
     language: str,
     *,
     source: Path,
-) -> tuple[str | None, list[dict[str, str]]]:
+) -> tuple[str | None, list[WarningRecord]]:
     """Run tesseract over one image and return the text it printed.
 
     ``stdout`` as the output base is what makes tesseract print its reading
@@ -187,7 +187,7 @@ def _failure_reason(source: Path, exc: DistillError) -> str:
 
 def _ocr_processed_image(
     command: str, processed: Any, source: Path, language: str
-) -> tuple[str | None, list[dict[str, str]]]:
+) -> tuple[str | None, list[WarningRecord]]:
     """OCR a preprocessed PIL image via a temp file next to ``source``."""
     handle = tempfile.NamedTemporaryFile(  # noqa: SIM115
         suffix=".png", prefix=f".{source.stem}.ocr.", dir=str(source.parent), delete=False
@@ -212,7 +212,7 @@ def ocr_frames(
     enabled: bool,
     progress: ProgressCounter | ProgressReporter | None = None,
     preprocess: bool = True,
-) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+) -> tuple[list[FrameArtifact], list[WarningRecord]]:
     """Read every **keyframe**'s image text onto the artifact that names it.
 
     The text goes onto the carrier rather than beside it, which is what puts it
