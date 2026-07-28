@@ -265,6 +265,17 @@ ALLOWED_WRITERS: dict[tuple[str, str], Licence] = {
             "is what releasing the lock means."
         ),
     ),
+    ("cli.py", "_discard"): Licence(
+        forms=("os.open",),
+        reason=(
+            "Writes no text, and opens the one file that cannot hold any: "
+            "`os.devnull`. The descriptor exists to be `dup2`-ed over a standard "
+            "stream whose reader has gone, so that the interpreter's shutdown "
+            "flush has somewhere harmless to send bytes nobody will read. "
+            "Routing it through the emitter would ask the emitter to open a "
+            "path outside every bundle in order to discard content."
+        ),
+    ),
     ("bundle_store.py", "ExclusiveLock.probe"): Licence(
         forms=("os.open",),
         reason=(

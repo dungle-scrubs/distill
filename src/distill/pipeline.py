@@ -1110,8 +1110,15 @@ def call_registered_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     return spec.handler(args)
 
 
-def list_tools() -> None:
-    print(json.dumps({"tools": sorted(tool_registry())}, indent=2))
+def list_tools() -> dict[str, Any]:
+    """The registered tool names. Returned, not printed.
+
+    Printing from here put one command's output outside the CLI's own emission
+    path, so whatever that path promises about stdout - the flush inside the
+    error boundary, the answer to a caller that stopped reading - held for every
+    command except this one.
+    """
+    return {"tools": sorted(tool_registry())}
 
 
 def configured_timeout_ms() -> int:

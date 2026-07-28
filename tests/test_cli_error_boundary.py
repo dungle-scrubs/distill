@@ -115,6 +115,137 @@ def test_a_corrupt_job_record_exits_two_from_a_real_process(tmp_path: Path) -> N
     assert json.loads(result.stderr)["code"] == "E_INTERNAL"
 
 
+# --- The boundary's own streams: what happens when the channel is not there. --
+#
+# Every test above drives a failure through a boundary whose stderr is a working
+# pipe. These drive the same boundary with the channel it writes to already
+# gone, which is the state a caller leaves behind by closing a descriptor or by
+# walking away from a pipe - and the state in which an error boundary that
+# cannot write is at its most dangerous, because the fallback it takes is the
+# one nobody chose.
+
+CLI_ENTRY_POINTS: dict[str, list[str]] = {
+    "module": [sys.executable, "-m", "distill.cli"],
+    "console_script": [str(Path(sys.executable).with_name("distill"))],
+}
+"""Both ways the boundary is entered, because the recipe has to be on both.
+
+`distill = distill.cli:main` is what an operator types; `python -m distill.cli`
+is what the rest of this file drives. They share `main`, and a guard written
+into `__main__` rather than into `main` would hold for one and not the other.
+"""
+
+
+def cli_child_env() -> dict[str, str]:
+    return {**os.environ, "PYTHONPATH": str(APP / "src")}
+
+
+def a_reader_that_is_already_gone() -> tuple[int, int]:
+    """A pipe with no reader at all, so the first write is `EPIPE` (no race).
+
+    Closing the read end *before* the child is started is what makes this
+    deterministic. Handing the child a pipe and closing the read end afterwards
+    races the child's first write against the parent's close, and a write that
+    wins that race lands in the pipe buffer and succeeds.
+    """
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    return read_fd, write_fd
+
+
+@pytest.mark.parametrize("entry", sorted(CLI_ENTRY_POINTS), ids=sorted(CLI_ENTRY_POINTS))
+def test_a_caller_that_stopped_reading_stdout_ends_the_command_at_141(entry: str) -> None:
+    """FAILS FIRST: `distill list-tools | head` exits 120 with interpreter noise.
+
+    A caller closing Distill's stdout is `| head`, and it is not a Distill
+    failure - it is the shell's own idiom. What it produced was a
+    `BrokenPipeError` converted by the catch-all into an `E_INTERNAL` record
+    saying an unexpected error ended the command, followed by the interpreter's
+    "Exception ignored on flushing sys.stdout" on the way out and exit 120: two
+    diagnoses of a defect, for a caller who did exactly what the shell invites.
+    """
+    _read_fd, write_fd = a_reader_that_is_already_gone()
+    try:
+        result = subprocess.run(
+            [*CLI_ENTRY_POINTS[entry], "list-tools"],
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env=cli_child_env(),
+        )
+    finally:
+        os.close(write_fd)
+
+    assert result.returncode == 141
+    assert result.stderr == ""
+
+
+def test_a_command_that_cannot_reach_stderr_writes_nothing_to_stdout(tmp_path: Path) -> None:
+    """FAILS FIRST: `print(file=None)` is `print(file=sys.stdout)`.
+
+    An interpreter started with file descriptor 2 closed has `sys.stderr is
+    None` - not a broken stream, no stream - and `print(..., file=None)` falls
+    back to stdout. So the one channel the boundary promises to keep clean is
+    exactly where the error record went, and a caller piping stdout to `jq` got
+    a result-shaped error after all.
+    """
+    a_corrupt_job_record(tmp_path, "corrupt-job")
+
+    result = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            'exec "$0" -m distill.cli get-job-status corrupt-job --output-dir "$1" 2>&-',
+            sys.executable,
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=cli_child_env(),
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_a_command_whose_stderr_is_a_broken_pipe_still_exits_two(tmp_path: Path) -> None:
+    """FAILS FIRST: the write raises inside the `except` clause. Exit 120.
+
+    `_fail` runs from an exception handler, so an `OSError` it raises is not
+    caught by anything: it leaves `main` as a second, unrelated failure, the
+    interpreter fails to print its traceback to the same dead stream, and the
+    process ends on the exit code that means "could not flush the std streams".
+    Exit 2 is what the contract says a failing command exits with, and a caller
+    that stopped reading the diagnosis has not changed what happened.
+    """
+    a_corrupt_job_record(tmp_path, "corrupt-job")
+    _read_fd, write_fd = a_reader_that_is_already_gone()
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "distill.cli",
+                "get-job-status",
+                "corrupt-job",
+                "--output-dir",
+                str(tmp_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=write_fd,
+            text=True,
+            check=False,
+            env=cli_child_env(),
+        )
+    finally:
+        os.close(write_fd)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
 def test_call_tool_with_unparseable_args_is_reported_as_the_json_error_object(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -380,6 +511,37 @@ def test_a_vision_timeout_no_socket_can_hold_is_refused_on_the_run_path(
     assert payload["code"] == "E_BAD_OPTIONS"
     assert payload["stage"] == "options"
     assert payload["details"]["local_vision_timeout_sec"] == repr(1e300)
+
+
+def test_details_json_cannot_write_still_reach_the_operator_as_a_record(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FAILS FIRST: `TypeError: Object of type PosixPath is not JSON serializable`.
+
+    A stage raising about a file puts the `Path` in `details` because that is
+    what it was holding. `_fail` runs from inside an `except` clause, so the
+    `TypeError` the serialization raises is caught by nothing at all: the
+    operator gets no error object, and the stack the boundary exists to replace
+    is the stack of the boundary itself.
+    """
+
+    def fault(*_args: object, **_kwargs: object) -> Any:
+        raise DistillError(
+            "E_BAD_MEDIA",
+            "source",
+            "unreadable",
+            {"path": Path("/tmp/clip.mp4"), "head": b"\xff\xd8"},
+        )
+
+    monkeypatch.setattr("distill.cli.timeout_diagnostics", fault)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["timeout-diagnostics"])
+
+    assert exit_info.value.code == 2
+    payload = error_object(capsys)
+    assert payload["code"] == "E_BAD_MEDIA"
+    assert "clip.mp4" in payload["details"]["path"]
 
 
 def test_the_error_object_names_the_exception_without_printing_its_stack(

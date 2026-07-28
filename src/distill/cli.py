@@ -7,13 +7,25 @@ and `resume_partial`, which are deliberately *not* part of the bundle key.
 Changing what this module forwards can therefore change manifest content at an
 unchanged bundle key, which is the stale hit the signature exists to catch.
 
-It also owns Distill's outermost error boundary (R-46). Every way a command can
-end badly leaves here as one shape - the **fatal error** record as JSON on
+It also owns Distill's outermost error boundary (R-46). Every exception a
+command raises leaves here as one shape - the **fatal error** record as JSON on
 stderr, exit code 2 - so an operator scripting Distill has one thing to parse
 and one code to branch on. Before that, only `DistillError` was converted and
 everything else left as a Python traceback with exit 1 (finding 14): an exit
 code that says nothing, a stack that names Distill's internals, and no code or
 stage to key on.
+
+*Raises*, and not "ends badly", because three ways a command ends are outside
+that shape on purpose and each one has a better answer than a record:
+
+- **An argument the parser rejects** is argparse's usage message and exit 2.
+  The usage message says what the accepted spellings are; a JSON record would
+  not.
+- **`Ctrl-C`** is `KeyboardInterrupt`: the operator ending their own command.
+  It leaves with the interpreter's own traceback and exit 130, because it is
+  not a failure to diagnose and not Distill's to relabel.
+- **A caller that stops reading stdout** (`distill … | head`) is exit 141, the
+  conventional 128 + SIGPIPE. Nothing failed; the reader left.
 """
 
 from __future__ import annotations
@@ -24,7 +36,7 @@ import os
 import sys
 from typing import Any, NoReturn
 
-from .errors import DistillError
+from .errors import INTERNAL_CODE, INTERNAL_STAGE, DistillError
 from .options import OPTION_SPECS, PROCESSING_OPTION_NAMES
 from .pipeline import (
     DistillSession,
@@ -63,7 +75,66 @@ def _args_payload(args: argparse.Namespace, keys: tuple[str, ...]) -> dict[str, 
 
 
 def _print_json(payload: Any) -> None:
+    """The one write to stdout, so the boundary's guarantees cover all of them.
+
+    Every command's result leaves through here - `list-tools` included, which
+    used to print from `pipeline` and so sat outside whatever this boundary
+    promises about the output stream.
+    """
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+BROKEN_PIPE_EXIT = 141
+"""What a command exits when the caller stopped reading its output: 128 + SIGPIPE.
+
+`distill … | head` is the shell's own idiom, not a Distill failure, and it is
+not the operator's mistake either. Reported as an `E_INTERNAL` record it read as
+a defect in Distill; reported as the conventional signal exit it reads as what
+it is, and a shell that checks `$?` sees the number every other program uses.
+"""
+
+
+def _discard(stream: Any) -> None:
+    """Point `stream`'s descriptor at the null device, and stop worrying about it.
+
+    The interpreter flushes both standard streams on the way out. When the
+    reader is gone that flush fails *after* everything this module controls has
+    finished, and CPython answers by printing "Exception ignored on flushing
+    sys.stdout" and exiting 120 - a second diagnosis, on the error channel, of
+    something that was never Distill's failure, replacing the exit code the
+    contract names. Re-pointing the descriptor is the standard recipe: the
+    buffered bytes have nowhere to go either way, and this is the only way to
+    say so before shutdown asks.
+    """
+    if stream is None:
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(devnull, stream.fileno())
+    except (OSError, ValueError):
+        pass
+    finally:
+        os.close(devnull)
+
+
+def _flush_stdout_quietly() -> None:
+    """Empty the output buffer on a failing path, without adding a second failure.
+
+    Whatever a command wrote before it failed has already been written; what
+    must not happen is the interpreter discovering a dead stdout during its own
+    shutdown flush and printing noise *after* the error record, on the channel
+    the record was just written to.
+    """
+    stream = sys.stdout
+    if stream is None:
+        return
+    try:
+        stream.flush()
+    except OSError:
+        _discard(stream)
 
 
 TRACEBACK_ENV = "DISTILL_TRACEBACK"
@@ -76,15 +147,56 @@ and it is off by default because a traceback is not a contract.
 """
 
 
+def _emit_error(error: dict[str, Any]) -> None:
+    """Write `error` to the error channel, or write nothing anywhere.
+
+    Two ways the channel is not there, and both used to end somewhere worse
+    than silence:
+
+    - **No stream at all.** An interpreter started with file descriptor 2
+      closed has `sys.stderr is None`, and `print(..., file=None)` falls back to
+      *stdout*. The one channel this boundary promises to keep clean is
+      precisely where the error record went, so a caller piping stdout to `jq`
+      got a result-shaped error after all.
+    - **A stream nobody is reading.** `_fail` is called from inside an `except`
+      clause, so an `OSError` raised by the write is caught by nothing: it
+      leaves `main` as a second, unrelated failure and the process ends on the
+      exit code for "could not flush the std streams" rather than on the one the
+      contract names.
+
+    A caller that closed the error channel has said it does not want the
+    diagnosis. It has not changed what happened, so the exit code is unchanged.
+    """
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print(json.dumps(error, sort_keys=True), file=stream)
+        stream.flush()
+    except OSError:
+        # A failed flush leaves the bytes in the buffer, where the interpreter's
+        # own shutdown flush finds them and fails again - which is the exit-120
+        # path, one step further along.
+        _discard(stream)
+
+
 def _fail(error: dict[str, Any]) -> NoReturn:
     """End the command on `error`, the one way any command ends badly.
 
-    stderr, so a caller piping stdout to `jq` gets either a result or nothing
-    rather than a result-shaped error. Exit 2, which is also what argparse uses
-    for a usage error: both mean "this command produced no output", and an
-    operator branching on non-zero does not have to know which kind it was.
+    stderr, so a caller reading stdout with `jq` gets either a result or
+    nothing rather than a result-shaped error. Exit 2, which is also what
+    argparse uses for a usage error: both mean "this command produced no
+    output", and an operator branching on non-zero does not have to know which
+    kind it was.
+
+    The carve-out, stated because the promise is otherwise wider than the
+    mechanism: stdout is clean because nothing writes a failure to it, not
+    because a write can be undone. A command that fails *after* printing part
+    of its result - which is what a caller closing the pipe mid-write produces -
+    leaves those bytes where they landed.
     """
-    print(json.dumps(error, sort_keys=True), file=sys.stderr)
+    _flush_stdout_quietly()
+    _emit_error(error)
     raise SystemExit(2)
 
 
@@ -227,82 +339,118 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Dispatch one command, and convert every way it can fail (R-46).
+def _dispatch(argv: list[str] | None) -> None:
+    """Parse `argv` and run the command it names. Everything a boundary covers.
 
-    Parsing is outside the boundary on purpose. Argparse answers a typo with a
-    usage message and `SystemExit(2)`, which is the contract for an operator
-    error and better than any error object could be - the usage message says
-    what the accepted spellings are, and a JSON record would not. The boundary
-    covers what happens *after* a command was named.
-
-    `Exception`, not `BaseException`. `SystemExit` is the parser's answer and
-    `_fail`'s own; `KeyboardInterrupt` is the operator interrupting their own
-    command, which is not a failure to diagnose and not Distill's to relabel.
+    Parsing is *inside* the boundary and its answer to a typo is unchanged, and
+    those two facts are not in tension. Argparse ends a usage error by raising
+    `SystemExit`, which is a `BaseException` and passes through a clause naming
+    `Exception` untouched - so the usage message still stands alone, still exits
+    2, and still carries no error object. What the boundary picks up is the
+    other half: a type converter, a default, or an `argparse` action raising
+    something that is *not* a usage error. Those ran outside every handler, and
+    left as a traceback.
     """
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = build_parser().parse_args(argv)
+    if args.command == "process-local-video":
+        _print_json(
+            call_registered_tool(
+                "process_local_video",
+                {**_args_payload(args, PROCESSING_KEYS), "path": args.path},
+            )
+        )
+    elif args.command == "process-youtube-video":
+        _print_json(
+            call_registered_tool(
+                "process_youtube_video",
+                {**_args_payload(args, PROCESSING_KEYS), "url": args.url},
+            )
+        )
+    elif args.command == "process-video-directory":
+        keys = ("recursive", "max_items", "continue_on_error", "output_dir", "job_id")
+        _print_json(
+            call_registered_tool(
+                "process_video_directory",
+                {**_args_payload(args, keys), "path": args.path},
+            )
+        )
+    elif args.command == "process-youtube-playlist":
+        keys = (*PROCESSING_KEYS, "max_items", "continue_on_error")
+        _print_json(
+            call_registered_tool(
+                "process_youtube_playlist",
+                {**_args_payload(args, keys), "url": args.url},
+            )
+        )
+    elif args.command == "cleanup-cache":
+        keys = ("output_dir", "max_age_days", "keep_generations", "dry_run")
+        _print_json(call_registered_tool("cleanup_cache", _args_payload(args, keys)))
+    elif args.command == "cache-doctor":
+        keys = ("output_dir", "max_age_days", "keep_generations")
+        _print_json(call_registered_tool("cache_doctor", _args_payload(args, keys)))
+    elif args.command == "get-job-status":
+        _print_json(
+            call_registered_tool("get_job_status", _args_payload(args, ("job_id", "output_dir")))
+        )
+    elif args.command == "list-tools":
+        _print_json(list_tools())
+    elif args.command == "timeout-diagnostics":
+        _print_json(timeout_diagnostics())
+    elif args.command == "timeout-probe":
+        _print_json(run_timeout_probe(args.probe_ms))
+    elif args.command == "local-vision-diagnostics":
+        payload = _args_payload(args, LOCAL_VISION_DIAGNOSTIC_KEYS)
+        _print_json(local_vision_diagnostics(payload))
+    elif args.command == "call-tool":
+        response = DistillSession().call_tool(args.tool, _tool_args(args.args))
+        # The session speaks the MCP envelope, where a failure is a result
+        # with an `error` in it. A CLI does not: R-46 is one exit code and
+        # one record, so an envelope carrying an error ends the command the
+        # way every other failure does rather than printing success-shaped
+        # JSON and exiting 0.
+        error = response.get("error")
+        if isinstance(error, dict):
+            _fail(error)
+        _print_json(response)
+    else:
+        # The parser accepted a command this chain has no branch for, which is
+        # a defect in this module and not in the operator's argv. Without this
+        # arm the chain simply falls off the end: the command exits 0 having
+        # printed nothing, which is indistinguishable from a command that
+        # succeeded and had nothing to say.
+        raise DistillError(
+            INTERNAL_CODE,
+            INTERNAL_STAGE,
+            f"the {args.command} command is registered but no branch dispatches it",
+            {"command": args.command},
+        )
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run one command, and convert every way it can fail (R-46).
+
+    `Exception`, not `BaseException`, and the two things that pass through are
+    the two the boundary has nothing better to say about. `SystemExit` is
+    argparse's answer to a typo and `_fail`'s own; `KeyboardInterrupt` is the
+    operator interrupting their own command, which is not a failure to diagnose
+    and not Distill's to relabel.
+
+    `BrokenPipeError` is caught first and separately. It is the one `OSError`
+    that is not a failure at all - it means the caller stopped reading, which
+    `| head` does on purpose - so it ends the command on the conventional signal
+    exit rather than as a record saying an unexpected error occurred.
+    """
     try:
-        if args.command == "process-local-video":
-            _print_json(
-                call_registered_tool(
-                    "process_local_video",
-                    {**_args_payload(args, PROCESSING_KEYS), "path": args.path},
-                )
-            )
-        elif args.command == "process-youtube-video":
-            _print_json(
-                call_registered_tool(
-                    "process_youtube_video",
-                    {**_args_payload(args, PROCESSING_KEYS), "url": args.url},
-                )
-            )
-        elif args.command == "process-video-directory":
-            keys = ("recursive", "max_items", "continue_on_error", "output_dir", "job_id")
-            _print_json(
-                call_registered_tool(
-                    "process_video_directory",
-                    {**_args_payload(args, keys), "path": args.path},
-                )
-            )
-        elif args.command == "process-youtube-playlist":
-            keys = (*PROCESSING_KEYS, "max_items", "continue_on_error")
-            _print_json(
-                call_registered_tool(
-                    "process_youtube_playlist",
-                    {**_args_payload(args, keys), "url": args.url},
-                )
-            )
-        elif args.command == "cleanup-cache":
-            keys = ("output_dir", "max_age_days", "keep_generations", "dry_run")
-            _print_json(call_registered_tool("cleanup_cache", _args_payload(args, keys)))
-        elif args.command == "cache-doctor":
-            keys = ("output_dir", "max_age_days", "keep_generations")
-            _print_json(call_registered_tool("cache_doctor", _args_payload(args, keys)))
-        elif args.command == "get-job-status":
-            _print_json(
-                call_registered_tool("get_job_status", _args_payload(args, ("job_id", "output_dir")))
-            )
-        elif args.command == "list-tools":
-            list_tools()
-        elif args.command == "timeout-diagnostics":
-            _print_json(timeout_diagnostics())
-        elif args.command == "timeout-probe":
-            _print_json(run_timeout_probe(args.probe_ms))
-        elif args.command == "local-vision-diagnostics":
-            payload = _args_payload(args, LOCAL_VISION_DIAGNOSTIC_KEYS)
-            _print_json(local_vision_diagnostics(payload))
-        elif args.command == "call-tool":
-            response = DistillSession().call_tool(args.tool, _tool_args(args.args))
-            # The session speaks the MCP envelope, where a failure is a result
-            # with an `error` in it. A CLI does not: R-46 is one exit code and
-            # one record, so an envelope carrying an error ends the command the
-            # way every other failure does rather than printing success-shaped
-            # JSON and exiting 0.
-            error = response.get("error")
-            if isinstance(error, dict):
-                _fail(error)
-            _print_json(response)
+        _dispatch(argv)
+        if sys.stdout is not None:
+            # Inside the boundary, deliberately. `print` buffers when stdout is
+            # a pipe, so a caller that walked away is not discovered until the
+            # buffer is emptied - and left to the interpreter's own shutdown
+            # flush, that discovery happens where nothing can handle it.
+            sys.stdout.flush()
+    except BrokenPipeError:
+        _discard(sys.stdout)
+        raise SystemExit(BROKEN_PIPE_EXIT) from None
     except DistillError as exc:
         _fail(exc.to_dict())
     except Exception as exc:
