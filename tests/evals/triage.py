@@ -59,15 +59,28 @@ def _luminance(path: Path) -> float:
 
 
 def collect(cache_dir: Path) -> list[FrameSignal]:
+    """Read every bundle's **manifest** and survey the frames it records.
+
+    The manifest is the source because a **generation** holds no **stage
+    result** (R-13): this used to read each generation's `_ocr.json`, which only
+    ever appeared inside a bundle because publish renamed the run's resume
+    scratch into it. The manifest records the same per-frame index, relative
+    path and extracted text, and unlike scratch it is what a reader is entitled
+    to.
+    """
     signals: list[FrameSignal] = []
-    for ocr_json in cache_dir.glob("*/g*/_ocr.json"):
+    for manifest_json in cache_dir.glob("*/_manifest.json"):
         try:
-            frames = json.loads(ocr_json.read_text()).get("frames", [])
+            manifest = json.loads(manifest_json.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        bundle = ocr_json.parent.parent.name[:12]
+        generation = manifest_json.parent / str(manifest.get("active_generation", ""))
+        if not generation.is_dir():
+            continue
+        frames = manifest.get("frames", [])
+        bundle = manifest_json.parent.name[:12]
         for frame in frames:
-            path = ocr_json.parent / str(frame.get("relative_path", ""))
+            path = generation / str(frame.get("relative_path", ""))
             if not path.exists():
                 continue
             signals.append(

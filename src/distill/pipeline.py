@@ -17,18 +17,21 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .bundle import (
-    BundleGeneration,
-    active_paths,
+from .bundle_store import (
+    BATCH_ITEM_LOCK_WAIT_SEC,
+    DEFAULT_KEEP_GENERATIONS,
+    SINGLE_SOURCE_LOCK_WAIT_SEC,
+    BundleRun,
+    BundleSnapshot,
+    BundleStore,
+    PrunePolicy,
+    atomic_write_text,
     ensure_safe_directory,
-    patch_manifest_progress,
-    response_from_paths,
-    write_bundle_files,
 )
-from .cache import cleanup_cache
+from .cache_doctor import inspect_cache
 from .errors import DistillError
 from .frame_selection import select_keyframes
-from .jobs import read_job_status, write_job_status
+from .job_store import JobOutcome, JobStore
 from .local_vision import (
     FrameInterpreter,
     local_vision_config_from_args,
@@ -46,6 +49,7 @@ from .progress import (
 )
 from .redact_secrets import redact_text
 from .render import render_markdown
+from .response import manifest_document, run_response
 from .source import (
     normalize_youtube_url,
     release_acquisition_lease,
@@ -59,6 +63,7 @@ TOOLS = {
     "process_video_directory": "Process video files in a local directory into Distill bundles",
     "process_youtube_playlist": "Process videos from a YouTube playlist or channel URL",
     "cleanup_cache": "Prune old Distill cache bundles and generations",
+    "cache_doctor": "Report bundles, markers, generations, locks and a prune preview for an output root",
     "get_job_status": "Read a Distill job status record by job id",
 }
 DEFAULT_CONFIGURED_TIMEOUT_MS = 5_400_000
@@ -86,34 +91,88 @@ class DistillSession:
             return {"error": {"message": error.to_json_text()}}
 
 
-def process_local_video(args: dict[str, Any]) -> dict[str, Any]:
-    options = DistillOptions.from_args(args)
-    resolution = resolve_source_for_processing("local", str(args.get("path", "")), options)
-    return process_resolved_source(
-        resolution.source,
-        options,
-        resolution.output_root,
-        progress=resolution.progress,
-        tool="process_local_video",
-    )
+def acquire_and_process(
+    source_type: str,
+    value: str,
+    options: DistillOptions,
+    root: Path,
+    *,
+    progress: ProgressReporter | None,
+    tool: str,
+    lock_wait_sec: float,
+) -> dict[str, Any]:
+    """Acquire the source and produce its **generation**: everything a run does.
 
+    Both halves belong to one job, which is why they are one function: the
+    **job record** wraps this, and a record that started after acquisition
+    described the second half of a run as though it were the whole of it.
 
-def process_youtube_video(args: dict[str, Any]) -> dict[str, Any]:
-    options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
-    progress = ProgressReporter(emitter=progress_emitter(options.job_id))
+    A YouTube resolution reports the **output root** it validated and a local
+    one reports none, so the caller's root stands in - the same path, validated
+    before the record was opened rather than in the middle of the work.
+
+    `lock_wait_sec` is spent twice, at the two locks a run takes: the
+    **acquisition lease** on the source and the run lock on the **bundle key**.
+    Both are the same caller's decision (D-044) - a run a user is watching waits
+    for either, and a batch item gives up on either - and acquisition is the one
+    that a second run of the same video reaches first (finding 4-opus).
+    """
     resolution = resolve_source_for_processing(
-        "youtube",
-        str(args.get("url", "")),
+        source_type,
+        value,
         options,
         progress=progress,
+        lock_wait_sec=lock_wait_sec,
     )
     return process_resolved_source(
         resolution.source,
         options,
-        resolution.output_root,
+        resolution.output_root or root,
         progress=resolution.progress,
-        tool="process_youtube_video",
+        tool=tool,
+        lock_wait_sec=lock_wait_sec,
     )
+
+
+def process_local_video(
+    args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+) -> dict[str, Any]:
+    options = DistillOptions.from_args(args)
+    root = validate_output_root(options.output_dir)
+
+    def work() -> dict[str, Any]:
+        return acquire_and_process(
+            "local",
+            str(args.get("path", "")),
+            options,
+            root,
+            progress=None,
+            tool="process_local_video",
+            lock_wait_sec=lock_wait_sec,
+        )
+
+    return record_job(JobStore.open(root), options.job_id, "process_local_video", work)
+
+
+def process_youtube_video(
+    args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+) -> dict[str, Any]:
+    options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
+    root = validate_output_root(options.output_dir)
+    progress = ProgressReporter(emitter=progress_emitter(options.job_id))
+
+    def work() -> dict[str, Any]:
+        return acquire_and_process(
+            "youtube",
+            str(args.get("url", "")),
+            options,
+            root,
+            progress=progress,
+            tool="process_youtube_video",
+            lock_wait_sec=lock_wait_sec,
+        )
+
+    return record_job(JobStore.open(root), options.job_id, "process_youtube_video", work)
 
 
 def progress_emitter(job_id: str) -> Any:
@@ -125,14 +184,23 @@ def progress_emitter(job_id: str) -> Any:
     return emit
 
 
-def cache_hit_progress_summary(manifest: dict[str, Any], manifest_path: Path) -> dict[str, Any]:
-    progress_summary = manifest.get("progress")
-    if isinstance(progress_summary, dict) and progress_summary_is_terminal(progress_summary):
-        return progress_summary
+def cache_hit_progress_summary(
+    store: BundleStore, snapshot: BundleSnapshot
+) -> tuple[BundleSnapshot, dict[str, Any]]:
+    """The progress summary a cache hit reports, amending the manifest if it must.
 
-    progress_summary = OverallProgressAggregator().cached_summary({"source": "cache"})
-    patch_manifest_progress(manifest_path, progress_summary)
-    return progress_summary
+    A bundle published before progress was recorded terminally has no summary a
+    poller can use, so one is synthesized and written back through the store's
+    amendment path (R-14) rather than by rewriting the file here - a **manifest**
+    is the **bundle marker**, and a reader catching it half-rewritten sees a
+    directory that is briefly not a bundle at all.
+    """
+    recorded = snapshot.manifest.get("progress")
+    if isinstance(recorded, dict) and progress_summary_is_terminal(recorded):
+        return snapshot, recorded
+
+    summary = OverallProgressAggregator().cached_summary({"source": "cache"})
+    return store.patch_published(snapshot, {"progress": summary}), summary
 
 
 def progress_summary_is_terminal(progress_summary: dict[str, Any]) -> bool:
@@ -147,6 +215,33 @@ def progress_summary_is_terminal(progress_summary: dict[str, Any]) -> bool:
     )
 
 
+def _abandon_reason(exc: BaseException) -> str:
+    """Why a run gave up, in the terms the rest of Distill reports failures in.
+
+    A `DistillError`'s code is the identity an operator correlates on, and
+    `str(exc)` does not carry it; anything else falls back to its type, because
+    an uncoded exception's message alone rarely says which stage produced it.
+    """
+    if isinstance(exc, DistillError):
+        return f"{exc.code}: {exc}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _as_stage_payload(name: str, recorded: Any) -> dict[str, Any] | None:
+    """A recorded **stage result** in the shape this run expects, or `None`.
+
+    Anything else is treated as absent rather than as an error: a stage result
+    is scratch, so a shape a newer run does not recognize costs a recomputation
+    and nothing more. The one accommodation is a bare list under `frames`, which
+    is how an older run recorded that stage before payloads carried warnings.
+    """
+    if isinstance(recorded, dict):
+        return recorded
+    if name == "frames" and isinstance(recorded, list):
+        return {"frames": recorded, "warnings": []}
+    return None
+
+
 @dataclass
 class ProcessingRun:
     source: Any
@@ -154,76 +249,90 @@ class ProcessingRun:
     output_root: Path
     progress: ProgressReporter
     tool: str
+    lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+    """How long this run waits for a contended **bundle key** (D-044).
+
+    The run a user is watching waits five minutes, because the likely holder is
+    another run of the same video that is nearly done. One item of a batch or a
+    playlist waits five seconds and then fails `E_LOCKED`: serializing a
+    25-item playlist behind another run's 40-minute video would cost hours of
+    blocked waiting, and `continue_on_error` already defaults true, so the item
+    fails, the batch proceeds, and re-running picks it up as a cache hit.
+    """
 
     def execute(self) -> dict[str, Any]:
-        bundle_root = self.output_root / self.source.source_hash
-        ensure_safe_directory(bundle_root, self.output_root)
-        cached_response = self._cached_response(bundle_root)
-        if cached_response is not None:
-            return cached_response
+        """Produce this run's **generation**, or hand back the one already published.
+
+        The run lock is taken before anything under the **bundle key** is
+        created and held until the generation is committed (R-08), so the whole
+        of a run - the download, the vision pass, the publish - happens under
+        exclusion rather than only the staging that opens it. `begin` answers
+        the cache question from *under* that lock, which is what makes a waiter
+        coalesce onto the winner's result instead of redoing its work.
+        """
+        store = BundleStore.open(self.output_root)
+        began = store.begin(
+            self.source.source_hash,
+            wait_sec=self.lock_wait_sec,
+            resume=self.options.resume_partial,
+            reuse_active=not self.options.force_reprocess,
+        )
+        if isinstance(began, BundleSnapshot):
+            return self._cached_response(store, began)
 
         heartbeat = ProgressHeartbeat(self.progress.counter).start()
-        generation = BundleGeneration.stage(bundle_root, reset=not self.options.resume_partial)
         try:
-            response = self._produce_generation(generation, heartbeat)
+            with began as run:
+                try:
+                    return self._produce_generation(run, heartbeat)
+                except BaseException as exc:
+                    # A bundle that did not change is otherwise indistinguishable
+                    # from a run that never happened: the reason is the record.
+                    # The previous **active generation** is untouched and the
+                    # **staging directory** stays for the next run to resume.
+                    run.abandon(_abandon_reason(exc))
+                    raise
         finally:
             heartbeat.stop()
-        write_job_status(
-            self.output_root,
-            self.options.job_id,
-            status="completed",
-            tool=self.tool,
-            result=response,
-        )
-        return response
 
-    def _cached_response(self, bundle_root: Path) -> dict[str, Any] | None:
-        cached_paths = active_paths(bundle_root)
-        if not cached_paths or self.options.force_reprocess:
-            return None
-        manifest = json.loads(cached_paths.manifest.read_text())
-        progress_summary = cache_hit_progress_summary(manifest, cached_paths.manifest)
-        response = response_from_paths(
-            cached_paths,
+    def _cached_response(self, store: BundleStore, snapshot: BundleSnapshot) -> dict[str, Any]:
+        snapshot, progress_summary = cache_hit_progress_summary(store, snapshot)
+        manifest = snapshot.manifest
+        return run_response(
+            snapshot,
             self.source,
-            manifest.get("frames", []),
+            list(manifest.get("frames", [])),
             bool(manifest.get("transcript_present")),
             list(manifest.get("warnings", [])),
             cached=True,
             progress=progress_summary,
             job_id=self.options.job_id,
         )
-        write_job_status(
-            self.output_root,
-            self.options.job_id,
-            status="completed",
-            tool=self.tool,
-            result=response,
-        )
-        return response
 
     def _run_stage(
         self,
-        generation: BundleGeneration,
+        run: BundleRun,
         heartbeat: ProgressHeartbeat,
         warnings: list[dict[str, str]],
         name: str,
         skipped_mechanisms: tuple[str, ...],
         producer: Callable[[], dict[str, Any]],
     ) -> dict[str, Any]:
-        def on_resume() -> None:
+        """Recover a **stage result** or produce one, recording it either way.
+
+        Resume is the store's answer, not this module's: `read_stage` reports
+        `None` for every reason a recorded result cannot be used - the run is
+        not resuming, nothing was recorded, or what was recorded is unreadable -
+        and every one of them means the same thing here, which is compute it.
+        """
+        payload = _as_stage_payload(name, run.read_stage(name))
+        if payload is not None:
             for mechanism in skipped_mechanisms:
                 self.progress.skip_cached(mechanism, detail={"source": "partial_resume"})
-
-        def after_produce(_payload: dict[str, Any]) -> None:
+        else:
+            payload = producer()
             heartbeat.check()
-
-        payload = generation.run_stage(
-            name,
-            producer,
-            on_resume=on_resume,
-            after_produce=after_produce,
-        )
+            run.write_stage(name, payload)
         warnings.extend(list(payload.get("warnings", [])))
         return payload
 
@@ -265,16 +374,15 @@ class ProcessingRun:
 
     def _produce_generation(
         self,
-        generation: BundleGeneration,
+        run: BundleRun,
         heartbeat: ProgressHeartbeat,
     ) -> dict[str, Any]:
         warnings = list(self.source.warnings)
-        paths = generation.paths
 
         def produce_transcript() -> dict[str, Any]:
             transcript, transcript_warnings = transcribe_with_imports(
                 self.source.resolved_path,
-                paths.generation,
+                run.scratch_dir,
                 self.options,
                 self.progress,
                 duration_sec=self.source.duration_sec,
@@ -282,7 +390,7 @@ class ProcessingRun:
             return {"transcript": transcript, "warnings": transcript_warnings}
 
         transcript_payload = self._run_stage(
-            generation,
+            run,
             heartbeat,
             warnings,
             "transcript",
@@ -295,7 +403,7 @@ class ProcessingRun:
             frame_selection = self.options.frame_selection_config()
             frames, frame_warnings = select_keyframes(
                 self.source.resolved_path,
-                paths.frames,
+                run.frames_dir,
                 self.source.duration_sec,
                 frame_selection.max_keyframes,
                 frame_selection.min_interval_sec,
@@ -305,7 +413,7 @@ class ProcessingRun:
             return {"frames": frames, "warnings": frame_warnings}
 
         frames_payload = self._run_stage(
-            generation,
+            run,
             heartbeat,
             warnings,
             "frames",
@@ -315,7 +423,7 @@ class ProcessingRun:
         frames = frames_payload["frames"]
 
         ocr_payload = self._run_stage(
-            generation,
+            run,
             heartbeat,
             warnings,
             "ocr",
@@ -326,7 +434,7 @@ class ProcessingRun:
 
         if self.options.redact_secrets:
             redaction_payload = self._run_stage(
-                generation,
+                run,
                 heartbeat,
                 warnings,
                 "redaction",
@@ -339,7 +447,7 @@ class ProcessingRun:
 
         if self.options.caption_frames:
             vision_payload = self._run_stage(
-                generation,
+                run,
                 heartbeat,
                 warnings,
                 "local_vision",
@@ -361,27 +469,28 @@ class ProcessingRun:
         )
         self.progress.complete("rendering")
         self.progress.update("bundle_publish", status="running")
-        manifest = write_bundle_files(
-            paths,
+        run.write_render(markdown)
+        if transcript is not None:
+            run.write_transcript(transcript)
+        manifest = manifest_document(
             self.source,
             self.options,
-            transcript,
-            markdown,
-            frames,
-            warnings,
+            transcript_present=transcript is not None,
+            frames=frames,
+            warnings=warnings,
         )
-        generation_name = paths.generation.name.removeprefix(".tmp.")
-        self.progress.complete("bundle_publish", detail={"generation": generation_name})
+        self.progress.complete("bundle_publish", detail={"generation": run.generation_name})
         progress_summary = self.progress.aggregator.terminal_summary(self.progress.states)
-        final_paths = generation.publish(manifest, progress_summary)
+        manifest["progress"] = progress_summary
+        snapshot = run.commit(manifest)
 
         final_frames = []
         for frame in frames:
             copied = dict(frame)
-            copied["path"] = str(final_paths.frames / Path(str(frame["path"])).name)
+            copied["path"] = str(snapshot.frames / Path(str(frame["path"])).name)
             final_frames.append(copied)
-        return response_from_paths(
-            final_paths,
+        return run_response(
+            snapshot,
             self.source,
             final_frames,
             transcript is not None,
@@ -392,6 +501,40 @@ class ProcessingRun:
         )
 
 
+def record_job(
+    store: JobStore,
+    job_id: str,
+    tool: str,
+    work: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run `work` with a **job record** covering both ways it can end (R-17).
+
+    One helper rather than a `start`/`finish` pair written out at each call site.
+    Finding 12 was a missing failure path: the record was written where the
+    result was, so every way of not producing a result wrote nothing. A pair a
+    caller assembles by hand is a pair a caller can assemble half of, and the
+    half that gets forgotten is the one nobody exercises.
+
+    One envelope per tool call, opened as early as a record can be written -
+    after the arguments and the **output root** are validated, because an
+    unusable identifier or an unusable root leaves nowhere to write, and before
+    anything else. Everything after that point is work that can fail: a probe, a
+    download, a directory scan, a playlist listing. Wrapped further in, the
+    record covered only what happened after a source already existed, which is
+    finding 12 again for the whole acquisition half of a run. A second envelope
+    nested inside this one is refused by `JobStore.start` rather than trusted
+    not to exist.
+    """
+    store.start(job_id, tool)
+    try:
+        result = work()
+    except BaseException as exc:
+        store.finish(job_id, JobOutcome.failure(exc))
+        raise
+    store.finish(job_id, JobOutcome.success(result))
+    return result
+
+
 def process_resolved_source(
     source: Any,
     options: DistillOptions,
@@ -399,11 +542,20 @@ def process_resolved_source(
     progress: ProgressReporter | None = None,
     *,
     tool: str = "process_local_video",
+    lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
 ) -> dict[str, Any]:
+    """Produce a **generation** from a source that has already been acquired.
+
+    Records nothing: the **job record** belongs to the tool call, which began
+    before the source existed. An envelope here would be the second one over the
+    same run - and, since a held identifier cannot be started twice, would make
+    every run fail rather than merely mis-report one.
+    """
     try:
         output_root = output_root or validate_output_root(options.output_dir)
         progress = progress or ProgressReporter(emitter=progress_emitter(options.job_id))
-        return ProcessingRun(source, options, output_root, progress, tool).execute()
+        run = ProcessingRun(source, options, output_root, progress, tool, lock_wait_sec)
+        return run.execute()
     finally:
         # The end of the media file's read lifetime (R-36). Transcription and
         # keyframe selection both read `source.resolved_path`, so the
@@ -428,7 +580,14 @@ def bool_arg(value: Any, default: bool) -> bool:
 
 @dataclass
 class BatchRunner:
-    root: Path
+    """The per-item loop of a batch tool. Owns no record of its own.
+
+    The batch's **job record** is the parent job's, written around the whole
+    batch by `record_job`, so an item that fails the batch is a batch that
+    records a failure. `job_id` is carried only to derive each item's own job
+    identifier.
+    """
+
     job_id: str
     tool: str
     item_key: str
@@ -451,51 +610,51 @@ class BatchRunner:
                     raise
         return results, errors
 
-    def complete(self, summary: dict[str, Any]) -> dict[str, Any]:
-        write_job_status(self.root, self.job_id, status="completed", tool=self.tool, result=summary)
-        return summary
-
 
 def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
-    directory = Path(str(args.get("path", ""))).expanduser()
-    if not directory.exists() or not directory.is_dir():
-        raise DistillError(
-            "E_BAD_SOURCE", "source", "directory does not exist", {"path": str(directory)}
-        )
     options = DistillOptions.from_args(args)
+    root = validate_output_root(options.output_dir)
     max_items = int(args.get("max_items", 50))
     recursive = bool(args.get("recursive", False))
-    pattern = "**/*" if recursive else "*"
-    files = [
-        path
-        for path in sorted(directory.glob(pattern))
-        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
-    ][:max_items]
-    root = validate_output_root(options.output_dir)
+    continue_on_error = bool_arg(args.get("continue_on_error"), True)
 
     def process_item(path_text: str, index: int) -> dict[str, Any]:
         child_args = {**args, "path": path_text, "job_id": f"{options.job_id}-{index}"}
-        return process_local_video(child_args)
+        return process_local_video(child_args, lock_wait_sec=BATCH_ITEM_LOCK_WAIT_SEC)
 
-    runner = BatchRunner(
-        root=root,
-        job_id=options.job_id,
-        tool="process_video_directory",
-        item_key="path",
-        items=[str(path) for path in files],
-        continue_on_error=bool_arg(args.get("continue_on_error"), True),
-    )
-    results, errors = runner.run(process_item)
-    summary = {
-        "job_id": options.job_id,
-        "directory": str(directory.resolve()),
-        "video_count": len(files),
-        "processed_count": len(results),
-        "error_count": len(errors),
-        "results": results,
-        "errors": errors,
-    }
-    return runner.complete(summary)
+    def work() -> dict[str, Any]:
+        # Inside the record, because scanning a directory is work: the path may
+        # not be one, and a batch that finds nothing to do still ran.
+        directory = Path(str(args.get("path", ""))).expanduser()
+        if not directory.exists() or not directory.is_dir():
+            raise DistillError(
+                "E_BAD_SOURCE", "source", "directory does not exist", {"path": str(directory)}
+            )
+        pattern = "**/*" if recursive else "*"
+        files = [
+            path
+            for path in sorted(directory.glob(pattern))
+            if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+        ][:max_items]
+        runner = BatchRunner(
+            job_id=options.job_id,
+            tool="process_video_directory",
+            item_key="path",
+            items=[str(path) for path in files],
+            continue_on_error=continue_on_error,
+        )
+        results, errors = runner.run(process_item)
+        return {
+            "job_id": options.job_id,
+            "directory": str(directory.resolve()),
+            "video_count": len(files),
+            "processed_count": len(results),
+            "error_count": len(errors),
+            "results": results,
+            "errors": errors,
+        }
+
+    return record_job(JobStore.open(root), options.job_id, "process_video_directory", work)
 
 
 def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
@@ -533,9 +692,8 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
     options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
     root = validate_output_root(options.output_dir)
     playlist_root = root / "playlists" / playlist_folder_name(url)
-    ensure_safe_directory(playlist_root, root)
     max_items = int(args.get("max_items", 25))
-    urls = youtube_playlist_urls(url, max_items)
+    continue_on_error = bool_arg(args.get("continue_on_error"), True)
 
     def process_item(video_url: str, index: int) -> dict[str, Any]:
         child_args = {
@@ -544,52 +702,123 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
             "output_dir": str(playlist_root),
             "job_id": f"{options.job_id}-{index}",
         }
-        return process_youtube_video(child_args)
+        return process_youtube_video(child_args, lock_wait_sec=BATCH_ITEM_LOCK_WAIT_SEC)
 
-    runner = BatchRunner(
-        root=root,
-        job_id=options.job_id,
-        tool="process_youtube_playlist",
-        item_key="url",
-        items=urls,
-        continue_on_error=bool_arg(args.get("continue_on_error"), True),
+    def work() -> dict[str, Any]:
+        # Inside the record: creating the playlist root writes, and listing the
+        # playlist is a yt-dlp call - the parent job's first real step and the
+        # first thing that can fail without a single item ever being tried.
+        ensure_safe_directory(playlist_root, root)
+        urls = youtube_playlist_urls(url, max_items)
+        runner = BatchRunner(
+            job_id=options.job_id,
+            tool="process_youtube_playlist",
+            item_key="url",
+            items=urls,
+            continue_on_error=continue_on_error,
+        )
+        results, errors = runner.run(process_item)
+        summary = {
+            "job_id": options.job_id,
+            "playlist_url": url,
+            "playlist_output_dir": str(playlist_root),
+            "video_count": len(urls),
+            "processed_count": len(results),
+            "error_count": len(errors),
+            "results": results,
+            "errors": errors,
+        }
+        playlist_summary_path = playlist_root / "playlist.json"
+        summary["playlist_summary_path"] = str(playlist_summary_path)
+        # State a reader outside this process picks up, written through the one
+        # checked atomic writer (R-14, R-16). A bare `write_text` here followed a
+        # link pre-created at `playlist.json` and wrote over whatever it named,
+        # and it was the last durable write in the tree asking nothing.
+        atomic_write_text(
+            playlist_summary_path,
+            json.dumps(summary, indent=2, sort_keys=True) + "\n",
+            root=root,
+        )
+        return summary
+
+    return record_job(JobStore.open(root), options.job_id, "process_youtube_playlist", work)
+
+
+def _prune_policy(args: dict[str, Any]) -> PrunePolicy:
+    """The **prune** policy a tool call names, validated on construction (R-03).
+
+    `keep_generations=0` is finding 2's input and is refused where the policy is
+    built rather than reinterpreted where it is used; `max_age_days=None` means
+    no **bundle expiry** at all, which is not the same as a horizon of zero days.
+    """
+    return PrunePolicy(
+        keep_generations=int(args.get("keep_generations", DEFAULT_KEEP_GENERATIONS)),
+        max_age_days=float(args["max_age_days"]) if args.get("max_age_days") is not None else None,
     )
-    results, errors = runner.run(process_item)
-    summary = {
-        "job_id": options.job_id,
-        "playlist_url": url,
-        "playlist_output_dir": str(playlist_root),
-        "video_count": len(urls),
-        "processed_count": len(results),
-        "error_count": len(errors),
-        "results": results,
-        "errors": errors,
-    }
-    playlist_summary_path = playlist_root / "playlist.json"
-    summary["playlist_summary_path"] = str(playlist_summary_path)
-    playlist_summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    return runner.complete(summary)
 
 
 def cleanup_distill_cache(args: dict[str, Any]) -> dict[str, Any]:
+    """Prune the cache under an output root, or report what pruning would remove.
+
+    A dry run is the plan alone: a `PrunePlan` is advisory (D-023), so producing
+    one and declining to apply it is exactly what a preview is, and there is no
+    second code path whose answer could differ from what a real run would do.
+
+    The payload reports what was skipped and how many directories were
+    considered alongside what was deleted, so an empty result says which kind of
+    empty it is (R-57). `cache-doctor` is the surface for asking that question
+    without the ability to answer it destructively.
+    """
     root = validate_output_root(args.get("output_dir"))
-    return cleanup_cache(
+    store = BundleStore.open(root)
+    plan = store.plan_prune(_prune_policy(args))
+    dry_run = bool_arg(args.get("dry_run"), True)
+    payload: dict[str, Any] = {
+        "root": str(store.root),
+        "dry_run": dry_run,
+        "candidate_count": len(plan.targets),
+        "candidates": [str(target.path) for target in plan.targets],
+        "considered": plan.considered,
+        "skipped": [skip.to_dict() for skip in plan.skipped],
+        "skipped_count": len(plan.skipped),
+    }
+    if dry_run:
+        return {**payload, "deleted_count": 0, "deleted": [], "results": []}
+
+    outcome = store.apply_prune(plan)
+    return {
+        **payload,
+        "deleted_count": len(outcome.deleted),
+        "deleted": [str(path) for path in outcome.deleted],
+        "results": [result.to_dict() for result in outcome.results],
+    }
+
+
+def cache_doctor(args: dict[str, Any]) -> dict[str, Any]:
+    """Report the state of an output root, changing nothing under it (R-57).
+
+    The root is validated but not created: a command whose whole purpose is to
+    be safe to run first has to be safe to run against a path the user mistyped,
+    and creating a directory to report that it is empty is a mutation.
+    """
+    root = validate_output_root(args.get("output_dir"), create=False)
+    policy = _prune_policy(args)
+    return inspect_cache(
         root,
-        max_age_days=float(args["max_age_days"]) if args.get("max_age_days") is not None else None,
-        keep_generations=int(args.get("keep_generations", 3)),
-        dry_run=bool_arg(args.get("dry_run"), True),
+        keep_generations=policy.keep_generations,
+        max_age_days=policy.max_age_days,
     )
 
 
 def get_job_status(args: dict[str, Any]) -> dict[str, Any]:
     root = validate_output_root(args.get("output_dir"))
     job_id = str(args.get("job_id", ""))
-    if not job_id:
-        raise DistillError("E_BAD_JOB", "job", "job_id is required")
-    status = read_job_status(root, job_id)
-    if status is None:
+    # An identifier outside the domain names no record, so it is refused here
+    # rather than mapped onto whichever record it happens to resemble (R-18).
+    record = JobStore.open(root).read(job_id)
+    if record is None:
         raise DistillError("E_JOB_NOT_FOUND", "job", "job status not found", {"job_id": job_id})
-    return status
+    return record.to_dict()
 
 
 def transcribe_with_imports(
@@ -648,6 +877,7 @@ def tool_registry() -> dict[str, ToolSpec]:
             process_youtube_playlist,
         ),
         "cleanup_cache": ToolSpec(TOOLS["cleanup_cache"], cleanup_distill_cache),
+        "cache_doctor": ToolSpec(TOOLS["cache_doctor"], cache_doctor),
         "get_job_status": ToolSpec(TOOLS["get_job_status"], get_job_status),
     }
 

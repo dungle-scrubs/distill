@@ -103,6 +103,18 @@ The processing commands (`process-local-video`, `process-youtube-video`,
 `--local-vision-model`, `--local-vision-base-url`, and
 `--local-vision-timeout-sec`. Run `distill <command> --help` for the full list.
 
+### Upgrading a cache written by 0.1.0
+
+Run `cache-doctor` before the first `cleanup-cache` of an existing cache
+directory. 0.1.0 had a retention bug that could delete the generation its own
+manifest named as active, and a bundle left in that state - a manifest naming a
+generation that is not on disk - is not a bundle anything can serve. Cleanup now
+treats every generation under such a bundle as an orphan and proposes all of
+them, so readable generations that the manifest does not name can be removed by
+that first run. `cache-doctor` lists them, and `cleanup-cache --dry-run` shows
+exactly what would go; copy anything you still want out first. Reprocessing the
+source rebuilds the bundle either way.
+
 ## Local Vision
 
 Frame interpretation talks to a local **Rapid-MLX** server directly over its

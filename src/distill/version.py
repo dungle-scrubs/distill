@@ -7,8 +7,8 @@ reason. It does not own the released package version: that is `DISTILL_VERSION`
 in `release.py`, which is bundle content and is therefore signed.
 
 It does not own cache lookup, the bundle key, or any output. Those live in
-`pipeline.py` and `bundle.py`; this module only supplies the constants they mix
-into the bundle key.
+`pipeline.py`, `bundle_store.py` and `response.py`; this module only supplies
+the constants they mix into the bundle key.
 
 Per ADR-0003 signed-ness is a property, not a list: if editing a module can
 change bundle content, it is a signed module. `tests/test_pipeline_signature.py`
@@ -25,7 +25,7 @@ the cryptographic sense, and nothing verifies who produced it.
 
 from __future__ import annotations
 
-PIPELINE_VERSION = 25
+PIPELINE_VERSION = 27
 
 # Output-affecting source files covered by PIPELINE_SIGNATURE, named by their
 # path relative to `src/distill/` in posix form so that modules in subpackages
@@ -36,7 +36,7 @@ PIPELINE_VERSION = 25
 # ordering mechanical rather than incidental, and test_pipeline_signature
 # enforces that too.
 SIGNED_MODULES = (
-    "bundle.py",
+    "bundle_store.py",
     "capabilities.py",
     "cli.py",
     "errors.py",
@@ -51,6 +51,7 @@ SIGNED_MODULES = (
     "redact_secrets.py",
     "release.py",
     "render.py",
+    "response.py",
     "run_command.py",
     "source.py",
     "transcript.py",
@@ -64,20 +65,26 @@ SIGNED_MODULES = (
 EXEMPT_MODULES: dict[str, str] = {
     "__init__.py": (
         "Re-exports DISTILL_VERSION from the signed release.py and nothing "
-        "else. bundle.py stamps manifests from release.py directly, so this "
+        "else. response.py stamps manifests from release.py directly, so this "
         "re-export reaches no bundle and editing it cannot change bundle "
         "content."
     ),
-    "cache.py": (
-        "Prunes and deletes whole bundle generations under the cache root. It "
-        "can remove cached output but never produces or rewrites the content of "
-        "a bundle, so a change here cannot make a served bundle differ from what "
-        "the current code would produce."
+    "cache_doctor.py": (
+        "Reports on bundles under an output root and never writes, deletes or "
+        "repairs anything: it formats a BundleStore survey and an unapplied "
+        "PrunePlan. It cannot make a served bundle differ from what the current "
+        "code would produce, because it produces no bundle content and reaches "
+        "no bundle write path at all. Read-only is what this exemption rests "
+        "on; a repair mode added here would make the module signed."
     ),
-    "jobs.py": (
-        "Writes job-status records under the cache root's _jobs/ directory. "
-        "Those records live outside every bundle generation, are never published "
-        "into a bundle, and are never read back as pipeline input."
+    "job_store.py": (
+        "Owns job records and their identifier domain, written under the cache "
+        "root's _jobs/ directory. Those records live outside every bundle "
+        "generation, are never published into a bundle, and are never read back "
+        "as pipeline input: a run reads a job record to answer a caller, never "
+        "to decide what to produce. Rejecting an out-of-domain job id can end a "
+        "run before it produces a bundle, which changes whether a bundle exists "
+        "rather than what a bundle contains."
     ),
     "measure.py": (
         "Offline spike-tuning harness, not imported by cli.py or pipeline.py. It "
@@ -97,4 +104,4 @@ EXEMPT_MODULES: dict[str, str] = {
 }
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "329cbb580421ea0ff3f70d9584d30e5aa1d2b7fce0414c65aacdcc13e41c77f9"
+PIPELINE_SIGNATURE = "4b69f2a240544f81b6cbca446d739dd9aaa5d2bea7cb96ea73b91d5a2efad426"

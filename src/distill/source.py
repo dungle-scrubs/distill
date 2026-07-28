@@ -34,8 +34,6 @@ what a **generation** contains, or install anything.
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import hashlib
 import json
 import logging
@@ -51,6 +49,13 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
+from .bundle_store import (
+    SINGLE_SOURCE_LOCK_WAIT_SEC,
+    BundleStore,
+    ExclusiveLock,
+    confined_path,
+    ensure_safe_directory,
+)
 from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, warning
 from .options import DistillOptions
@@ -156,12 +161,6 @@ def _acquisition_log(event: str, **detail: Any) -> None:
     )
 
 
-# `flock` refusing a lock somebody else holds, which is an answer rather than a
-# failure. Every other errno says this filesystem cannot give Distill the
-# exclusion it asked for, and is fatal.
-_LOCK_HELD_ERRNOS = frozenset({errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES})
-
-
 @dataclass
 class AcquisitionLease:
     """The exclusive right to acquire and read one **source**'s media.
@@ -171,14 +170,14 @@ class AcquisitionLease:
     lease, which is exactly what stops the second from replacing media the first
     is still reading (R-36).
 
-    The lease *is* an open descriptor holding a `flock`, not a file whose
-    contents describe a holder. That is what makes it exclusive: a lock whose
-    content names its owner has to be created before it can be written, and a
-    contender reading it in between finds a lock nobody owns, calls it
-    abandoned, and takes it - two runs, one lock key. Here the lock exists for
-    exactly as long as the descriptor does, so there is nothing to publish, no
-    staleness to guess at, and no pid that could be reused. A holder killed
-    outright releases it the moment the kernel closes its descriptors.
+    The exclusion itself is `bundle_store.ExclusiveLock` - one `flock` primitive
+    for the whole package. The lease and the bundle lock stay two locks, because
+    they answer different questions on different keys ("is another run fetching
+    this source?" against "is another run producing this bundle?"), but they are
+    not two mechanisms: the argument for why an open descriptor is exclusive and
+    a lock file's *contents* are not is the argument finding 11 came from
+    getting wrong, and a second copy of it is a second chance to get it wrong
+    again.
 
     Held until `release`, which the reader calls when it is finished with the
     media - not when the download ends. `release` is idempotent, because the
@@ -191,41 +190,32 @@ class AcquisitionLease:
 
     lock_key: str
     lock_path: Path
-    fd: int
+    lock: ExclusiveLock
     warnings: list[dict[str, str]] = field(default_factory=list)
-    released: bool = False
+
+    @property
+    def released(self) -> bool:
+        return self.lock.released
 
     @classmethod
     def take(cls, lock_key: str, lock_path: Path) -> AcquisitionLease | None:
         """Take the lease, or report `None` if another run holds it.
 
-        The descriptor stays open inside the returned lease: closing it is what
-        releasing means, so nothing else may close it. `flock` is per open file
-        description rather than per process, so a second lease taken against the
-        same path is refused even inside the process that holds the first.
-
         A filesystem that cannot take the lock (`flock` reporting anything other
         than "held") is fatal: `E_LOCK_UNSUPPORTED` rather than a fallback that
-        would let two runs read one source without either of them knowing.
+        would let two runs read one source without either of them knowing. The
+        stage and message name *this* question, so a user downloading a video
+        is told which lock could not be taken.
         """
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            os.close(fd)
-            if exc.errno in _LOCK_HELD_ERRNOS:
-                return None
-            reported = errno.errorcode.get(exc.errno, "") if exc.errno is not None else ""
-            raise DistillError(
-                "E_LOCK_UNSUPPORTED",
-                "youtube",
-                "filesystem cannot lock the YouTube source directory",
-                {"lock_path": str(lock_path), "errno": reported or str(exc.errno)},
-            ) from exc
-        except BaseException:
-            os.close(fd)
-            raise
-        return cls(lock_key=lock_key, lock_path=lock_path, fd=fd)
+        lock = ExclusiveLock.take(
+            lock_key,
+            lock_path,
+            stage="youtube",
+            message="filesystem cannot lock the YouTube source directory",
+        )
+        if lock is None:
+            return None
+        return cls(lock_key=lock_key, lock_path=lock_path, lock=lock)
 
     def release(self) -> None:
         """Give the lease up by closing the descriptor the kernel locked.
@@ -236,16 +226,18 @@ class AcquisitionLease:
         that inode while the next run creates a fresh file at the same path and
         locks that - two runs, again, one lock key. Leaving the file costs one
         empty inode per **lock key** and keeps the path itself the identity of
-        the lease. Reclaiming those files is **prune**'s business, not a
-        release's.
+        the lease.
 
-        Closing releases only what this process was granted: a descriptor with
-        no lock behind it frees nobody, whatever the file at that path says.
+        Nothing ever removes it, **prune** included: `_youtube_locks` is a
+        reserved name the walk skips, so no rule proposes what is inside it
+        (finding 7-opus). That is the intended end state - a lock file deleted
+        while any run might be about to open its path is the same lost
+        exclusivity - and the cost is bounded by the number of distinct sources
+        this root has ever acquired.
         """
-        if self.released:
+        if self.lock.released:
             return
-        self.released = True
-        os.close(self.fd)
+        self.lock.release()
         _acquisition_log(
             "lease_released",
             lock_key=self.lock_key,
@@ -301,6 +293,17 @@ class SourceRequest:
     options: DistillOptions
     output_root: Path | None = None
     progress: ProgressReporter | None = None
+    lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+    """How long this run waits for a **lock key** another run holds (D-044).
+
+    Carried on the request because the budget is the *caller's* decision and
+    acquisition is where a second run of one video meets the first: two runs of
+    the same source share a lock key long before they contend for a **bundle
+    key**, so a downloader constructed with its own idea of the budget makes
+    D-044 unreachable for the case it was written for (finding 4-opus). The
+    values are `bundle_store`'s, so the run a user is watching waits the same
+    300 s at both locks and a batch item gives up after the same 5 s at both.
+    """
 
 
 @dataclass(frozen=True)
@@ -536,12 +539,36 @@ def resolve_local_source(
     return LocalSourceProvider().resolve(SourceRequest(path_text, options, progress=progress))
 
 
-def validate_output_root(output_dir: str | None) -> Path:
+def validate_output_root(output_dir: str | None, *, create: bool = True) -> Path:
+    """Accept an output root, or refuse it before anything is written under it.
+
+    `create=False` validates without creating, which is what a read-only caller
+    needs: `cache-doctor` reports on a root and must not bring one into
+    existence to say it is empty (R-57). Every writing caller takes the default.
+
+    An output root is a place Distill owns: it creates bundles there and prunes
+    them there. `$HOME` and the system temp directory are not such places - they
+    hold the user's own files and other programs' - so R-15 admits only a
+    subdirectory of either. Accepting `$HOME` itself is what gave finding 1 its
+    blast radius, since every directory in the home directory then sat inside an
+    output root.
+
+    The root is resolved first, so confinement is decided on the real path a
+    symlinked argument points at rather than on the name given.
+    """
     root = Path(output_dir).expanduser() if output_dir else Path.home() / ".cache" / "distill"
     root = root.resolve()
     home = Path.home().resolve()
     temp = Path(tempfile.gettempdir()).resolve()
-    if not (root in (home, temp) or root.is_relative_to(home) or root.is_relative_to(temp)):
+    if root in (home, temp):
+        raise DistillError(
+            "E_BAD_OUTPUT_DIR",
+            "bundle",
+            "output_dir must be a subdirectory of $HOME or the system temp "
+            "directory, not the directory itself",
+            {"output_dir": str(root)},
+        )
+    if not (root.is_relative_to(home) or root.is_relative_to(temp)):
         raise DistillError(
             "E_BAD_OUTPUT_DIR",
             "bundle",
@@ -557,9 +584,8 @@ def validate_output_root(output_dir: str | None) -> Path:
             "output_dir points inside a sensitive path",
             {"output_dir": str(root), "matched": sensitive},
         )
-    root.mkdir(parents=True, exist_ok=True)
-    if root.is_symlink():
-        raise DistillError("E_BAD_OUTPUT_DIR", "bundle", "output_dir must not be a symlink")
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -568,13 +594,25 @@ def sensitive_path_match(
     *,
     case_sensitive: bool | None = None,
 ) -> str | None:
+    """The sensitive location `root` sits in, or `None`.
+
+    Matching is by whole path components, not by substring: `.sshfs-mounts`
+    contains `.ssh` and `my.aws-notes` contains `.aws`, yet neither is the
+    directory the rule protects, and refusing them refuses output roots a user
+    may legitimately ask for. Multi-component entries such as
+    `.config/1password` match as a consecutive run of components.
+    """
     if case_sensitive is None:
         case_sensitive = sys.platform != "darwin"
-    root_text = str(root) if case_sensitive else str(root).lower()
-    for sensitive in SENSITIVE_COMPONENTS:
-        candidate = sensitive if case_sensitive else sensitive.lower()
-        if candidate in root_text:
-            return sensitive
+    parts = [part if case_sensitive else part.lower() for part in Path(root).parts]
+    for sensitive in sorted(SENSITIVE_COMPONENTS):
+        wanted = [
+            component if case_sensitive else component.lower()
+            for component in sensitive.split("/")
+        ]
+        for start in range(len(parts) - len(wanted) + 1):
+            if parts[start : start + len(wanted)] == wanted:
+                return sensitive
     return None
 
 
@@ -930,7 +968,7 @@ def validate_media_file(path: Path) -> list[dict[str, str]]:
     return list(probe_warnings)
 
 
-def promote_media(produced: Path, media_dir: Path) -> Path:
+def promote_media(produced: Path, media_dir: Path, *, root: Path) -> Path:
     """Move a validated file onto its immutable path in one indivisible step.
 
     `os.replace` on one filesystem is the whole promotion: a reader either sees
@@ -939,9 +977,16 @@ def promote_media(produced: Path, media_dir: Path) -> Path:
     clearing the directory first would each reintroduce the window RV-3
     describes, in which the only good copy is already gone when the replacement
     turns out not to arrive.
+
+    Both ends of the rename are checked against `root` (R-16). A rename has two
+    of them: a symlink at the media directory sends the destination outside the
+    output root and replaces whatever it names, and a substituted staging
+    directory makes the *source* a file of the user's that promotion then moves
+    away from where they left it.
     """
-    media_dir.mkdir(parents=True, exist_ok=True)
-    promoted = media_dir / produced.name
+    ensure_safe_directory(media_dir, root)
+    produced = confined_path(produced, root)
+    promoted = confined_path(media_dir / produced.name, root)
     os.replace(produced, promoted)
     _acquisition_log(
         "media_promoted",
@@ -956,10 +1001,20 @@ class YoutubeDownloader:
     def __init__(
         self,
         output_root: Path,
-        lock_wait_sec: float = 0.0,
+        *,
+        lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
         lock_poll_sec: float = 0.25,
         lock_warn_after_sec: float = 5.0,
     ) -> None:
+        """Acquire one remote **source** under an **acquisition lease**.
+
+        `lock_wait_sec` defaults to the budget of the run a user is watching
+        rather than to zero (D-044). A zero default was one production call site
+        away from making the wait unreachable, and it was that call site: every
+        second run of a video was denied on its first attempt, which is the case
+        the budget exists for (finding 4-opus). A caller that means "do not
+        wait" now says so.
+        """
         self.output_root = output_root
         self.lock_wait_sec = lock_wait_sec
         self.lock_poll_sec = lock_poll_sec
@@ -985,12 +1040,14 @@ class YoutubeDownloader:
                 result = self._download(url, staging_dir, progress)
                 produced = select_downloaded_media(staging_dir)
                 validation_warnings = validate_media_file(produced)
-                promoted = promote_media(produced, self._media_dir(lock_key))
+                promoted = promote_media(
+                    produced, self._media_dir(lock_key), root=self.output_root
+                )
             finally:
                 # The staging directory is scratch: whatever survived the run -
                 # a rejected file, an unmerged fragment, a `.part` - is
                 # discarded with it. Nothing under the promoted path is touched.
-                shutil.rmtree(staging_dir, ignore_errors=True)
+                self._discard(staging_dir)
             if progress:
                 progress.complete("youtube_download", detail={"path": str(promoted)})
         except BaseException:
@@ -1005,6 +1062,18 @@ class YoutubeDownloader:
     def _media_dir(self, lock_key: str) -> Path:
         return self.output_root / MEDIA_DIR_NAME / lock_key
 
+    def _discard(self, staging_dir: Path) -> None:
+        """Remove a staging directory, having first proved it is one (R-16).
+
+        The check is re-run here rather than trusted from creation, and it
+        raises rather than skipping. A path that was inside the output root when
+        it was made and is not when it is deleted is a substitution in progress,
+        which is a sharper thing to report than whatever the download was doing
+        when it happened - so this is allowed to replace an in-flight error.
+        """
+        confined_path(staging_dir, self.output_root)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
     def _new_staging_dir(self, lock_key: str) -> Path:
         """A staging directory no other run can be writing into.
 
@@ -1013,13 +1082,24 @@ class YoutubeDownloader:
         directories that cannot collide. Created under the lease, which is also
         what makes discarding any staging directory left by an earlier run of
         this source safe: no live run can own one.
+
+        The lease proves who is running, not what the path is, so every entry
+        this walks is checked against the output root immediately before it is
+        removed (R-16). Both halves matter: a symlink at `<lock key>` makes
+        `iterdir` enumerate somebody else's directory, and a link planted among
+        real entries names a directory this run never staged into. Each is a
+        `rmtree` of the user's files, and neither is anything the lease can see.
         """
-        parent = self.output_root / STAGING_DIR_NAME / lock_key
-        parent.mkdir(parents=True, exist_ok=True)
-        for stale in parent.iterdir():
+        parent = ensure_safe_directory(
+            self.output_root / STAGING_DIR_NAME / lock_key, self.output_root
+        )
+        for stale in sorted(parent.iterdir()):
+            confined_path(stale, self.output_root)
             if stale.is_dir():
                 shutil.rmtree(stale, ignore_errors=True)
-        staging_dir = parent / f"{os.getpid()}-{uuid.uuid4().hex}"
+        staging_dir = confined_path(
+            parent / f"{os.getpid()}-{uuid.uuid4().hex}", self.output_root
+        )
         staging_dir.mkdir()
         return staging_dir
 
@@ -1028,8 +1108,10 @@ class YoutubeDownloader:
         lock_key: str,
         progress: ProgressReporter | None,
     ) -> AcquisitionLease:
-        locks = self.output_root / LOCK_DIR_NAME
-        locks.mkdir(parents=True, exist_ok=True)
+        locks = ensure_safe_directory(self.output_root / LOCK_DIR_NAME, self.output_root)
+        # The lock path itself is checked by `_acquire`, once per attempt, rather
+        # than here: it is created by the attempt that takes it, and a wait that
+        # can run for minutes is exactly the gap a check placed here would leave.
         lock = locks / f"{lock_key}.lock"
         if progress:
             progress.update("youtube_download", status="running", detail={"step": "lock"})
@@ -1115,10 +1197,16 @@ class YoutubeDownloader:
         The budget is the only thing that ends the wait: a lock is held until
         its holder gives it up or dies, and neither is something to time out on
         a holder's behalf.
+
+        Each attempt creates the lock file if it is not there, so each attempt
+        re-checks the path (R-16). A wait that can run for minutes and validates
+        once at the top is a check separated from its use by the whole wait,
+        which is the window the check exists to close.
         """
         started = time.monotonic()
         warnings: list[dict[str, str]] = []
         while True:
+            confined_path(lock, self.output_root)
             lease = AcquisitionLease.take(lock_key, lock)
             if lease is not None:
                 waited = time.monotonic() - started
@@ -1142,19 +1230,25 @@ class YouTubeSourceProvider:
         request: SourceRequest,
         metadata: YouTubeMetadata | None = None,
     ) -> SourceInfo | None:
-        """Return a SourceInfo from a published manifest, or None on miss."""
+        """Describe a source from a servable bundle, or `None` if there is none.
+
+        The question is "can this download be skipped?", and the only answer
+        that justifies skipping it is a **bundle** whose **active generation**
+        is on disk (R-04). `BundleStore.load_active` is what proves that, so it
+        is asked rather than the manifest file being read directly: a manifest
+        naming a generation retention deleted is a promise, not evidence, and
+        reusing the media path it records would resolve a source for a bundle
+        nobody can serve (D-041).
+        """
         if request.output_root is None:
             raise DistillError("E_BAD_OUTPUT_DIR", "youtube", "output_root is required")
         video_id = metadata.video_id if metadata is not None else canonical_youtube_id(request.value)
         fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
         sh = source_hash(fingerprint, request.options.opts_hash("youtube"))
-        manifest_path = request.output_root / sh / "_manifest.json"
-        if not manifest_path.exists():
+        snapshot = BundleStore.open(request.output_root).load_active(sh)
+        if snapshot is None:
             return None
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return None
+        manifest = snapshot.manifest
         duration = manifest.get("duration_sec")
         resolved_path = manifest.get("source_resolved_path")
         if not isinstance(duration, (int, float)) or not isinstance(resolved_path, str):
@@ -1196,7 +1290,9 @@ class YouTubeSourceProvider:
         source = source_hash(fingerprint, options.opts_hash("youtube"))
         from .links import extract_relevant_links
 
-        downloader = downloader or YoutubeDownloader(output_root)
+        downloader = downloader or YoutubeDownloader(
+            output_root, lock_wait_sec=request.lock_wait_sec
+        )
         acquired = downloader.acquire(request.value, lock_key, progress)
         # Everything from here reads the acquired media, so every failure has to
         # release the lease rather than strand it until the staleness window
@@ -1279,9 +1375,16 @@ class SourceResolver:
         downloader: YouTubeDownloaderProtocol | None = None,
         progress: ProgressReporter | None = None,
         metadata: YouTubeMetadata | None = None,
+        lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
     ) -> SourceInfo:
         return self.youtube.resolve(
-            SourceRequest(url, options, output_root=output_root, progress=progress),
+            SourceRequest(
+                url,
+                options,
+                output_root=output_root,
+                progress=progress,
+                lock_wait_sec=lock_wait_sec,
+            ),
             downloader=downloader,
             metadata=metadata,
         )
@@ -1294,6 +1397,7 @@ class SourceResolver:
         *,
         progress: ProgressReporter | None = None,
         downloader: YouTubeDownloaderProtocol | None = None,
+        lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
     ) -> SourceResolution:
         if source_type == "local":
             return SourceResolution(
@@ -1334,6 +1438,7 @@ class SourceResolver:
                 downloader=downloader,
                 progress=progress,
                 metadata=metadata,
+                lock_wait_sec=lock_wait_sec,
             ),
             output_root=root,
             progress=progress,
@@ -1365,11 +1470,21 @@ def resolve_source_for_processing(
     *,
     progress: ProgressReporter | None = None,
     downloader: YouTubeDownloaderProtocol | None = None,
+    lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
 ) -> SourceResolution:
+    """Resolve one **source** for a run, on that run's wait budget (D-044).
+
+    `lock_wait_sec` is the caller's, and it belongs here rather than at the
+    downloader because acquisition is the *first* lock a run meets: two runs of
+    one video contend for a **lock key** before either reaches a **bundle key**,
+    so a budget that stops short of this function is a budget the case it was
+    written for never reaches (finding 4-opus).
+    """
     return SourceResolver().resolve(
         source_type,
         value,
         options,
         progress=progress,
         downloader=downloader,
+        lock_wait_sec=lock_wait_sec,
     )

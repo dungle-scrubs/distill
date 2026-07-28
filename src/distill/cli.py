@@ -109,6 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--keep-generations", type=int)
     cleanup.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=None)
 
+    # Read-only (R-57), and deliberately without a --dry-run flag: there is no
+    # other mode. `cleanup-cache --dry-run` previews a command that can delete;
+    # this one cannot, which is what makes it safe to reach for first.
+    doctor = subcommands.add_parser(
+        "cache-doctor", help="Inspect Distill cache bundles, locks and a prune preview"
+    )
+    doctor.add_argument("--output-dir")
+    doctor.add_argument("--max-age-days", type=float)
+    doctor.add_argument("--keep-generations", type=int)
+
     status = subcommands.add_parser("get-job-status", help="Read a Distill job status record")
     status.add_argument("job_id")
     status.add_argument("--output-dir")
@@ -173,6 +183,9 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "cleanup-cache":
             keys = ("output_dir", "max_age_days", "keep_generations", "dry_run")
             _print_json(call_registered_tool("cleanup_cache", _args_payload(args, keys)))
+        elif args.command == "cache-doctor":
+            keys = ("output_dir", "max_age_days", "keep_generations")
+            _print_json(call_registered_tool("cache_doctor", _args_payload(args, keys)))
         elif args.command == "get-job-status":
             _print_json(
                 call_registered_tool("get_job_status", _args_payload(args, ("job_id", "output_dir")))

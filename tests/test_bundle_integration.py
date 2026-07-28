@@ -1,21 +1,31 @@
+"""What a run publishes, and what its caller is told about it.
+
+The seam is the pair D-041 leaves after `bundle.py` is deleted: `BundleRun`,
+which turns a **staging directory** into the **active generation**, and
+`response.py`, which produces the **manifest** content and the response payload
+from the same description of the run. These tests hold the behavior the old
+`bundle.py` tests pinned - the publish, the response keys, the frame shape - now
+stated against the surfaces that own them.
+"""
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from distill.bundle import (
-    active_paths,
+from distill.bundle_store import (
+    BundleRun,
+    BundleStore,
     ensure_safe_directory,
-    publish_generation,
-    read_manifest,
-    response_from_paths,
     stage_paths,
-    write_bundle_files,
 )
 from distill.errors import DistillError
 from distill.options import DistillOptions
+from distill.response import manifest_document, run_response
 from distill.source import SourceInfo
 from distill.version import PIPELINE_VERSION
+
+BUNDLE_KEY = "hash"
 
 
 def source(tmp_path: Path) -> SourceInfo:
@@ -26,7 +36,7 @@ def source(tmp_path: Path) -> SourceInfo:
         resolved_path=video,
         duration_sec=1.0,
         source_fingerprint="fingerprint",
-        source_hash="hash",
+        source_hash=BUNDLE_KEY,
         warnings=[],
     )
 
@@ -39,7 +49,7 @@ def youtube_source(tmp_path: Path) -> SourceInfo:
         resolved_path=video,
         duration_sec=1.0,
         source_fingerprint="fingerprint",
-        source_hash="hash",
+        source_hash=BUNDLE_KEY,
         warnings=[],
         related_links=[
             {
@@ -52,12 +62,21 @@ def youtube_source(tmp_path: Path) -> SourceInfo:
     )
 
 
+def begin(root: Path) -> tuple[BundleStore, BundleRun]:
+    """Open a run over a fresh bundle key, the way a pipeline run does."""
+    root.mkdir(parents=True, exist_ok=True)
+    store = BundleStore.open(root)
+    run = store.begin(BUNDLE_KEY)
+    assert isinstance(run, BundleRun)
+    return store, run
+
+
 def minimal_manifest(tmp_path: Path) -> dict:
     return {
         "pipeline_version": 1,
         "distill_version": "0.1.0",
         "source_type": "local",
-        "source_hash": "hash",
+        "source_hash": BUNDLE_KEY,
         "source_resolved_path": str(tmp_path / "video.mp4"),
         "duration_sec": 1.0,
         "options": {},
@@ -70,10 +89,8 @@ def minimal_manifest(tmp_path: Path) -> dict:
 
 
 def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    frame = staged.frames / "frame_0001.png"
+    store, run = begin(tmp_path / "output")
+    frame = run.frames_dir / "frame_0001.png"
     frame.write_bytes(b"png")
     frames = [
         {
@@ -84,61 +101,44 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
             "ocr_text": "text",
         }
     ]
-    manifest = write_bundle_files(
-        staged,
-        source(tmp_path),
-        DistillOptions(),
-        {"segments": [{"start": 0, "end": 1, "text": "hi"}]},
-        "# Video\n",
-        frames,
-        [],
+    run.write_render("# Video\n")
+    run.write_transcript({"segments": [{"start": 0, "end": 1, "text": "hi"}]})
+
+    snapshot = run.commit(
+        manifest_document(
+            source(tmp_path),
+            DistillOptions(),
+            transcript_present=True,
+            frames=frames,
+            warnings=[],
+        )
     )
-    final = publish_generation(staged, manifest)
-    assert final.generation.name == "g1"
-    assert final.markdown.exists()
-    manifest_data = read_manifest(root)
-    active = active_paths(root)
-    assert manifest_data is not None
+
+    assert snapshot.generation.name == "g1"
+    assert snapshot.markdown.exists()
+    active = store.load_active(BUNDLE_KEY)
     assert active is not None
-    assert manifest_data["active_generation"] == "g1"
-    assert active.generation == final.generation
+    assert active.manifest["active_generation"] == "g1"
+    assert active.generation == snapshot.generation
 
 
-def test_publish_rewrites_staged_paths_in_partial_files(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    frame = staged.frames / "frame_0001.png"
-    frame.write_bytes(b"png")
-    partial = {
-        "frames": [
-            {
-                "index": 1,
-                "timestamp_sec": 0.0,
-                "path": str(frame),
-                "relative_path": "frames/frame_0001.png",
-            }
-        ],
-        "warnings": [{"detail": {"path": str(staged.generation / "log.txt")}}],
-    }
-    (staged.generation / "_ocr.json").write_text(json.dumps(partial, indent=2) + "\n")
-
-    final = publish_generation(staged, minimal_manifest(tmp_path))
-    rewritten = json.loads((final.generation / "_ocr.json").read_text())
-
-    assert rewritten["frames"][0]["path"] == str(final.frames / "frame_0001.png")
-    assert rewritten["warnings"][0]["detail"]["path"] == str(final.generation / "log.txt")
-    assert ".tmp.g1" not in (final.generation / "_ocr.json").read_text()
+# `test_publish_rewrites_staged_paths_in_partial_files` stood here. It required
+# `_ocr.json` to survive publication with its staged paths rewritten - a
+# **stage result** served as bundle content, which is finding 4's disk half
+# exactly. classification.md records it as a *defect* against R-13 with action
+# delete: R-13 forbids a stage result from existing in a **generation** at all,
+# so there is no path left to rewrite. `tests/test_bundle_publish.py` asserts
+# the invariant that replaces it.
 
 
 def test_response_shape(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    staged.markdown.write_text("# Video\n")
-    staged.transcript.write_text("{}")
-    final = publish_generation(staged, minimal_manifest(tmp_path))
-    response = response_from_paths(final, source(tmp_path), [], True, [], cached=False)
+    _, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+    run.write_transcript({})
+    snapshot = run.commit(minimal_manifest(tmp_path))
+
+    response = run_response(snapshot, source(tmp_path), [], True, [], cached=False)
+
     assert response["markdown_path"].endswith("video.md")
     assert response["transcript_path"].endswith("transcript.json")
     assert response["manifest_path"].endswith("_manifest.json")
@@ -147,39 +147,36 @@ def test_response_shape(tmp_path: Path) -> None:
 
 
 def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
+    store, run = begin(tmp_path / "output")
     source_info = youtube_source(tmp_path)
+    run.write_render("# Video\n")
+    run.write_transcript({"segments": [{"start": 0, "end": 1, "text": "hi"}]})
 
-    manifest = write_bundle_files(
-        staged,
-        source_info,
-        DistillOptions(),
-        {"segments": [{"start": 0, "end": 1, "text": "hi"}]},
-        "# Video\n",
-        [],
-        [],
+    snapshot = run.commit(
+        manifest_document(
+            source_info,
+            DistillOptions(),
+            transcript_present=True,
+            frames=[],
+            warnings=[],
+        )
     )
-    final = publish_generation(staged, manifest)
-    response = response_from_paths(final, source_info, [], True, [], cached=False)
+    response = run_response(snapshot, source_info, [], True, [], cached=False)
 
-    manifest_data = read_manifest(root)
-    assert manifest_data is not None
-    assert manifest_data["related_links"] == source_info.related_links
+    active = store.load_active(BUNDLE_KEY)
+    assert active is not None
+    assert active.manifest["related_links"] == source_info.related_links
     assert response["related_links"] == source_info.related_links
 
 
 def test_response_can_include_progress_summary(tmp_path: Path) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    staged.markdown.write_text("# Video\n")
-    staged.transcript.write_text("{}")
-    final = publish_generation(staged, minimal_manifest(tmp_path))
+    _, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+    run.write_transcript({})
+    snapshot = run.commit(minimal_manifest(tmp_path))
 
-    response = response_from_paths(
-        final,
+    response = run_response(
+        snapshot,
         source(tmp_path),
         [],
         True,
@@ -194,15 +191,13 @@ def test_response_can_include_progress_summary(tmp_path: Path) -> None:
 def test_response_frames_keep_ocr_and_visual_interpretation_separate(
     tmp_path: Path,
 ) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    staged = stage_paths(root)
-    staged.markdown.write_text("# Video\n")
-    final = publish_generation(staged, minimal_manifest(tmp_path))
+    _, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+    snapshot = run.commit(minimal_manifest(tmp_path))
     frame = {
         "index": 1,
         "timestamp_sec": 0.0,
-        "path": str(staged.frames / "frame.png"),
+        "path": str(snapshot.frames / "frame.png"),
         "relative_path": "frames/frame.png",
         "ocr_text": "raw text",
         "visual_interpretation": {
@@ -216,7 +211,7 @@ def test_response_frames_keep_ocr_and_visual_interpretation_separate(
         },
     }
 
-    response = response_from_paths(final, source(tmp_path), [frame], False, [], cached=False)
+    response = run_response(snapshot, source(tmp_path), [frame], False, [], cached=False)
 
     assert response["frames"][0]["ocr_text"] == "raw text"
     assert response["frames"][0]["visual_interpretation"]["visual_summary"] == "A chart"
@@ -225,21 +220,32 @@ def test_response_frames_keep_ocr_and_visual_interpretation_separate(
     )
 
 
-def test_manifest_schema_validation_rejects_malformed_cache_manifest(
+def test_a_cache_lookup_never_fails_the_run_over_a_manifest_it_cannot_use(
     tmp_path: Path,
 ) -> None:
-    root = tmp_path / "hash"
-    root.mkdir()
-    (root / "_manifest.json").write_text('{"active_generation": "g1"}')
+    """R-04 (was `test_manifest_schema_validation_rejects_malformed_cache_manifest`).
 
-    try:
-        read_manifest(root)
-    except DistillError as exc:
-        assert exc.code == "E_BAD_MANIFEST"
-        assert exc.stage == "bundle"
-        assert exc.details["field"] == "pipeline_version"
-    else:
-        raise AssertionError("expected malformed manifest to fail validation")
+    Classified a *defect*: the old test pinned a fatal `E_BAD_MANIFEST` keyed on
+    the `pipeline_version` field for a manifest naming a generation that is not
+    on disk. R-04 makes that a cache miss - the lookup answers "no bundle here",
+    and the run produces one - rather than an error that ends the run.
+
+    Both shapes are misses: the original malformed fixture, and the one finding 2
+    actually produced - a well-formed manifest still naming the generation
+    retention deleted out from under it.
+    """
+    output_root = tmp_path / "output"
+    (output_root / "malformed").mkdir(parents=True)
+    (output_root / "malformed" / "_manifest.json").write_text('{"active_generation": "g1"}')
+
+    (output_root / "hash").mkdir()
+    manifest = {**minimal_manifest(tmp_path), "active_generation": "g1"}
+    (output_root / "hash" / "_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    store = BundleStore.open(output_root)
+
+    assert store.load_active("malformed") is None
+    assert store.load_active("hash") is None
 
 
 def test_precreated_symlink_component_under_output_tree_fails_closed(
@@ -274,3 +280,58 @@ def test_precreated_tmp_symlink_fails_before_cleanup(tmp_path: Path) -> None:
         assert exc.stage == "bundle"
     else:
         raise AssertionError("expected symlinked staging path to fail closed")
+
+
+# --- A new manifest records its bundle key by that name (finding 5-opus) ----
+
+
+def test_a_new_manifest_records_the_bundle_key_under_the_current_name(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (finding 5-opus, D-008): every new manifest used the old name.
+
+    The value hashes a **source fingerprint** together with an **options hash**,
+    so it identifies a **bundle** and not a source - which is why D-008 renamed
+    it. `IDENTITY_FIELDS` says only `bundle_key` is written from here on and
+    accepts `source_hash` for what is already on disk; the writer never caught
+    up, so the legacy name was still the only one Distill produced and the
+    vocabulary's `_Avoid_` entry described current behavior.
+    """
+    store, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+
+    run.commit(
+        manifest_document(
+            source(tmp_path),
+            DistillOptions(),
+            transcript_present=False,
+            frames=[],
+            warnings=[],
+        )
+    )
+
+    active = store.load_active(BUNDLE_KEY)
+    assert active is not None
+    assert active.manifest["bundle_key"] == BUNDLE_KEY
+    assert "source_hash" not in active.manifest
+
+
+def test_a_manifest_written_before_the_rename_is_still_a_bundle(tmp_path: Path) -> None:
+    """D-017: the legacy name stays readable, so old bundles stay prunable.
+
+    Writing the current name is not the same as refusing the old one. A bundle
+    published before this rename records `source_hash` and nothing will ever
+    rewrite it, so recognition has to keep accepting it - the alternative is
+    disk no **prune** can reclaim because nothing recognizes it as Distill's.
+    """
+    store, run = begin(tmp_path / "output")
+    run.write_render("# Video\n")
+    legacy = {**minimal_manifest(tmp_path)}
+    assert legacy["source_hash"] == BUNDLE_KEY
+
+    run.commit(legacy)
+
+    active = store.load_active(BUNDLE_KEY)
+    assert active is not None
+    assert active.bundle_key == BUNDLE_KEY
+    assert active.manifest["source_hash"] == BUNDLE_KEY
