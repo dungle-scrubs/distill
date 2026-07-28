@@ -543,11 +543,20 @@ def manifest_duration(manifest: Mapping[str, Any]) -> float | None:
 
     `bool` is refused explicitly, because `True` is an `int` in Python and a
     manifest saying `"duration_sec": true` is not a one-second video.
+
+    The conversion itself is guarded, because JSON has no integer ceiling and
+    Python's `int` has none either: a manifest recording a 401-digit number is
+    a document this function has to answer about, and `float()` on it raises
+    `OverflowError`. An unusable number is a **cache miss**, whichever way it
+    is unusable.
     """
     duration = manifest.get("duration_sec")
     if isinstance(duration, bool) or not isinstance(duration, (int, float)):
         return None
-    duration = float(duration)
+    try:
+        duration = float(duration)
+    except OverflowError:
+        return None
     if not math.isfinite(duration) or duration <= 0:
         return None
     return duration

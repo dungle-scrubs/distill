@@ -343,6 +343,37 @@ def test_a_local_manifest_duration_over_the_cap_is_refused_rather_than_served(
     assert failure.value.details["duration_sec"] == 12.5
 
 
+def test_a_manifest_recording_a_boolean_duration_is_a_miss_not_a_one_second_hit(
+    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    tmp_path: Path,
+) -> None:
+    """What `manifest_duration` refuses, the resolution treats as no bundle at all.
+
+    `True` is an `int` in Python, so a manifest saying `"duration_sec": true`
+    would otherwise describe a one-second video - and every window, interval
+    and percentage the run derives would be computed from that one second. The
+    guard is a line in a function no other test reaches with this shape, so
+    this is the end of it a reader can see: with the acquisition tool absent, a
+    hit is a served **bundle** and a miss is `E_MISSING_TOOL`.
+    """
+    args = youtube_args(tmp_path)
+    options = DistillOptions.from_args(args)
+    bundle_key = source_hash(
+        hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
+    )
+    bundle = write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")
+    manifest_path = bundle / "_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["duration_sec"] = True
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    with pytest.raises(DistillError) as failure:
+        distill_session.process_youtube_video(dict(args))
+
+    assert failure.value.code == "E_MISSING_TOOL"
+    assert failure.value.details["tool"] == "yt-dlp"
+
+
 def test_a_youtube_cache_miss_with_yt_dlp_absent_is_still_fatal(
     fake_tool: Callable[[str, str], Path],
     tmp_path: Path,

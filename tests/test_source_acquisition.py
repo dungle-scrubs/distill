@@ -1220,3 +1220,39 @@ def test_a_container_reporting_a_nan_duration_is_not_promoted(
 
     assert exc.value.code == "E_BAD_MEDIA"
     assert "duration" in exc.value.message
+
+
+@pytest.mark.parametrize(
+    ("recorded", "expected"),
+    [
+        pytest.param({}, None, id="no_duration_field"),
+        pytest.param({"duration_sec": None}, None, id="null"),
+        pytest.param({"duration_sec": "12.5"}, None, id="string"),
+        pytest.param({"duration_sec": True}, None, id="true"),
+        pytest.param({"duration_sec": 0}, None, id="zero"),
+        pytest.param({"duration_sec": -1}, None, id="negative"),
+        pytest.param({"duration_sec": float("nan")}, None, id="nan"),
+        pytest.param({"duration_sec": float("inf")}, None, id="inf"),
+        pytest.param({"duration_sec": 10**400}, None, id="401_digit_integer"),
+        pytest.param({"duration_sec": 12.5}, 12.5, id="a_usable_duration"),
+    ],
+)
+def test_a_manifests_recorded_duration_is_read_as_input_rather_than_fact(
+    recorded: dict[str, object],
+    expected: float | None,
+) -> None:
+    """Every shape a **manifest**'s `duration_sec` can arrive in, and what it means.
+
+    A manifest is a document another process wrote, so this is the one place
+    that decides what counts as a duration a cache hit may reuse - and each
+    branch was reachable only through a whole cached run, so deleting the
+    `bool` guard or the non-finite test left the suite green.
+
+    The 401-digit integer is the shape the function did not survive: JSON has
+    no integer ceiling, `float()` on one raises `OverflowError`, and that
+    escaped as a bare stdlib exception from a resolution that should have
+    reported a **cache miss**.
+    """
+    from distill.source import manifest_duration
+
+    assert manifest_duration(recorded) == expected
