@@ -42,6 +42,22 @@ decides whether it ends the run or costs it a **stage result**.
 Nor does it see durable content Distill does not write itself - a download from
 `yt-dlp`, a **keyframe** from `ffmpeg`. Those are third-party writes, and no
 emitter can be their choke point.
+
+The other half of what must be true of text before it is durable is the
+**untrusted-data boundary**: **extracted text** was chosen by whoever produced
+the **source**, and a **render** is written to be fed to an LLM agent, so text
+that stops being quoted starts being read as instruction. Selecting the
+delimiter that holds - a fence longer than the longest backtick run in the
+content (R-25), an escape that keeps a link label from closing its own
+construct (R-27) - lives here, beside the write, because it is the same
+question about the same text: what has to be true of it before a later reader
+sees it. What it is *not* is markdown document structure: which heading a block
+sits under, and what the document says about it, are `render.py`'s.
+
+Delimiting is a mitigation and not a guarantee (D-022). A sufficiently
+persuasive payload may still influence a model that reads a render; a delimiter
+raises the cost of one and makes its provenance legible, and nothing here
+claims more.
 """
 
 from __future__ import annotations
@@ -50,6 +66,7 @@ import errno
 import itertools
 import logging
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import ClassVar
@@ -77,6 +94,53 @@ user with a group-writable umask ended up with a bundle whose files disagreed
 about who may change them. Group-writable bundle content is the wrong side of
 that disagreement to settle on: a **generation** is immutable once published,
 and a reader is entitled to it, not a writer (D-015 covers the on-disk change).
+"""
+
+
+UNTRUSTED_TEXT_LABEL = "untrusted-text"
+"""The **trust class** a delimited block carries, written as its info string.
+
+One class rather than a set, because only one needs saying: **extracted text**
+is the text a reader must not act on, and everything else in a **render** is
+Distill's own words, which the document already speaks in. A block tagged this
+way says who chose its contents - the person who produced the **source** - and
+that is what a reader needs to know before reading it.
+"""
+
+MIN_FENCE_BACKTICKS = 3
+"""The shortest run of backticks that opens a fenced block at all."""
+
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+_PLAIN_DESTINATION_RE = re.compile(r"[^\s()<>\\`\[\]\x00-\x1f\x7f]+")
+"""A link destination that needs no angle brackets to be unambiguous.
+
+Nothing in it can end the `(...)` that holds it, and nothing in it takes part
+in another construct: no parentheses, no whitespace, no line ending, no angle
+bracket, no backslash, no backtick and no bracket. The last two are not known
+escapes - a destination is parsed from the raw text, so a code span inside one
+mangles the link rather than retargeting it - and they are excluded anyway,
+because the value of this path is that a reader can see at a glance that
+nothing in it participates in anything. Matched in full or not at all: a
+destination is not partly safe.
+"""
+
+_LABEL_ESCAPED_CHARACTERS = frozenset("\\`[]<>")
+"""What a link label must not be allowed to open or close.
+
+`]` is the retarget (RV-5): a label carrying `](` closes itself and opens a
+destination the label's author chose. `[` is the same construct opened one
+level in, a backtick opens a code span that swallows the `]` that would have
+closed the label, `<` opens an autolink, and `\\` is escaped first so that
+every other escape below means what it says.
+"""
+
+_DESTINATION_ENCODED_RE = re.compile(r"[\x00-\x1f\x7f]")
+"""Control characters in a destination, percent-encoded rather than escaped.
+
+A destination in angle brackets may not contain a line ending at all, so a
+newline cannot be backslash-escaped into safety - it has to stop being a line
+ending. Percent-encoding is what a URL does with one anyway.
 """
 
 
@@ -154,6 +218,80 @@ class TextEmitter:
             raise
         _fsync_directory(path.parent)
         return path
+
+    def fence_for(self, text: str) -> str:
+        """The shortest backtick fence `text` cannot close (R-25).
+
+        Mechanical, because a fixed length is a guess about content nobody has
+        seen yet: three backticks was the guess, and a slide showing a code
+        sample - or a payload written to look like one - ended the quotation
+        (finding 5). A fence one backtick longer than the longest run in the
+        content cannot be closed from inside it, whatever the content is.
+        """
+        longest = max((len(run.group()) for run in _BACKTICK_RUN_RE.finditer(text)), default=0)
+        return "`" * max(MIN_FENCE_BACKTICKS, longest + 1)
+
+    def delimit(self, text: str, *, label: str = UNTRUSTED_TEXT_LABEL) -> list[str]:
+        """`text` as a fenced block it cannot terminate, tagged with its trust class.
+
+        Lines rather than a string because a **render** is assembled as lines,
+        and the caller decides what surrounds the block.
+
+        The label is written as the block's info string, which is where a
+        reader - person or model - is told what it is about to read. A label
+        holding a backtick would not be an info string at all, so it is refused
+        rather than sanitized: the labels are Distill's own words, and one that
+        cannot be written is a mistake in this module, not input to defend
+        against.
+        """
+        if "`" in label:
+            raise ValueError(f"a fenced block's info string cannot hold a backtick: {label!r}")
+        body = text.replace("\r\n", "\n").replace("\r", "\n")
+        fence = self.fence_for(body)
+        return [f"{fence}{label}", *body.split("\n"), fence]
+
+    def link_label(self, text: str) -> str:
+        """`text` escaped so it cannot end the link label holding it (R-27).
+
+        Lossless: every escape is a backslash before the character it escapes,
+        and a backslash is escaped first, so a reader recovers exactly the text
+        the **source** carried. A line ending becomes a visible `\\n` because a
+        link label is one line of a document - a real newline in one ends the
+        bullet the link sits in, whether or not it also ends the label.
+        """
+        escaped: list[str] = []
+        for character in text:
+            if character in _LABEL_ESCAPED_CHARACTERS:
+                escaped.append(f"\\{character}")
+            elif character == "\n":
+                escaped.append("\\n")
+            elif character == "\r":
+                escaped.append("\\r")
+            else:
+                escaped.append(character)
+        return "".join(escaped)
+
+    def link_destination(self, url: str) -> str:
+        """`url` written so it cannot end the `(...)` holding it (R-27).
+
+        Angle brackets when the destination needs them and not otherwise, which
+        is a rule rather than a preference: a destination carrying nothing that
+        could terminate the construct is already unambiguous, and wrapping it
+        would make every ordinary link in every render harder to read for the
+        sake of a case it is not in. Everything else is wrapped, its own
+        brackets and backslashes escaped, and its control characters
+        percent-encoded so no line ending survives inside the brackets.
+        """
+        destination = url.strip()
+        if _PLAIN_DESTINATION_RE.fullmatch(destination):
+            return destination
+        escaped = (
+            destination.replace("\\", "\\\\").replace("<", "\\<").replace(">", "\\>")
+        )
+        encoded = _DESTINATION_ENCODED_RE.sub(
+            lambda match: f"%{ord(match.group()):02X}", escaped
+        )
+        return f"<{encoded}>"
 
     def temporary_for(self, path: Path) -> Path:
         """Name the temporary an atomic write to `path` would use.
