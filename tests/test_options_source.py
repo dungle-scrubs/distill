@@ -380,6 +380,9 @@ VALID_ID = "YE7VzlLtp-4"
         pytest.param(
             f"https://www.youtube.com/watch?v={VALID_ID}&list=PL1", None, id="a_playlist_attached"
         ),
+        pytest.param(
+            f"https://www.youtube.com/watch?v={VALID_ID}&list=", None, id="an_empty_playlist_param"
+        ),
         pytest.param("https://www.youtube.com/playlist?list=PL1", None, id="no_video_id_at_all"),
         pytest.param(f"https://example.com/watch?v={VALID_ID}", None, id="not_a_youtube_host"),
     ],

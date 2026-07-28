@@ -845,7 +845,12 @@ def youtube_fast_path_video_id(url: str) -> str | None:
     parsed = urlparse(url)
     if parsed.netloc.lower() not in YOUTUBE_HOSTS:
         return None
-    query = parse_qs(parsed.query)
+    # `keep_blank_values`, for the reason `normalize_youtube_url` twenty lines
+    # above keeps blanks: `list=` with nothing after it is a `list` param, and
+    # what yt-dlp does with an empty one is its business. The default drops it,
+    # so `watch?v=A&list=` took the fast path while `watch?v=A&list=P` did not -
+    # one URL form deciding a **bundle key** on a query-parser default.
+    query = parse_qs(parsed.query, keep_blank_values=True)
     if "list" in query:
         return None
     segments = [segment for segment in parsed.path.split("/") if segment]
