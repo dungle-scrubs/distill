@@ -9,10 +9,19 @@ exists only to *produce* a **bundle** - yt-dlp to acquire a remote source,
 ffprobe to read a duration - is not a tool a run needs in order to *serve* one
 that is already published, so resolution derives the **bundle key** from inputs
 it already has (the video id in the URL; the local file's own bytes) and asks
-the store first. Identity is unchanged by this: the same fingerprint functions
-are fed from cache-safe inputs, so a bundle an earlier Distill wrote is still
-found. A miss is where the capability rules apply, unweakened - an absent
-**required capability** is still a **fatal error** (ADR-0002).
+the store first. What the reorder leaves alone is **source fingerprint**
+derivation: the same fingerprint functions are fed from cache-safe inputs, so
+the fingerprint this version computes for a given video id or file is the one it
+always computed, and reordering the lookup re-keys nothing.
+
+It does not promise that a **bundle** an earlier Distill wrote is still found.
+The **pipeline version** is in the **options hash** and so in every **bundle
+key**, so raising it re-keys every bundle deliberately - that is how stale
+output stops being served (D-015), and serving a bundle an older pipeline
+produced as this version's output would reverse the mechanism.
+
+A miss is where the capability rules apply, unweakened - an absent **required
+capability** is still a **fatal error** (ADR-0002).
 
 Acquiring a remote source is staging, validation and promotion, in that order
 (R-35). The download lands in a staging directory unique to the run; the media

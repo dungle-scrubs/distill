@@ -62,6 +62,12 @@ def test_a_sub_millisecond_static_window_is_refused_rather_than_spun_on() -> Non
         filtered_candidates([0.0, 5.0], 10.0, 4.0, 0.0001)
 
     assert at_the_schedule.value.code == "E_BAD_OPTIONS"
+    # Same code, different stage, and deliberately so: a **stage** names where
+    # the failure was raised, not what kind of value caused it. The operator's
+    # number is refused at `options` when it arrives and at `frames` when a
+    # schedule is asked to honour it, and a reader of the second needs to know
+    # the run got as far as building one.
+    assert at_the_schedule.value.stage == "frames"
     assert "0.001 or greater" in at_the_schedule.value.message
     assert at_the_schedule.value.details == {"max_static_window_sec": "0.0001"}
 
@@ -320,12 +326,15 @@ def test_candidate_generation_terminates_across_a_deterministic_boundary_and_sam
             assert len(schedule) >= duration / (window + QUANTUM / 2), tuple_report
 
 
-# A pHash sequence whose neighbours are 64 bits apart, so nothing dedupes and
-# the frame budget is the only thing that can end the run early.
-DISTINCT_HASHES = itertools.cycle(("0" * 16, "f" * 16))
-
-
 def _four_candidates_and_a_frame_each(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A pHash sequence whose neighbours are 64 bits apart, so nothing dedupes
+    # and the frame budget is the only thing that can end the run early. Built
+    # here rather than at module level: a shared cycle carries its position from
+    # one test into the next, so a test that consumed an odd number of hashes
+    # would hand the next one a starting hash that dedupes against its first
+    # frame. Parity happens to work out today, which is not a property to leave
+    # a test resting on.
+    distinct_hashes = itertools.cycle(("0" * 16, "f" * 16))
     monkeypatch.setattr(
         frame_selection, "scene_midpoint_candidates", lambda _path, _duration: [0.0, 2.0, 4.0, 6.0]
     )
@@ -334,7 +343,7 @@ def _four_candidates_and_a_frame_each(monkeypatch: pytest.MonkeyPatch) -> None:
         "extract_frame",
         lambda _video, _timestamp, output: (output.write_bytes(b"png"), (True, []))[1],
     )
-    monkeypatch.setattr(frame_selection, "phash", lambda _path: next(DISTINCT_HASHES))
+    monkeypatch.setattr(frame_selection, "phash", lambda _path: next(distinct_hashes))
 
 
 def test_the_candidates_a_frame_budget_never_reaches_are_warned_about(
