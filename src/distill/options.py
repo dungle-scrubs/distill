@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from .errors import DistillError
+from .frame_selection import CANDIDATE_TIMESTAMP_QUANTUM_SEC
 from .local_vision import (
     DEFAULT_LOCAL_VISION_BACKEND,
     DEFAULT_LOCAL_VISION_BASE_URL,
@@ -79,10 +80,16 @@ class NumericDomain:
     `integral` the second. Nothing here is infinite or unknown: a NaN limit
     cannot fire at all and an infinite one is an unbounded run reporting a
     bound.
+
+    `floor` is for the option whose smallest usable value is not the smallest
+    positive one: a quantity the pipeline measures in a unit of its own has a
+    floor of that unit, and a value below it is not a small request but an
+    unanswerable one (R-48).
     """
 
     integral: bool = False
     admits_zero: bool = False
+    floor: float = 0.0
 
 
 NUMERIC_OPTION_DOMAINS: dict[str, NumericDomain] = {
@@ -92,7 +99,10 @@ NUMERIC_OPTION_DOMAINS: dict[str, NumericDomain] = {
     # to, which is why the domain is per option rather than one global floor.
     "min_interval_sec": NumericDomain(admits_zero=True),
     "max_duration_sec": NumericDomain(),
-    "max_static_window_sec": NumericDomain(),
+    # A window narrower than the millisecond a candidate timestamp is rounded
+    # to names a spacing the **keyframe** schedule cannot express, and the walk
+    # that fills a static stretch with it never advances (finding 7).
+    "max_static_window_sec": NumericDomain(floor=CANDIDATE_TIMESTAMP_QUANTUM_SEC),
     "local_vision_timeout_sec": NumericDomain(),
     # Not a `DistillOptions` field - `max_items` bounds a batch rather than a
     # bundle, so it is not part of the options hash - but it is an operator's
@@ -114,7 +124,10 @@ They belong to `PrunePolicy`, which validates them where the policy is built
 
 def _bad_number(name: str, value: Any, domain: NumericDomain) -> DistillError:
     quantity = "a whole number" if domain.integral else "a finite number"
-    floor = "0 or greater" if domain.admits_zero else "greater than 0"
+    if domain.floor:
+        floor = f"{domain.floor} or greater"
+    else:
+        floor = "0 or greater" if domain.admits_zero else "greater than 0"
     return DistillError(
         "E_BAD_OPTIONS",
         "options",
@@ -147,7 +160,7 @@ def validated_number(name: str, value: Any) -> int | float:
         raise _bad_number(name, value, domain) from None
     if not math.isfinite(number):
         raise _bad_number(name, value, domain)
-    if number < 0 or (number == 0 and not domain.admits_zero):
+    if number < 0 or (number == 0 and not domain.admits_zero) or number < domain.floor:
         raise _bad_number(name, value, domain)
     if domain.integral:
         # `int(2.7)` answered 2. Truncating an operator's number is the quiet

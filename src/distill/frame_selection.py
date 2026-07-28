@@ -26,6 +26,16 @@ from .progress import ProgressCounter, ProgressReporter
 from .run_command import CommandTimeouts, run
 
 PHASH_DISTANCE_THRESHOLD = 10
+CANDIDATE_TIMESTAMP_QUANTUM_SEC = 0.001
+"""The smallest difference between two candidate timestamps that survives.
+
+Candidate timestamps are rounded to the millisecond - it is what `ffmpeg -ss`
+is given (`{:.3f}`) and what a **frame artifact** carries - so two candidates
+closer together than this are the same seek. It is therefore also the smallest
+`max_static_window_sec` a schedule can express, and `options` refuses anything
+below it rather than quietly widening it to a spacing the operator did not ask
+for (R-48).
+"""
 # Wall-clock ceiling for a single ffmpeg frame grab so a wedged decode cannot
 # hang the whole run. Grabbing one frame is short even on a long source - the
 # seek is not a scan - so here the total deadline is the meaningful limit and
@@ -56,15 +66,63 @@ def scene_midpoint_candidates(video_path: Path, duration_sec: float) -> list[flo
     return candidates
 
 
+def quantized_timestamp(seconds: float, ceiling_sec: float) -> float:
+    """One candidate timestamp as the schedule carries it: to the millisecond.
+
+    Never past `ceiling_sec`, even when the nearest millisecond is: rounding
+    a value that sits within half a quantum of the end of the source produced
+    a seek half a millisecond beyond it, which is a **keyframe** ffmpeg has no
+    frame for.
+    """
+    point = round(min(seconds, ceiling_sec), 3)
+    return point if point <= ceiling_sec else round(point - CANDIDATE_TIMESTAMP_QUANTUM_SEC, 3)
+
+
+def _step_from(anchor: float, step_sec: float, ceiling_sec: float) -> float | None:
+    """The next schedule timestamp after `anchor`, or `None` if there is none.
+
+    Every loop that walks a schedule forward asks this, and it answers with a
+    timestamp strictly greater than `anchor` or with nothing - which is what
+    makes those loops end (R-48). Two ways to have nothing: the ceiling has
+    been reached, or `anchor` is so large that a step of this size disappears
+    into the float. Neither is worth a step that stands still, and neither is
+    worth silently taking a *bigger* step than asked for: a window the operator
+    named is refused at the boundary, not rounded up here.
+    """
+    point = quantized_timestamp(anchor + step_sec, ceiling_sec)
+    return point if point > anchor else None
+
+
+def ensure_static_window_is_expressible(max_static_window_sec: float) -> None:
+    """Refuse a static window no schedule can express (R-48, finding 7).
+
+    Below one **quantum** the gap-filling cursor rounds back onto the timestamp
+    it started from, so the loop that fills toward a candidate never arrives.
+    Refusing states the floor; widening the window to the quantum would answer
+    an operator who asked for 0.0001s with a schedule ten times coarser and no
+    way to tell.
+    """
+    if max_static_window_sec >= CANDIDATE_TIMESTAMP_QUANTUM_SEC:
+        return
+    raise DistillError(
+        "E_BAD_OPTIONS",
+        "frames",
+        "max_static_window_sec must be a finite number "
+        f"{CANDIDATE_TIMESTAMP_QUANTUM_SEC} or greater",
+        {"max_static_window_sec": repr(max_static_window_sec)},
+    )
+
+
 def fixed_interval_candidates(duration_sec: float, interval_sec: float) -> list[float]:
     if duration_sec <= 0:
         return []
     interval = max(1.0, interval_sec)
     values = [0.0]
-    current = interval
-    while current < duration_sec:
+    while True:
+        current = _step_from(values[-1], interval, duration_sec)
+        if current is None or current >= duration_sec:
+            break
         values.append(current)
-        current += interval
     return values
 
 
@@ -74,7 +132,16 @@ def filtered_candidates(
     min_interval_sec: float,
     max_static_window_sec: float,
 ) -> list[float]:
-    sorted_candidates = sorted({round(max(0.0, min(duration_sec, c)), 3) for c in candidates})
+    """The timestamps worth seeking to, in order, each at least a quantum apart.
+
+    Gap filling is what makes this more than a sort: a stretch longer than
+    `max_static_window_sec` with no scene change in it is still sampled, so a
+    slide left on screen for ten minutes is not one **keyframe**. That walk
+    forward is also the only unbounded thing here, which is why every step it
+    takes comes from `_step_from` (R-48).
+    """
+    ensure_static_window_is_expressible(max_static_window_sec)
+    sorted_candidates = sorted({quantized_timestamp(max(0.0, c), duration_sec) for c in candidates})
     if not sorted_candidates:
         sorted_candidates = fixed_interval_candidates(duration_sec, max_static_window_sec)
         return sorted_candidates
@@ -84,12 +151,18 @@ def filtered_candidates(
         if not kept and candidate > max_static_window_sec:
             kept.append(0.0)
         while kept and candidate - kept[-1] > max_static_window_sec:
-            kept.append(round(min(duration_sec, kept[-1] + max_static_window_sec), 3))
+            fill = _step_from(kept[-1], max_static_window_sec, duration_sec)
+            if fill is None:
+                break
+            kept.append(fill)
         if candidate - last_candidate >= min_interval_sec:
             kept.append(candidate)
             last_candidate = candidate
     while kept and duration_sec - kept[-1] > max_static_window_sec:
-        kept.append(round(min(duration_sec, kept[-1] + max_static_window_sec), 3))
+        fill = _step_from(kept[-1], max_static_window_sec, duration_sec)
+        if fill is None:
+            break
+        kept.append(fill)
     return sorted(set(kept))
 
 
@@ -195,8 +268,10 @@ def select_keyframes(
         )
     frames: list[FrameArtifact] = []
     last_hash: str | None = None
+    unexamined = 0
     for index, timestamp in enumerate(candidates):
         if len(frames) >= max_keyframes:
+            unexamined = len(candidates) - index
             break
         path = frames_dir / f"frame_{len(frames) + 1:04d}.png"
         extracted, frame_warnings = extract_frame(video_path, timestamp, path)
@@ -240,6 +315,20 @@ def select_keyframes(
         )
         warnings.extend(dict(item) for item in artifact.warnings)
         frames.append(artifact)
+    if unexamined:
+        # The **bundle** covers less of the source than the schedule asked
+        # for, and nothing downstream can tell: a run that stopped early and
+        # one whose source only had this much in it publish the same frames.
+        # Only when it happened - a run that spent its budget exactly is not
+        # a run that lost anything.
+        warnings.append(
+            warning(
+                "frames",
+                "keyframe_budget_reached",
+                f"stopped at max_keyframes={max_keyframes}; {unexamined} of "
+                f"{len(candidates)} candidate timestamps were not examined",
+            )
+        )
     if isinstance(progress, ProgressReporter):
         progress.complete(
             "frame_extraction",
