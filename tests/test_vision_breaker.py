@@ -241,6 +241,29 @@ def test_one_warning_records_the_transport_failure_count(tmp_path: Path) -> None
     assert breaker[0]["stage"] == "local_vision"
     assert "3 consecutive transport failures" in breaker[0]["message"]
     assert "75" in breaker[0]["message"]
+    # The 75 are the ones the breaker refused to attempt. The three that timed
+    # out before it opened also continue with OCR-only output and are not in
+    # that number, so the sentence has to say which group it is counting.
+    assert "not attempted" in breaker[0]["message"]
+
+
+def test_a_breaker_that_skipped_nothing_does_not_warn_about_nothing(tmp_path: Path) -> None:
+    """The trip lands on the last keyframe, so no keyframe was ever refused.
+
+    The breaker exists to stop a run paying for a server that is gone, and its
+    **warning** exists to say what that cost. Tripping on the final keyframe
+    costs nothing - the three failures already have their own warnings - so a
+    record here would report a **degradation** that did not happen, and would
+    do it in a sentence saying zero of three keyframes were affected.
+    """
+    server = _Server([TIMEOUT])
+    _frames_out, warnings = _interpreter(server).interpret(_frames(tmp_path, 3))
+
+    assert len(server.attempts) == 3
+    assert [w["code"] for w in warnings].count("local_vision_transport_breaker_open") == 0
+    # The failures themselves are still reported - folded, as R-41 folds them;
+    # it is only the summary of what the trip cost that has nothing to say.
+    assert [(w["code"], w["occurrences"]) for w in warnings] == [(TIMEOUT.code, 3)]
 
 
 def test_the_breaker_transition_is_emitted_with_the_attempt_count_that_tripped_it(

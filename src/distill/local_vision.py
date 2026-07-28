@@ -300,23 +300,35 @@ class _TransportBreaker:
             }
 
     def summary_warning(self, frame_count: int) -> WarningRecord | None:
-        """The one **warning** R-40 asks for, or `None` if the breaker held.
+        """The one **warning** R-40 asks for, or `None` if it cost nothing.
 
         One record for every keyframe the run gave up on, carrying the count
         that tripped it and the count that cost - which is the whole point of
         the breaker: 77 timeouts said this once each.
+
+        `None` when the breaker held *and* when it opened without refusing a
+        keyframe - a trip on the last one, where the failures that tripped it
+        already have their own warnings and there is nothing left to give up
+        on. A record there would report a **degradation** that did not happen,
+        in a sentence saying zero keyframes were affected.
+
+        The count is of keyframes *not attempted*, and says so. "Continue with
+        OCR-only output" describes them and also describes the ones that failed
+        before the trip, which are not in this number - so a reader adding the
+        sentence up got a different run than the one that happened.
         """
         with self._lock:
             opened = self._opened
             skipped = self._skipped
-        if opened is None:
+        if opened is None or not skipped:
             return None
         return warning(
             "local_vision",
             BREAKER_WARNING_CODE,
             f"local vision stopped after {opened['consecutive_failures']} consecutive "
             f"transport failures ({opened['code']}) at keyframe {opened['frame']}; "
-            f"{skipped} of {frame_count} keyframes continue with OCR-only output.",
+            f"{skipped} of {frame_count} keyframes were not attempted and continue "
+            "with OCR-only output.",
         )
 
     def state(self) -> dict[str, Any]:
