@@ -577,6 +577,55 @@ def test_a_run_releases_its_lock_when_used_as_a_context_manager(tmp_path: Path) 
     assert lock_is_held(lock_path(root)) is False
 
 
+def test_an_interrupt_survives_a_release_that_fails_on_the_way_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST: the release's `RuntimeError` replaces the `KeyboardInterrupt`.
+
+    `__exit__` calls a fallible release. Raising from it while an exception is
+    already travelling *substitutes* that exception - so an operator's `Ctrl-C`
+    left the CLI boundary as `E_INTERNAL`, exit 2, saying an unexpected
+    `RuntimeError` ended the command. The interrupt is the true diagnosis and it
+    is the one that was thrown away; the release failure is real too, which is
+    why it is recorded rather than dropped.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+    run = begin_run(store)
+
+    def refuse_to_release() -> None:
+        raise RuntimeError("the descriptor could not be closed")
+
+    monkeypatch.setattr(run.lock, "release", refuse_to_release)
+
+    with pytest.raises(KeyboardInterrupt), run:
+        raise KeyboardInterrupt
+
+
+def test_a_release_that_fails_on_a_clean_exit_is_still_a_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other half: with nothing in flight there is nothing to preserve.
+
+    A lock this process believes it released and did not is a **bundle key** no
+    later run can take, so swallowing the failure unconditionally would trade
+    one wrong diagnosis for a silent one.
+    """
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+    run = begin_run(store)
+
+    def refuse_to_release() -> None:
+        raise RuntimeError("the descriptor could not be closed")
+
+    monkeypatch.setattr(run.lock, "release", refuse_to_release)
+
+    with pytest.raises(RuntimeError, match="could not be closed"), run:
+        pass
+
+
 def test_resume_keeps_the_staging_directory_a_stopped_run_left(tmp_path: Path) -> None:
     """Resume is a real feature (D-046): the stage results survive `begin`."""
     root = tmp_path / "output"

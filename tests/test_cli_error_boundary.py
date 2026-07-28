@@ -410,6 +410,106 @@ def test_an_operator_typo_still_gets_argparses_usage_message(
     assert '"code"' not in output.err
 
 
+def test_a_probe_no_clock_can_sleep_for_is_refused_as_a_bad_argument(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FAILS FIRST: `OverflowError` from `time.sleep`, reported as `E_INTERNAL`.
+
+    The same escape `NumericDomain.ceiling` closed for `--local-vision-timeout-
+    sec`, at the one door that does not go through the option boundary.
+    `run_timeout_probe` already refuses a negative probe and a long one; above
+    the range a sleep can represent it refused nothing, and the number an
+    operator typed reached `time.sleep` as `OverflowError: timestamp out of
+    range for platform time_t`.
+
+    `E_BAD_ARGUMENT` at stage `timeout`, which is what this function already
+    answers its floor with. The catch-all is a backstop for defects, and
+    reporting an operator's own number as an internal fault is a wrong diagnosis
+    with the argument's name thrown away.
+    """
+    monkeypatch.setenv("DISTILL_ENABLE_LONG_TIMEOUT_PROBE", "1")
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["timeout-probe", str(10**30)])
+
+    assert exit_info.value.code == 2
+    payload = error_object(capsys)
+    assert payload["code"] == "E_BAD_ARGUMENT"
+    assert payload["stage"] == "timeout"
+    assert payload["details"]["probe_ms"] == 10**30
+
+
+def test_a_registered_command_no_branch_dispatches_is_reported_not_silent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FAILS FIRST: the dispatch chain falls off the end and the command exits 0.
+
+    A subcommand registered on the parser without a branch in `_dispatch` prints
+    nothing and succeeds, which is indistinguishable from a command that ran and
+    had nothing to say - so a script driving Distill reads success for work that
+    never happened. `test_the_sweep_covers_every_registered_subcommand` catches
+    the omission in this repository's own tests; nothing caught it at runtime.
+    """
+
+    def parser_with_an_unrouted_command() -> argparse.ArgumentParser:
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                action.add_parser("unrouted")
+        return parser
+
+    monkeypatch.setattr("distill.cli.build_parser", parser_with_an_unrouted_command)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["unrouted"])
+
+    assert exit_info.value.code == 2
+    payload = error_object(capsys)
+    assert payload["code"] == "E_INTERNAL"
+    assert payload["details"]["command"] == "unrouted"
+
+
+def test_a_converter_that_fails_at_parse_time_is_converted_like_any_other_fault(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FAILS FIRST: parsing ran outside the boundary, so this left as a traceback.
+
+    Argparse turns a `ValueError` or a `TypeError` from a `type=` converter into
+    a usage error, and turns nothing else into anything: an action, a default or
+    a converter that raises for any other reason walks straight out of
+    `parse_args`. With parsing outside the `try` there was no handler above it
+    at all, which is finding 14 again at the one place the boundary did not
+    cover.
+
+    The typo contract is unchanged, and
+    `test_an_operator_typo_still_gets_argparses_usage_message` is the other half
+    of this pair: argparse ends a usage error with `SystemExit`, a
+    `BaseException`, which passes a clause naming `Exception` untouched.
+    """
+
+    def explode(_raw: str) -> int:
+        raise RuntimeError("a converter three modules down")
+
+    def parser_with_a_faulting_converter() -> argparse.ArgumentParser:
+        parser = build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for probe_action in action.choices["timeout-probe"]._actions:
+                    if probe_action.dest == "probe_ms":
+                        probe_action.type = explode
+        return parser
+
+    monkeypatch.setattr("distill.cli.build_parser", parser_with_a_faulting_converter)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["timeout-probe", "1"])
+
+    assert exit_info.value.code == 2
+    payload = error_object(capsys)
+    assert payload["code"] == "E_INTERNAL"
+    assert "RuntimeError" in json.dumps(payload)
+
+
 def test_the_debug_escape_hatch_re_raises_the_original_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

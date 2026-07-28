@@ -1610,11 +1610,48 @@ class BundleRun:
         """End the hold. Idempotent, and safe to call from a failure path."""
         self.lock.release()
 
+    def _release_without_replacing(self, failure: BaseException) -> None:
+        """Release while `failure` is travelling, and never take its place.
+
+        Cleanup that raises during an exception *substitutes* that exception for
+        its own. Here the exception being replaced was the run's real diagnosis
+        and the replacement is a note about a descriptor: an operator's `Ctrl-C`
+        reached the CLI boundary as `E_INTERNAL` saying an unexpected
+        `RuntimeError` ended the command, which is wrong twice - the run was not
+        interrupted by a defect, and the interrupt was not Distill's to relabel.
+
+        The release failure is not dropped, because a lock this process believes
+        it released and did not is a **bundle key** no later run can take. It is
+        recorded, beside the failure it declined to replace.
+        """
+        try:
+            self.release()
+        except Exception as release_failure:
+            _bundle_log(
+                "lock_release_failed",
+                bundle_key=self.bundle_key,
+                error=repr(release_failure),
+                during=type(failure).__name__,
+            )
+
     def __enter__(self) -> BundleRun:
         return self
 
-    def __exit__(self, *_exc: object) -> None:
-        self.release()
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        """End the hold, and let whatever is travelling keep travelling.
+
+        A release failure with nothing in flight is raised normally: it is the
+        only report that a lock was not given up.
+        """
+        if exc is None:
+            self.release()
+        else:
+            self._release_without_replacing(exc)
 
     @property
     def staging_duration_sec(self) -> float:
@@ -1772,7 +1809,7 @@ class BundleRun:
             manifest=published_manifest(manifest, final_paths),
         )
 
-    def abandon(self, reason: str) -> None:
+    def abandon(self, reason: str, *, during: BaseException | None = None) -> None:
         """Give up the run, leaving the previous **active generation** intact.
 
         The **staging directory** stays: its **stage results** are what a later
@@ -1782,6 +1819,10 @@ class BundleRun:
 
         The reason is the record: a bundle that did not change is otherwise
         indistinguishable from a run that never happened.
+
+        `during` is the failure this abandonment is cleaning up after, when
+        there is one. Named, because a release that raises while it travels
+        would replace it - see `_release_without_replacing`.
         """
         _bundle_log(
             "run_abandoned",
@@ -1790,7 +1831,10 @@ class BundleRun:
             staging=str(self.paths.generation),
             staging_duration_sec=self.staging_duration_sec,
         )
-        self.release()
+        if during is None:
+            self.release()
+        else:
+            self._release_without_replacing(during)
 
 
 UNRECLAIMABLE_NOTE = (

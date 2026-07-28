@@ -305,16 +305,38 @@ class SourceInfo:
     acquisition_lease: AcquisitionLease | None = None
 
 
-def release_acquisition_lease(source: Any) -> None:
+def release_acquisition_lease(source: Any, *, during: BaseException | None = None) -> None:
     """Release the lease a source carries, if it carries one.
 
     Takes anything with the attribute rather than a `SourceInfo`, because the
     reader that calls this handles local sources, cache hits and test doubles
     through the same path, and none of those hold a lease.
+
+    `during` is the failure this release is cleaning up after, when there is
+    one. Cleanup that raises while an exception travels *substitutes* that
+    exception, so a lease that could not be given up turned an operator's
+    `Ctrl-C` into an `E_INTERNAL` record about a descriptor - the wrong
+    diagnosis, and the true one thrown away. With a failure named, the release
+    failure is logged instead of raised; with none, it is raised, because a
+    lease this process believes it released and did not is a **lock key** the
+    next run of the same source will wait out.
     """
     lease = getattr(source, "acquisition_lease", None)
-    if isinstance(lease, AcquisitionLease):
+    if not isinstance(lease, AcquisitionLease):
+        return
+    if during is None:
         lease.release()
+        return
+    try:
+        lease.release()
+    except Exception as release_failure:
+        _acquisition_log(
+            "lease_release_failed",
+            lock_key=lease.lock_key,
+            lock_path=str(lease.lock_path),
+            error=repr(release_failure),
+            during=type(during).__name__,
+        )
 
 
 @dataclass(frozen=True)

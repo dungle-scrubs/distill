@@ -447,6 +447,89 @@ def test_releasing_a_lease_this_process_does_not_hold_frees_nobody(
     holder.wait()
 
 
+def a_lease_that_cannot_be_released(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> AcquisitionLease:
+    """A real lease whose descriptor refuses to close.
+
+    Real, because the caller under test asks `isinstance` before it releases
+    anything. What is faked is only the one operation that can fail on the way
+    out of a run.
+    """
+    lock = tmp_path / "stuck.lock"
+    lease = AcquisitionLease(
+        lock_key=LOCK_KEY,
+        lock_path=lock,
+        lock=ExclusiveLock(
+            subject=LOCK_KEY,
+            path=lock,
+            fd=os.open(lock, os.O_CREAT | os.O_RDWR, 0o600),
+        ),
+    )
+
+    def refuse_to_release() -> None:
+        raise RuntimeError("the lease descriptor could not be closed")
+
+    monkeypatch.setattr(lease.lock, "release", refuse_to_release)
+    return lease
+
+
+def test_an_interrupt_survives_a_lease_that_cannot_be_released(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST: the `finally` release replaces the `KeyboardInterrupt`.
+
+    The lease is given up at the end of the media file's read lifetime, on the
+    way out of the run whether it succeeded or not. Raising from that release
+    while an exception travels substitutes it - so an operator's `Ctrl-C`
+    arrived at the CLI boundary as `E_INTERNAL`, saying an unexpected
+    `RuntimeError` ended the command. The interrupt is what happened.
+    """
+    from distill.options import DistillOptions
+    from distill.pipeline import ProcessingRun, process_resolved_source
+
+    class Source:
+        source_hash = "a" * 16
+        acquisition_lease = a_lease_that_cannot_be_released(monkeypatch, tmp_path)
+
+    def interrupt(_self: ProcessingRun) -> dict[str, Any]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ProcessingRun, "execute", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        process_resolved_source(
+            Source(),
+            DistillOptions(output_dir=str(tmp_path / "out")),
+        )
+
+
+def test_a_lease_that_cannot_be_released_by_a_run_that_succeeded_is_reported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other half: with nothing in flight, a stuck lease is the only news.
+
+    A lease this process believes it released and did not is a **lock key** the
+    next run of the same source waits out for its whole budget and then fails
+    `E_LOCKED` on, so swallowing the failure everywhere would trade one wrong
+    diagnosis for a silent one.
+    """
+    from distill.options import DistillOptions
+    from distill.pipeline import ProcessingRun, process_resolved_source
+
+    class Source:
+        source_hash = "a" * 16
+        acquisition_lease = a_lease_that_cannot_be_released(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(ProcessingRun, "execute", lambda _self: {"ok": True})
+
+    with pytest.raises(RuntimeError, match="could not be closed"):
+        process_resolved_source(
+            Source(),
+            DistillOptions(output_dir=str(tmp_path / "out")),
+        )
+
+
 def test_each_run_stages_its_download_in_its_own_directory(
     fake_tool: Callable[[str, str], Path],
     monkeypatch: pytest.MonkeyPatch,

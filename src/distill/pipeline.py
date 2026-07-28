@@ -34,6 +34,7 @@ from .errors import DistillError, WarningRecord, aggregate_warnings
 from .frame_selection import select_keyframes
 from .job_store import JobOutcome, JobStore
 from .local_vision import (
+    MAX_SOCKET_TIMEOUT_SEC,
     FrameInterpreter,
     local_vision_config_from_args,
     probe_local_vision,
@@ -71,6 +72,18 @@ DEFAULT_CONFIGURED_TIMEOUT_MS = 5_400_000
 TIMEOUT_ENV = "DISTILL_EFFECTIVE_TIMEOUT_MS"
 LONG_TIMEOUT_PROBE_ENV = "DISTILL_ENABLE_LONG_TIMEOUT_PROBE"
 TIMEOUT_PROBE_LIMIT_MS = 1_000
+
+TIMEOUT_PROBE_CEILING_MS = int(MAX_SOCKET_TIMEOUT_SEC * 1000)
+"""The longest sleep that can be asked for, as opposed to the longest one wanted.
+
+`TIMEOUT_PROBE_LIMIT_MS` is a policy - a probe longer than a second wants asking
+for twice - and the opt-out lifts it. This is not a policy: CPython holds a
+duration as nanoseconds in a signed 64-bit integer, so past this point
+`time.sleep` answers `OverflowError` rather than sleeping, whatever anybody
+opted into. It is the same fact about the same representation that gives
+`--local-vision-timeout-sec` its ceiling, which is why it is derived from that
+constant rather than written out again.
+"""
 
 
 @dataclass(frozen=True)
@@ -283,7 +296,7 @@ class ProcessingRun:
                     # from a run that never happened: the reason is the record.
                     # The previous **active generation** is untouched and the
                     # **staging directory** stays for the next run to resume.
-                    run.abandon(_abandon_reason(exc))
+                    run.abandon(_abandon_reason(exc), during=exc)
                     raise
         finally:
             heartbeat.stop()
@@ -734,18 +747,26 @@ def process_resolved_source(
     same run - and, since a held identifier cannot be started twice, would make
     every run fail rather than merely mis-report one.
     """
+    # The lease is released at the end of the media file's read lifetime (R-36).
+    # Transcription and keyframe selection both read `source.resolved_path`, so
+    # the **acquisition lease** taken to fetch it is only safe to release once
+    # this returns - until then another run sharing the **lock key** but not the
+    # **bundle key** could promote a replacement underneath the read.
+    #
+    # Two arms rather than one `finally`, because the two cases owe different
+    # things. On the way out of a failure the release must not raise, or it
+    # replaces the failure it is cleaning up after; on the way out of a success
+    # it must, because nothing else would report a lease that was not given up.
     try:
         output_root = output_root or validate_output_root(options.output_dir)
         progress = progress or ProgressReporter(emitter=progress_emitter(options.job_id))
         run = ProcessingRun(source, options, output_root, progress, tool, lock_wait_sec)
-        return run.execute()
-    finally:
-        # The end of the media file's read lifetime (R-36). Transcription and
-        # keyframe selection both read `source.resolved_path`, so the
-        # **acquisition lease** taken to fetch it is only safe to release once
-        # this returns - until then another run sharing the **lock key** but not
-        # the **bundle key** could promote a replacement underneath the read.
-        release_acquisition_lease(source)
+        result = run.execute()
+    except BaseException as exc:
+        release_acquisition_lease(source, during=exc)
+        raise
+    release_acquisition_lease(source)
+    return result
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
@@ -1147,12 +1168,34 @@ def timeout_diagnostics(effective_timeout_ms: int | None = None) -> dict[str, An
 
 
 def run_timeout_probe(probe_ms: int) -> dict[str, Any]:
+    """Sleep for `probe_ms`, or say why that is not a duration.
+
+    Three refusals, all `E_BAD_ARGUMENT` at the `timeout` stage, because all
+    three are the operator's own number and none of them is a defect in Distill:
+    below zero is not a duration, above `TIMEOUT_PROBE_LIMIT_MS` is a wait long
+    enough to want asking for twice, and above `TIMEOUT_PROBE_CEILING_MS` is a
+    duration no clock can represent.
+
+    The ceiling is the same escape `NumericDomain.ceiling` closed at the option
+    boundary, at the one door that does not pass through it: the long-probe
+    opt-out lifts the *policy* limit, and past that the number reached
+    `time.sleep` and came back as `OverflowError: timestamp out of range for
+    platform time_t` - reported by the CLI's catch-all as an internal fault,
+    with the argument's name thrown away.
+    """
     if probe_ms < 0:
         raise DistillError(
             "E_BAD_ARGUMENT",
             "timeout",
             "timeout probe duration must be non-negative",
             {"probe_ms": probe_ms},
+        )
+    if probe_ms >= TIMEOUT_PROBE_CEILING_MS:
+        raise DistillError(
+            "E_BAD_ARGUMENT",
+            "timeout",
+            "timeout probe duration is longer than a sleep can be asked for",
+            {"probe_ms": probe_ms, "ceiling_ms": TIMEOUT_PROBE_CEILING_MS},
         )
     long_probe_enabled = os.environ.get(LONG_TIMEOUT_PROBE_ENV) == "1"
     if probe_ms > TIMEOUT_PROBE_LIMIT_MS and not long_probe_enabled:
