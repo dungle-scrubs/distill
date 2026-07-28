@@ -32,6 +32,9 @@ compare or add counts would be doing arithmetic the checker had already been
 told was text.
 """
 
+FrozenWarningRecord = Mapping[str, Any]
+"""The same record once a carrier holds it: read-only, and still counted."""
+
 
 @dataclass(frozen=True)
 class WarningPayload:

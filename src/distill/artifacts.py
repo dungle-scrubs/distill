@@ -39,7 +39,7 @@ from functools import cache
 from types import MappingProxyType, NoneType, UnionType
 from typing import Any, ClassVar, Union, get_args, get_origin, get_type_hints
 
-from .errors import DistillError, warning
+from .errors import DistillError, FrozenWarningRecord, warning
 from .redact_secrets import redact_text
 
 # R-58 / D-045: each individual extracted-text field is capped, and no aggregate
@@ -133,7 +133,7 @@ class _PolicyText:
         return cls(text)
 
 
-def _cap_extracted_text(text: _PolicyText, *, path: str, warnings: list[Mapping[str, str]]) -> str:
+def _cap_extracted_text(text: _PolicyText, *, path: str, warnings: list[FrozenWarningRecord]) -> str:
     """Return `text` within the per-field cap, recording a **warning** if it was cut.
 
     The budget is bytes, because KiB is a byte unit and a character is not a
@@ -162,11 +162,11 @@ def _cap_extracted_text(text: _PolicyText, *, path: str, warnings: list[Mapping[
     return truncated
 
 
-def _frozen_warning(payload: Mapping[str, str]) -> Mapping[str, str]:
+def _frozen_warning(payload: FrozenWarningRecord) -> FrozenWarningRecord:
     return MappingProxyType(dict(payload))
 
 
-def _redact(text: str, *, warnings: list[Mapping[str, str]]) -> _PolicyText:
+def _redact(text: str, *, warnings: list[FrozenWarningRecord]) -> _PolicyText:
     """Return `text` with secret-shaped values replaced, keeping the policy's warnings.
 
     Every string in an extracted-text region goes through this, every time,
@@ -214,7 +214,7 @@ def _freeze(
     value: Any,
     *,
     path: str,
-    warnings: list[Mapping[str, str]],
+    warnings: list[FrozenWarningRecord],
     cap: bool,
     redact: bool,
 ) -> Any:
@@ -392,7 +392,7 @@ class Carrier(ABC):
     EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = ()
 
     redaction: RedactionState = RedactionState.NOT_APPLIED
-    warnings: tuple[Mapping[str, str], ...] = ()
+    warnings: tuple[FrozenWarningRecord, ...] = ()
 
     def __post_init__(self) -> None:
         # A region named here that is not a field would read as "capped" and
@@ -423,7 +423,7 @@ class Carrier(ABC):
         # and the alternative - dropping warnings a producer deliberately
         # attached - loses a **degradation** nobody would then be told about.
         apply_policy = self.redaction is not RedactionState.DISABLED
-        collected: list[Mapping[str, str]] = []
+        collected: list[FrozenWarningRecord] = []
         for field in dataclasses.fields(self):
             if field.name in {"warnings", "redaction"}:
                 continue
