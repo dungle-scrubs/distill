@@ -315,23 +315,31 @@ def _low_confidence_lines(assessment: GroundingAssessment | None, caveat: str) -
     assessment of a reading, and its level and reason are literals in
     `grounding.py`. What holds that is a claim about another module rather than
     a property of this text, and an assessment rebuilt from a document takes
-    whatever the document held - so the banner is *made* one line rather than
-    trusted to be one, and the level is printed only when it is a level this
-    codebase defines. Neither is a delimiter and neither pretends to be one:
-    they bound the banner to the line it is supposed to be, so a reason that
-    grew a line ending cannot continue as document structure.
+    whatever the document held - `FrameArtifact.from_document` declares that
+    document to be input under R-23 and leaves the hardening here. So each part
+    of the banner is made safe rather than trusted to be: the level is printed
+    only when it is a level this codebase defines, and the reason is escaped
+    the way a link label is, which is what stops a line ending in it continuing
+    as document structure and stops an inline construct in it acting at all.
+
+    Escaping and not a fence, because the sentence is Distill's: a block would
+    label Distill's own assessment as **extracted text**. The escape is
+    lossless, so the reason still reads as what it said.
     """
     if assessment is None or not assessment.is_low_confidence:
         return []
     level = assessment.level if assessment.level in GROUNDING_LEVELS else "low"
-    return [
-        f"> ⚠ Low-confidence frame ({level}): {_one_line(assessment.reason)}. {caveat}",
-        "",
-    ]
+    reason = EMITTER.link_label(_one_line(assessment.reason))
+    return [f"> ⚠ Low-confidence frame ({level}): {reason}. {caveat}", ""]
 
 
 def _one_line(text: str) -> str:
-    """`text` with every run of whitespace, line endings included, made a space."""
+    """`text` with every run of whitespace, line endings included, made a space.
+
+    Legibility rather than safety, now that the banner's reason is escaped: the
+    escape is what stops a line ending from ending the line, and this is what
+    keeps the result a sentence instead of a run of visible `\\n`.
+    """
     return " ".join(text.split())
 
 

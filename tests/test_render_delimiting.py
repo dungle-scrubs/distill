@@ -22,6 +22,7 @@ as document structure instead.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import pytest
@@ -198,9 +199,13 @@ def test_the_low_confidence_banner_is_bounded_to_one_line() -> None:
     literals in `grounding.py`, so the banner is not delimited - the render is
     speaking. But a `GroundingAssessment` rebuilt from a document takes what the
     document held, and "another module only ever writes literals here" is a
-    claim about that module rather than a property of this text. Folding the
-    banner onto one line costs nothing for the literals and leaves a reason
-    that grew a line ending unable to continue as document structure.
+    claim about that module rather than a property of this text.
+
+    Two lines hold the banner to one line and they are not the same claim. The
+    escape is what makes a line ending unable to end the line, and it is what
+    this asserts first. Collapsing the whitespace is what keeps the result a
+    sentence rather than a string of visible `\\n`, and that is asserted as
+    itself - a reason nobody can read is a banner that has stopped reporting.
     """
     frame, _warnings = keyframe().with_interpretation(
         read(visual_summary="A dark slide"),
@@ -219,6 +224,7 @@ def test_the_low_confidence_banner_is_bounded_to_one_line() -> None:
     assert not any(
         line.lstrip().startswith("# grounding") for line in outside_fences(markdown).split("\n")
     )
+    assert "\\n" not in banner
 
 
 def test_the_banner_names_a_level_only_when_it_is_one() -> None:
@@ -240,6 +246,35 @@ def test_the_banner_names_a_level_only_when_it_is_one() -> None:
 
     assert "Low-confidence frame (low):" in markdown
     assert SENTINEL not in markdown
+
+
+def test_the_banner_cannot_open_a_construct_from_its_reason() -> None:
+    """The banner is Distill's sentence, so what lands in it must not be able to act.
+
+    Folding the reason onto one line closes the block-level escape and nothing
+    else: a link, an autolink and a raw tag are all inline, so a reason rebuilt
+    from a **stage result** on **resume** put a live link and raw HTML in the
+    sentence the document presents as its own assessment.
+
+    Escaping rather than delimiting, because the banner is Distill speaking:
+    the same rule a link label runs under neutralizes every opener without
+    labelling Distill's words as the source's, and it is lossless, so the
+    reason still reads as what it said.
+    """
+    reason = f"unreadable: see [docs]({ATTACKER_URL}), <{ATTACKER_URL}>, <b>read this</b>"
+    frame, _warnings = keyframe().with_interpretation(
+        read(visual_summary="A dark slide"),
+        grounding={"level": "ungrounded", "text_overlap": None, "reason": reason},
+    )
+    markdown = render(frames=[frame])
+    banner = next(
+        line for line in outside_fences(markdown).split("\n") if "Low-confidence frame" in line
+    )
+
+    assert destinations(markdown) == [FRAME_IMAGE]
+    assert autolinks(markdown) == []
+    assert "<b>" not in banner
+    assert reason in _unescape(banner)
 
 
 # --- R-26: the transcript ---------------------------------------------------
@@ -421,19 +456,98 @@ def destinations(markdown: str) -> list[str]:
     return [destination for _label, destination in inline_links(markdown)]
 
 
-def test_a_link_label_cannot_retarget_the_link() -> None:
-    """RV-5: `](` in a label closes the label and opens a destination.
+_WRAPPED_DESTINATION_RE = re.compile(r"\]\(<(?:\\.|[^>\\])*>\)", re.DOTALL)
+_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.\-]{1,31}:[^<>\x00-\x20]*>")
 
-    The label is extracted text - a description's author wrote it - so a label
-    reading `docs](https://attacker.example/evil) [rest` renamed the link and
-    pointed it somewhere else, and the render showed a plausible name over an
-    attacker's URL.
+
+def autolinks(markdown: str) -> list[str]:
+    """Every `<scheme:...>` a reader turns into a live link of its own.
+
+    `inline_links` is blind to this shape, and a label is the one place it
+    matters: a link may not hold another link, so an autolink inside a label
+    wins and the destination the render chose is dropped. A test that asked
+    `inline_links` alone would report the render's own destination and call
+    the label harmless.
+
+    A destination the render wrapped in angle brackets is not an autolink - it
+    is the `(...)` half of a link `inline_links` has already accounted for - so
+    the wrapped form is removed before the search. Backslash-escaped text is
+    stepped over, because an escaped `<` opens nothing.
     """
-    hostile = f"docs]({ATTACKER_URL}) [rest"
+    text = _WRAPPED_DESTINATION_RE.sub("]()", outside_fences(markdown))
+    found: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        match = _AUTOLINK_RE.match(text, index)
+        if match is None:
+            index += 1
+            continue
+        found.append(match.group()[1:-1])
+        index = match.end()
+    return found
+
+
+def outside_links(text: str) -> str:
+    """The lines of `text` no link sits on.
+
+    A link label and a destination are escaped rather than fenced (R-27), so a
+    payload in either stays visible as prose - held to the one line the link
+    occupies, which is the whole of what escaping buys there. Everything else
+    is where the render speaks in its own voice, and a payload reaching it is
+    the finding.
+    """
+    return "\n".join(line for line in text.split("\n") if "](" not in line)
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        f"docs]({ATTACKER_URL}) [rest",
+        f"<{ATTACKER_URL}>",
+    ],
+    ids=["closes-the-label", "autolink"],
+)
+def test_a_link_label_cannot_retarget_the_link(hostile: str) -> None:
+    """RV-5: a label can name the destination unless every opener in it is escaped.
+
+    The label is extracted text - a description's author wrote it - and two
+    shapes of ordinary text take the link over. `docs](https://…) [rest` closes
+    the label and opens a destination the label's author chose. `<https://…>`
+    is an autolink, and since a link may not hold another link, a reader drops
+    the render's own link and leaves the label's URL as the live one. Either
+    way the render showed a plausible name over an attacker's URL.
+
+    A code span in a label is not a third shape: a backtick swallows the `]`
+    that would close the label rather than retargeting anything, so escaping it
+    buys legibility and not this.
+    """
     markdown = render(related_links=[link(label=hostile)])
 
     assert destinations(markdown) == ["https://github.com/example/repo", FRAME_IMAGE]
+    assert autolinks(markdown) == []
     assert (hostile, "https://github.com/example/repo") in inline_links(markdown)
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
+def test_a_link_label_holding_a_line_ending_cannot_open_a_heading(ending: str) -> None:
+    """A label is one line of a document, and a line ending in one ends that line.
+
+    The label is escaped rather than fenced, so the line ending is the whole of
+    the boundary: a real one lands the rest of the label at the document's own
+    indentation, and `# PWNED` there is a heading the render appears to have
+    written. A reader ends a line on `\\r` as readily as on `\\n`, so a lone CR
+    does it too.
+    """
+    label = f"line1{ending}{ending}# PWNED HEADING{ending}{ending}line2"
+    markdown = render(related_links=[link(label=label)])
+    structure = outside_fences(markdown)
+
+    assert [line for line in re.split(r"\r\n|\r|\n", structure) if line.startswith("# ")] == [
+        "# Video Bundle"
+    ]
 
 
 def test_a_link_destination_cannot_terminate_the_construct() -> None:
@@ -524,6 +638,12 @@ def test_no_extracted_text_region_of_a_hostile_bundle_reaches_document_structure
     link label and a caption of newlines - the four shapes Gate 5->6 names -
     and the claim is the same for all of them: nothing they contain appears
     where the render speaks for itself.
+
+    The link halves carry the same payload every other region does, and not a
+    bespoke single-line one. A label built to retarget the link proves only the
+    `]` escape; the payload's line endings are what prove the rest, and leaving
+    them out left the one region the render escapes rather than fences with no
+    test behind its line-ending handling at all.
     """
     reading = read(
         visual_summary=attack("summary"),
@@ -540,15 +660,18 @@ def test_no_extracted_text_region_of_a_hostile_bundle_reaches_document_structure
         warnings=[{"stage": "ocr", "code": "tesseract_failed", "message": attack("warning")}],
         related_links=[
             link(
-                label="docs](https://attacker.example/evil) [rest",
-                url="https://ok.example/a) [pwn](https://attacker.example/evil",
+                label=f'{attack("label")}](https://attacker.example/evil) [rest <{ATTACKER_URL}>',
+                url=f'{attack("url")}) [pwn](https://attacker.example/evil',
             )
         ],
     )
     structure = outside_fences(markdown)
 
-    assert SENTINEL not in structure
+    headings = [line.lstrip() for line in re.split(r"\r\n|\r|\n", structure)]
+
+    assert SENTINEL not in outside_links(structure)
     assert ATTACKER_URL not in destinations(markdown)
+    assert autolinks(markdown) == []
     for marker in (
         "source",
         "segment",
@@ -560,5 +683,7 @@ def test_no_extracted_text_region_of_a_hostile_bundle_reaches_document_structure
         "verbatim",
         "confidence",
         "warning",
+        "label",
+        "url",
     ):
-        assert f"# {marker}" not in structure, marker
+        assert not any(line.startswith(f"# {marker}") for line in headings), marker
