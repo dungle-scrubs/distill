@@ -801,3 +801,73 @@ def test_no_file_in_a_published_generation_holds_the_secret(
     assert "github.com/example/repo" in render
     assert "the key is" in render
     assert files_holding(output_root, SECRET) == []
+
+
+# 9. R-50: a format the pattern set learned reaches every sink without anything
+#    else being told about it
+
+
+def test_a_newly_covered_credential_format_is_redacted_in_a_published_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """R-50 with R-19: adding a pattern is the whole change.
+
+    Redaction moved to carrier construction in M4.2, so a format the pattern set
+    learns is covered at every **redaction sink** at once. That is a claim about
+    the arrangement, not about `redact_text`, so it is asserted where a user
+    would find out it was false: in a published **generation**.
+
+    Both credentials here were invisible to the pre-R-50 pattern set - a GitLab
+    token matched nothing, and an opaque bearer value is too short for the
+    generic base64 rule - so this run publishes them verbatim if either pattern
+    is removed.
+    """
+    # 20 characters after the prefix, which is what GitLab issues. Assembled
+    # rather than written as one literal so the file carries no token-shaped
+    # string for a secret scanner to block on.
+    gitlab_token = "glpat-" + "3xAmPl3T0k3nV4lu3abc"
+    bearer_value = "9f8c2b1a4d7e6f0c3b5a8d92e1f4c7b0"
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+    monkeypatch.setattr(
+        distill_session,
+        "transcribe_with_imports",
+        transcript_saying(f"the runner token is {gitlab_token}"),
+    )
+    monkeypatch.setattr(
+        distill_session,
+        "ocr_frames",
+        ocr_reading(f"curl -H 'Authorization: Bearer {bearer_value}' https://api.example.com"),
+    )
+    source = SourceInfo(
+        source_type="youtube",
+        resolved_path=video,
+        duration_sec=1.0,
+        source_fingerprint="fingerprint",
+        source_hash=BUNDLE_KEY,
+        warnings=[],
+        related_links=extract_relevant_links(
+            f"Runner setup: https://gitlab.com/example/repo?private_token={gitlab_token}",
+            source="youtube_description",
+        ),
+    )
+    output_root = tmp_path / "cache"
+    output_root.mkdir()
+
+    response = distill_session.process_resolved_source(
+        source,
+        DistillOptions(ocr=True, caption_frames=False, max_keyframes=3),
+        output_root,
+    )
+
+    generation = published_generation(response)
+    render = (generation / "video.md").read_text()
+    # Each sink is asserted present in redacted form as well as absent in raw
+    # form, so a sink that quietly stopped being written cannot pass by having
+    # nothing in it to find.
+    assert "Bearer [REDACTED]" in render
+    assert "the runner token is" in render
+    assert "gitlab.com/example/repo" in render
+    assert files_holding(output_root, gitlab_token) == []
+    assert files_holding(output_root, bearer_value) == []
