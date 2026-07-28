@@ -12,8 +12,11 @@ import itertools
 import json
 import math
 import random
+import signal
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from types import FrameType
 
 import pytest
 from test_local_integration import fake_transcribe, make_short_screencast
@@ -152,6 +155,46 @@ def test_a_source_no_detector_answered_for_is_still_sampled_at_the_static_window
 # advancing, not the clock.
 SWEEP_POINT_CEILING = 5_000
 
+SWEEP_TUPLE_DEADLINE_SEC = 10.0
+"""Generous: every tuple in the sweep returns in microseconds on this hardware.
+
+It is not a performance assertion. It exists because the failure this sweep
+guards against is a cursor that stops advancing, and a cursor that stops
+advancing does not fail a test - it appends forever, and pytest hangs with no
+tuple named and no seed printed. A test that cannot report is not a test, so
+the stall is turned into an ordinary failure carrying the tuple that caused it.
+"""
+
+
+@contextmanager
+def _fails_rather_than_hangs(report: str) -> Iterator[None]:
+    """Turn a non-terminating schedule into a failure that names its tuple.
+
+    `SIGALRM` rather than a thread or a subprocess, because the loop being
+    watched is pure Python in this process: the handler runs between bytecodes
+    and the `AssertionError` it raises unwinds through `filtered_candidates`
+    with the tuple already in hand. On a platform without `SIGALRM` the sweep
+    still runs and a stall still hangs - there is nothing to report from, and
+    Distill is macOS-first.
+    """
+    if not hasattr(signal, "SIGALRM"):  # pragma: no cover - macOS and Linux have it
+        yield
+        return
+
+    def stalled(_signum: int, _frame: FrameType | None) -> None:
+        raise AssertionError(
+            f"candidate generation did not terminate within "
+            f"{SWEEP_TUPLE_DEADLINE_SEC}s: {report}"
+        )
+
+    previous = signal.signal(signal.SIGALRM, stalled)
+    signal.setitimer(signal.ITIMER_REAL, SWEEP_TUPLE_DEADLINE_SEC)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
+
 
 def _candidate_shapes(duration: float) -> tuple[tuple[float, ...], ...]:
     return (
@@ -172,6 +215,18 @@ def _swept_tuples() -> Iterator[tuple[tuple[float, ...], float, float, float]]:
     Boundaries first because that is where the arithmetic changes character:
     the quantum itself, a window that divides the duration, one that exactly
     equals it, and one wider than the source is long.
+
+    A tuple whose schedule would hold more than `SWEEP_POINT_CEILING` entries is
+    skipped, and what that skip is standing in front of is worth saying plainly:
+    the schedule is bounded by `ceil(duration_sec / max_static_window_sec)`,
+    which is finite for every validated tuple but is not a bound on *memory*.
+    `--max-duration-sec 1e9` with a matching source and a one-second window is a
+    billion-entry list of floats - tens of gigabytes, so an out-of-memory kill
+    rather than a large schedule. R-48 is about termination and that walk does
+    terminate; the size is a separate, documented, deliberately un-redesigned
+    gap (bounding the schedule by `max_keyframes` was considered and rejected:
+    candidates that dedupe on pHash are examined and dropped, so capping the
+    list at the frame budget would cost real frames on the ordinary path).
     """
     # Durations and windows that are not whole milliseconds are in here on
     # purpose: a step of 1.0004s is quantized to 1.000s, so the schedule
@@ -216,7 +271,7 @@ def _swept_tuples() -> Iterator[tuple[tuple[float, ...], float, float, float]]:
         )
 
 
-def test_candidate_generation_terminates_for_every_validated_option_tuple() -> None:
+def test_candidate_generation_terminates_across_a_deterministic_boundary_and_sample_sweep() -> None:
     """R-48, structurally: a finite bound, and a step that always advances.
 
     A schedule holds at most one entry per candidate the detector offered plus
@@ -228,13 +283,23 @@ def test_candidate_generation_terminates_for_every_validated_option_tuple() -> N
     A step is the window less at most half a quantum, because quantizing can
     round one down - a 0.0014s window advances the cursor by 0.001s. Dividing
     by the window itself would be a bound the code is not obliged to meet.
+
+    What this sweeps, stated so the name is not read as more than it is: the
+    boundary structure of the validated option space, plus a `Random(20260728)`
+    sample - a few thousand tuples, not every validated tuple, which is an
+    uncountable set. And tuples whose schedule would exceed
+    `SWEEP_POINT_CEILING` entries are skipped rather than run: the sweep
+    executes what it asserts about, and a validated tuple can name a schedule
+    too large to hold in memory (see `_swept_tuples`). Those are not tuples the
+    property is false for; they are tuples this test declines to build.
     """
     for candidates, duration, min_interval, window in _swept_tuples():
         tuple_report = (
             f"seed={SWEEP_SEED} candidates={candidates} duration={duration} "
             f"min_interval={min_interval} window={window}"
         )
-        schedule = filtered_candidates(candidates, duration, min_interval, window)
+        with _fails_rather_than_hangs(tuple_report):
+            schedule = filtered_candidates(candidates, duration, min_interval, window)
 
         assert schedule == sorted(set(schedule)), tuple_report
         assert all(0.0 <= point <= duration for point in schedule), tuple_report
