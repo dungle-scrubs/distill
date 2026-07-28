@@ -549,10 +549,7 @@ class Interpretation:
         when the on-screen text cannot be read - reached **grounding** as
         though the model had said nothing, and was graded a textless frame.
         """
-        document = self.document()
-        return any(
-            _substantive_text(name, document.get(name)) for name in self.DESCRIPTIVE_FIELDS
-        )
+        return any(_substantive_text(name, getattr(self, name)) for name in self.DESCRIPTIVE_FIELDS)
 
     @property
     def carries_a_reading(self) -> bool:
