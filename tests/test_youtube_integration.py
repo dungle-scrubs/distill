@@ -250,7 +250,14 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     manifest = json.loads(Path(response["manifest_path"]).read_text())
     assert manifest["progress"]["overall_percent"] == 100.0
     assert manifest["progress"]["mechanisms"]["youtube_download"]["status"] == "completed"
+    assert "path" not in manifest["progress"]["mechanisms"]["youtube_download"]["detail"]
     assert manifest["progress"]["mechanisms"]["bundle_publish"]["status"] == "completed"
+    portable_manifest = {
+        key: value
+        for key, value in manifest.items()
+        if key not in {"source_resolved_path", "warnings"}
+    }
+    assert str(tmp_path) not in json.dumps(portable_manifest)
     assert reporters[0].states["youtube_download"].status == "completed"
     assert reporters[0].states["bundle_publish"].detail["generation"] == "g1"
 

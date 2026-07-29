@@ -3056,21 +3056,13 @@ def published_manifest(manifest: dict[str, Any], final_paths: BundlePaths) -> di
 
     One function rather than a step inside `publish_staging`, so that what a
     commit hands its caller and what is on disk cannot drift into two different
-    documents - the frame paths below are rewritten, and a caller reading the
-    pre-publish manifest would be reading paths to a directory that no longer
-    exists under that name.
+    documents. Frame projection belongs to `manifest_document`; publication
+    adds only the generation name it alone knows, then validates that exact
+    final document.
     """
     published = dict(manifest)
     published["active_generation"] = final_paths.generation.name
     validate_manifest_schema(published, require_active_generation=True)
-    # Frame paths are recorded absolute and were recorded against the staging
-    # directory, which is about to stop existing under that name.
-    published["frames"] = [
-        {**frame, "path": str(final_paths.frames / Path(str(frame["path"])).name)}
-        if isinstance(frame, dict) and "path" in frame
-        else frame
-        for frame in published.get("frames", [])
-    ]
     return published
 
 

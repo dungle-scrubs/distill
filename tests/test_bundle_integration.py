@@ -20,7 +20,7 @@ from distill.bundle_store import (
     ensure_safe_directory,
     stage_paths,
 )
-from distill.errors import DistillError
+from distill.errors import DistillError, warning
 from distill.links import extract_relevant_links
 from distill.options import DistillOptions
 from distill.response import (
@@ -154,7 +154,82 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
     active = store.load_active(BUNDLE_KEY)
     assert active is not None
     assert active.manifest["active_generation"] == "g1"
+    assert active.manifest["frames"] == [
+        {
+            "index": 1,
+            "timestamp_sec": 0.0,
+            "relative_path": "frames/frame_0001.png",
+            "ocr_text": "text",
+        }
+    ]
     assert active.generation == snapshot.generation
+
+
+def test_manifest_options_record_only_local_bundle_identity(tmp_path: Path) -> None:
+    """FAILS FIRST: invocation controls described the producing machine and run.
+
+    A manifest records the choices that determine its **bundle key**, plus the
+    hash of those choices. `cache_mode` is part of local-source identity even
+    though it is not part of YouTube identity. Output placement and cache-reuse
+    controls describe only how this invocation was made.
+    """
+    options = DistillOptions(
+        cache_mode="content",
+        output_dir=str(tmp_path / "machine-local-output"),
+        force_reprocess=True,
+        resume_partial=False,
+    )
+
+    manifest = manifest_document(
+        source(tmp_path),
+        options,
+        transcript_present=False,
+        frames=[],
+        warnings=[],
+    )
+
+    identity_options = options.cache_payload("local")
+    identity_options.pop("pipeline_version")
+    assert manifest["options"] == {
+        **identity_options,
+        "opts_hash": options.opts_hash("local"),
+    }
+    assert manifest["options"]["cache_mode"] == "content"
+
+
+def test_path_bearing_warning_history_is_exempt_from_the_portable_manifest_claim(
+    tmp_path: Path,
+) -> None:
+    """Warning text stays historical even when it names the producing machine.
+
+    Warning messages are diagnostic records that must not be rewritten after
+    the event. This scan therefore excludes `warnings` explicitly. D-006 also
+    keeps `source_resolved_path` as a schema and cache-read compatibility field.
+    Every other durable manifest field must be free of this machine's root.
+    """
+    machine_path = tmp_path / "resolved-video.mp4"
+    manifest = manifest_document(
+        source(tmp_path),
+        DistillOptions(),
+        transcript_present=False,
+        frames=[],
+        warnings=[
+            warning(
+                "source",
+                "symlink_resolved",
+                f"source path resolved to {machine_path}",
+            )
+        ],
+    )
+
+    assert manifest["source_resolved_path"] == str(tmp_path / "video.mp4")
+    assert str(machine_path) in json.dumps(manifest["warnings"])
+    portable_claims = {
+        key: value
+        for key, value in manifest.items()
+        if key not in {"source_resolved_path", "warnings"}
+    }
+    assert str(tmp_path) not in json.dumps(portable_claims)
 
 
 # `test_publish_rewrites_staged_paths_in_partial_files` stood here. It required
@@ -267,6 +342,7 @@ def test_response_frames_keep_ocr_and_visual_interpretation_separate(
 
     response = run_response(snapshot, source(tmp_path), [frame], False, [], cached=False)
 
+    assert response["frames"][0]["path"] == str(snapshot.frames / "frame.png")
     assert response["frames"][0]["ocr_text"] == "raw text"
     assert response["frames"][0]["visual_interpretation"]["visual_summary"] == "A chart"
     assert response["summary"] == (

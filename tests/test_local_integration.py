@@ -151,6 +151,37 @@ def test_cache_hit_returns_under_one_second(
     assert elapsed < 1.0
 
 
+def test_fresh_and_cache_hit_responses_report_the_same_frame_shape(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+    args = {
+        "path": str(video),
+        "output_dir": str(tmp_path / "cache"),
+        "ocr": False,
+        "redact_secrets": False,
+        "caption_frames": False,
+        "max_keyframes": 1,
+        "max_static_window_sec": 1,
+    }
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+
+    fresh = distill_session.process_local_video(args)
+    cached = distill_session.process_local_video(args)
+
+    fresh_frame = fresh["frames"][0]
+    cached_frame = cached["frames"][0]
+    assert cached["cached"] is True
+    assert cached_frame.keys() == fresh_frame.keys()
+    assert Path(cached_frame["path"]).is_absolute()
+    assert cached_frame["path"] == fresh_frame["path"]
+
+    manifest = json.loads(Path(cached["manifest_path"]).read_text())
+    assert "path" not in manifest["frames"][0]
+
+
 def test_pipeline_reports_render_and_publish_progress_and_no_redaction_stage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
