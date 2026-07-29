@@ -36,6 +36,8 @@ from distill.source import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 README = REPO_ROOT / "README.md"
 AGENTS = REPO_ROOT / "AGENTS.md"
+CONFIG_SOURCE = REPO_ROOT / "src" / "distill" / "config.py"
+VERSION_SOURCE = REPO_ROOT / "src" / "distill" / "version.py"
 
 # Indentation allowed on both fences: AGENTS.md fences a command inside a list
 # item, and a fence this misses leaves its backticks to pair with prose, which
@@ -182,8 +184,31 @@ def test_the_readme_states_the_default_output_root_the_code_uses() -> None:
     """
     declared = declared_default_output_roots(prose(README))
 
-    assert len(declared) == 1, f"the README declares {len(declared)} default output roots: {declared}"
+    assert len(declared) == 1, (
+        f"the README declares {len(declared)} default output roots: {declared}"
+    )
     assert Path(declared[0]).expanduser() == validate_output_root(None, create=False)
+
+
+def test_phase_one_configuration_claims_match_their_mechanisms() -> None:
+    readme = README.read_text(encoding="utf-8")
+    configuration = readme.split("## Configuration", 1)[1].split("## Commands", 1)[0]
+    flowed_configuration = flowed(configuration)
+    lower_configuration = flowed_configuration.lower()
+    config_source = CONFIG_SOURCE.read_text(encoding="utf-8")
+    version_source = VERSION_SOURCE.read_text(encoding="utf-8")
+
+    assert "endpoint policy" in lower_configuration
+    assert "fatal" in lower_configuration
+    assert "`cache_mode`" in configuration
+    assert "tool argument" in flowed_configuration
+    assert "option table" in flowed_configuration
+    assert "argparse" in flowed_configuration
+    assert "2.5" in flowed_configuration
+    assert "E_BAD_OPTIONS" in flowed_configuration
+    assert "Configuring one does not configure the other" in flowed(readme)
+    assert "explicit override is authoritative even when it is absent" in flowed(config_source)
+    assert "every processing option there is part of the options" not in version_source
 
 
 def test_the_readme_states_the_class_and_cost_the_capability_table_records() -> None:
@@ -216,7 +241,7 @@ def test_agents_carries_the_same_capability_table() -> None:
 
 
 def test_the_readme_commands_table_lists_every_registered_subcommand() -> None:
-    """"The following subcommands" has to be all of them, and only them.
+    """ "The following subcommands" has to be all of them, and only them.
 
     Read off `build_parser`'s own registry, so a command added without a row -
     which is how `cache-doctor` came to be documented only in an upgrade note -
@@ -227,9 +252,7 @@ def test_the_readme_commands_table_lists_every_registered_subcommand() -> None:
     unremarked: a row for `frobnicate` documents a command nobody can run, which
     is a reader following instructions into a usage error.
     """
-    documented = {
-        command.split()[0] for command in table_rows(prose(README), columns=2)
-    }
+    documented = {command.split()[0] for command in table_rows(prose(README), columns=2)}
 
     assert documented == registered_subcommands()
 
@@ -256,9 +279,7 @@ def test_the_readme_names_every_shared_processing_option() -> None:
     )
 
     assert listing is not None, "the README lists no shared processing options"
-    named = {
-        flag for span in INLINE_CODE.findall(listing.group(0)) for flag in FLAG.findall(span)
-    }
+    named = {flag for span in INLINE_CODE.findall(listing.group(0)) for flag in FLAG.findall(span)}
     for key in PROCESSING_KEYS:
         flag = f"--{key.replace('_', '-')}"
         assert flag in named, f"{flag} is accepted but the list omits it"

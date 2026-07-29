@@ -25,7 +25,7 @@ the cryptographic sense, and nothing verifies who produced it.
 
 from __future__ import annotations
 
-PIPELINE_VERSION = 40
+PIPELINE_VERSION = 42
 
 # Output-affecting source files covered by PIPELINE_SIGNATURE, named by their
 # path relative to `src/distill/` in posix form so that modules in subpackages
@@ -40,6 +40,13 @@ SIGNED_MODULES = (
     "bundle_store.py",
     "capabilities.py",
     "cli.py",
+    # Signed because it decides which values a run is configured with: a key it
+    # folds in from `distill.json` or from `DISTILL_OUTPUT_DIR` reaches the
+    # option table, and identity-determining processing options there enter the
+    # options hash. Other resolved options can change where or whether a run
+    # publishes. Editing this module can therefore change bundle behavior
+    # without any option being typed differently.
+    "config.py",
     "emit.py",
     "errors.py",
     "frame_selection.py",
@@ -106,4 +113,4 @@ EXEMPT_MODULES: dict[str, str] = {
 }
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "4009f9b3b237a80da848a9738dd17ab71fcfe8c322d7c0b0ea6eeb0cef8f7a91"
+PIPELINE_SIGNATURE = "7d492c96c13a8633e5682642a452c7d0a7af81900dfc7ad73e24cdccc7fe3fe8"

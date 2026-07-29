@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from .artifacts import FrameArtifact, Interpretation, document_carries_a_reading
+from .config import config_dir as general_config_dir
 from .errors import DistillError, WarningRecord, aggregate_warnings, occurrences_of, warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
@@ -522,9 +523,7 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     operator's configuration was ignored.
     """
     try:
-        _checked_endpoint_url(
-            config.base_url, allow_remote_endpoint=config.allow_remote_endpoint
-        )
+        _checked_endpoint_url(config.base_url, allow_remote_endpoint=config.allow_remote_endpoint)
     except EndpointRejected as exc:
         raise DistillError(
             "E_BAD_OPTIONS",
@@ -535,14 +534,20 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     return config
 
 
-def config_dir() -> Path:
-    return Path(os.environ.get("DISTILL_CONFIG_DIR", Path.home() / ".distill")).expanduser()
+config_dir = general_config_dir
+"""Where local-vision configuration lives: the general config directory.
+
+Re-exported rather than resolved again here, because two answers to "where does
+config live" is a machine where `distill.json` is read from one directory and
+`distill.local-vision.json` from another. `config.py` owns the resolution; this
+module owns only its own forgiving reader and coercions.
+"""
 
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
 
@@ -1543,9 +1548,7 @@ def _urlopen_json(
             # evidence the transport works and must not count toward the
             # breaker's consecutive-failure tally. It is unusable for the same
             # reason a truncated body is - hence malformed, not unavailable.
-            raise RuntimeError(
-                f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap"
-            )
+            raise RuntimeError(f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap")
         raw = payload.decode("utf-8")
     except urllib.error.HTTPError as exc:
         # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so

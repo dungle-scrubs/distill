@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 from uuid import uuid4
 
+from .config import resolve_options
 from .errors import DistillError
 from .frame_selection import CANDIDATE_TIMESTAMP_QUANTUM_SEC
 from .local_vision import (
@@ -24,6 +25,8 @@ from .local_vision import (
 from .version import PIPELINE_VERSION
 
 DEFAULT_MAX_DURATION_SEC = 7200.0
+FALSE_BOOLEAN_SPELLINGS = frozenset({"0", "false", "no", "off"})
+TRUE_BOOLEAN_SPELLINGS = frozenset({"1", "true", "yes", "on"})
 
 
 @dataclass(frozen=True)
@@ -42,9 +45,9 @@ def _coerce_bool(value: Any, default: bool) -> bool:
         return value
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized in {"0", "false", "no", "off"}:
+        if normalized in FALSE_BOOLEAN_SPELLINGS:
             return False
-        if normalized in {"1", "true", "yes", "on"}:
+        if normalized in TRUE_BOOLEAN_SPELLINGS:
             return True
     return bool(value)
 
@@ -68,6 +71,20 @@ OPTION_SPECS: tuple[OptionSpec, ...] = (
     OptionSpec("resume_partial", True, bool, boolean=True, cache_key=False),
 )
 OPTION_DEFAULTS = {spec.name: spec.default for spec in OPTION_SPECS}
+GENERAL_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.name != "job_id")
+"""The options a config file or an environment variable may set.
+
+The general schema is the option table except `job_id`, which identifies one
+invocation and cannot be pinned across every run in a directory (R-18).
+`force_reprocess` and `resume_partial` stay configurable: they govern cache
+reuse for a run and a later invocation can override either one. `config.py` is
+told this vocabulary rather than holding a second copy that could drift.
+
+The local-vision options are deliberately not here. They arrive from their own
+files through `local_vision_config_from_args`, and a top-level key naming one in
+`distill.json` is not a second way to set it (the nested `local_vision` object
+is the one way).
+"""
 
 
 @dataclass(frozen=True)
@@ -244,6 +261,47 @@ def validated_count(name: str, value: Any) -> int:
     return int(validated_number(name, value))
 
 
+def _validated_option_type(spec: OptionSpec, value: Any) -> Any:
+    """A general option value before any Python coercion can rewrite its type."""
+    if spec.name in NUMERIC_OPTION_DOMAINS:
+        return value
+    if spec.boolean:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in (
+            FALSE_BOOLEAN_SPELLINGS | TRUE_BOOLEAN_SPELLINGS
+        ):
+            return value
+        expected = "a boolean or recognized on/off spelling"
+    elif spec.name == "output_dir":
+        if value is None or isinstance(value, str):
+            return value
+        expected = "text or null"
+    elif spec.caster is str:
+        if isinstance(value, str):
+            return value
+        expected = "text"
+    else:
+        return value
+    raise DistillError(
+        "E_BAD_OPTIONS",
+        "options",
+        f"{spec.name} must be {expected}",
+        {spec.name: repr(value)},
+    )
+
+
+def _annotate_configured_refusal(
+    error: DistillError,
+    args: dict[str, Any],
+    option: str,
+) -> DistillError:
+    configured_from = getattr(args, "configured_from", {}).get(option)
+    if configured_from is not None:
+        error.details["configured_from"] = str(configured_from)
+    return error
+
+
 CACHE_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.cache_key)
 PROCESSING_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.name != "cache_mode")
 LOCAL_VISION_OPTION_NAMES = (
@@ -312,21 +370,30 @@ class DistillOptions:
 
     @classmethod
     def from_args(cls, args: dict[str, Any]) -> DistillOptions:
+        # The configured layers first, so a value from `distill.json` or from
+        # `DISTILL_OUTPUT_DIR` is read, cast and validated below by the code
+        # that reads a typed value. A second door for configured values is how
+        # a config file comes to accept a number the command line refuses.
+        args = resolve_options(args, general_keys=GENERAL_OPTION_NAMES)
         local_vision = local_vision_config_from_args(args)
         values: dict[str, Any] = {}
         for spec in OPTION_SPECS:
             default = OPTION_DEFAULTS[spec.name]
-            raw_value = args.get(spec.name, default)
-            if spec.boolean:
-                values[spec.name] = _coerce_bool(raw_value, bool(default))
-            elif spec.name in NUMERIC_OPTION_DOMAINS:
-                # Before the `None` branch below: `None` is a legitimate value
-                # for `output_dir` and an unusable one for a quantity.
-                values[spec.name] = validated_number(spec.name, raw_value)
-            elif raw_value is None:
-                values[spec.name] = None
-            else:
-                values[spec.name] = spec.caster(raw_value)
+            try:
+                raw_value = _validated_option_type(spec, args.get(spec.name, default))
+                if spec.boolean:
+                    values[spec.name] = _coerce_bool(raw_value, bool(default))
+                elif spec.name in NUMERIC_OPTION_DOMAINS:
+                    # Before the `None` branch below: `None` is a legitimate value
+                    # for `output_dir` and an unusable one for a quantity.
+                    values[spec.name] = validated_number(spec.name, raw_value)
+                elif raw_value is None:
+                    values[spec.name] = None
+                else:
+                    values[spec.name] = spec.caster(raw_value)
+            except DistillError as exc:
+                _annotate_configured_refusal(exc, args, spec.name)
+                raise
         options = cls(
             whisper_model=values["whisper_model"],
             whisper_language=values["whisper_language"],
@@ -359,11 +426,15 @@ class DistillOptions:
             resume_partial=values["resume_partial"],
         )
         if options.cache_mode not in {"fingerprint", "content"}:
-            raise DistillError(
-                "E_BAD_OPTIONS",
-                "options",
-                "cache_mode must be 'fingerprint' or 'content'",
-                {"cache_mode": options.cache_mode},
+            raise _annotate_configured_refusal(
+                DistillError(
+                    "E_BAD_OPTIONS",
+                    "options",
+                    "cache_mode must be 'fingerprint' or 'content'",
+                    {"cache_mode": options.cache_mode},
+                ),
+                args,
+                "cache_mode",
             )
         # Every numeric floor is `NUMERIC_OPTION_DOMAINS`, applied above as the
         # value is read. A check here would run after construction, which is

@@ -30,6 +30,7 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .cache_doctor import inspect_cache
+from .config import resolve_options
 from .errors import DistillError, WarningRecord, aggregate_warnings
 from .frame_selection import select_keyframes
 from .job_store import JobOutcome, JobStore
@@ -41,7 +42,12 @@ from .local_vision import (
     try_interpret_image,
 )
 from .ocr import ocr_frames
-from .options import DistillOptions, validated_count, validated_number
+from .options import (
+    GENERAL_OPTION_NAMES,
+    DistillOptions,
+    validated_count,
+    validated_number,
+)
 from .progress import (
     TERMINAL_PROGRESS_STATUSES,
     OverallProgressAggregator,
@@ -994,6 +1000,18 @@ def _prune_policy(args: dict[str, Any]) -> PrunePolicy:
     )
 
 
+def configured_args(args: dict[str, Any]) -> dict[str, Any]:
+    """`args` with the configured layers folded in: CLI > env > file > default.
+
+    A processing tool gets this inside `DistillOptions.from_args`, where the
+    options it resolves are then cast and validated. The tools that read an
+    output root without building options - prune, doctor, job status - ask for
+    it here, so `distill cache-doctor` reports on the root a run would publish
+    into rather than on the default one while runs go somewhere else.
+    """
+    return resolve_options(args, general_keys=GENERAL_OPTION_NAMES)
+
+
 def cleanup_distill_cache(args: dict[str, Any]) -> dict[str, Any]:
     """Prune the cache under an output root, or report what pruning would remove.
 
@@ -1006,7 +1024,7 @@ def cleanup_distill_cache(args: dict[str, Any]) -> dict[str, Any]:
     empty it is (R-57). `cache-doctor` is the surface for asking that question
     without the ability to answer it destructively.
     """
-    root = validate_output_root(args.get("output_dir"))
+    root = validate_output_root(configured_args(args).get("output_dir"))
     store = BundleStore.open(root)
     plan = store.plan_prune(_prune_policy(args))
     dry_run = bool_arg(args.get("dry_run"), True)
@@ -1038,7 +1056,7 @@ def cache_doctor(args: dict[str, Any]) -> dict[str, Any]:
     be safe to run first has to be safe to run against a path the user mistyped,
     and creating a directory to report that it is empty is a mutation.
     """
-    root = validate_output_root(args.get("output_dir"), create=False)
+    root = validate_output_root(configured_args(args).get("output_dir"), create=False)
     policy = _prune_policy(args)
     return inspect_cache(
         root,
@@ -1048,7 +1066,7 @@ def cache_doctor(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_job_status(args: dict[str, Any]) -> dict[str, Any]:
-    root = validate_output_root(args.get("output_dir"))
+    root = validate_output_root(configured_args(args).get("output_dir"))
     job_id = str(args.get("job_id", ""))
     # An identifier outside the domain names no record, so it is refused here
     # rather than mapped onto whichever record it happens to resemble (R-18).

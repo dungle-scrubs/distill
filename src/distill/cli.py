@@ -326,8 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     directory.add_argument(
         "--continue-on-error", action=argparse.BooleanOptionalAction, default=None
     )
-    directory.add_argument("--output-dir")
-    directory.add_argument("--job-id")
+    _add_common_processing_options(directory)
 
     playlist = subcommands.add_parser(
         "process-youtube-playlist", help="Process a YouTube playlist or channel"
@@ -415,7 +414,7 @@ def _dispatch(argv: list[str] | None) -> None:
             )
         )
     elif args.command == "process-video-directory":
-        keys = ("recursive", "max_items", "continue_on_error", "output_dir", "job_id")
+        keys = (*PROCESSING_KEYS, "recursive", "max_items", "continue_on_error")
         _print_json(
             call_registered_tool(
                 "process_video_directory",

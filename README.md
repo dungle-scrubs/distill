@@ -92,7 +92,8 @@ distill cleanup-cache --keep-generations 3 --dry-run
 ## Output layout
 
 Output lands under `~/.cache/distill` by default; override the root with
-`--output-dir`. A run that does the work publishes one **generation** into the
+`--output-dir`, with `DISTILL_OUTPUT_DIR`, or with `output_dir` in a config file
+(see [Configuration](#configuration)). A run that does the work publishes one **generation** into the
 **bundle** that its **bundle key** names; a run that hits the cache publishes
 nothing and serves the generation already there:
 
@@ -121,8 +122,8 @@ the records.
 
 An output root must be a subdirectory of `$HOME` or of the system temp
 directory - neither directory itself - and Distill refuses one inside a
-sensitive path such as `~/.ssh` or `~/.aws`. `~/.distill` is the *config*
-directory (override with `DISTILL_CONFIG_DIR`), not an output root.
+sensitive path such as `~/.ssh` or `~/.aws`. Configuration and output roots are
+separate settings. Configuring one does not configure the other.
 
 ### How a source is matched to its bundle
 
@@ -157,6 +158,60 @@ impose. It has no CLI flag - it is a tool argument:
 distill call-tool process_local_video \
   --args '{"path": "./demo.mp4", "cache_mode": "content"}'
 ```
+
+## Configuration
+
+Configuration is read from one directory. An absolute `DISTILL_CONFIG_DIR` is
+authoritative even when the directory does not exist; in that case there is no
+config file and no lower directory is consulted. Without an absolute explicit
+override, `$XDG_CONFIG_HOME/distill`, then `~/.config/distill`, then
+`~/.distill` are considered. The first existing directory is read and the rest
+are not. Relative `DISTILL_CONFIG_DIR` and `XDG_CONFIG_HOME` values are ignored
+so configuration never depends on the process working directory.
+
+`distill.json` in that directory configures a run. Recognized top-level keys
+come from the same option table used by processing tools. `job_id` is excluded
+because it identifies one invocation. `cache_mode` is the exception to the CLI
+flag surface: it is configurable here and remains a tool argument accepted
+through `call-tool --args`. The nested `local_vision` object, and
+`distill.local-vision.json` beside it, configure the vision client:
+
+```json
+{
+  "output_dir": "~/media/distill",
+  "max_keyframes": 40,
+  "local_vision": { "model": "mlx-community/Qwen3-VL-8B-Instruct-8bit" }
+}
+```
+
+A `distill.json` that cannot be parsed, cannot be read, or does not hold a JSON
+object ends the command with `E_BAD_OPTIONS` naming the file and what was wrong
+with it. It is not treated as an empty file: a run that quietly fell back to the
+defaults for every option you meant to set would produce a bundle you did not
+ask for. Unknown top-level keys are refused for the same reason. A file that is
+simply not there is the ordinary case and configures nothing.
+
+General values use the same option table and numeric domains regardless of
+source, but the outer refusal surface can differ. For example,
+`--max-keyframes 2.5` is rejected by argparse with a usage message, while
+`"max_keyframes": 2.5` in `distill.json` reaches the option table and is
+refused as `E_BAD_OPTIONS` naming the file.
+
+`distill.local-vision.json` and the nested `local_vision` object keep their own
+forgiving reader. A malformed file or unusable timeout falls back to defaults,
+which can cost captions without ending the run. Endpoint policy is different:
+a forbidden scheme or host is a fatal `E_BAD_OPTIONS`, because silently
+ignoring a configured endpoint would hide that the operator's configuration
+was not used.
+
+A value can come from four places, and the first of these that names it wins:
+the command line, then the environment, then the config file, then Distill's
+own defaults. `DISTILL_OUTPUT_DIR` is the only option the environment sets - it
+answers where this machine keeps its bundles, which is a property of the machine
+rather than of the processing being asked for. The other `DISTILL_*` variables
+(`DISTILL_TRACEBACK`, `DISTILL_LOCAL_VISION_DEBUG`,
+`DISTILL_EFFECTIVE_TIMEOUT_MS`, `DISTILL_ENABLE_LONG_TIMEOUT_PROBE`) steer
+diagnosis and are not options: none of them changes what a run produces.
 
 ## Commands
 
@@ -195,7 +250,7 @@ stdout's contents survives a descriptor the caller broke.
 | --- | --- |
 | `process-local-video PATH` | Process one local video file into a bundle. |
 | `process-youtube-video URL` | Download and process one personal-use YouTube video. |
-| `process-video-directory PATH` | Process every video in a directory. Flags: `--recursive`, `--max-items`, `--continue-on-error/--no-continue-on-error`, `--output-dir`, `--job-id`. |
+| `process-video-directory PATH` | Process every video in a directory. Flags: `--recursive`, `--max-items`, `--continue-on-error/--no-continue-on-error`, plus the processing options. |
 | `process-youtube-playlist URL` | Process videos from a YouTube playlist or channel URL. Flags: `--max-items`, `--continue-on-error/--no-continue-on-error`, plus the processing options. |
 | `cleanup-cache` | Prune old cache bundles. Flags: `--output-dir`, `--max-age-days`, `--keep-generations`, `--dry-run/--no-dry-run`. |
 | `cache-doctor` | Report what is under an output root - bundles, active generations, orphan generations, locks, a prune preview - and change nothing. Flags: `--output-dir`, `--max-age-days`, `--keep-generations`. |
@@ -207,7 +262,7 @@ stdout's contents survives a descriptor the caller broke.
 | `call-tool TOOL [--args JSON]` | Call any registered tool by its MCP-style name with a JSON arguments object. Prints the MCP envelope, so the tool's own JSON is the string at `.result.content[0].text` rather than the printed document itself. |
 
 The processing commands (`process-local-video`, `process-youtube-video`,
-`process-youtube-playlist`) share these options: `--whisper-model`,
+`process-video-directory`, `process-youtube-playlist`) share these options: `--whisper-model`,
 `--whisper-language`, `--ocr`/`--no-ocr`, `--ocr-language`, `--ocr-preprocess`,
 `--redact-secrets`/`--no-redact-secrets`, `--max-keyframes`, `--min-interval-sec`,
 `--max-duration-sec`, `--vad-filter`/`--no-vad-filter`, `--max-static-window-sec`,
