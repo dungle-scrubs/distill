@@ -35,7 +35,7 @@ from typing import Any
 import pytest
 
 from distill import pipeline
-from distill.artifacts import FrameArtifact, RedactionState
+from distill.artifacts import FrameArtifact, Provenance, RedactionState
 from distill.bundle_store import (
     STAGE_RESULT_SCHEMA_VERSION,
     BundleRun,
@@ -183,6 +183,11 @@ def resuming_run(
             source_fingerprint="fingerprint",
             source_hash=BUNDLE_KEY,
             warnings=[],
+            provenance=Provenance(
+                title=video.name,
+                duration_sec=1.0,
+                processed_at="2026-07-29T14:20:00Z",
+            ),
         ),
         options=DistillOptions(caption_frames=False, job_id="job-1"),
         output_root=output_root,

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,6 +34,7 @@ from distill.source import (
     YouTubeDownloaderProtocol,
     YouTubeMetadata,
     YouTubeSourceProvider,
+    _first_description_paragraph,
     source_hash,
     youtube_metadata,
 )
@@ -146,6 +149,27 @@ def test_youtube_metadata_uses_uploader_when_channel_is_absent(
     assert metadata.channel == "Fallback Uploader"
 
 
+def test_youtube_metadata_uses_uploader_when_channel_is_whitespace(
+    fake_tool: Callable[[str, str], Path],
+) -> None:
+    fake_tool(
+        "yt-dlp",
+        """
+import json
+
+print(json.dumps({
+    "id": "abcdefghijk",
+    "channel": "   ",
+    "uploader": "  Fallback Uploader  ",
+}))
+""",
+    )
+
+    metadata = youtube_metadata("https://youtu.be/abcdefghijk")
+
+    assert metadata.channel == "Fallback Uploader"
+
+
 def test_youtube_metadata_preserves_the_full_description_for_existing_callers(
     fake_tool: Callable[[str, str], Path],
 ) -> None:
@@ -154,6 +178,13 @@ def test_youtube_metadata_preserves_the_full_description_for_existing_callers(
     metadata = youtube_metadata("https://youtu.be/abcdefghijk")
 
     assert metadata.description == "First paragraph.\n\nSecond paragraph."
+
+
+@pytest.mark.parametrize("separator", ["\r", "\u2029"])
+def test_first_description_paragraph_stops_at_non_lf_paragraph_separators(
+    separator: str,
+) -> None:
+    assert _first_description_paragraph(f"first{separator}second") == "first"
 
 
 def test_local_source_provenance_uses_only_the_original_basename_and_measured_facts(
@@ -239,7 +270,68 @@ def test_youtube_source_combines_metadata_with_measured_provenance(
         lease.release()
 
 
-def test_failed_youtube_metadata_lookup_warns_and_keeps_processing(
+def test_a_tool_returned_secret_shaped_id_never_reaches_the_manifest(
+    fake_tool: Callable[[str, str], Path],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    secret = "sk-live-0123456789abcdefghij"
+    fake_tool(
+        "yt-dlp",
+        f"""
+import json
+
+print(json.dumps({{
+    "id": "{secret}",
+    "title": "Release notes",
+}}))
+""",
+    )
+    video = tmp_path / "source.mp4"
+    video.write_bytes(b"video")
+    lease = AcquisitionLease.take("abcdefghijk", tmp_path / "youtube.lock")
+    assert lease is not None
+
+    class FakeDownloader:
+        def acquire(
+            self,
+            url: str,
+            lock_key: str,
+            progress: ProgressReporter | None = None,
+        ) -> AcquiredSource:
+            _ = (url, lock_key, progress)
+            return AcquiredSource(path=video, lease=lease)
+
+    monkeypatch.setattr("distill.source.check_disk_floor", lambda _path: None)
+    monkeypatch.setattr("distill.source.probe_duration", lambda _path: (12.5, []))
+
+    source = YouTubeSourceProvider().resolve(
+        SourceRequest(
+            "https://youtu.be/abcdefghijk",
+            DistillOptions(),
+            processed_at="2026-07-29T14:20:00Z",
+            output_root=tmp_path,
+        ),
+        downloader=FakeDownloader(),
+    )
+
+    try:
+        manifest = manifest_document(
+            source,
+            DistillOptions(),
+            transcript_present=False,
+            frames=[],
+            warnings=source.warnings,
+        )
+        assert secret not in json.dumps(manifest)
+        assert manifest["provenance"]["canonical_url"] == (
+            "https://www.youtube.com/watch?v=abcdefghijk"
+        )
+    finally:
+        lease.release()
+
+
+def test_youtube_metadata_exception_warns_and_keeps_processing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -312,6 +404,27 @@ def test_nonzero_youtube_metadata_lookup_yields_partial_metadata(
     ]
 
 
+def test_non_object_youtube_metadata_json_yields_partial_metadata(
+    fake_tool: Callable[[str, str], Path],
+) -> None:
+    fake_tool(
+        "yt-dlp",
+        """
+import json
+
+print(json.dumps("scalar-json"))
+""",
+    )
+
+    metadata = youtube_metadata("https://youtu.be/abcdefghijk")
+
+    assert metadata.video_id == "abcdefghijk"
+    assert metadata.title is None
+    assert [item["code"] for item in metadata.warnings] == [
+        "metadata_unavailable"
+    ]
+
+
 def test_youtube_resolution_reuses_one_request_for_cache_and_acquisition(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -359,6 +472,68 @@ def test_youtube_resolution_reuses_one_request_for_cache_and_acquisition(
 
     assert len(seen) == 2
     assert seen[0] is seen[1]
+
+
+def test_provenance_survives_when_a_cache_hit_is_removed_before_begin(
+    tmp_path: Path,
+) -> None:
+    options = DistillOptions()
+    video_id = "abcdefghijk"
+    fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
+    bundle_key = source_hash(fingerprint, options.opts_hash("youtube"))
+    original = SourceInfo(
+        source_type="youtube",
+        resolved_path=tmp_path / "source.mp4",
+        duration_sec=12.5,
+        source_fingerprint=fingerprint,
+        source_hash=bundle_key,
+        warnings=[],
+        provenance=Provenance(
+            title="Release notes",
+            channel="Distill Channel",
+            canonical_url=f"https://www.youtube.com/watch?v={video_id}",
+            duration_sec=12.5,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
+    )
+    store = BundleStore.open(tmp_path)
+    first_run = store.begin(bundle_key)
+    assert isinstance(first_run, BundleRun)
+    first_run.write_render("# Video\n")
+    first = first_run.commit(
+        manifest_document(
+            original,
+            options,
+            transcript_present=False,
+            frames=[],
+            warnings=[],
+        )
+    )
+
+    cached = YouTubeSourceProvider().cached_for_video_id(
+        SourceRequest(
+            f"https://youtu.be/{video_id}",
+            options,
+            output_root=tmp_path,
+        ),
+        video_id,
+    )
+    assert cached is not None
+    shutil.rmtree(first.root)
+    replacement_run = store.begin(bundle_key)
+    assert isinstance(replacement_run, BundleRun)
+    replacement_run.write_render("# Video\n")
+    replacement = replacement_run.commit(
+        manifest_document(
+            cached,
+            options,
+            transcript_present=False,
+            frames=[],
+            warnings=[],
+        )
+    )
+
+    assert replacement.manifest["provenance"] == first.manifest["provenance"]
 
 
 def test_manifest_serializes_redacted_provenance_without_the_raw_secret(
@@ -428,7 +603,7 @@ def test_manifest_refuses_a_provenance_carrier_whose_policy_never_ran() -> None:
         )
 
 
-def test_manifest_schema_keeps_provenance_optional_but_typed_when_present() -> None:
+def test_manifest_schema_keeps_provenance_optional_but_validates_it_when_present() -> None:
     source = SourceInfo(
         source_type="local",
         resolved_path=Path("/tmp/demo.mp4"),
@@ -436,22 +611,62 @@ def test_manifest_schema_keeps_provenance_optional_but_typed_when_present() -> N
         source_fingerprint="fingerprint",
         source_hash="bundle-key",
         warnings=[],
+        provenance=Provenance(
+            title="demo.mp4",
+            duration_sec=12.5,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
     )
-    legacy = manifest_document(
+    current = manifest_document(
         source,
         DistillOptions(),
         transcript_present=False,
         frames=[],
         warnings=[],
     )
+    legacy = {key: value for key, value in current.items() if key != "provenance"}
     validate_manifest_schema(legacy, require_active_generation=False)
 
-    invalid = {**legacy, "provenance": "attacker-chosen text"}
-    with pytest.raises(DistillError) as raised:
-        validate_manifest_schema(invalid, require_active_generation=False)
+    invalid_provenance_documents = [
+        {
+            "title": ["not", "text"],
+            "duration_sec": "wrong",
+            "processed_at": "not-a-time",
+        },
+        {
+            "duration_sec": float("nan"),
+            "processed_at": "2026-07-29T14:20:00Z",
+        },
+        {
+            "duration_sec": 12.5,
+            "processed_at": "2026-07-29T14:20:00+00:00",
+        },
+        {
+            "channel": 42,
+            "duration_sec": 12.5,
+            "processed_at": "2026-07-29T14:20:00Z",
+        },
+        {
+            "canonical_url": "https://example.com/watch?v=abcdefghijk",
+            "duration_sec": 12.5,
+            "processed_at": "2026-07-29T14:20:00Z",
+        },
+        {
+            "duration_sec": 12.5,
+            "processed_at": "2026-07-29T14:20:00Z",
+            "unknown": "field",
+        },
+        "attacker-chosen text",
+    ]
+    for provenance in invalid_provenance_documents:
+        with pytest.raises(DistillError) as raised:
+            validate_manifest_schema(
+                {**legacy, "provenance": provenance},
+                require_active_generation=False,
+            )
 
-    assert raised.value.code == "E_BAD_MANIFEST"
-    assert raised.value.details["field"] == "provenance"
+        assert raised.value.code == "E_BAD_MANIFEST"
+        assert raised.value.details["field"].startswith("provenance")
 
 
 def test_manifest_refuses_contradictory_source_and_provenance_durations() -> None:

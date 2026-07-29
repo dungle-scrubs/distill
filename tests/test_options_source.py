@@ -848,7 +848,7 @@ def test_probe_duration_reports_the_truncation_its_probe_recorded(
 FAKE_YTDLP_METADATA_FLOODS_STDERR = f"""
 import json, sys
 
-sys.stdout.write(json.dumps({{"id": "abc123", "description": "hello"}}))
+sys.stdout.write(json.dumps({{"id": "abcdefghijk", "description": "hello"}}))
 sys.stderr.write("x" * ({OUTPUT_CAP_BYTES} + 1024))
 """
 
@@ -859,9 +859,9 @@ def test_youtube_metadata_carries_its_invocations_truncation_warning(
     """R-33: metadata that parsed is not proof the invocation lost nothing."""
     fake_tool("yt-dlp", FAKE_YTDLP_METADATA_FLOODS_STDERR)
 
-    metadata = youtube_metadata("https://youtu.be/abc123")
+    metadata = youtube_metadata("https://youtu.be/abcdefghijk")
 
-    assert metadata.video_id == "abc123"
+    assert metadata.video_id == "abcdefghijk"
     assert [item["code"] for item in metadata.warnings] == [TRUNCATION_WARNING_CODE]
 
 

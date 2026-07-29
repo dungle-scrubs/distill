@@ -128,7 +128,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from .artifacts import (
     Carrier,
@@ -226,6 +226,30 @@ IDENTITY_FIELDS = ("bundle_key", "source_hash")
 bundle rather than a source. Both are accepted as identity; only `bundle_key` is
 written from here on.
 """
+
+PROVENANCE_FIELDS = frozenset(
+    {
+        "title",
+        "channel",
+        "description",
+        "upload_date",
+        "canonical_url",
+        "duration_sec",
+        "processed_at",
+    }
+)
+PROVENANCE_OPTIONAL_TEXT_FIELDS = (
+    "title",
+    "channel",
+    "description",
+    "upload_date",
+)
+PROVENANCE_RFC3339_UTC_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
+)
+PROVENANCE_CANONICAL_URL_RE = re.compile(
+    r"https://www\.youtube\.com/watch\?v=[0-9A-Za-z_-]{11}"
+)
 
 LOCK_DIR_NAME = "_locks"
 """Where the run locks live: beside the bundles, not inside them.
@@ -2312,6 +2336,60 @@ def recorded_identity(manifest: dict[str, Any]) -> str | None:
     return None
 
 
+def _invalid_manifest_field(field: str, expected: str) -> DistillError:
+    return DistillError(
+        "E_BAD_MANIFEST",
+        "bundle",
+        "cache manifest schema is invalid",
+        {"field": field, "expected": expected},
+    )
+
+
+def _validate_manifest_provenance(value: object) -> None:
+    if not isinstance(value, dict):
+        raise _invalid_manifest_field("provenance", "dict")
+    provenance = cast(dict[str, object], value)
+
+    unknown = sorted(set(provenance) - PROVENANCE_FIELDS)
+    if unknown:
+        raise _invalid_manifest_field("provenance", "no unknown fields")
+
+    duration = provenance.get("duration_sec")
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(float(duration))
+    ):
+        raise _invalid_manifest_field("provenance.duration_sec", "finite number")
+
+    processed_at = provenance.get("processed_at")
+    if (
+        not isinstance(processed_at, str)
+        or PROVENANCE_RFC3339_UTC_RE.fullmatch(processed_at) is None
+    ):
+        raise _invalid_manifest_field("provenance.processed_at", "RFC3339 UTC string")
+    try:
+        datetime.fromisoformat(f"{processed_at[:-1]}+00:00")
+    except ValueError as exc:
+        raise _invalid_manifest_field(
+            "provenance.processed_at", "RFC3339 UTC string"
+        ) from exc
+
+    for name in PROVENANCE_OPTIONAL_TEXT_FIELDS:
+        if name in provenance and not isinstance(provenance[name], str):
+            raise _invalid_manifest_field(f"provenance.{name}", "str")
+
+    canonical_url = provenance.get("canonical_url")
+    if canonical_url is not None and (
+        not isinstance(canonical_url, str)
+        or PROVENANCE_CANONICAL_URL_RE.fullmatch(canonical_url) is None
+    ):
+        raise _invalid_manifest_field(
+            "provenance.canonical_url",
+            "canonical YouTube watch URL",
+        )
+
+
 def is_generation_name(name: str) -> bool:
     """Whether `name` names a **generation** (`g1`, `g2`, ...)."""
     return name.startswith(GENERATION_PREFIX) and name[len(GENERATION_PREFIX) :].isdigit()
@@ -2360,13 +2438,8 @@ def validate_manifest_schema(
                 "cache manifest schema is invalid",
                 {"field": key, "expected": expected_name},
             )
-    if "provenance" in manifest and not isinstance(manifest["provenance"], dict):
-        raise DistillError(
-            "E_BAD_MANIFEST",
-            "bundle",
-            "cache manifest schema is invalid",
-            {"field": "provenance", "expected": "dict"},
-        )
+    if "provenance" in manifest:
+        _validate_manifest_provenance(manifest["provenance"])
     if recorded_identity(manifest) is None:
         raise DistillError(
             "E_BAD_MANIFEST",

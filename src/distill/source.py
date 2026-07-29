@@ -1011,6 +1011,13 @@ def youtube_url_names_one_video(url: str) -> bool:
     return youtube_fast_path_video_id(url) is not None
 
 
+def _validated_youtube_video_id(value: object) -> str | None:
+    video_id = str(value or "").strip()
+    if YOUTUBE_VIDEO_ID_PATTERN.fullmatch(video_id) is None:
+        return None
+    return video_id
+
+
 def parse_youtube_url(url: str) -> str:
     ensure_youtube_host(url)
     parsed = urlparse(url)
@@ -1101,8 +1108,13 @@ def _metadata_unavailable() -> WarningRecord:
     )
 
 
+def _metadata_text(payload: Mapping[str, Any], name: str) -> str:
+    return str(payload.get(name) or "").strip()
+
+
 def _first_description_paragraph(description: str) -> str:
-    return re.split(r"\r?\n[ \t]*\r?\n", description.strip(), maxsplit=1)[0]
+    normalized = description.replace("\r\n", "\n").replace("\r", "\u2029")
+    return re.split(r"(?:\u2029|\n[ \t]*\n)", normalized.strip(), maxsplit=1)[0]
 
 
 def youtube_description(url: str) -> tuple[str, list[WarningRecord]]:
@@ -1142,17 +1154,20 @@ def youtube_metadata(url: str) -> YouTubeMetadata:
             payload = json.loads(proc.stdout)
         except json.JSONDecodeError:
             payload = {}
-        video_id = str(payload.get("id") or "").strip()
-        if video_id:
-            return YouTubeMetadata(
-                video_id=video_id,
-                description=str(payload.get("description") or "").strip(),
-                warnings=probe_warnings,
-                title=str(payload.get("title") or "").strip() or None,
-                channel=str(payload.get("channel") or payload.get("uploader") or "").strip()
-                or None,
-                upload_date=str(payload.get("upload_date") or "").strip() or None,
-            )
+        if isinstance(payload, Mapping):
+            video_id = _validated_youtube_video_id(payload.get("id"))
+            if video_id is not None:
+                channel = _metadata_text(payload, "channel")
+                if not channel:
+                    channel = _metadata_text(payload, "uploader")
+                return YouTubeMetadata(
+                    video_id=video_id,
+                    description=_metadata_text(payload, "description"),
+                    warnings=probe_warnings,
+                    title=_metadata_text(payload, "title") or None,
+                    channel=channel or None,
+                    upload_date=_metadata_text(payload, "upload_date") or None,
+                )
 
     video_id = youtube_fast_path_video_id(url)
     if video_id is not None:
@@ -1180,9 +1195,10 @@ def canonical_youtube_id(url: str) -> str:
             "yt-dlp could not resolve video id",
             {"stderr": proc.stderr.strip()},
         )
-    video_id = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
-    if not video_id:
-        raise DistillError("E_YTDLP", "youtube", "yt-dlp returned an empty video id")
+    raw_video_id = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    video_id = _validated_youtube_video_id(raw_video_id)
+    if video_id is None:
+        raise DistillError("E_YTDLP", "youtube", "yt-dlp returned an invalid video id")
     return video_id
 
 
@@ -1670,6 +1686,41 @@ def _manifest_related_links(
     ]
 
 
+def _manifest_provenance(
+    manifest: Mapping[str, Any],
+    options: DistillOptions,
+    *,
+    duration_sec: float,
+    processed_at: str,
+    video_id: str,
+) -> Provenance:
+    """Rebuild cached provenance as a carrier under this run's policy."""
+    recorded = manifest.get("provenance")
+    fields = recorded if isinstance(recorded, Mapping) else {}
+
+    def optional_string(name: str) -> str | None:
+        value = fields.get(name)
+        return value if isinstance(value, str) else None
+
+    return Provenance(
+        title=optional_string("title"),
+        channel=optional_string("channel"),
+        description=optional_string("description"),
+        upload_date=optional_string("upload_date"),
+        canonical_url=(
+            optional_string("canonical_url")
+            or f"https://www.youtube.com/watch?v={video_id}"
+        ),
+        duration_sec=duration_sec,
+        processed_at=optional_string("processed_at") or processed_at,
+        redaction=(
+            RedactionState.NOT_APPLIED
+            if options.redact_secrets
+            else RedactionState.DISABLED
+        ),
+    )
+
+
 class YouTubeSourceProvider:
     def cached(
         self,
@@ -1740,6 +1791,13 @@ class YouTubeSourceProvider:
             source_fingerprint=fingerprint,
             source_hash=sh,
             warnings=[],
+            provenance=_manifest_provenance(
+                manifest,
+                request.options,
+                duration_sec=duration,
+                processed_at=request.processed_at,
+                video_id=video_id,
+            ),
             youtube_video_id=video_id,
             youtube_lock_key=youtube_lock_key(video_id),
             related_links=_manifest_related_links(manifest, request.options),

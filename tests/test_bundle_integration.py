@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from distill.artifacts import FrameArtifact, Transcript
+from distill.artifacts import FrameArtifact, Provenance, Transcript
 from distill.bundle_store import (
     BundleRun,
     BundleStore,
@@ -60,6 +60,11 @@ def source(tmp_path: Path) -> SourceInfo:
         source_fingerprint="fingerprint",
         source_hash=BUNDLE_KEY,
         warnings=[],
+        provenance=Provenance(
+            title=video.name,
+            duration_sec=1.0,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
     )
 
 
@@ -73,6 +78,11 @@ def youtube_source(tmp_path: Path) -> SourceInfo:
         source_fingerprint="fingerprint",
         source_hash=BUNDLE_KEY,
         warnings=[],
+        provenance=Provenance(
+            canonical_url="https://www.youtube.com/watch?v=abcdefghijk",
+            duration_sec=1.0,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
         # Built the way a run builds them - `extract_relevant_links` is where
         # the carrier is constructed, and R-19 puts the **redaction** policy
         # there - rather than hand-written, which would describe a source no
