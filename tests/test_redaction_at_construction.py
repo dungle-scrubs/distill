@@ -27,6 +27,7 @@ from distill import pipeline as distill_session
 from distill.artifacts import (
     FrameArtifact,
     Interpretation,
+    Provenance,
     RedactionPolicyNotApplied,
     RedactionState,
     Transcript,
@@ -462,6 +463,11 @@ def source_carrying(links: list[RelatedLink]) -> SourceInfo:
         source_fingerprint="fingerprint",
         source_hash=BUNDLE_KEY,
         warnings=[],
+        provenance=Provenance(
+            canonical_url="https://www.youtube.com/watch?v=abcdefghijk",
+            duration_sec=1.0,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
         related_links=links,
     )
 
@@ -559,7 +565,7 @@ def test_a_cache_hit_reads_its_related_links_back_as_carriers(tmp_path: Path) ->
     root = tmp_path / "output"
     root.mkdir()
     options = DistillOptions()
-    video_id = "abc123"
+    video_id = "abcdefghijk"
     key = source_hash(hashlib.sha256(video_id.encode()).hexdigest(), options.opts_hash("youtube"))
     fresh = SourceInfo(
         source_type="youtube",
@@ -568,6 +574,11 @@ def test_a_cache_hit_reads_its_related_links_back_as_carriers(tmp_path: Path) ->
         source_fingerprint="fingerprint",
         source_hash=key,
         warnings=[],
+        provenance=Provenance(
+            canonical_url=f"https://www.youtube.com/watch?v={video_id}",
+            duration_sec=12.0,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
         related_links=extract_relevant_links(
             f"Skill repo: https://github.com/example/repo?api_key={SECRET}",
             source="youtube_description",
@@ -642,7 +653,12 @@ def test_a_warning_a_link_raised_at_construction_reaches_the_runs_warnings(
         description=f"Skill repo: https://github.com/example/repo?api_key={obfuscated}",
     )
 
-    assert [warning["code"] for warning in source.warnings] == ["possible_confusable_secret"]
+    assert [warning["code"] for warning in source.warnings] == [
+        "possible_confusable_secret",
+        "possible_confusable_secret",
+    ]
+    assert source.provenance is not None
+    assert "[REDACTED]" in (source.provenance.description or "")
     assert source.related_links is not None
     assert "[REDACTED]" in source.related_links[0].url
 
@@ -777,6 +793,11 @@ def test_no_file_in_a_published_generation_holds_the_secret(
         source_fingerprint="fingerprint",
         source_hash=BUNDLE_KEY,
         warnings=[],
+        provenance=Provenance(
+            canonical_url="https://www.youtube.com/watch?v=abcdefghijk",
+            duration_sec=1.0,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
         related_links=extract_relevant_links(
             f"Skill repo ({SECRET}): https://github.com/example/repo?api_key={SECRET}",
             source="youtube_description",
@@ -847,6 +868,11 @@ def test_a_newly_covered_credential_format_is_redacted_in_a_published_generation
         source_fingerprint="fingerprint",
         source_hash=BUNDLE_KEY,
         warnings=[],
+        provenance=Provenance(
+            canonical_url="https://www.youtube.com/watch?v=abcdefghijk",
+            duration_sec=1.0,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
         related_links=extract_relevant_links(
             f"Runner setup: https://gitlab.com/example/repo?private_token={gitlab_token}",
             source="youtube_description",

@@ -16,7 +16,7 @@ import pytest
 from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import pipeline as distill_session
-from distill.artifacts import FrameArtifact, Interpretation, RedactionState
+from distill.artifacts import FrameArtifact, Interpretation, Provenance, RedactionState
 from distill.bundle_store import BundleRun, BundleStore
 from distill.errors import aggregate_warnings, warning
 from distill.local_vision import (
@@ -353,6 +353,11 @@ def test_the_manifests_warning_count_counts_events_and_not_records() -> None:
             source_fingerprint="fingerprint",
             source_hash="bundle-key",
             warnings=[],
+            provenance=Provenance(
+                title="video.mp4",
+                duration_sec=1.0,
+                processed_at="2026-07-29T14:20:00Z",
+            ),
             related_links=None,
         ),
         DistillOptions(),
@@ -385,6 +390,11 @@ def test_a_manifest_warning_without_a_count_still_counts_as_one() -> None:
             source_fingerprint="fingerprint",
             source_hash="bundle-key",
             warnings=[],
+            provenance=Provenance(
+                title="video.mp4",
+                duration_sec=1.0,
+                processed_at="2026-07-29T14:20:00Z",
+            ),
             related_links=None,
         ),
         DistillOptions(),
@@ -467,6 +477,11 @@ def test_the_runs_own_fold_reaches_the_manifest_without_a_video(
         source_fingerprint="fingerprint",
         source_hash="bundlekey000",
         warnings=[warning("source", "source_metadata_missing", "no metadata")],
+        provenance=Provenance(
+            title=video.name,
+            duration_sec=2.0,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
         related_links=None,
     )
 

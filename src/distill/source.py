@@ -67,11 +67,12 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
-from .artifacts import RedactionState
+from .artifacts import Provenance, RedactionState
 from .bundle_store import (
     SINGLE_SOURCE_LOCK_WAIT_SEC,
     BundleStore,
@@ -300,6 +301,7 @@ class SourceInfo:
     source_fingerprint: str
     source_hash: str
     warnings: list[WarningRecord]
+    provenance: Provenance | None = None
     youtube_video_id: str | None = None
     youtube_lock_key: str | None = None
     related_links: list[RelatedLink] | None = None
@@ -353,23 +355,32 @@ def release_acquisition_lease(source: Any, *, during: BaseException | None = Non
         )
 
 
+def _processed_at_utc() -> str:
+    return (
+        datetime.now(UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
 @dataclass(frozen=True)
 class SourceRequest:
+    """One source resolution, with one capture time and one lock-wait budget.
+
+    `lock_wait_sec` is the caller's decision (D-044). Acquisition is where a
+    second run of one video meets the first: two runs of the same source share
+    a lock key before they contend for a bundle key, so the budget must travel
+    with the request. `processed_at` is captured once on that same request and
+    passed into provenance construction.
+    """
+
     value: str
     options: DistillOptions
     output_root: Path | None = None
     progress: ProgressReporter | None = None
     lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
-    """How long this run waits for a **lock key** another run holds (D-044).
-
-    Carried on the request because the budget is the *caller's* decision and
-    acquisition is where a second run of one video meets the first: two runs of
-    the same source share a lock key long before they contend for a **bundle
-    key**, so a downloader constructed with its own idea of the budget makes
-    D-044 unreachable for the case it was written for (finding 4-opus). The
-    values are `bundle_store`'s, so the run a user is watching waits the same
-    300 s at both locks and a batch item gives up after the same 5 s at both.
-    """
+    processed_at: str = field(default_factory=_processed_at_utc)
 
 
 @dataclass(frozen=True)
@@ -384,6 +395,9 @@ class YouTubeMetadata:
     video_id: str
     description: str
     warnings: list[WarningRecord]
+    title: str | None = None
+    channel: str | None = None
+    upload_date: str | None = None
 
 
 class YouTubeDownloaderProtocol(Protocol):
@@ -699,6 +713,17 @@ class LocalSourceProvider:
             ensure_duration_allowed(duration, options.max_duration_sec)
             if progress:
                 progress.skip_cached("duration_probe", detail={"source": "cached_manifest"})
+        provenance = Provenance(
+            title=original.name,
+            duration_sec=duration,
+            processed_at=request.processed_at,
+            redaction=(
+                RedactionState.NOT_APPLIED
+                if options.redact_secrets
+                else RedactionState.DISABLED
+            ),
+        )
+        warnings.extend(dict(item) for item in provenance.warnings)
         return SourceInfo(
             source_type="local",
             resolved_path=resolved,
@@ -706,6 +731,7 @@ class LocalSourceProvider:
             source_fingerprint=fingerprint,
             source_hash=bundle_key,
             warnings=warnings,
+            provenance=provenance,
         )
 
     def _served_duration(self, request: SourceRequest, bundle_key: str) -> float | None:
@@ -985,6 +1011,13 @@ def youtube_url_names_one_video(url: str) -> bool:
     return youtube_fast_path_video_id(url) is not None
 
 
+def _validated_youtube_video_id(value: object) -> str | None:
+    video_id = str(value or "").strip()
+    if YOUTUBE_VIDEO_ID_PATTERN.fullmatch(video_id) is None:
+        return None
+    return video_id
+
+
 def parse_youtube_url(url: str) -> str:
     ensure_youtube_host(url)
     parsed = urlparse(url)
@@ -1071,8 +1104,17 @@ def _metadata_unavailable() -> WarningRecord:
     return warning(
         "youtube",
         "metadata_unavailable",
-        "yt-dlp could not read YouTube description",
+        "yt-dlp could not read YouTube provenance metadata",
     )
+
+
+def _metadata_text(payload: Mapping[str, Any], name: str) -> str:
+    return str(payload.get(name) or "").strip()
+
+
+def _first_description_paragraph(description: str) -> str:
+    normalized = description.replace("\r\n", "\n").replace("\r", "\u2029")
+    return re.split(r"(?:\u2029|\n[ \t]*\n)", normalized.strip(), maxsplit=1)[0]
 
 
 def youtube_description(url: str) -> tuple[str, list[WarningRecord]]:
@@ -1093,7 +1135,17 @@ def youtube_description(url: str) -> tuple[str, list[WarningRecord]]:
 
 
 def youtube_metadata(url: str) -> YouTubeMetadata:
-    proc = _run_ytdlp(["--skip-download", "--dump-json"], url)
+    try:
+        proc = _run_ytdlp(["--skip-download", "--dump-json"], url)
+    except DistillError:
+        video_id = youtube_fast_path_video_id(url)
+        if video_id is None:
+            raise
+        return YouTubeMetadata(
+            video_id=video_id,
+            description="",
+            warnings=[_metadata_unavailable()],
+        )
     # Carried whichever branch answers: a metadata invocation that lost part of
     # its own output (R-33) is the same loss whether or not the document parsed.
     probe_warnings = list(proc.warnings)
@@ -1102,14 +1154,28 @@ def youtube_metadata(url: str) -> YouTubeMetadata:
             payload = json.loads(proc.stdout)
         except json.JSONDecodeError:
             payload = {}
-        video_id = str(payload.get("id") or "").strip()
-        if video_id:
-            return YouTubeMetadata(
-                video_id=video_id,
-                description=str(payload.get("description") or "").strip(),
-                warnings=probe_warnings,
-            )
+        if isinstance(payload, Mapping):
+            video_id = _validated_youtube_video_id(payload.get("id"))
+            if video_id is not None:
+                channel = _metadata_text(payload, "channel")
+                if not channel:
+                    channel = _metadata_text(payload, "uploader")
+                return YouTubeMetadata(
+                    video_id=video_id,
+                    description=_metadata_text(payload, "description"),
+                    warnings=probe_warnings,
+                    title=_metadata_text(payload, "title") or None,
+                    channel=channel or None,
+                    upload_date=_metadata_text(payload, "upload_date") or None,
+                )
 
+    video_id = youtube_fast_path_video_id(url)
+    if video_id is not None:
+        return YouTubeMetadata(
+            video_id=video_id,
+            description="",
+            warnings=[*probe_warnings, _metadata_unavailable()],
+        )
     video_id = canonical_youtube_id(url)
     description, metadata_warnings = youtube_description(url)
     return YouTubeMetadata(
@@ -1129,9 +1195,10 @@ def canonical_youtube_id(url: str) -> str:
             "yt-dlp could not resolve video id",
             {"stderr": proc.stderr.strip()},
         )
-    video_id = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
-    if not video_id:
-        raise DistillError("E_YTDLP", "youtube", "yt-dlp returned an empty video id")
+    raw_video_id = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    video_id = _validated_youtube_video_id(raw_video_id)
+    if video_id is None:
+        raise DistillError("E_YTDLP", "youtube", "yt-dlp returned an invalid video id")
     return video_id
 
 
@@ -1619,6 +1686,41 @@ def _manifest_related_links(
     ]
 
 
+def _manifest_provenance(
+    manifest: Mapping[str, Any],
+    options: DistillOptions,
+    *,
+    duration_sec: float,
+    processed_at: str,
+    video_id: str,
+) -> Provenance:
+    """Rebuild cached provenance as a carrier under this run's policy."""
+    recorded = manifest.get("provenance")
+    fields = recorded if isinstance(recorded, Mapping) else {}
+
+    def optional_string(name: str) -> str | None:
+        value = fields.get(name)
+        return value if isinstance(value, str) else None
+
+    return Provenance(
+        title=optional_string("title"),
+        channel=optional_string("channel"),
+        description=optional_string("description"),
+        upload_date=optional_string("upload_date"),
+        canonical_url=(
+            optional_string("canonical_url")
+            or f"https://www.youtube.com/watch?v={video_id}"
+        ),
+        duration_sec=duration_sec,
+        processed_at=optional_string("processed_at") or processed_at,
+        redaction=(
+            RedactionState.NOT_APPLIED
+            if options.redact_secrets
+            else RedactionState.DISABLED
+        ),
+    )
+
+
 class YouTubeSourceProvider:
     def cached(
         self,
@@ -1689,6 +1791,13 @@ class YouTubeSourceProvider:
             source_fingerprint=fingerprint,
             source_hash=sh,
             warnings=[],
+            provenance=_manifest_provenance(
+                manifest,
+                request.options,
+                duration_sec=duration,
+                processed_at=request.processed_at,
+                video_id=video_id,
+            ),
             youtube_video_id=video_id,
             youtube_lock_key=youtube_lock_key(video_id),
             related_links=_manifest_related_links(manifest, request.options),
@@ -1754,6 +1863,21 @@ class YouTubeSourceProvider:
             # rather than inside the link, which is bundle content and not a
             # place a **degradation** can be counted (finding 7).
             warnings.extend(dict(item) for link in related_links for item in link.warnings)
+            provenance = Provenance(
+                title=metadata.title,
+                channel=metadata.channel,
+                description=_first_description_paragraph(metadata.description) or None,
+                upload_date=metadata.upload_date,
+                canonical_url=f"https://www.youtube.com/watch?v={video_id}",
+                duration_sec=duration,
+                processed_at=request.processed_at,
+                redaction=(
+                    RedactionState.NOT_APPLIED
+                    if options.redact_secrets
+                    else RedactionState.DISABLED
+                ),
+            )
+            warnings.extend(dict(item) for item in provenance.warnings)
         except BaseException:
             acquired.lease.release()
             raise
@@ -1764,6 +1888,7 @@ class YouTubeSourceProvider:
             source_fingerprint=fingerprint,
             source_hash=source,
             warnings=warnings,
+            provenance=provenance,
             youtube_video_id=video_id,
             youtube_lock_key=lock_key,
             related_links=related_links,
@@ -1895,14 +2020,10 @@ class SourceResolver:
             if served is not None:
                 return served
         return SourceResolution(
-            self.youtube_source(
-                url,
-                options,
-                root,
+            self.youtube.resolve(
+                request,
                 downloader=downloader,
-                progress=progress,
                 metadata=metadata,
-                lock_wait_sec=lock_wait_sec,
             ),
             output_root=root,
             progress=progress,

@@ -12,6 +12,7 @@ from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import pipeline as distill_session
 from distill import source as distill_source
+from distill.artifacts import Provenance
 from distill.errors import DistillError
 from distill.local_vision import LocalVisionProbe
 from distill.progress import ProgressReporter
@@ -31,7 +32,7 @@ def test_mocked_youtube_integration_passes_through_shared_pipeline(
 ) -> None:
     video = tmp_path / "youtube.mp4"
     make_short_screencast(video)
-    lock_key = youtube_lock_key("mock-video")
+    lock_key = youtube_lock_key("abcdefghijk")
 
     def fake_resolve(
         _provider: object,
@@ -44,10 +45,15 @@ def test_mocked_youtube_integration_passes_through_shared_pipeline(
             source_type="youtube",
             resolved_path=video,
             duration_sec=1.0,
-            source_fingerprint="mock-video",
+            source_fingerprint="abcdefghijk",
             source_hash=f"youtube-{request.options.opts_hash('youtube')}",
             warnings=[],
-            youtube_video_id="mock-video",
+            provenance=Provenance(
+                canonical_url="https://www.youtube.com/watch?v=abcdefghijk",
+                duration_sec=1.0,
+                processed_at="2026-07-29T14:20:00Z",
+            ),
+            youtube_video_id="abcdefghijk",
             youtube_lock_key=lock_key,
         )
 
@@ -60,12 +66,12 @@ def test_mocked_youtube_integration_passes_through_shared_pipeline(
     monkeypatch.setattr(
         distill_source,
         "youtube_metadata",
-        lambda _url: YouTubeMetadata("mock-video", "", []),
+        lambda _url: YouTubeMetadata("abcdefghijk", "", []),
     )
 
     response = distill_session.process_youtube_video(
         {
-            "url": "https://www.youtube.com/watch?v=mock-video",
+            "url": "https://www.youtube.com/watch?v=abcdefghijk",
             "output_dir": str(tmp_path / "cache"),
             "ocr": False,
             "redact_secrets": False,
@@ -86,7 +92,7 @@ def test_cache_hit_skips_youtube_download(
 ) -> None:
     video = tmp_path / "youtube.mp4"
     make_short_screencast(video)
-    video_id = "mock-video"
+    video_id = "abcdefghijk"
     fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
     lock_key = youtube_lock_key(video_id)
     download_calls = {"count": 0}
@@ -106,6 +112,11 @@ def test_cache_hit_skips_youtube_download(
             source_fingerprint=fingerprint,
             source_hash=source_hash(fingerprint, request.options.opts_hash("youtube")),
             warnings=[],
+            provenance=Provenance(
+                canonical_url=f"https://www.youtube.com/watch?v={video_id}",
+                duration_sec=1.0,
+                processed_at="2026-07-29T14:20:00Z",
+            ),
             youtube_video_id=video_id,
             youtube_lock_key=lock_key,
         )
@@ -144,7 +155,7 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     video = tmp_path / "youtube.mp4"
     make_short_screencast(video)
     reporters: list[ProgressReporter] = []
-    video_id = "mock-video"
+    video_id = "abcdefghijk"
 
     class FakeDownloader:
         def __init__(self, output_root: Path, *, lock_wait_sec: float = 0.0) -> None:
@@ -152,7 +163,7 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
             # stand-in for one takes it too - taking a different shape here is
             # how the suite stopped noticing that production passed none.
             self.lock_wait_sec = lock_wait_sec
-            self.lock_path = output_root / "_youtube_locks" / "mock-video.lock"
+            self.lock_path = output_root / "_youtube_locks" / "abcdefghijk.lock"
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
 
         def acquire(
@@ -201,11 +212,11 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     # lease must still be held while it runs. Observing it here rather than
     # after the run is what distinguishes "held for the read lifetime" from
     # "released at some point".
-    lock_path = tmp_path / "cache" / "_youtube_locks" / "mock-video.lock"
+    lock_path = tmp_path / "cache" / "_youtube_locks" / "abcdefghijk.lock"
     held_during_read: list[bool] = []
 
     def transcribe_under_the_lease(*args: Any, **kwargs: Any) -> Any:
-        held_during_read.append(lease_is_held("mock-video", lock_path))
+        held_during_read.append(lease_is_held("abcdefghijk", lock_path))
         return fake_transcribe(*args, **kwargs)
 
     monkeypatch.setattr(distill_session, "transcribe_with_imports", transcribe_under_the_lease)
@@ -227,7 +238,7 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     assert Path(response["manifest_path"]).exists()
     assert held_during_read == [True]
     # ... and released once the run has no further use for the media.
-    assert not lease_is_held("mock-video", lock_path)
+    assert not lease_is_held("abcdefghijk", lock_path)
     assert any(
         warning["code"] == "local_vision_rapid_mlx_unavailable" for warning in response["warnings"]
     )

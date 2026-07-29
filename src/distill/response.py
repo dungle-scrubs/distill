@@ -63,7 +63,13 @@ def manifest_document(
     accepts both, because a bundle published before the rename records the old
     name and nothing will rewrite it (D-017).
     """
-    return {
+    if source.provenance is None:
+        raise AssertionError("current publication requires provenance")
+    if source.provenance.duration_sec != source.duration_sec:
+        raise AssertionError(
+            "source duration and provenance duration must describe the same measurement"
+        )
+    document = {
         "pipeline_version": PIPELINE_VERSION,
         "distill_version": DISTILL_VERSION,
         "source_type": source.source_type,
@@ -81,6 +87,11 @@ def manifest_document(
         "frames": frames,
         "warnings": warnings,
     }
+    # Provenance is deliberately outside bundle identity. A cache hit therefore
+    # carries the title recorded by the generation it serves until the caller
+    # asks for --force-reprocess.
+    document["provenance"] = serialize(source.provenance)
+    return document
 
 
 def response_related_links(links: list[RelatedLink] | None) -> list[dict[str, Any]]:
