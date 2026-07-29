@@ -65,7 +65,7 @@ from .source import (
     source_path_kind,
     validate_output_root,
 )
-from .youtube import _run_ytdlp, ensure_youtube_host
+from .youtube import ensure_youtube_host, youtube_playlist_urls
 
 TOOLS = {
     "process_local_video": "Process a local video into a transcript/keyframe markdown bundle",
@@ -934,24 +934,6 @@ def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
         }
 
     return record_job(JobStore.open(root), options.job_id, "process_video_directory", work)
-
-
-def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
-    # _run_ytdlp adds `--socket-timeout`, a `--` terminator before the URL, and
-    # maps a missing/hung yt-dlp onto clean errors. `names_one_video=False` is
-    # the one call in Distill whose subject really is a playlist: the default
-    # would have this enumerate a single video.
-    proc = _run_ytdlp(
-        ["--flat-playlist", "--print", "webpage_url"], url, names_one_video=False
-    )
-    if proc.returncode != 0:
-        raise DistillError(
-            "E_YTDLP",
-            "youtube",
-            "yt-dlp could not list playlist videos",
-            {"stderr": proc.stderr.strip()},
-        )
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()][:max_items]
 
 
 def playlist_folder_name(url: str) -> str:

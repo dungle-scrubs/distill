@@ -15,4 +15,4 @@ this constant can be and must be.
 
 from __future__ import annotations
 
-DISTILL_VERSION = "0.1.0"
+DISTILL_VERSION = "0.2.0"

@@ -345,3 +345,21 @@ def canonical_youtube_id(url: str) -> str:
     if video_id is None:
         raise DistillError("E_YTDLP", "youtube", "yt-dlp returned an invalid video id")
     return video_id
+
+
+def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
+    # _run_ytdlp adds `--socket-timeout`, a `--` terminator before the URL, and
+    # maps a missing/hung yt-dlp onto clean errors. `names_one_video=False` is
+    # the one call in Distill whose subject really is a playlist: the default
+    # would have this enumerate a single video.
+    proc = _run_ytdlp(
+        ["--flat-playlist", "--print", "webpage_url"], url, names_one_video=False
+    )
+    if proc.returncode != 0:
+        raise DistillError(
+            "E_YTDLP",
+            "youtube",
+            "yt-dlp could not list playlist videos",
+            {"stderr": proc.stderr.strip()},
+        )
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()][:max_items]
