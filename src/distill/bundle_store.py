@@ -155,6 +155,7 @@ The filename is where to look, never what is proved: what makes the directory
 Distill's is the **bundle key** recorded inside, matching the directory's name."""
 
 RENDER_NAME = "video.md"
+SELF_CONTAINED_RENDER_NAME = "video.self-contained.md"
 TRANSCRIPT_NAME = "transcript.json"
 FRAMES_DIR_NAME = "frames"
 GENERATION_PREFIX = "g"
@@ -399,6 +400,7 @@ class BundlePaths:
     manifest: Path
     transcript: Path
     markdown: Path
+    self_contained_markdown: Path
 
 
 @dataclass(frozen=True)
@@ -444,6 +446,10 @@ class BundleSnapshot:
     @property
     def markdown(self) -> Path:
         return self.generation / RENDER_NAME
+
+    @property
+    def self_contained_markdown(self) -> Path:
+        return self.generation / SELF_CONTAINED_RENDER_NAME
 
     @property
     def transcript(self) -> Path:
@@ -980,7 +986,11 @@ class BundleStore:
         if not isinstance(generation_name, str) or not is_generation_name(generation_name):
             return None
         generation = directory / generation_name
-        if not generation.is_dir() or not (generation / RENDER_NAME).is_file():
+        renders = (
+            generation / RENDER_NAME,
+            generation / SELF_CONTAINED_RENDER_NAME,
+        )
+        if not generation.is_dir() or not all(render.is_file() for render in renders):
             return None
 
         return BundleSnapshot(
@@ -1780,6 +1790,15 @@ class BundleRun:
         """
         ensure_safe_directory(self.paths.markdown, self.paths.root, create_leaf=False)
         return EMITTER.emit(self.paths.markdown, markdown)
+
+    def write_self_contained_render(self, markdown: str) -> Path:
+        """Write the **self-contained render** into the staging directory."""
+        ensure_safe_directory(
+            self.paths.self_contained_markdown,
+            self.paths.root,
+            create_leaf=False,
+        )
+        return EMITTER.emit(self.paths.self_contained_markdown, markdown)
 
     def write_transcript(self, transcript: Transcript) -> Path:
         """Write the **transcript** into the staging directory, on the same terms.
@@ -2994,7 +3013,7 @@ def publish_staging(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePaths
     promise and the file is the evidence, which is R-04 stated at the moment the
     promise is made rather than at the moment it is read.
     """
-    _require_render(paths)
+    _require_renders(paths)
     final_paths = published_paths(paths)
     published = published_manifest(manifest, final_paths)
 
@@ -3006,8 +3025,8 @@ def publish_staging(paths: BundlePaths, manifest: dict[str, Any]) -> BundlePaths
     return final_paths
 
 
-def _require_render(paths: BundlePaths) -> None:
-    """Refuse to publish a **staging directory** that holds no **render**.
+def _require_renders(paths: BundlePaths) -> None:
+    """Refuse to publish a **staging directory** missing either **render**.
 
     The path is *derived* from the directory about to be renamed rather than
     read off `paths.markdown`, because that field proves nothing about what the
@@ -3022,20 +3041,21 @@ def _require_render(paths: BundlePaths) -> None:
     reclaim. Then a regular file, because that is what "there is something to
     serve" means on disk.
     """
-    render = paths.generation / RENDER_NAME
-    confined_path(render, paths.root)
-    try:
-        state = _file_state(render)
-    except OSError as exc:
-        state = "absent"
-        LOGGER.debug("render state unreadable: %s", errno_name(exc))
-    if state != "regular":
-        raise DistillError(
-            "E_INCOMPLETE_GENERATION",
-            "bundle",
-            "a generation must carry a render before it can be published",
-            {"render": str(render), "render_state": state},
-        )
+    for name in (RENDER_NAME, SELF_CONTAINED_RENDER_NAME):
+        render = paths.generation / name
+        confined_path(render, paths.root)
+        try:
+            state = _file_state(render)
+        except OSError as exc:
+            state = "absent"
+            LOGGER.debug("render state unreadable: %s", errno_name(exc))
+        if state != "regular":
+            raise DistillError(
+                "E_INCOMPLETE_GENERATION",
+                "bundle",
+                "a generation must carry both renders before it can be published",
+                {"render": str(render), "render_state": state},
+            )
 
 
 def published_paths(paths: BundlePaths) -> BundlePaths:
@@ -3048,6 +3068,7 @@ def published_paths(paths: BundlePaths) -> BundlePaths:
         manifest=paths.root / MANIFEST_NAME,
         transcript=generation / TRANSCRIPT_NAME,
         markdown=generation / RENDER_NAME,
+        self_contained_markdown=generation / SELF_CONTAINED_RENDER_NAME,
     )
 
 
@@ -3107,4 +3128,5 @@ def stage_paths(bundle_root: Path, *, reset: bool = True) -> BundlePaths:
         manifest=bundle_root / MANIFEST_NAME,
         transcript=tmp / TRANSCRIPT_NAME,
         markdown=tmp / RENDER_NAME,
+        self_contained_markdown=tmp / SELF_CONTAINED_RENDER_NAME,
     )

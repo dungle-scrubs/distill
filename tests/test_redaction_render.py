@@ -5,7 +5,13 @@ from typing import Any
 import pytest
 
 from distill import ocr
-from distill.artifacts import FrameArtifact, Interpretation, RedactionState, Transcript
+from distill.artifacts import (
+    FrameArtifact,
+    Interpretation,
+    Provenance,
+    RedactionState,
+    Transcript,
+)
 from distill.errors import DistillError
 from distill.grounding import assess_grounding
 from distill.progress import ProgressReporter
@@ -236,8 +242,8 @@ def test_render_interleaves_frame_at_transcript_word_boundary() -> None:
                 "text": "first second third",
                 "words": [
                     {"word": "first", "start": 0.0, "end": 0.5},
-                    {"word": "second", "start": 0.5, "end": 1.5},
-                    {"word": "third", "start": 1.5, "end": 2.5},
+                    {"word": " second", "start": 0.5, "end": 1.5},
+                    {"word": " third", "start": 1.5, "end": 2.5},
                 ],
             }
         ),
@@ -247,6 +253,65 @@ def test_render_interleaves_frame_at_transcript_word_boundary() -> None:
 
     assert markdown.index("first second") < markdown.index("![Frame 1]")
     assert markdown.index("![Frame 1]") < markdown.index("third")
+
+
+def test_transcript_tokens_keep_attached_punctuation_with_and_without_a_keyframe() -> None:
+    """FAILS FIRST: stripping and joining tokens injected spaces at punctuation."""
+    markdown = render_markdown(
+        "demo.mp4",
+        10.0,
+        spoken(
+            {
+                "start": 0.0,
+                "end": 2.0,
+                "text": "co-founder",
+                "words": [
+                    {"word": "co", "start": 0.0, "end": 0.5},
+                    {"word": "-founder", "start": 0.5, "end": 1.5},
+                ],
+            },
+            {
+                "start": 3.0,
+                "end": 6.0,
+                "text": "40,000 raised",
+                "words": [
+                    {"word": "40", "start": 3.0, "end": 3.3},
+                    {"word": ",000", "start": 3.3, "end": 3.8},
+                    {"word": " raised", "start": 4.1, "end": 5.0},
+                ],
+            },
+        ),
+        [keyframe(timestamp_sec=4.0)],
+        [],
+    )
+
+    assert "```untrusted-text\nco-founder\n```" in markdown
+    assert "```untrusted-text\n40,000\n```" in markdown
+    assert "co -founder" not in markdown
+    assert "40 ,000" not in markdown
+
+
+def test_a_segment_with_only_empty_word_records_uses_its_recorded_text() -> None:
+    """FAILS FIRST: a nonempty `words` list suppressed the segment fallback."""
+    markdown = render_markdown(
+        "demo.mp4",
+        10.0,
+        spoken(
+            {
+                "start": 0.0,
+                "end": 2.0,
+                "text": "fallback transcript text",
+                "words": [
+                    {"word": "", "start": 0.0, "end": 0.5},
+                    {"word": "   ", "start": 0.5, "end": 1.5},
+                ],
+            }
+        ),
+        [],
+        [],
+    )
+
+    assert "```untrusted-text\nfallback transcript text\n```" in markdown
 
 
 def test_vad_gap_frame_renders_as_standalone_chronological_section() -> None:
@@ -268,16 +333,39 @@ def test_vad_gap_frame_renders_as_standalone_chronological_section() -> None:
 def test_content_threshold_helpers_are_documented_behavior() -> None:
     """The two thresholds `ensure_content` reads, stated against carriers.
 
-    The `blank` flag the third case used to assert is gone with the bare frame
-    dict: no producer ever set it, so it described a frame nothing could make.
-    A frame with no image is now the only useless one, and `select_keyframes`
-    drops a **keyframe** it could not extract rather than recording it.
+    A **self-contained render** deliberately omits image links, so a frame is
+    useful only when it carries OCR text or an interpretation a reader can use.
     """
     assert transcript_is_empty(spoken({"text": "ok"})) is True
     assert transcript_is_empty(spoken({"text": "okay"})) is False
     assert frames_are_useless([]) is True
-    assert frames_are_useless([keyframe()]) is False
-    assert frames_are_useless([keyframe(relative_path="")]) is True
+    assert frames_are_useless([keyframe()]) is True
+    assert frames_are_useless([keyframe(extracted_text="slide")]) is False
+    interpreted, _warnings = keyframe().with_interpretation(
+        Interpretation(visual_summary="A readable slide")
+    )
+    assert frames_are_useless([interpreted]) is False
+
+
+def test_a_slides_only_reading_is_usable_without_a_generation_path() -> None:
+    """FAILS FIRST: usability was based on `relative_path`, not a frame reading."""
+    frame = keyframe(relative_path="", extracted_text="slides-only source")
+
+    assert frames_are_useless([frame]) is False
+    markdown = render_markdown(
+        "ignored-machine-path.mp4",
+        10.0,
+        None,
+        [frame],
+        [],
+        provenance=Provenance(
+            title="slides.mp4",
+            duration_sec=10.0,
+            processed_at="2026-07-29T14:20:00Z",
+        ),
+        include_frame_links=False,
+    )
+    assert "slides-only source" in markdown
 
 
 def test_ocr_reports_frame_index_progress(monkeypatch: pytest.MonkeyPatch) -> None:

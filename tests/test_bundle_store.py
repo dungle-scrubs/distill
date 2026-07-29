@@ -58,6 +58,7 @@ def write_bundle(
         (directory / generation).mkdir()
         if render:
             (directory / generation / "video.md").write_text("# Video\n")
+            (directory / generation / "video.self-contained.md").write_text("# Video\n")
     manifest = published_manifest(
         identity_field=identity_field,
         identity=bundle_key if identity is None else identity,

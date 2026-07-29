@@ -459,7 +459,11 @@ def test_the_runs_own_fold_reaches_the_manifest_without_a_video(
         _options: DistillOptions,
         _progress: ProgressReporter,
     ) -> tuple[list[FrameArtifact], list[dict[str, Any]]]:
-        return frames, [
+        interpreted = [
+            frame.with_interpretation(Interpretation(visual_summary="A readable frame"))[0]
+            for frame in frames
+        ]
+        return interpreted, [
             *[warning("local_vision", "local_vision_timeout", "frame timed out")] * 80,
             *[warning("local_vision", "frame_text_ungrounded", "nothing to read")] * 2,
         ]

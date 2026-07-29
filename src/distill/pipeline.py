@@ -658,9 +658,22 @@ class ProcessingRun:
             warnings,
             getattr(self.source, "related_links", None),
         )
+        if self.source.provenance is None:
+            raise AssertionError("current self-contained render requires provenance")
+        self_contained_markdown = render_markdown(
+            str(self.source.resolved_path),
+            self.source.duration_sec,
+            transcript,
+            frames,
+            warnings,
+            getattr(self.source, "related_links", None),
+            provenance=self.source.provenance,
+            include_frame_links=False,
+        )
         self.progress.complete("rendering")
         self.progress.update("bundle_publish", status="running")
         run.write_render(markdown)
+        run.write_self_contained_render(self_contained_markdown)
         if transcript is not None:
             run.write_transcript(transcript)
         manifest = manifest_document(

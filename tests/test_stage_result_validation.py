@@ -129,6 +129,7 @@ def fake_select_keyframes(
             timestamp_sec=0.0,
             path=str(image),
             relative_path="frames/frame_0001.png",
+            extracted_text="recomputed frame reading",
             redaction=redaction,
         )
     ], []
