@@ -40,6 +40,7 @@ SIGNED_MODULES = (
     "bundle_store.py",
     "capabilities.py",
     "cli.py",
+    "config.py",
     "emit.py",
     "errors.py",
     "frame_selection.py",

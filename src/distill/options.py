@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 from uuid import uuid4
 
+from .config import resolve_options
 from .errors import DistillError
 from .frame_selection import CANDIDATE_TIMESTAMP_QUANTUM_SEC
 from .local_vision import (
@@ -68,6 +69,18 @@ OPTION_SPECS: tuple[OptionSpec, ...] = (
     OptionSpec("resume_partial", True, bool, boolean=True, cache_key=False),
 )
 OPTION_DEFAULTS = {spec.name: spec.default for spec in OPTION_SPECS}
+GENERAL_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS)
+"""The options a config file or an environment variable may set.
+
+The general schema is exactly the option table, so a key `distill.json` can
+carry is a key a run has - `config.py` is told this vocabulary rather than
+holding a second copy of it that could drift from the table above.
+
+The local-vision options are deliberately not here. They arrive from their own
+files through `local_vision_config_from_args`, and a top-level key naming one in
+`distill.json` is not a second way to set it (the nested `local_vision` object
+is the one way).
+"""
 
 
 @dataclass(frozen=True)
@@ -312,6 +325,11 @@ class DistillOptions:
 
     @classmethod
     def from_args(cls, args: dict[str, Any]) -> DistillOptions:
+        # The configured layers first, so a value from `distill.json` or from
+        # `DISTILL_OUTPUT_DIR` is read, cast and validated below by the code
+        # that reads a typed value. A second door for configured values is how
+        # a config file comes to accept a number the command line refuses.
+        args = resolve_options(args, general_keys=GENERAL_OPTION_NAMES)
         local_vision = local_vision_config_from_args(args)
         values: dict[str, Any] = {}
         for spec in OPTION_SPECS:

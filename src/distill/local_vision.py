@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from .artifacts import FrameArtifact, Interpretation, document_carries_a_reading
+from .config import config_dir as general_config_dir
 from .errors import DistillError, WarningRecord, aggregate_warnings, occurrences_of, warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
@@ -535,8 +536,14 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     return config
 
 
-def config_dir() -> Path:
-    return Path(os.environ.get("DISTILL_CONFIG_DIR", Path.home() / ".distill")).expanduser()
+config_dir = general_config_dir
+"""Where local-vision configuration lives: the general config directory.
+
+Re-exported rather than resolved again here, because two answers to "where does
+config live" is a machine where `distill.json` is read from one directory and
+`distill.local-vision.json` from another. `config.py` owns the resolution; this
+module owns only its own forgiving reader and coercions.
+"""
 
 
 def _read_json(path: Path) -> dict[str, Any]:

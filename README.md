@@ -92,7 +92,8 @@ distill cleanup-cache --keep-generations 3 --dry-run
 ## Output layout
 
 Output lands under `~/.cache/distill` by default; override the root with
-`--output-dir`. A run that does the work publishes one **generation** into the
+`--output-dir`, with `DISTILL_OUTPUT_DIR`, or with `output_dir` in a config file
+(see [Configuration](#configuration)). A run that does the work publishes one **generation** into the
 **bundle** that its **bundle key** names; a run that hits the cache publishes
 nothing and serves the generation already there:
 
@@ -121,8 +122,8 @@ the records.
 
 An output root must be a subdirectory of `$HOME` or of the system temp
 directory - neither directory itself - and Distill refuses one inside a
-sensitive path such as `~/.ssh` or `~/.aws`. `~/.distill` is the *config*
-directory (override with `DISTILL_CONFIG_DIR`), not an output root.
+sensitive path such as `~/.ssh` or `~/.aws`. A config directory is not an output
+root.
 
 ### How a source is matched to its bundle
 
@@ -157,6 +158,37 @@ impose. It has no CLI flag - it is a tool argument:
 distill call-tool process_local_video \
   --args '{"path": "./demo.mp4", "cache_mode": "content"}'
 ```
+
+## Configuration
+
+Configuration is read from one directory: `DISTILL_CONFIG_DIR` if it is set,
+then `$XDG_CONFIG_HOME/distill`, then `~/.config/distill`, then `~/.distill`.
+The first of those that exists is the one that is read, and the rest are not
+consulted - the directories never merge, so the file you edited is the file that
+takes effect.
+
+`distill.json` in that directory configures a run. Every top-level key names an
+option a processing command takes - `max_keyframes`, `whisper_model`,
+`output_dir` and the rest - and a configured value is validated exactly as the
+same value typed on the command line is. The nested `local_vision` object, and
+`distill.local-vision.json` beside it, configure the vision client:
+
+```json
+{
+  "output_dir": "~/media/distill",
+  "max_keyframes": 40,
+  "local_vision": { "model": "mlx-community/Qwen3-VL-8B-Instruct-8bit" }
+}
+```
+
+A value can come from four places, and the first of these that names it wins:
+the command line, then the environment, then the config file, then Distill's
+own defaults. `DISTILL_OUTPUT_DIR` is the only option the environment sets - it
+answers where this machine keeps its bundles, which is a property of the machine
+rather than of the processing being asked for. The other `DISTILL_*` variables
+(`DISTILL_TRACEBACK`, `DISTILL_LOCAL_VISION_DEBUG`,
+`DISTILL_EFFECTIVE_TIMEOUT_MS`, `DISTILL_ENABLE_LONG_TIMEOUT_PROBE`) steer
+diagnosis and are not options: none of them changes what a run produces.
 
 ## Commands
 

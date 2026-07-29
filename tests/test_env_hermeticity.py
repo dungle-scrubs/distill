@@ -21,6 +21,9 @@ LEAKED_VARIABLES = (
     "DISTILL_ENABLE_LONG_TIMEOUT_PROBE",
     # Read by local_vision's debug toggle.
     "DISTILL_LOCAL_VISION_DEBUG",
+    # Read by config's environment layer; leaking it moves every run's output
+    # root, so a test would publish bundles into the developer's own root.
+    "DISTILL_OUTPUT_DIR",
     # A variable nobody has written yet: prefix-wide clearing must cover it.
     "DISTILL_SOME_FUTURE_SETTING",
 )
@@ -47,6 +50,27 @@ def test_fixture_clears_every_inherited_distill_variable(tmp_path: Path) -> None
         # neutralization is scoped to the test and does not corrupt the process.
         for name in LEAKED_VARIABLES:
             assert os.environ[name] == "leaked-from-the-developer-shell"
+
+
+def test_fixture_clears_an_inherited_xdg_config_home(tmp_path: Path) -> None:
+    """The one config input outside the DISTILL_ namespace (R-53).
+
+    Config resolution walks `$XDG_CONFIG_HOME/distill`, so a variable the prefix
+    clearing cannot see would hand the suite the developer's own config
+    directory. It is cleared, not redirected: the throwaway HOME then carries
+    the whole chain.
+    """
+    home = tmp_path / "home"
+    config_dir = home / ".distill"
+    config_dir.mkdir(parents=True)
+
+    with pytest.MonkeyPatch.context() as leaked_shell:
+        leaked_shell.setenv("XDG_CONFIG_HOME", "/somewhere/the/developer/configured")
+
+        with pytest.MonkeyPatch.context() as environment:
+            neutralize_distill_environment(environment, home=home, config_dir=config_dir)
+
+            assert "XDG_CONFIG_HOME" not in os.environ
 
 
 def test_fixture_keeps_test_selection_switches(tmp_path: Path) -> None:

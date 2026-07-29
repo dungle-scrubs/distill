@@ -41,6 +41,13 @@ def neutralize_distill_environment(
         ):
             environment.delenv(name, raising=False)
     environment.delenv("CONFIG_DIR", raising=False)
+    # XDG_CONFIG_HOME is not in the DISTILL_ namespace and is now one of the
+    # directories config resolution walks, so an inherited one would point at
+    # the developer's own ~/.config/distill - a real distill.json steering a
+    # test run, which is the exact failure the prefix clearing above exists to
+    # prevent. Cleared rather than redirected: with it unset, resolution falls
+    # to the throwaway HOME below, which is already hermetic.
+    environment.delenv("XDG_CONFIG_HOME", raising=False)
     environment.setenv("HOME", str(home))
     environment.setenv("USERPROFILE", str(home))
     environment.setenv("DISTILL_CONFIG_DIR", str(config_dir))
