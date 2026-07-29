@@ -1185,3 +1185,39 @@ def test_valid_numbers_keep_their_json_types_in_the_current_identity_payload() -
     assert options.opts_hash("youtube") == hashlib.sha256(
         json.dumps(expected, sort_keys=True).encode()
     ).hexdigest()
+
+
+def test_a_duration_cap_and_narrow_window_that_would_build_an_unbounded_schedule_are_refused() -> None:
+    """M7.1/D-009: nothing caps max_duration_sec, so a large cap and a narrow
+    static window are a keyframe schedule bounded only by memory. The bound is
+    on the candidate count, refused at the options door before generation."""
+    from distill.errors import DistillError
+    from distill.frame_selection import MAX_CANDIDATE_SCHEDULE
+
+    with pytest.raises(DistillError) as excinfo:
+        DistillOptions.from_args(
+            {"max_duration_sec": 1_000_000_000.0, "max_static_window_sec": 0.001}
+        )
+    error = excinfo.value
+    assert error.code == "E_BAD_OPTIONS"
+    assert error.stage == "options"
+    assert str(MAX_CANDIDATE_SCHEDULE) in error.message
+    assert error.details["max_static_window_sec"] == 0.001
+
+    # The default two-hour cap at the 0.001s window floor is 7.2M candidates -
+    # also refused, because the floor is a per-window rule and the pair is what
+    # is unphysical.
+    with pytest.raises(DistillError):
+        DistillOptions.from_args({"max_static_window_sec": 0.001})
+
+
+def test_a_dense_but_bounded_schedule_is_accepted() -> None:
+    """The bound refuses the unphysical, not the merely dense: a schedule just
+    under the ceiling is a valid option tuple."""
+    from distill.frame_selection import MAX_CANDIDATE_SCHEDULE
+
+    # 3600 / 0.01 = 360_000 candidates, under the 500_000 ceiling.
+    options = DistillOptions.from_args(
+        {"max_duration_sec": 3600.0, "max_static_window_sec": 0.01}
+    )
+    assert options.max_duration_sec / options.max_static_window_sec < MAX_CANDIDATE_SCHEDULE

@@ -80,9 +80,13 @@ def test_the_smallest_expressible_window_is_admitted_and_still_advances() -> Non
     strictly increasing, and no two entries collapsing onto the same
     millisecond seek.
     """
-    assert DistillOptions.from_args({"max_static_window_sec": QUANTUM}).max_static_window_sec == (
-        QUANTUM
-    )
+    # A bounded duration cap paired with the floor window, so the pair stays
+    # under the candidate-count ceiling (M7.1): the floor is admitted, and it is
+    # the combination with an uncapped duration that is unphysical, not the
+    # window value itself.
+    assert DistillOptions.from_args(
+        {"max_static_window_sec": QUANTUM, "max_duration_sec": 100.0}
+    ).max_static_window_sec == QUANTUM
 
     schedule = filtered_candidates([0.0], 0.01, 0.0, QUANTUM)
 

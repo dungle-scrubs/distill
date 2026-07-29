@@ -27,6 +27,20 @@ from .progress import ProgressCounter, ProgressReporter
 from .run_command import CommandTimeouts, run
 
 PHASH_DISTANCE_THRESHOLD = 10
+MAX_CANDIDATE_SCHEDULE = 500_000
+"""The most candidate timestamps a schedule may hold before the option tuple
+that produced it is refused (D-009).
+
+The gap-filling walk builds one candidate every `max_static_window_sec` across
+the source, so its length is bounded by `duration / max_static_window_sec` -
+finite, but nothing caps `max_duration_sec`, so a large cap paired with a narrow
+window is a schedule bounded only by memory. There is no maximum accepted source
+duration to derive a ceiling from, so the bound is placed on the candidate count
+itself: a worst-case schedule of half a million keyframes is already far past
+any real use (a two-hour source sampled every 14 milliseconds), and past it the
+tuple is unphysical rather than merely large.
+"""
+
 CANDIDATE_TIMESTAMP_QUANTUM_SEC = 0.001
 """The smallest difference between two candidate timestamps that survives.
 
