@@ -350,10 +350,17 @@ def test_youtube_metadata_exception_warns_and_keeps_processing(
             _ = (url, lock_key, progress)
             return AcquiredSource(path=video, lease=lease)
 
+    metadata_calls: list[object] = []
+
     def fail_metadata(*_args: object, **_kwargs: object) -> object:
+        metadata_calls.append(_args)
         raise DistillError("E_YTDLP", "youtube", "metadata lookup failed")
 
-    monkeypatch.setattr("distill.source._run_ytdlp", fail_metadata)
+    # Patched where the call resolves: `youtube_metadata` invokes `_run_ytdlp`
+    # from its own module, so a patch on the `distill.source` re-export would be
+    # silently ineffective and the assertion below would pass off a real yt-dlp
+    # run as the injected failure.
+    monkeypatch.setattr("distill.youtube._run_ytdlp", fail_metadata)
     monkeypatch.setattr("distill.source.check_disk_floor", lambda _path: None)
     monkeypatch.setattr("distill.source.probe_duration", lambda _path: (12.5, []))
     fixed = "2026-07-29T14:20:00Z"
@@ -369,6 +376,7 @@ def test_youtube_metadata_exception_warns_and_keeps_processing(
     )
 
     try:
+        assert metadata_calls, "the injected metadata failure never fired"
         assert source.provenance is not None
         assert serialize(source.provenance) == {
             "canonical_url": "https://www.youtube.com/watch?v=abcdefghijk",
