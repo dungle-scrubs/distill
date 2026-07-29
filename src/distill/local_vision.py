@@ -523,9 +523,7 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     operator's configuration was ignored.
     """
     try:
-        _checked_endpoint_url(
-            config.base_url, allow_remote_endpoint=config.allow_remote_endpoint
-        )
+        _checked_endpoint_url(config.base_url, allow_remote_endpoint=config.allow_remote_endpoint)
     except EndpointRejected as exc:
         raise DistillError(
             "E_BAD_OPTIONS",
@@ -549,7 +547,7 @@ module owns only its own forgiving reader and coercions.
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
 
@@ -1550,9 +1548,7 @@ def _urlopen_json(
             # evidence the transport works and must not count toward the
             # breaker's consecutive-failure tally. It is unusable for the same
             # reason a truncated body is - hence malformed, not unavailable.
-            raise RuntimeError(
-                f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap"
-            )
+            raise RuntimeError(f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap")
         raw = payload.decode("utf-8")
     except urllib.error.HTTPError as exc:
         # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so

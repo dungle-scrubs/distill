@@ -2,15 +2,17 @@
 
 This module owns three things:
 
-- **The config directory.** `DISTILL_CONFIG_DIR`, then `$XDG_CONFIG_HOME/distill`,
-  then `~/.config/distill`, then `~/.distill`; the first that exists is *the*
-  config directory and the rest are not read. Directories do not merge, because
-  an option whose value depends on which of four directories happens to exist on
-  a particular machine is a value nobody can predict from the file they edited.
+- **The config directory.** An absolute `DISTILL_CONFIG_DIR` is authoritative,
+  including when it is absent. Without one, `$XDG_CONFIG_HOME/distill`, then
+  `~/.config/distill`, then `~/.distill` are considered; the first directory
+  that exists is *the* config directory and the rest are not read. Relative
+  environment paths are skipped. Directories do not merge, because an option
+  whose value depends on which directory happens to exist on a particular
+  machine is a value nobody can predict from the file they edited.
 - **The general schema over `distill.json`.** Every top-level key of that file
   except the nested `local_vision` object, which belongs to another owner (see
-  below). A key here names an option; a key naming nothing is passed over. What
-  is *not* passed over is the file: absent is no configuration, but unparsable,
+  below). A key here names an option; a key naming nothing is refused. What is
+  also not passed over is the file: absent is no configuration, but unparsable,
   unreadable or not-an-object is `E_BAD_OPTIONS` at stage `options` naming the
   path, because a run that falls back to the defaults for a file somebody wrote
   produces a **bundle** nobody asked for (D-011).
@@ -46,9 +48,10 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .errors import DistillError, errno_name
 
@@ -71,48 +74,93 @@ the processing being asked for (ADR-0004).
 """
 
 
+class ResolvedOptions(dict[str, Any]):
+    """Resolved values plus the file origin of values still supplied by it."""
+
+    def __init__(
+        self,
+        values: Mapping[str, Any],
+        *,
+        configured_from: Mapping[str, Path],
+    ) -> None:
+        super().__init__(values)
+        self.configured_from = dict(configured_from)
+
+
 def config_dir_candidates() -> tuple[Path, ...]:
     """The directories configuration may live in, highest precedence first.
 
     `DISTILL_CONFIG_DIR` and `$XDG_CONFIG_HOME` contribute a candidate only when
-    they are set to something: an empty variable is a variable nobody meant to
-    set, and reading `distill.json` out of the process's working directory
-    because `XDG_CONFIG_HOME=""` was exported is not configuration, it is an
-    accident.
+    they are set to an absolute path. An empty variable is a variable nobody
+    meant to set, and a relative one would read `distill.json` relative to the
+    process working directory. Neither is configuration.
     """
     candidates: list[Path] = []
     override = os.environ.get(CONFIG_DIR_ENV)
     if override:
-        candidates.append(Path(override).expanduser())
+        override_path = Path(override).expanduser()
+        if override_path.is_absolute():
+            candidates.append(override_path)
     xdg_config_home = os.environ.get(XDG_CONFIG_HOME_ENV)
     if xdg_config_home:
-        candidates.append(Path(xdg_config_home).expanduser() / "distill")
+        xdg_path = Path(xdg_config_home).expanduser()
+        if xdg_path.is_absolute():
+            candidates.append(xdg_path / "distill")
     home = Path.home()
     candidates.append(home / ".config" / "distill")
     candidates.append(home / ".distill")
     return tuple(candidates)
 
 
+def _config_directory_kind(path: Path) -> Literal["directory", "other", "absent"]:
+    """Classify one candidate, refusing when the filesystem gives no answer."""
+    try:
+        info = path.stat()
+    except (FileNotFoundError, NotADirectoryError, ValueError):
+        return "absent"
+    except OSError as exc:
+        raise _bad_config_file(
+            path,
+            "config directory could not be read",
+            errno=errno_name(exc),
+        ) from exc
+    return "directory" if stat.S_ISDIR(info.st_mode) else "other"
+
+
 def config_dir() -> Path:
     """The one directory configuration is read from.
 
-    The first candidate that exists as a directory, and when none does, the
-    highest-precedence candidate - so an operator who points `DISTILL_CONFIG_DIR`
-    at a directory they have not created yet is answered with the directory they
-    named rather than with whatever older location happens to be on the machine.
+    An absolute `DISTILL_CONFIG_DIR` explicit override is authoritative even
+    when it is absent: absence means an explicit-but-empty configuration, not
+    permission to read a lower stale directory. If it exists but is not a
+    directory, or cannot be classified, it is a typed refusal.
 
-    A path that exists but is not a directory is not a config directory, so
-    resolution continues past it: a file called `distill` under
-    `$XDG_CONFIG_HOME` holds no `distill.json` and never will.
+    Only the implicit XDG and home candidates fall through. An absent path or
+    one that is not a directory contributes no config, and the first existing
+    directory wins.
     """
+    override = os.environ.get(CONFIG_DIR_ENV)
+    if override:
+        explicit = Path(override).expanduser()
+        if explicit.is_absolute():
+            kind = _config_directory_kind(explicit)
+            if kind == "absent":
+                return explicit
+            if kind == "other":
+                raise _bad_config_file(
+                    explicit,
+                    "config directory is not a directory",
+                    errno="ENOTDIR",
+                )
+            return explicit
     candidates = config_dir_candidates()
     for candidate in candidates:
-        if candidate.is_dir():
+        if _config_directory_kind(candidate) == "directory":
             return candidate
     return candidates[0]
 
 
-def _bad_config_file(path: Path, message: str, **details: str) -> DistillError:
+def _bad_config_file(path: Path, message: str, **details: Any) -> DistillError:
     """The one refusal this module raises, so all three name the same things.
 
     `E_BAD_OPTIONS` at stage `options`, because a config file is an operator
@@ -145,8 +193,30 @@ def _read_json(path: Path) -> dict[str, Any]:
     """
     try:
         text = path.read_text()
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
+        try:
+            path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            return {}
+        except OSError as exc:
+            raise _bad_config_file(
+                path,
+                "config file presence could not be checked",
+                errno=errno_name(exc),
+            ) from exc
+        raise _bad_config_file(
+            path,
+            "config file points to a missing target",
+            errno="ENOENT",
+        ) from None
+    except NotADirectoryError:
         return {}
+    except UnicodeDecodeError as exc:
+        raise _bad_config_file(
+            path,
+            "config file is not UTF-8 text",
+            error=str(exc),
+        ) from exc
     except OSError as exc:
         raise _bad_config_file(
             path, "config file could not be read", errno=errno_name(exc)
@@ -201,7 +271,7 @@ def resolve_options(
     *,
     general_keys: Iterable[str],
     base_dir: Path | None = None,
-) -> dict[str, Any]:
+) -> ResolvedOptions:
     """`args`, with the configured layers folded in underneath it.
 
     The order is CLI > environment > file > default. The default layer is not
@@ -219,14 +289,34 @@ def resolve_options(
     unused flag, and a configured value has to survive it.
     """
     known = frozenset(general_keys)
-    resolved: dict[str, Any] = {
-        key: value for key, value in general_config(base_dir).items() if key in known
+    root = base_dir or config_dir()
+    file_options = general_config(root)
+    unknown = sorted(set(file_options) - known)
+    if unknown:
+        raise _bad_config_file(
+            root / GENERAL_CONFIG_FILENAME,
+            "config file names unknown options",
+            unknown_options=unknown,
+        )
+    file_options = {
+        key: value
+        for key, value in file_options.items()
+        if not (key == "output_dir" and value == "")
     }
-    resolved.update(
-        {key: value for key, value in environment_options().items() if key in known}
+    resolved = ResolvedOptions(
+        {key: value for key, value in file_options.items() if key in known},
+        configured_from={
+            key: root / GENERAL_CONFIG_FILENAME for key in file_options if key in known
+        },
     )
+    for key, value in environment_options().items():
+        if key not in known:
+            continue
+        resolved[key] = value
+        resolved.configured_from.pop(key, None)
     for key, value in args.items():
         if value is None and key in resolved:
             continue
         resolved[key] = value
+        resolved.configured_from.pop(key, None)
     return resolved

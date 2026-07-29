@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from distill import config, local_vision, pipeline
+from distill import cli, config, local_vision, pipeline
 from distill.config import OPTION_ENV_VARIABLES, resolve_options
 from distill.errors import DistillError
 from distill.local_vision import DEFAULT_TIMEOUT_SEC
@@ -211,6 +211,118 @@ def test_distill_config_dir_wins_over_every_other_location(
     assert DistillOptions.from_args({}).max_keyframes == 31
 
 
+def test_an_absent_explicit_config_directory_is_authoritative_and_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An explicit missing root means no config, never a lower stale config."""
+    explicit = tmp_path / "not-created"
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(explicit))
+    write_config(home() / ".config" / "distill", {"max_keyframes": 33})
+
+    assert config.config_dir() == explicit
+    assert DistillOptions.from_args({}).max_keyframes == 80
+
+
+def test_an_explicit_config_path_that_is_not_a_directory_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    explicit = tmp_path / "config-file"
+    explicit.write_text("not a directory")
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(explicit))
+
+    with pytest.raises(DistillError) as refusal:
+        DistillOptions.from_args({})
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.stage == "options"
+    assert refusal.value.details == {"path": str(explicit), "errno": "ENOTDIR"}
+
+
+@pytest.mark.parametrize(
+    ("variable", "relative_directory"),
+    [
+        ("DISTILL_CONFIG_DIR", Path("relative-config")),
+        ("XDG_CONFIG_HOME", Path("relative-xdg") / "distill"),
+    ],
+)
+def test_a_relative_config_environment_path_is_skipped(
+    variable: str,
+    relative_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Config environment paths never turn the process directory into policy."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DISTILL_CONFIG_DIR")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv(
+        variable,
+        str(relative_directory.parent if variable == "XDG_CONFIG_HOME" else relative_directory),
+    )
+    write_config(tmp_path / relative_directory, {"max_keyframes": 7})
+    write_config(home() / ".config" / "distill", {"max_keyframes": 9})
+
+    assert DistillOptions.from_args({}).max_keyframes == 9
+
+
+def test_an_unreadable_explicit_config_parent_is_a_typed_process_refusal(
+    tmp_path: Path,
+) -> None:
+    """A real process reports EACCES for the config root instead of E_INTERNAL."""
+    blocked_parent = tmp_path / "blocked"
+    explicit = blocked_parent / "config"
+    explicit.mkdir(parents=True)
+    blocked_parent.chmod(0o000)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "distill.cli", "cache-doctor"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                "PYTHONPATH": str(PACKAGE_ROOT / "src"),
+                "DISTILL_CONFIG_DIR": str(explicit),
+                "HOME": str(home()),
+            },
+        )
+    finally:
+        blocked_parent.chmod(0o700)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    record = json.loads(result.stderr)
+    assert record["code"] == "E_BAD_OPTIONS"
+    assert record["stage"] == "options"
+    assert record["details"] == {"path": str(explicit), "errno": "EACCES"}
+
+
+def test_an_unreadable_implicit_config_candidate_is_a_typed_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "distill"
+    monkeypatch.delenv("DISTILL_CONFIG_DIR")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    real_stat = Path.stat
+
+    def deny_candidate(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        if path == candidate:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", deny_candidate)
+
+    with pytest.raises(DistillError) as refusal:
+        config.config_dir()
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.stage == "options"
+    assert refusal.value.details == {"path": str(candidate), "errno": "EACCES"}
+
+
 @pytest.mark.parametrize(
     "tool",
     [pipeline.cache_doctor, pipeline.cleanup_distill_cache],
@@ -232,6 +344,49 @@ def test_a_root_reading_tool_reads_the_configured_root(
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
 
     assert tool({})["root"] == str(configured.resolve())
+
+
+def test_the_directory_command_forwards_common_processing_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def capture(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+        seen.update(tool=tool, args=args)
+        return {"ok": True}
+
+    monkeypatch.setattr(cli, "call_registered_tool", capture)
+
+    cli.main(
+        [
+            "process-video-directory",
+            "recordings",
+            "--max-keyframes",
+            "17",
+            "--no-ocr",
+            "--local-vision-model",
+            "reader",
+            "--output-dir",
+            "bundles",
+            "--job-id",
+            "batch",
+        ]
+    )
+
+    assert capsys.readouterr().err == ""
+    assert seen == {
+        "tool": "process_video_directory",
+        "args": {
+            "path": "recordings",
+            "recursive": False,
+            "max_keyframes": 17,
+            "ocr": False,
+            "local_vision_model": "reader",
+            "output_dir": "bundles",
+            "job_id": "batch",
+        },
+    }
 
 
 def test_a_job_lookup_reads_the_configured_root(
@@ -268,24 +423,43 @@ def test_the_environment_layer_names_only_the_output_root() -> None:
     assert not set(OPTION_ENV_VARIABLES.values()) & set(DIAGNOSTIC_VARIABLES)
 
 
-def test_a_config_file_cannot_introduce_a_key_that_is_not_an_option(
+def test_a_general_config_file_cannot_pin_a_job_identifier(tmp_path: Path) -> None:
+    """Run identity is per invocation even when reuse controls are configured."""
+    path = write_config(tmp_path, {"job_id": "shared-run"})
+
+    with pytest.raises(DistillError) as refusal:
+        resolve_options({}, general_keys=GENERAL_OPTION_NAMES, base_dir=tmp_path)
+
+    assert "job_id" not in GENERAL_OPTION_NAMES
+    assert {"force_reprocess", "resume_partial"} <= set(GENERAL_OPTION_NAMES)
+    assert refusal.value.details == {
+        "path": str(path),
+        "unknown_options": ["job_id"],
+    }
+
+
+def test_an_unknown_general_config_key_is_refused_with_the_file_and_keys(
     tmp_path: Path,
 ) -> None:
-    """A config file sets options, and `general_keys` is the whole list of them.
-
-    A file that names something else - a source path, a batch limit, a typo -
-    contributes nothing, so a `distill.json` can never hand a tool an argument
-    the caller did not give it.
-    """
-    write_config(tmp_path, {"path": "/etc/passwd", "max_keyframes": 9, "nonsense": 1})
-
-    resolved = resolve_options(
-        {"url": "https://youtu.be/abc"},
-        general_keys=GENERAL_OPTION_NAMES,
-        base_dir=tmp_path,
+    """A typo cannot silently produce a bundle using the default option."""
+    path = write_config(
+        tmp_path,
+        {"path": "/etc/passwd", "max_keyframes": 9, "nonsense": 1},
     )
 
-    assert resolved == {"url": "https://youtu.be/abc", "max_keyframes": 9}
+    with pytest.raises(DistillError) as refusal:
+        resolve_options(
+            {"url": "https://youtu.be/abc"},
+            general_keys=GENERAL_OPTION_NAMES,
+            base_dir=tmp_path,
+        )
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.stage == "options"
+    assert refusal.value.details == {
+        "path": str(path),
+        "unknown_options": ["nonsense", "path"],
+    }
 
 
 def test_the_local_vision_section_is_not_a_general_option(tmp_path: Path) -> None:
@@ -312,6 +486,19 @@ def test_an_unused_flag_does_not_overrule_a_configured_value(tmp_path: Path) -> 
 
     resolved = resolve_options(
         {"max_keyframes": None},
+        general_keys=GENERAL_OPTION_NAMES,
+        base_dir=tmp_path,
+    )
+
+    assert resolved == {"max_keyframes": 7}
+
+
+def test_an_empty_file_output_root_is_not_a_setting(tmp_path: Path) -> None:
+    """An empty file value follows the environment layer's no-setting rule."""
+    write_config(tmp_path, {"output_dir": "", "max_keyframes": 7})
+
+    resolved = resolve_options(
+        {},
         general_keys=GENERAL_OPTION_NAMES,
         base_dir=tmp_path,
     )
@@ -366,6 +553,44 @@ def refusal_site(error: DistillError) -> tuple[str, str]:
 
 
 @pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("ocr", {}),
+        ("ocr", "nope"),
+        ("whisper_model", {"name": "small"}),
+        ("whisper_model", None),
+        ("output_dir", {}),
+    ],
+    ids=[
+        "boolean-object",
+        "boolean-typo",
+        "text-object",
+        "text-null",
+        "output-root-object",
+    ],
+)
+def test_general_json_values_must_have_the_option_type(
+    option: str,
+    value: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """JSON types and boolean typos are refused before Python can coerce them."""
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    write_config(tmp_path, {option: value})
+
+    with pytest.raises(DistillError) as configured:
+        DistillOptions.from_args({})
+    with pytest.raises(DistillError) as typed:
+        DistillOptions.from_args({option: value})
+
+    assert configured.value.code == typed.value.code == "E_BAD_OPTIONS"
+    assert configured.value.stage == typed.value.stage == "options"
+    assert configured.value.message == typed.value.message
+    assert option in configured.value.message
+
+
+@pytest.mark.parametrize(
     "value",
     [-5, 0, 2.5, "many"],
     ids=["below-the-floor", "zero", "not-whole", "not-a-number"],
@@ -382,7 +607,7 @@ def test_a_configured_number_is_refused_where_a_typed_one_is(
     would be the one that produced a **bundle** nobody could ask for again.
     """
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
-    write_config(tmp_path, {"max_keyframes": value})
+    path = write_config(tmp_path, {"max_keyframes": value})
 
     with pytest.raises(DistillError) as configured:
         DistillOptions.from_args({})
@@ -391,7 +616,11 @@ def test_a_configured_number_is_refused_where_a_typed_one_is(
 
     assert configured.value.code == "E_BAD_OPTIONS"
     assert configured.value.stage == "options"
-    assert configured.value.to_dict() == typed.value.to_dict()
+    assert configured.value.code == typed.value.code
+    assert configured.value.stage == typed.value.stage
+    assert configured.value.message == typed.value.message
+    assert configured.value.details["configured_from"] == str(path)
+    assert "configured_from" not in typed.value.details
     assert refusal_site(configured.value) == refusal_site(typed.value)
     assert refusal_site(configured.value)[0] == "options.py"
 
@@ -433,6 +662,21 @@ def test_a_malformed_general_config_file_names_the_file_and_the_parse_failure(
     details = refusal.value.details
     assert details["path"] == str(path)
     assert "line 1" in details["error"]
+
+
+def test_a_non_utf8_general_config_file_is_refused_and_names_the_file(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "distill.json"
+    path.write_bytes(b'{"max_keyframes": "\xff"}')
+
+    with pytest.raises(DistillError) as refusal:
+        config.general_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.stage == "options"
+    assert refusal.value.message == "config file is not UTF-8 text"
+    assert refusal.value.details["path"] == str(path)
 
 
 def test_a_general_config_file_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
@@ -483,6 +727,20 @@ def test_an_absent_general_config_file_is_not_a_refusal(tmp_path: Path) -> None:
     assert config.general_config(tmp_path) == {}
 
 
+def test_a_broken_general_config_symlink_is_refused_as_present(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "distill.json"
+    path.symlink_to(tmp_path / "missing-target.json")
+
+    with pytest.raises(DistillError) as refusal:
+        config.general_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.stage == "options"
+    assert refusal.value.details == {"path": str(path), "errno": "ENOENT"}
+
+
 def test_a_local_vision_value_is_coerced_where_a_general_value_is_refused(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -523,6 +781,14 @@ def test_a_malformed_local_vision_file_is_still_read_forgivingly(tmp_path: Path)
     assert local_vision.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
 
 
+def test_a_non_utf8_local_vision_file_still_degrades_to_defaults(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "distill.local-vision.json").write_bytes(b'{"timeout_sec": "\xff"}')
+
+    assert local_vision.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
+
+
 def test_a_configured_option_changes_the_options_hash(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -540,6 +806,33 @@ def test_a_configured_option_changes_the_options_hash(
 
     assert DistillOptions.from_args({}).opts_hash("local") != default_hash
     assert "config.py" in SIGNED_MODULES
+
+
+def test_file_and_cli_values_produce_the_same_options_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    write_config(tmp_path, {"max_keyframes": 17})
+
+    from_file = DistillOptions.from_args({}).opts_hash("local")
+    from_cli = DistillOptions.from_args({"max_keyframes": 17}).opts_hash("local")
+
+    assert from_file == from_cli
+
+
+def test_file_output_roots_do_not_change_the_options_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    write_config(tmp_path, {"output_dir": str(home() / "first")})
+    first = DistillOptions.from_args({}).opts_hash("local")
+
+    write_config(tmp_path, {"output_dir": str(home() / "second")})
+    second = DistillOptions.from_args({}).opts_hash("local")
+
+    assert first == second
 
 
 def test_a_malformed_config_file_leaves_the_cli_as_the_error_object(tmp_path: Path) -> None:
