@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .config import resolve_options
 from .errors import DistillError
-from .frame_selection import CANDIDATE_TIMESTAMP_QUANTUM_SEC
+from .frame_selection import CANDIDATE_TIMESTAMP_QUANTUM_SEC, MAX_CANDIDATE_SCHEDULE
 from .local_vision import (
     DEFAULT_LOCAL_VISION_BACKEND,
     DEFAULT_LOCAL_VISION_BASE_URL,
@@ -443,6 +443,28 @@ class DistillOptions:
                 "options",
                 "local_vision_backend must be 'rapid-mlx'",
                 {"local_vision_backend": options.local_vision_backend},
+            )
+        # The candidate schedule holds one keyframe every `max_static_window_sec`
+        # across the source, and nothing caps `max_duration_sec` - so a large cap
+        # and a narrow window are a schedule bounded only by memory (D-009). The
+        # bound is on the count, checked against the cap because the source's own
+        # duration is not known here and the cap is the worst a run will process.
+        worst_case_candidates = options.max_duration_sec / options.max_static_window_sec
+        if worst_case_candidates > MAX_CANDIDATE_SCHEDULE:
+            raise _annotate_configured_refusal(
+                DistillError(
+                    "E_BAD_OPTIONS",
+                    "options",
+                    "max_duration_sec and max_static_window_sec would build a keyframe "
+                    f"schedule of more than {MAX_CANDIDATE_SCHEDULE} candidates; widen "
+                    "the window or lower the duration cap",
+                    {
+                        "max_duration_sec": options.max_duration_sec,
+                        "max_static_window_sec": options.max_static_window_sec,
+                    },
+                ),
+                args,
+                "max_static_window_sec",
             )
         return options
 
