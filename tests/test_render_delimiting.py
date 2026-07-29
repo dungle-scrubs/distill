@@ -657,7 +657,10 @@ def test_self_contained_provenance_is_classified_by_origin_below_the_preamble() 
         "upload_date": attack("provenance upload date"),
     }
     provenance = Provenance(
-        **source_chosen,
+        title=source_chosen["title"],
+        channel=source_chosen["channel"],
+        description=source_chosen["description"],
+        upload_date=source_chosen["upload_date"],
         canonical_url="https://www.youtube.com/watch?v=abcdefghijk",
         duration_sec=10.0,
         processed_at="2026-07-29T14:20:00Z",
@@ -667,8 +670,9 @@ def test_self_contained_provenance_is_classified_by_origin_below_the_preamble() 
     structure = outside_fences(markdown)
     bodies = untrusted_bodies(markdown)
     preamble = structure.split("## ")[0].lower()
+    preamble_claim = preamble.replace("\n> ", " ")
 
-    assert "provenance" in preamble
+    assert "source-chosen provenance" in preamble_claim
     for marker, value in source_chosen.items():
         assert any(value in body for body in bodies), marker
         assert value not in structure, marker
