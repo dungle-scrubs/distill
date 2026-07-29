@@ -65,6 +65,7 @@ from .source import (
     source_path_kind,
     validate_output_root,
 )
+from .youtube import _run_ytdlp, ensure_youtube_host
 
 TOOLS = {
     "process_local_video": "Process a local video into a transcript/keyframe markdown bundle",
@@ -936,8 +937,6 @@ def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
-    from .source import _run_ytdlp
-
     # _run_ytdlp adds `--socket-timeout`, a `--` terminator before the URL, and
     # maps a missing/hung yt-dlp onto clean errors. `names_one_video=False` is
     # the one call in Distill whose subject really is a playlist: the default
@@ -967,8 +966,6 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
     url = normalize_youtube_url(str(args.get("url", "")))
     if not url:
         raise DistillError("E_BAD_URL", "youtube", "url is required")
-    from .source import ensure_youtube_host
-
     # Reject non-YouTube hosts / option-injection values before any yt-dlp call.
     ensure_youtube_host(url)
     options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
