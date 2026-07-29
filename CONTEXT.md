@@ -51,6 +51,13 @@ _Avoid_: latest generation (the newest generation is not necessarily active)
 The bundle-level record that names the **active generation** and describes what
 was produced.
 
+**Machine-local claim**:
+A recorded value that is true only where it was produced — a filesystem path, a
+server address, a flag naming how one invocation was told to behave. It is not a
+fact about what a **generation** contains, and a record carrying one stops being
+true the moment it is read anywhere else.
+_Avoid_: absolute path (that is one instance of the problem, not the class)
+
 **Staging directory**:
 The mutable place a run assembles a **generation** before publishing it; never
 authoritative and never served to a reader.
@@ -103,9 +110,21 @@ what it inferred.
 The markdown account of a **generation**, written to be read by a person or an
 LLM agent.
 
+**Self-contained render**:
+A **render** that refers to no file outside itself, so it stays complete when it
+is separated from its **bundle** and read somewhere else.
+_Avoid_: standalone, exported (neither says what the property actually is)
+
 **Related link**:
 A code or reference URL recovered from a **source**'s metadata and judged
 relevant rather than promotional.
+
+**Provenance**:
+The facts saying which **source** a **generation** came from: the title, channel
+and description carried in the source's own metadata, and the canonical URL,
+duration and processing date Distill knows for itself. The source-chosen half is
+**extracted text**; the Distill-known half is Distill's own words.
+_Avoid_: metadata (a **manifest** is full of metadata that is not provenance)
 
 ### Trust and redaction
 
@@ -200,6 +219,13 @@ came from an eval may only be changed by another eval.
   one **grounding**
 - **Extracted text** flows from a **source** into **frame artifacts** and the
   **transcript**, and reaches a reader only through a **redaction sink**
+- A **generation** records the **provenance** of the **source** it came from;
+  the source-chosen half crosses the **untrusted-data boundary** like any other
+  **extracted text**
+- A **self-contained render** carries its **provenance**, because the
+  **manifest** that would otherwise answer for it is left behind
+- A **manifest** describes what a **generation** contains; a **machine-local
+  claim** describes where the producing happened and belongs to neither
 - Every **signed module** contributes to the **pipeline signature**
 - The **pipeline version** contributes to the **options hash**, and so to every
   **bundle key**
@@ -242,6 +268,21 @@ Staging directory ─────────> Generation   (indivisible: the ge
 > **Domain expert:** "Only if every **redaction sink** is covered. The render
 > is one sink. If that text is also written to disk anywhere else, that's
 > another sink, and the secret is still in the bundle."
+>
+> **Dev:** "I'll put the video's title at the top of the render as a heading, so
+> you can tell the files apart."
+> **Domain expert:** "The title is **extracted text** — whoever uploaded the
+> video wrote it. As a heading it becomes Distill's own words, at the top of the
+> document, above the warning that says which parts are untrusted. It goes
+> inside the boundary like a **related link** label does. The processing date
+> and the duration are Distill's own, so those can be prose."
+>
+> **Dev:** "The manifest records the output directory, so I know where the
+> bundle lives."
+> **Domain expert:** "You had to know where it lives to open it. That field is a
+> **machine-local claim**: it can never tell a reader something they don't
+> already have, and it becomes false the moment somebody copies the bundle. What
+> a manifest describes is what the **generation** contains."
 
 ## Flagged ambiguities
 
@@ -271,3 +312,18 @@ Staging directory ─────────> Generation   (indivisible: the ge
 - **"signed module"** was treated as a maintained list rather than a property —
   resolved: signed-ness is definitional (editing it can change bundle content),
   so an unsigned output-affecting module is a defect, not an omission.
+- **"metadata"** covered both the facts naming which **source** a **generation**
+  came from and the bookkeeping a **manifest** keeps about the run — resolved:
+  **provenance** is the source-identifying subset, and its source-chosen half is
+  **extracted text** rather than Distill's own words. A title is written by
+  whoever produced the video, so a header presenting one as Distill's own words
+  puts attacker-chosen text above the boundary that warns about it.
+- A **manifest** recorded the output directory and the resolved source path as
+  though they described the **generation** — resolved: **machine-local claim**.
+  They are facts about the machine that produced it, and they stop being true
+  when the artifact is read anywhere else.
+- **"archive"** and **"distiller"** were proposed as Distill terms — rejected:
+  Distill produces **bundles** and knows nothing about where a **render** is
+  later kept or which machine keeps it. What Distill owes such a reader is a
+  **self-contained render**; the collection and the topology are the caller's
+  vocabulary, not the domain's.
