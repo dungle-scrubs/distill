@@ -2340,6 +2340,10 @@ def validate_manifest_schema(
         "frames": list,
         "warnings": list,
     }
+    # `provenance` is optional here so bundles published before Phase 2 remain
+    # servable. Every newly resolved source supplies the carrier and
+    # `manifest_document` writes it, but an old bundle cannot be made to contain
+    # provenance without reprocessing its source.
     if require_active_generation:
         required_types["active_generation"] = str
     for key, expected_type in required_types.items():
@@ -2356,6 +2360,13 @@ def validate_manifest_schema(
                 "cache manifest schema is invalid",
                 {"field": key, "expected": expected_name},
             )
+    if "provenance" in manifest and not isinstance(manifest["provenance"], dict):
+        raise DistillError(
+            "E_BAD_MANIFEST",
+            "bundle",
+            "cache manifest schema is invalid",
+            {"field": "provenance", "expected": "dict"},
+        )
     if recorded_identity(manifest) is None:
         raise DistillError(
             "E_BAD_MANIFEST",

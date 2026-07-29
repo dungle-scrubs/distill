@@ -642,7 +642,12 @@ def test_a_warning_a_link_raised_at_construction_reaches_the_runs_warnings(
         description=f"Skill repo: https://github.com/example/repo?api_key={obfuscated}",
     )
 
-    assert [warning["code"] for warning in source.warnings] == ["possible_confusable_secret"]
+    assert [warning["code"] for warning in source.warnings] == [
+        "possible_confusable_secret",
+        "possible_confusable_secret",
+    ]
+    assert source.provenance is not None
+    assert "[REDACTED]" in (source.provenance.description or "")
     assert source.related_links is not None
     assert "[REDACTED]" in source.related_links[0].url
 

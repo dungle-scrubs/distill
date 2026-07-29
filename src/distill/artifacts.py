@@ -1,7 +1,7 @@
 """The carriers **extracted text** travels in, and the one serializer that lets it out.
 
-This module owns the shape of a **frame artifact**, a **transcript** and a
-**stage result** in memory: their fields, the field names of the
+This module owns the shape of **provenance**, a **frame artifact**, a
+**transcript** and a **stage result** in memory: their fields, the field names of the
 **interpretation** nested inside a frame artifact, *when* the **redaction**
 policy runs over them and the state that records it, the per-field 256 KiB cap
 on extracted text (R-58), the immutability of everything nested inside them, and
@@ -31,9 +31,11 @@ stages hand to the writers, so it must not depend on either side.
 from __future__ import annotations
 
 import dataclasses
+import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from functools import cache
 from types import MappingProxyType, NoneType, UnionType
@@ -52,6 +54,9 @@ EXTRACTED_TEXT_LIMIT_BYTES = 256 * 1024
 WARNING_STAGE = "artifacts"
 TRUNCATION_WARNING_CODE = "extracted_text_truncated"
 REDACTION_POLICY_NOT_APPLIED_CODE = "E_REDACTION_POLICY_NOT_APPLIED"
+_RFC3339_UTC_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
+)
 
 
 class RedactionState(StrEnum):
@@ -470,6 +475,53 @@ class Carrier(ABC):
         only supported way out, and a caller who reaches past it gets a
         structure `json` refuses rather than a silently mangled bundle file.
         """
+
+
+@dataclass(frozen=True, kw_only=True)
+class Provenance(Carrier):
+    """The facts identifying which **source** a generation came from.
+
+    `title`, `channel`, `description`, and `upload_date` are source-chosen
+    **extracted text**. `canonical_url`, `duration_sec`, and `processed_at` are
+    Distill's own words. Tool provenance belongs to the manifest and is not
+    folded into this carrier.
+    """
+
+    EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = (
+        "title",
+        "channel",
+        "description",
+        "upload_date",
+    )
+
+    duration_sec: float
+    processed_at: str
+    title: str | None = None
+    channel: str | None = None
+    description: str | None = None
+    upload_date: str | None = None
+    canonical_url: str | None = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if _RFC3339_UTC_RE.fullmatch(self.processed_at) is None:
+            raise ValueError("processed_at must be RFC 3339 UTC ending in Z")
+        try:
+            datetime.fromisoformat(f"{self.processed_at[:-1]}+00:00")
+        except ValueError as exc:
+            raise ValueError("processed_at must be RFC 3339 UTC ending in Z") from exc
+
+    def _payload(self) -> Mapping[str, Any]:
+        fields = {
+            "title": self.title,
+            "channel": self.channel,
+            "description": self.description,
+            "upload_date": self.upload_date,
+            "canonical_url": self.canonical_url,
+            "duration_sec": self.duration_sec,
+            "processed_at": self.processed_at,
+        }
+        return MappingProxyType({key: value for key, value in fields.items() if value is not None})
 
 
 @dataclass(frozen=True)
@@ -920,6 +972,7 @@ __all__ = [
     "Carrier",
     "FrameArtifact",
     "Interpretation",
+    "Provenance",
     "RedactionPolicyNotApplied",
     "RedactionState",
     "StageResult",
