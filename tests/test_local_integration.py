@@ -404,7 +404,7 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
 
     monkeypatch.setattr(distill_session, "ocr_frames", fake_ocr)
     monkeypatch.setattr(distill_session, "probe_local_vision", fake_probe)
-    monkeypatch.setattr(distill_session, "try_interpret_image", fake_interpret)
+    monkeypatch.setattr(distill_session, "try_interpret_image_after_probe", fake_interpret)
     reporter = ProgressReporter()
     monkeypatch.setattr(distill_session, "ProgressReporter", lambda **_kwargs: reporter)
 
