@@ -170,9 +170,10 @@ def test_the_endpoint_scheme_is_restricted_to_http_and_https(tmp_path: Path) -> 
 def test_the_opt_out_permits_a_non_loopback_host(tmp_path: Path) -> None:
     """R-43: an operator who says so explicitly can point the client elsewhere.
 
-    The flag travels with the rest of the local-vision config - a run that
-    reached a different endpoint produced a different bundle, so it is part of
-    the cache identity too.
+    The flag travels with the local-vision policy but not bundle identity. On a
+    loopback endpoint both values permit the same reader and produce the same
+    output. On a remote endpoint false produces no bundle, so the flag cannot
+    distinguish two bundle contents under ADR-0004.
     """
     config = local_vision_config_from_args(
         {"local_vision_base_url": PRIVATE_URL, "local_vision_allow_remote_endpoint": True},
@@ -195,10 +196,10 @@ def test_the_opt_out_permits_a_non_loopback_host(tmp_path: Path) -> None:
         caption_frames=options.caption_frames,
         allow_remote_endpoint=True,
     )
-    # Same endpoint on both sides, so only the flag can move the hash.
+    # Same loopback endpoint on both sides, so only the policy flag differs.
     permitted = DistillOptions.from_args({"local_vision_allow_remote_endpoint": True})
     assert permitted.local_vision_base_url == DistillOptions.from_args({}).local_vision_base_url
-    assert permitted.opts_hash("local") != DistillOptions.from_args({}).opts_hash("local")
+    assert permitted.opts_hash("local") == DistillOptions.from_args({}).opts_hash("local")
 
 
 def test_a_redirect_to_a_link_local_address_is_not_followed(

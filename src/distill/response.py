@@ -47,9 +47,9 @@ def manifest_document(
     staging directory became.
 
     `frames` arrives as the documents `response_frames` produced, never as
-    carriers. The manifest and the response carry the same frame document, and a
-    cache hit reads it back out of the manifest rather than rebuilding it, so
-    there is one producer of that shape and no second one to disagree with it.
+    carriers. The durable projection removes only `path`, which addresses the
+    producing machine; `relative_path` addresses the frame artifact inside its
+    generation. A cache hit reads this portable projection from the manifest.
 
     The **related links** on `source` arrive the other way round - as carriers,
     because nothing before this has serialized them - and are turned into
@@ -62,6 +62,12 @@ def manifest_document(
     legacy `source_hash` for every new manifest (finding 5-opus). Reading still
     accepts both, because a bundle published before the rename records the old
     name and nothing will rewrite it (D-017).
+
+    Machine-local claims are excluded except at two explicit compatibility
+    seams. D-006 keeps `source_resolved_path` schema-required for cache reads,
+    and warning messages remain unchanged historical diagnostics even when
+    they record a path. Invocation controls, frame paths, and progress-detail
+    paths are not part of the durable description.
     """
     if source.provenance is None:
         raise AssertionError("current publication requires provenance")
@@ -84,7 +90,12 @@ def manifest_document(
         # counts distinct (stage, code) pairs - a run that timed out eighty
         # times would publish `warning_count: 2` and read as a clean run.
         "warning_count": total_occurrences(warnings),
-        "frames": frames,
+        "frames": [
+            {key: value for key, value in frame.items() if key != "path"}
+            if isinstance(frame, dict)
+            else frame
+            for frame in frames
+        ],
         "warnings": warnings,
     }
     # Provenance is deliberately outside bundle identity. A cache hit therefore
@@ -118,17 +129,18 @@ def response_related_links(links: list[RelatedLink] | None) -> list[dict[str, An
 
 
 def response_frames(frames: list[FrameArtifact]) -> list[dict[str, Any]]:
-    """The frame shape both documents carry, produced once so they cannot diverge.
+    """The frame shape a response carries and a manifest projects from.
 
     Image text and the vision model's reading of the same frame stay separate
     fields: they are different claims about the frame, and merging them loses
     which one a reader is looking at.
 
     This is the one adapter from a **frame artifact** to the document a caller
-    and a later cache hit read, and it is the only place besides the carrier
-    itself that names these fields. The names overlap with the carrier's without
-    being the carrier's: what a stage passes along and what a reader is served
-    are two schemas, and the second one is this module's to change (D-015).
+    reads. `manifest_document` projects the same fields minus the machine-local
+    `path`; a later cache hit therefore returns the durable portable shape.
+    The names overlap with the carrier's without being the carrier's: what a
+    stage passes along and what a reader is served are two schemas, and the
+    second one is this module's to change (D-015).
 
     A carrier in and a document out, never a document in, and the way out is
     `serialize`. A **manifest** is durable and a response is what a caller

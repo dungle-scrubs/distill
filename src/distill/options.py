@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -304,13 +304,11 @@ def _annotate_configured_refusal(
 
 CACHE_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.cache_key)
 PROCESSING_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.name != "cache_mode")
-LOCAL_VISION_OPTION_NAMES = (
+LOCAL_VISION_IDENTITY_OPTION_NAMES = (
     "caption_frames",
     "local_vision_backend",
     "local_vision_model",
-    "local_vision_base_url",
     "local_vision_timeout_sec",
-    "local_vision_allow_remote_endpoint",
 )
 
 
@@ -489,7 +487,9 @@ class DistillOptions:
 
     def cache_payload(self, source_type: str) -> dict[str, Any]:
         payload = {name: getattr(self, name) for name in CACHE_OPTION_NAMES}
-        payload.update({name: getattr(self, name) for name in LOCAL_VISION_OPTION_NAMES})
+        payload.update(
+            {name: getattr(self, name) for name in LOCAL_VISION_IDENTITY_OPTION_NAMES}
+        )
         payload["pipeline_version"] = PIPELINE_VERSION
         if source_type == "local":
             payload["cache_mode"] = self.cache_mode
@@ -500,7 +500,7 @@ class DistillOptions:
         return hashlib.sha256(raw).hexdigest()
 
     def public_dict(self, source_type: str) -> dict[str, Any]:
-        payload = asdict(self)
+        payload = self.cache_payload(source_type)
+        payload.pop("pipeline_version")
         payload["opts_hash"] = self.opts_hash(source_type)
-        payload.pop("job_id", None)
         return payload

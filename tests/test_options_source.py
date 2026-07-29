@@ -133,13 +133,29 @@ def test_local_opts_hash_includes_cache_mode_but_youtube_excludes_it() -> None:
     assert fingerprint.opts_hash("youtube") == content.opts_hash("youtube")
 
 
-def test_local_vision_settings_affect_cache_key() -> None:
+def test_output_affecting_local_vision_settings_change_identity() -> None:
     no_caption = DistillOptions(caption_frames=False)
     caption = DistillOptions(caption_frames=True)
     larger_model = DistillOptions(caption_frames=True, local_vision_model="qwen3-vl:32b")
 
     assert no_caption.opts_hash("local") != caption.opts_hash("local")
     assert caption.opts_hash("local") != larger_model.opts_hash("local")
+
+
+def test_local_vision_server_address_does_not_change_the_bundle_key() -> None:
+    """FAILS FIRST: the address of an equal-output reader entered identity."""
+    first = DistillOptions.from_args(
+        {"local_vision_base_url": "http://127.0.0.1:8000/v1"}
+    )
+    second = DistillOptions.from_args(
+        {"local_vision_base_url": "http://127.0.0.1:9000/v1"}
+    )
+
+    fingerprint = "same-source"
+    assert source_hash(fingerprint, first.opts_hash("local")) == source_hash(
+        fingerprint,
+        second.opts_hash("local"),
+    )
 
 
 def test_source_hash_uses_fingerprint_and_options_hash() -> None:
@@ -1118,17 +1134,15 @@ def test_the_spacing_floor_is_the_one_numeric_option_zero_still_means_something_
     assert zero_admitted == ["min_interval_sec"]
 
 
-def test_validating_numbers_leaves_a_valid_option_tuple_hashing_as_before() -> None:
+def test_valid_numbers_keep_their_json_types_in_the_current_identity_payload() -> None:
     """R-47: validation refuses values, it does not rewrite the ones it admits.
 
     The **options hash** is sha256 over JSON, where `80` and `80.0` are
-    different text and therefore a different **bundle key**. A validator that
-    returned a float for a counted option would silently orphan every published
-    **bundle**, so the payload is compared as the JSON it is hashed as.
+    different text and therefore a different **bundle key**, so the current
+    payload is compared as the JSON it is hashed as.
     """
     from distill.local_vision import (
         DEFAULT_LOCAL_VISION_BACKEND,
-        DEFAULT_LOCAL_VISION_BASE_URL,
         DEFAULT_LOCAL_VISION_MODEL,
         DEFAULT_TIMEOUT_SEC,
     )
@@ -1139,9 +1153,7 @@ def test_validating_numbers_leaves_a_valid_option_tuple_hashing_as_before() -> N
     )
     expected = {
         "caption_frames": True,
-        "local_vision_allow_remote_endpoint": False,
         "local_vision_backend": DEFAULT_LOCAL_VISION_BACKEND,
-        "local_vision_base_url": DEFAULT_LOCAL_VISION_BASE_URL,
         "local_vision_model": DEFAULT_LOCAL_VISION_MODEL,
         "local_vision_timeout_sec": DEFAULT_TIMEOUT_SEC,
         "max_duration_sec": 7200.0,

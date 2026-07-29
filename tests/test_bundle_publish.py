@@ -530,32 +530,35 @@ def test_a_job_record_does_not_follow_a_symlink_at_the_jobs_directory(
 
 
 def test_the_snapshot_a_commit_returns_describes_what_is_on_disk(tmp_path: Path) -> None:
-    """A caller reads the returned manifest instead of re-reading the bundle.
-
-    Frame paths are recorded absolute against the **staging directory**, which
-    stops existing under that name at the rename. A snapshot carrying the
-    pre-publish document hands back paths into `.tmp.g1` - a directory that is
-    gone - while the manifest on disk carries the right ones.
-    """
+    """A caller reads the exact final manifest without re-reading the bundle."""
     root = tmp_path / "output"
     root.mkdir()
     store = BundleStore.open(root)
     run = begin_run(store)
     assemble(run.paths)
-    frame = run.paths.frames / "frame_0001.png"
-    frame.write_bytes(b"png")
     manifest = {
         **manifest_for(),
         "frame_count": 1,
-        "frames": [{"index": 1, "timestamp_sec": 0.0, "path": str(frame)}],
+        "frames": [
+            {
+                "index": 1,
+                "timestamp_sec": 0.0,
+                "relative_path": "frames/frame_0001.png",
+            }
+        ],
     }
 
     snapshot = run.commit(manifest)
 
     on_disk = json.loads((root / BUNDLE_KEY / "_manifest.json").read_text())
     assert snapshot.manifest == on_disk
-    assert snapshot.manifest["frames"][0]["path"] == str(snapshot.frames / "frame_0001.png")
-    assert ".tmp." not in snapshot.manifest["frames"][0]["path"]
+    assert snapshot.manifest["frames"] == [
+        {
+            "index": 1,
+            "timestamp_sec": 0.0,
+            "relative_path": "frames/frame_0001.png",
+        }
+    ]
 
 
 def test_commit_reports_the_generation_it_published_and_how_long_staging_took(

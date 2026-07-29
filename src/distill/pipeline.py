@@ -243,6 +243,28 @@ def progress_summary_is_terminal(progress_summary: dict[str, Any]) -> bool:
     )
 
 
+def _manifest_progress_summary(progress_summary: dict[str, Any]) -> dict[str, Any]:
+    """Project live progress into a durable summary without machine-local paths."""
+    portable = dict(progress_summary)
+    mechanisms = progress_summary.get("mechanisms")
+    if not isinstance(mechanisms, dict):
+        return portable
+    portable["mechanisms"] = {
+        name: {
+            **state,
+            "detail": {
+                key: value
+                for key, value in state.get("detail", {}).items()
+                if key != "path"
+            },
+        }
+        if isinstance(state, dict) and isinstance(state.get("detail"), dict)
+        else state
+        for name, state in mechanisms.items()
+    }
+    return portable
+
+
 def _abandon_reason(exc: BaseException) -> str:
     """Why a run gave up, in the terms the rest of Distill reports failures in.
 
@@ -637,7 +659,7 @@ class ProcessingRun:
         )
         self.progress.complete("bundle_publish", detail={"generation": run.generation_name})
         progress_summary = self.progress.aggregator.terminal_summary(self.progress.states)
-        manifest["progress"] = progress_summary
+        manifest["progress"] = _manifest_progress_summary(progress_summary)
         snapshot = run.commit(manifest)
 
         # The publish renamed the **staging directory**, so the image path each
