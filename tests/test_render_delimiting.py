@@ -38,7 +38,7 @@ from untrusted_blocks import (
     untrusted_bodies,
 )
 
-from distill.artifacts import FrameArtifact, Interpretation, Transcript
+from distill.artifacts import FrameArtifact, Interpretation, Provenance, Transcript
 from distill.emit import EMITTER, UNTRUSTED_TEXT_LABEL
 from distill.links import RelatedLink
 from distill.render import render_markdown
@@ -80,6 +80,8 @@ def render(**overrides: Any) -> str:
         "frames": [keyframe(extracted_text="slide text")],
         "warnings": [],
         "related_links": None,
+        "provenance": None,
+        "include_frame_links": True,
     }
     arguments.update(overrides)
     return render_markdown(
@@ -89,6 +91,8 @@ def render(**overrides: Any) -> str:
         arguments["frames"],
         arguments["warnings"],
         arguments["related_links"],
+        provenance=arguments["provenance"],
+        include_frame_links=arguments["include_frame_links"],
     )
 
 
@@ -590,6 +594,28 @@ def test_the_keyframe_image_link_survives_the_same_escaping() -> None:
     assert "![Frame 1](frames/frame_0001.png)" in markdown
 
 
+def test_self_contained_render_omits_frame_links_but_keeps_the_same_reading() -> None:
+    """FAILS FIRST: both render calls emitted the generation-relative image link."""
+    frame = keyframe(extracted_text="portable slide reading")
+    provenance = Provenance(
+        title="demo.mp4",
+        duration_sec=10.0,
+        processed_at="2026-07-29T14:20:00Z",
+    )
+
+    linked = render(frames=[frame])
+    self_contained = render(
+        frames=[frame],
+        provenance=provenance,
+        include_frame_links=False,
+    )
+
+    assert destinations(linked) == [FRAME_IMAGE]
+    assert destinations(self_contained) == []
+    assert "portable slide reading" in linked
+    assert "portable slide reading" in self_contained
+
+
 # --- R-24: the preamble -----------------------------------------------------
 
 
@@ -620,6 +646,40 @@ def test_the_preamble_precedes_every_piece_of_extracted_text() -> None:
     )
 
     assert markdown.index("Untrusted data") < markdown.index("demo.mp4")
+
+
+def test_self_contained_provenance_is_classified_by_origin_below_the_preamble() -> None:
+    """FAILS FIRST: the render accepted no provenance carrier or provenance region."""
+    source_chosen = {
+        "title": attack("provenance title"),
+        "channel": attack("provenance channel"),
+        "description": attack("provenance description"),
+        "upload_date": attack("provenance upload date"),
+    }
+    provenance = Provenance(
+        title=source_chosen["title"],
+        channel=source_chosen["channel"],
+        description=source_chosen["description"],
+        upload_date=source_chosen["upload_date"],
+        canonical_url="https://www.youtube.com/watch?v=abcdefghijk",
+        duration_sec=10.0,
+        processed_at="2026-07-29T14:20:00Z",
+    )
+
+    markdown = render(provenance=provenance)
+    structure = outside_fences(markdown)
+    bodies = untrusted_bodies(markdown)
+    preamble = structure.split("## ")[0].lower()
+    preamble_claim = preamble.replace("\n> ", " ")
+
+    assert "source-chosen provenance" in preamble_claim
+    for marker, value in source_chosen.items():
+        assert any(value in body for body in bodies), marker
+        assert value not in structure, marker
+    assert "Canonical URL: https://www.youtube.com/watch?v=abcdefghijk" in structure
+    assert "Source duration: 10.000s" in structure
+    assert "Processed at: 2026-07-29T14:20:00Z" in structure
+    assert markdown.index("Untrusted data") < markdown.index(source_chosen["title"])
 
 
 # --- the adversarial fixture suite ------------------------------------------

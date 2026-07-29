@@ -647,6 +647,7 @@ def write_published_bundle(
     bundle = root / bundle_key
     (bundle / "g1").mkdir(parents=True)
     (bundle / "g1" / "video.md").write_text("# cached render\n")
+    (bundle / "g1" / "video.self-contained.md").write_text("# cached render\n")
     (bundle / "g1" / "transcript.json").write_text(json.dumps({"segments": []}))
     (bundle / "_manifest.json").write_text(
         json.dumps(

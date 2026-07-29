@@ -203,6 +203,7 @@ def run_response(
         summary += f" and visual interpretation for {visual_count} frames"
     response: dict[str, Any] = {
         "markdown_path": str(snapshot.markdown),
+        "self_contained_markdown_path": str(snapshot.self_contained_markdown),
         "transcript_path": str(snapshot.transcript)
         if transcript_present and snapshot.transcript.exists()
         else None,

@@ -500,6 +500,7 @@ def test_provenance_survives_when_a_cache_hit_is_removed_before_begin(
     first_run = store.begin(bundle_key)
     assert isinstance(first_run, BundleRun)
     first_run.write_render("# Video\n")
+    first_run.write_self_contained_render("# Video\n")
     first = first_run.commit(
         manifest_document(
             original,
@@ -523,6 +524,7 @@ def test_provenance_survives_when_a_cache_hit_is_removed_before_begin(
     replacement_run = store.begin(bundle_key)
     assert isinstance(replacement_run, BundleRun)
     replacement_run.write_render("# Video\n")
+    replacement_run.write_self_contained_render("# Video\n")
     replacement = replacement_run.commit(
         manifest_document(
             cached,
@@ -571,6 +573,7 @@ def test_manifest_serializes_redacted_provenance_without_the_raw_secret(
     run = BundleStore.open(tmp_path).begin("bundle-key")
     assert isinstance(run, BundleRun)
     run.write_render("# Video\n")
+    run.write_self_contained_render("# Video\n")
     snapshot = run.commit(manifest)
     assert snapshot.manifest["provenance"] == manifest["provenance"]
     assert secret not in snapshot.manifest_path.read_text()

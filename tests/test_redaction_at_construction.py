@@ -587,6 +587,7 @@ def test_a_cache_hit_reads_its_related_links_back_as_carriers(tmp_path: Path) ->
     run = BundleStore.open(root).begin(key)
     assert isinstance(run, BundleRun)
     run.write_render("# Video\n")
+    run.write_self_contained_render("# Video\n")
     run.commit(
         manifest_document(fresh, options, transcript_present=False, frames=[], warnings=[])
     )

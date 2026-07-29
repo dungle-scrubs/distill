@@ -77,7 +77,7 @@ def fake_transcribe(
                     "text": "short screencast",
                     "words": [
                         {"word": "short", "start": 0.0, "end": 0.4},
-                        {"word": "screencast", "start": 0.4, "end": 0.9},
+                        {"word": " screencast", "start": 0.4, "end": 0.9},
                     ],
                 }
             ],
@@ -118,6 +118,64 @@ def test_short_local_screencast_fixture_produces_transcript_and_frames(
     assert probed_duration > 0
     assert len(RECORDED_DURATIONS) == 1
     assert RECORDED_DURATIONS[0] == probed_duration
+
+
+def test_a_fresh_run_writes_and_reports_both_render_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: a generation carried and reported only `video.md`."""
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+
+    response = distill_session.process_local_video(
+        {
+            "path": str(video),
+            "output_dir": str(tmp_path / "cache"),
+            "ocr": False,
+            "redact_secrets": False,
+            "caption_frames": False,
+            "max_keyframes": 1,
+            "max_static_window_sec": 1,
+        }
+    )
+
+    linked = Path(response["markdown_path"])
+    self_contained = Path(response["self_contained_markdown_path"])
+    assert linked.name == "video.md"
+    assert self_contained.name == "video.self-contained.md"
+    assert self_contained.parent == linked.parent
+    assert linked.is_file()
+    assert self_contained.is_file()
+
+
+def test_a_credential_named_local_source_leaves_no_name_or_absolute_path_in_the_archive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Gate 4->5: only redacted provenance names the archived local source."""
+    secret_name = f"ghp_{'a' * 36}"
+    video = tmp_path / f"{secret_name}.mp4"
+    make_short_screencast(video)
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+
+    response = distill_session.process_local_video(
+        {
+            "path": str(video),
+            "output_dir": str(tmp_path / "cache"),
+            "ocr": False,
+            "caption_frames": False,
+            "max_keyframes": 1,
+            "max_static_window_sec": 1,
+        }
+    )
+
+    archived = Path(response["self_contained_markdown_path"]).read_text()
+    assert secret_name not in archived
+    assert str(video) not in archived
+    assert str(tmp_path) not in archived
+    assert "[REDACTED].mp4" in archived
 
 
 def test_cache_hit_returns_under_one_second(
@@ -174,6 +232,8 @@ def test_fresh_and_cache_hit_responses_report_the_same_frame_shape(
     fresh_frame = fresh["frames"][0]
     cached_frame = cached["frames"][0]
     assert cached["cached"] is True
+    assert cached["self_contained_markdown_path"] == fresh["self_contained_markdown_path"]
+    assert Path(cached["self_contained_markdown_path"]).is_file()
     assert cached_frame.keys() == fresh_frame.keys()
     assert Path(cached_frame["path"]).is_absolute()
     assert cached_frame["path"] == fresh_frame["path"]

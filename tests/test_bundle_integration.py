@@ -104,6 +104,12 @@ def begin(root: Path) -> tuple[BundleStore, BundleRun]:
     return store, run
 
 
+def write_renders(run: BundleRun, text: str = "# Video\n") -> None:
+    """Write both render artifacts required for publication."""
+    run.write_render(text)
+    run.write_self_contained_render(text)
+
+
 def minimal_manifest(tmp_path: Path) -> dict:
     return {
         "pipeline_version": 1,
@@ -136,7 +142,7 @@ def test_generation_publish_and_active_manifest(tmp_path: Path) -> None:
             )
         ]
     )
-    run.write_render("# Video\n")
+    write_renders(run)
     run.write_transcript(spoken({"start": 0, "end": 1, "text": "hi"}))
 
     snapshot = run.commit(
@@ -243,7 +249,7 @@ def test_path_bearing_warning_history_is_exempt_from_the_portable_manifest_claim
 
 def test_response_shape(tmp_path: Path) -> None:
     _, run = begin(tmp_path / "output")
-    run.write_render("# Video\n")
+    write_renders(run)
     run.write_transcript(spoken())
     snapshot = run.commit(minimal_manifest(tmp_path))
 
@@ -273,7 +279,7 @@ def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> N
     """
     store, run = begin(tmp_path / "output")
     source_info = youtube_source(tmp_path)
-    run.write_render("# Video\n")
+    write_renders(run)
     run.write_transcript(spoken({"start": 0, "end": 1, "text": "hi"}))
 
     snapshot = run.commit(
@@ -300,7 +306,7 @@ def test_bundle_manifest_and_response_include_related_links(tmp_path: Path) -> N
 
 def test_response_can_include_progress_summary(tmp_path: Path) -> None:
     _, run = begin(tmp_path / "output")
-    run.write_render("# Video\n")
+    write_renders(run)
     run.write_transcript(spoken())
     snapshot = run.commit(minimal_manifest(tmp_path))
 
@@ -321,7 +327,7 @@ def test_response_frames_keep_ocr_and_visual_interpretation_separate(
     tmp_path: Path,
 ) -> None:
     _, run = begin(tmp_path / "output")
-    run.write_render("# Video\n")
+    write_renders(run)
     snapshot = run.commit(minimal_manifest(tmp_path))
     frame = {
         "index": 1,
@@ -362,7 +368,7 @@ def test_the_summary_does_not_claim_an_interpretation_that_interprets_nothing(
     which is a reading.
     """
     _, run = begin(tmp_path / "output")
-    run.write_render("# Video\n")
+    write_renders(run)
     snapshot = run.commit(minimal_manifest(tmp_path))
 
     def frame(index: int, interpretation: dict[str, object]) -> dict[str, object]:
@@ -470,7 +476,7 @@ def test_a_new_manifest_records_the_bundle_key_under_the_current_name(
     vocabulary's `_Avoid_` entry described current behavior.
     """
     store, run = begin(tmp_path / "output")
-    run.write_render("# Video\n")
+    write_renders(run)
 
     run.commit(
         manifest_document(
@@ -497,7 +503,7 @@ def test_a_manifest_written_before_the_rename_is_still_a_bundle(tmp_path: Path) 
     disk no **prune** can reclaim because nothing recognizes it as Distill's.
     """
     store, run = begin(tmp_path / "output")
-    run.write_render("# Video\n")
+    write_renders(run)
     legacy = {**minimal_manifest(tmp_path)}
     assert legacy["source_hash"] == BUNDLE_KEY
 

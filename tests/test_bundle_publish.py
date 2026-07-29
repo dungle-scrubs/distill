@@ -84,8 +84,9 @@ def begin_run(store: BundleStore, bundle_key: str = BUNDLE_KEY) -> BundleRun:
 
 
 def assemble(paths: Any, text: str = "# Video\n") -> None:
-    """Write the **render** a servable generation must carry."""
+    """Write both **renders** a servable generation must carry."""
     paths.markdown.write_text(text)
+    paths.self_contained_markdown.write_text(text)
 
 
 def test_a_published_generation_holds_no_stage_result(tmp_path: Path) -> None:
@@ -754,6 +755,39 @@ def test_a_commit_without_a_render_leaves_the_active_generation_alone(
     assert active.markdown.read_text() == "# published\n"
 
 
+def test_publish_refuses_a_generation_without_its_self_contained_render(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: publication required `video.md` but not the archive artifact."""
+    bundle_root = tmp_path / BUNDLE_KEY
+    bundle_root.mkdir()
+    staged = stage_paths(bundle_root)
+    staged.markdown.write_text("# linked render\n")
+
+    with pytest.raises(DistillError) as failure:
+        publish_staging(staged, manifest_for())
+
+    assert failure.value.code == "E_INCOMPLETE_GENERATION"
+    assert staged.generation.is_dir()
+    assert not (bundle_root / "g1").exists()
+    assert not (bundle_root / "_manifest.json").exists()
+
+
+def test_an_active_generation_missing_its_self_contained_render_is_not_served(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: cache validation checked only the linked render."""
+    root = tmp_path / "output"
+    root.mkdir()
+    store = BundleStore.open(root)
+    run = begin_run(store)
+    assemble(run.paths)
+    snapshot = run.commit(manifest_for())
+    snapshot.self_contained_markdown.unlink()
+
+    assert store.load_active(BUNDLE_KEY) is None
+
+
 def test_publish_refuses_a_render_that_is_a_symlink(tmp_path: Path) -> None:
     """R-16 at the last moment before the rename, not only at the write.
 
@@ -804,6 +838,7 @@ def test_publish_proves_the_render_inside_the_generation_it_is_renaming(
         manifest=second.paths.manifest,
         transcript=second.paths.transcript,
         markdown=live.markdown,
+        self_contained_markdown=second.paths.self_contained_markdown,
     )
     try:
         with pytest.raises(DistillError) as failure:
@@ -844,6 +879,7 @@ def test_a_published_generation_holds_no_run_scratch(tmp_path: Path) -> None:
     assert sorted(path.name for path in snapshot.generation.iterdir()) == [
         "frames",
         "video.md",
+        "video.self-contained.md",
     ]
 
 
