@@ -70,7 +70,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from .artifacts import Provenance, RedactionState
 from .bundle_store import (
@@ -80,18 +79,113 @@ from .bundle_store import (
     confined_path,
     ensure_safe_directory,
 )
-from .capabilities import MISSING_TOOL_CODE, missing_tool_consequence
 from .errors import DistillError, WarningRecord, errno_name, warning
 from .links import RelatedLink, extract_relevant_links
+from .media_inspect import (  # noqa: F401  re-exported: media inspection
+    CONTENT_HASH_LIMIT_BYTES as CONTENT_HASH_LIMIT_BYTES,
+)
+from .media_inspect import (
+    FFPROBE_TIMEOUTS as FFPROBE_TIMEOUTS,
+)
+from .media_inspect import (
+    FINGERPRINT_INTERIOR_ANCHORS as FINGERPRINT_INTERIOR_ANCHORS,
+)
+from .media_inspect import (
+    FINGERPRINT_SAMPLE_BYTES as FINGERPRINT_SAMPLE_BYTES,
+)
+from .media_inspect import (
+    _anchor_label as _anchor_label,
+)
+from .media_inspect import (
+    ensure_duration_allowed as ensure_duration_allowed,
+)
+from .media_inspect import (
+    fingerprint_anchor_offsets as fingerprint_anchor_offsets,
+)
+from .media_inspect import (
+    local_fingerprint as local_fingerprint,
+)
+from .media_inspect import (
+    manifest_duration as manifest_duration,
+)
+from .media_inspect import (
+    probe_duration as probe_duration,
+)
+from .media_inspect import (
+    source_hash as source_hash,
+)
 from .options import DistillOptions
 from .progress import ProgressReporter
 from .run_command import (
     CommandResult,
-    CommandTimeouts,
-    run,
     run_json,
-    silent_tool_timeouts,
     stream,
+)
+from .youtube import (  # noqa: F401  re-exported: the YouTube client
+    NO_PLAYLIST_ARG as NO_PLAYLIST_ARG,
+)
+from .youtube import (
+    YOUTUBE_HOSTS as YOUTUBE_HOSTS,
+)
+from .youtube import (
+    YOUTUBE_STRIP_QUERY_KEYS as YOUTUBE_STRIP_QUERY_KEYS,
+)
+from .youtube import (
+    YOUTUBE_VIDEO_ID_PATTERN as YOUTUBE_VIDEO_ID_PATTERN,
+)
+from .youtube import (
+    YTDLP_DOWNLOAD_TIMEOUTS as YTDLP_DOWNLOAD_TIMEOUTS,
+)
+from .youtube import (
+    YTDLP_METADATA_TIMEOUTS as YTDLP_METADATA_TIMEOUTS,
+)
+from .youtube import (
+    YTDLP_SOCKET_TIMEOUT_SEC as YTDLP_SOCKET_TIMEOUT_SEC,
+)
+from .youtube import (
+    YouTubeMetadata as YouTubeMetadata,
+)
+from .youtube import (
+    _first_description_paragraph as _first_description_paragraph,
+)
+from .youtube import (
+    _metadata_text as _metadata_text,
+)
+from .youtube import (
+    _metadata_unavailable as _metadata_unavailable,
+)
+from .youtube import (
+    _run_ytdlp as _run_ytdlp,
+)
+from .youtube import (
+    _validated_youtube_video_id as _validated_youtube_video_id,
+)
+from .youtube import (
+    _ytdlp_command as _ytdlp_command,
+)
+from .youtube import (
+    canonical_youtube_id as canonical_youtube_id,
+)
+from .youtube import (
+    ensure_youtube_host as ensure_youtube_host,
+)
+from .youtube import (
+    normalize_youtube_url as normalize_youtube_url,
+)
+from .youtube import (
+    parse_youtube_url as parse_youtube_url,
+)
+from .youtube import (
+    youtube_description as youtube_description,
+)
+from .youtube import (
+    youtube_fast_path_video_id as youtube_fast_path_video_id,
+)
+from .youtube import (
+    youtube_metadata as youtube_metadata,
+)
+from .youtube import (
+    youtube_url_names_one_video as youtube_url_names_one_video,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -105,12 +199,6 @@ thing a path can be. There is deliberately no "unreadable" member: a path that
 could not be asked about is not a kind of answer, it is the absence of one.
 """
 
-CONTENT_HASH_LIMIT_BYTES = 5 * 1024 * 1024 * 1024
-FINGERPRINT_SAMPLE_BYTES = 64 * 1024
-# Interior anchors sampled between the head and tail anchors. The sampled set is
-# capped at FINGERPRINT_INTERIOR_ANCHORS + 2 anchors, so the default cache mode
-# reads at most 576 KiB no matter how large the source is.
-FINGERPRINT_INTERIOR_ANCHORS = 7
 YOUTUBE_DISK_FLOOR_BYTES = 1024 * 1024 * 1024
 # Wall-clock ceilings so a wedged tool or a stalled network call cannot hang the
 # whole run. yt-dlp additionally gets `--socket-timeout` so it aborts a stalled
@@ -120,14 +208,10 @@ YOUTUBE_DISK_FLOOR_BYTES = 1024 * 1024 * 1024
 # never resets - see `silent_tool_timeouts`, which is why one number governs
 # here. A lower idle value would not catch a stall, it would just cut the probe's
 # budget, and a probe that runs out is fatal (`E_COMMAND`), not a degradation.
-FFPROBE_TIMEOUTS = silent_tool_timeouts(60.0)
-YTDLP_METADATA_TIMEOUTS = CommandTimeouts(total_sec=120.0, idle_sec=60.0)
 # A download is bounded by silence, not by length (R-30): a legitimate multi-GB
 # fetch on a slow link may run for hours, while a wedged one stops emitting
 # progress within seconds. The total is a backstop against a tool that reports
 # progress forever without finishing.
-YTDLP_DOWNLOAD_TIMEOUTS = CommandTimeouts(total_sec=6 * 60 * 60.0, idle_sec=120.0)
-YTDLP_SOCKET_TIMEOUT_SEC = 30
 # Where a run assembles a download, and where a proven one is promoted to. They
 # are siblings under one output root so promotion is a rename on one filesystem
 # rather than a copy across two, and so the promoted directory holds nothing but
@@ -150,13 +234,6 @@ SENSITIVE_COMPONENTS = {
     ".aws",
     ".config/1password",
     "library/keychains",
-}
-YOUTUBE_HOSTS = {
-    "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
-    "youtu.be",
-    "music.youtube.com",
 }
 
 BYTE_UNITS = {
@@ -390,16 +467,6 @@ class SourceResolution:
     progress: ProgressReporter | None = None
 
 
-@dataclass(frozen=True)
-class YouTubeMetadata:
-    video_id: str
-    description: str
-    warnings: list[WarningRecord]
-    title: str | None = None
-    channel: str | None = None
-    upload_date: str | None = None
-
-
 class YouTubeDownloaderProtocol(Protocol):
     def acquire(
         self,
@@ -409,216 +476,18 @@ class YouTubeDownloaderProtocol(Protocol):
     ) -> AcquiredSource: ...
 
 
-def probe_duration(path: Path) -> tuple[float, list[WarningRecord]]:
-    """The source's duration, with any **warning** the probe itself recorded.
-
-    The warnings are truncated capture (R-33). They are returned rather than
-    dropped because this is the only place they exist, and a caller that took
-    the duration alone would publish a **bundle** that never mentions the loss.
-    """
-    data, probe_warnings = run_json(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "json",
-            str(path),
-        ],
-        stage="source",
-        total_timeout_sec=FFPROBE_TIMEOUTS.total_sec,
-        idle_timeout_sec=FFPROBE_TIMEOUTS.idle_sec,
-    )
-    try:
-        duration = float(data["format"]["duration"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise DistillError("E_FFPROBE", "source", "could not read video duration") from exc
-    return duration, list(probe_warnings)
 
 
-def ensure_duration_allowed(duration_sec: float, max_duration_sec: float) -> None:
-    """Refuse a **source** whose claimed duration is unusable or over the cap (R-47).
-
-    Two refusals, and they are not the same kind. The cap is the operator's
-    policy about a source that is genuinely too long. Usability is about the
-    number itself: a duration arrives from ffprobe, so it is data from outside
-    rather than operator error, and it is refused as `E_BAD_MEDIA` the way the
-    acquisition path refuses media it cannot use.
-
-    NaN is why this exists. It clears `> max_duration_sec` and it clears
-    `<= 0`, so the cap silently stopped existing and every window, interval and
-    percentage computed from the duration afterwards was NaN too.
-    """
-    if not math.isfinite(duration_sec) or duration_sec <= 0:
-        raise DistillError(
-            "E_BAD_MEDIA",
-            "source",
-            "source reports an unusable duration",
-            # Text, because a fatal error is published as JSON and a bare NaN
-            # is not JSON a strict reader will parse.
-            {"duration_sec": repr(duration_sec)},
-        )
-    if duration_sec > max_duration_sec:
-        raise DistillError(
-            "E_DURATION_CAP",
-            "source",
-            "video exceeds max_duration_sec",
-            {"duration_sec": duration_sec, "max_duration_sec": max_duration_sec},
-        )
 
 
-def fingerprint_anchor_offsets(size: int) -> list[int]:
-    """Byte offsets the sampling cache mode reads, derived only from ``size``.
-
-    The head anchor sits at 0 and the tail anchor at ``size - 64 KiB``, with
-    ``FINGERPRINT_INTERIOR_ANCHORS`` interior anchors spread evenly between
-    them. Offsets depend on nothing but the size, so the same file always yields
-    the same anchor set; coinciding offsets collapse, which is why a file barely
-    over one sample still reports two anchors rather than nine.
-    """
-    if size <= FINGERPRINT_SAMPLE_BYTES:
-        return [0]
-    last = size - FINGERPRINT_SAMPLE_BYTES
-    offsets = {0, last}
-    for index in range(1, FINGERPRINT_INTERIOR_ANCHORS + 1):
-        offsets.add(last * index // (FINGERPRINT_INTERIOR_ANCHORS + 1))
-    return sorted(offsets)
 
 
-def _anchor_label(offset: int, offsets: list[int]) -> str:
-    if offset == offsets[0]:
-        return "first"
-    if offset == offsets[-1]:
-        return "last"
-    return "interior"
 
 
-def local_fingerprint(
-    path: Path,
-    cache_mode: str,
-    progress: ProgressReporter | None = None,
-) -> str:
-    """Return the source fingerprint for a local file under ``cache_mode``.
-
-    ``content`` hashes every byte, so it distinguishes any two files whose
-    contents differ at all. It refuses files over 5 GB, because reading one is
-    not a cost a cache lookup may impose.
-
-    ``fingerprint`` - the default - samples instead. It hashes the file's size,
-    its mtime in nanoseconds, and 64 KiB read at each offset in
-    ``fingerprint_anchor_offsets``: the head, the tail, and seven evenly spread
-    interior anchors. Each anchor's offset is hashed alongside its bytes, so
-    overlapping or reordered anchors cannot alias. Reading is therefore bounded
-    at 576 KiB regardless of source size, which is what makes the default cheap
-    enough to run on every cache lookup of a file up to 5 GB.
-
-    Sampling is what it sounds like, and the property it buys is worth stating
-    plainly: two *distinct* sources collide iff they share a size, an mtime to
-    the nanosecond, and every sampled anchor's bytes. Two independently produced
-    videos do not do this - differing content gives differing sizes, and mtimes
-    are not byte-identical by accident. Constructing such a pair on purpose is
-    entirely possible, because the anchor offsets are public and deterministic;
-    an attacker who can write both files can leave every anchor untouched and
-    differ everywhere else. A colliding pair shares a bundle key, so one source
-    is served the other's bundle. Where sources are untrusted or adversarial,
-    ``content`` is the cache mode that removes the property; the default trades
-    it for bounded cost. See R-38, R-51.
-    """
-    stat = path.stat()
-    if cache_mode == "content":
-        if stat.st_size > CONTENT_HASH_LIMIT_BYTES:
-            raise DistillError(
-                "E_CONTENT_HASH_TOO_LARGE",
-                "source",
-                "content cache mode refuses files over 5 GB",
-                {"size_bytes": stat.st_size},
-            )
-        digest = hashlib.sha256()
-        bytes_read = 0
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-                bytes_read += len(chunk)
-                if progress:
-                    progress.update(
-                        "source_fingerprint",
-                        percent=(bytes_read / max(1, stat.st_size)) * 100,
-                        detail={
-                            "cache_mode": "content",
-                            "bytes_read": bytes_read,
-                            "total_bytes": stat.st_size,
-                        },
-                    )
-        if progress and stat.st_size == 0:
-            progress.complete(
-                "source_fingerprint",
-                detail={"cache_mode": "content", "total_bytes": 0},
-            )
-        return digest.hexdigest()
-
-    digest = hashlib.sha256()
-    digest.update(str(stat.st_size).encode())
-    digest.update(str(stat.st_mtime_ns).encode())
-    offsets = fingerprint_anchor_offsets(stat.st_size)
-    sample_total = len(offsets)
-    sample_done = 0
-    with path.open("rb") as handle:
-        for offset in offsets:
-            handle.seek(offset)
-            # The offset is hashed with its bytes so two anchors reading the same
-            # region, or the same regions in another order, cannot alias.
-            digest.update(str(offset).encode())
-            digest.update(handle.read(FINGERPRINT_SAMPLE_BYTES))
-            sample_done += 1
-            if progress:
-                progress.update(
-                    "source_fingerprint",
-                    percent=(sample_done / sample_total) * 100,
-                    detail={
-                        "cache_mode": "fingerprint",
-                        "sample": _anchor_label(offset, offsets),
-                        "offset": offset,
-                        "samples_done": sample_done,
-                        "samples_total": sample_total,
-                    },
-                )
-    return digest.hexdigest()
 
 
-def source_hash(source_fingerprint: str, opts_hash: str) -> str:
-    return hashlib.sha256(f"{source_fingerprint}:{opts_hash}".encode()).hexdigest()
 
 
-def manifest_duration(manifest: Mapping[str, Any]) -> float | None:
-    """The duration a **manifest** records, if it records a usable one.
-
-    A manifest is a document another process wrote, so the number in it is input
-    rather than a fact: `None` covers a missing field, a field that is not a
-    number, and one that is a number no source can have. Every caller that
-    reuses a published duration asks here, so "what makes a recorded duration
-    usable" has one answer rather than one per cache path.
-
-    `bool` is refused explicitly, because `True` is an `int` in Python and a
-    manifest saying `"duration_sec": true` is not a one-second video.
-
-    The conversion itself is guarded, because JSON has no integer ceiling and
-    Python's `int` has none either: a manifest recording a 401-digit number is
-    a document this function has to answer about, and `float()` on it raises
-    `OverflowError`. An unusable number is a **cache miss**, whichever way it
-    is unusable.
-    """
-    duration = manifest.get("duration_sec")
-    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
-        return None
-    try:
-        duration = float(duration)
-    except OverflowError:
-        return None
-    if not math.isfinite(duration) or duration <= 0:
-        return None
-    return duration
 
 
 def servable_duration(output_root: Path, bundle_key: str) -> float | None:
@@ -895,311 +764,6 @@ def sensitive_path_match(
             if parts[start : start + len(wanted)] == wanted:
                 return sensitive
     return None
-
-
-YOUTUBE_STRIP_QUERY_KEYS = {"t", "start", "end", "time_continue"}
-
-
-def normalize_youtube_url(url: str) -> str:
-    """Drop player-state query params (e.g. `t=900s`) so the full video is consumed."""
-    parsed = urlparse(url)
-    if parsed.netloc.lower() not in YOUTUBE_HOSTS:
-        return url
-    pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    kept = [
-        (k, v)
-        for k, v in pairs
-        if k not in YOUTUBE_STRIP_QUERY_KEYS
-    ]
-    if len(kept) == len(pairs):
-        return url
-    new_query = urlencode(kept)
-    fragment = "" if parsed.fragment.startswith("t=") else parsed.fragment
-    return urlunparse(parsed._replace(query=new_query, fragment=fragment))
-
-
-def ensure_youtube_host(url: str) -> None:
-    """Reject non-YouTube hosts (and option-injection values) before yt-dlp runs.
-
-    Playlist/channel URLs carry no video id, so this host-only check is the guard
-    the playlist path uses in place of ``parse_youtube_url``.
-    """
-    if urlparse(url).netloc.lower() not in YOUTUBE_HOSTS:
-        raise DistillError("E_BAD_URL", "youtube", "only YouTube URLs are supported", {"url": url})
-
-
-YOUTUBE_VIDEO_ID_PATTERN = re.compile(r"[0-9A-Za-z_-]{11}")
-"""The id shape yt-dlp's YouTube extractor matches, and nothing wider.
-
-Eleven characters of `[0-9A-Za-z_-]`, which is what the extractor's own regex
-takes and what every published video id is. It is here because the **bundle
-key** read off a URL has to be the key the run would publish under: yt-dlp
-matches those eleven characters and ignores whatever follows, so a longer value
-in `v=` names a video yt-dlp will report a *different* id for.
-"""
-
-
-def youtube_fast_path_video_id(url: str) -> str | None:
-    """The id a **bundle** may be looked up by without asking yt-dlp, or `None`.
-
-    `None` is not a refusal of the URL - it declines the shortcut, and the run
-    resolves the id the way it always did. So this answers one question only:
-    is the id written in this URL certainly the id yt-dlp resolves for it?
-
-    It is not, in three ways, and each one would key a lookup on a string the
-    run cannot publish under:
-
-    - **A playlist is attached.** `watch?v=A&list=P` used to be the playlist to
-      yt-dlp: `--dump-json` emitted one document per entry, which does not parse
-      as one, and `canonical_youtube_id` fell back to `--print id` and took the
-      *last* line, so the URL published under some other entry's id. Every
-      single-video invocation now carries `NO_PLAYLIST_ARG`, so the id written
-      in such a URL *is* the id a run publishes under, and the shortcut is
-      declined here on the narrower ground that widening it changes which
-      **bundle key** a URL is looked up by - a cache decision, taken
-      deliberately or not at all. Declining still costs one resolution.
-    - **The id is not id-shaped.** yt-dlp's extractor matches exactly eleven
-      `[0-9A-Za-z_-]` characters and ignores trailing material, so
-      `watch?v=YE7VzlLtp-4x` is published under `YE7VzlLtp-4`. Reading twelve
-      characters off the URL keys a **bundle** nothing ever wrote - a false
-      **cache miss**, and with yt-dlp uninstalled an `E_MISSING_TOOL` over data
-      that is on disk. Truncating to eleven instead would be guessing at
-      another tool's parser; declining costs one resolution.
-    - **The URL names more than one.** `watch?v=A&v=B`, or a path with segments
-      after the id. Which one yt-dlp picks is its business, not something to
-      infer here.
-
-    Case is preserved, because a video id is case-sensitive and `A` and `a` are
-    different videos.
-    """
-    parsed = urlparse(url)
-    if parsed.netloc.lower() not in YOUTUBE_HOSTS:
-        return None
-    # `keep_blank_values`, for the reason `normalize_youtube_url` twenty lines
-    # above keeps blanks: `list=` with nothing after it is a `list` param, and
-    # what yt-dlp does with an empty one is its business. The default drops it,
-    # so `watch?v=A&list=` took the fast path while `watch?v=A&list=P` did not -
-    # one URL form deciding a **bundle key** on a query-parser default.
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    if "list" in query:
-        return None
-    segments = [segment for segment in parsed.path.split("/") if segment]
-    if parsed.netloc.lower() == "youtu.be":
-        candidates = segments[:1] if len(segments) == 1 else []
-    elif any(parsed.path.startswith(prefix) for prefix in ("/shorts/", "/embed/", "/live/", "/v/")):
-        candidates = segments[1:2] if len(segments) == 2 else []
-    else:
-        candidates = query.get("v", [])
-    if len(candidates) != 1 or not YOUTUBE_VIDEO_ID_PATTERN.fullmatch(candidates[0]):
-        return None
-    return candidates[0]
-
-
-def youtube_url_names_one_video(url: str) -> bool:
-    """Whether the URL's own video id is the id yt-dlp will resolve for it.
-
-    The boundary of the R-49 reorder rather than a detail of it. Reading a
-    **bundle key** off the URL is only sound where the URL's id is the id a run
-    would have published under; where it is not, the cache is asked the question
-    it was always asked, after resolution, and yt-dlp is needed to ask it.
-    Serving a bundle keyed by `A` for a URL this Distill would publish under `B`
-    would be a cache hit for a bundle the same URL cannot produce.
-
-    `youtube_fast_path_video_id` is the decision; this is the same answer as a
-    question.
-    """
-    return youtube_fast_path_video_id(url) is not None
-
-
-def _validated_youtube_video_id(value: object) -> str | None:
-    video_id = str(value or "").strip()
-    if YOUTUBE_VIDEO_ID_PATTERN.fullmatch(video_id) is None:
-        return None
-    return video_id
-
-
-def parse_youtube_url(url: str) -> str:
-    ensure_youtube_host(url)
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    if host == "youtu.be":
-        video_id = parsed.path.strip("/").split("/")[0]
-    elif any(parsed.path.startswith(prefix) for prefix in ("/shorts/", "/embed/", "/live/", "/v/")):
-        video_id = parsed.path.strip("/").split("/")[1]
-    else:
-        video_id = parse_qs(parsed.query).get("v", [""])[0]
-    if not video_id:
-        raise DistillError(
-            "E_BAD_URL",
-            "youtube",
-            f"could not find YouTube video id in URL: {url}",
-        )
-    return video_id
-
-
-NO_PLAYLIST_ARG = "--no-playlist"
-"""What makes a `watch?v=A&list=P` URL name the video it says it names.
-
-yt-dlp reads a `list` parameter as the thing being asked for, so without this a
-URL an operator copied out of a playlist page resolves to every entry of the
-playlist: `--dump-json` emits one document per entry, `--print id` one line per
-entry, and the download points one output template at all of them. Which entry
-the run then proceeds against is whichever landed on `source.mp4`.
-
-Every yt-dlp invocation about *one video* carries it, and the one invocation
-whose subject really is a playlist - the listing a playlist job starts with -
-does not. That is why it is a parameter here rather than a constant folded into
-the shared argv: a flag added unconditionally would make a playlist job
-enumerate one video.
-"""
-
-
-def _ytdlp_command(extra_args: list[str], url: str, *, names_one_video: bool = True) -> list[str]:
-    """Build a yt-dlp argv with a stall guard and a `--` terminator.
-
-    The `--` before the URL stops a value that begins with `-` from being parsed
-    as a yt-dlp option (argument injection), and `--socket-timeout` lets yt-dlp
-    abort a stalled connection on its own.
-
-    `names_one_video` defaults true because all but one caller is asking about a
-    single video, and the default that has to be remembered is the one that gets
-    forgotten.
-    """
-    return [
-        "yt-dlp",
-        "--socket-timeout",
-        str(YTDLP_SOCKET_TIMEOUT_SEC),
-        *([NO_PLAYLIST_ARG] if names_one_video else []),
-        *extra_args,
-        "--",
-        url,
-    ]
-
-
-def _run_ytdlp(
-    extra_args: list[str],
-    url: str,
-    *,
-    timeouts: CommandTimeouts = YTDLP_METADATA_TIMEOUTS,
-    names_one_video: bool = True,
-) -> CommandResult:
-    """Run a non-downloading yt-dlp invocation and hand back what it produced.
-
-    `check=False`: every caller inspects `returncode` itself, because "yt-dlp
-    ran and said no" means something different at each one - an unresolvable id
-    is fatal, an unreadable description is a **degradation**. A yt-dlp that is
-    absent or wedged still raises, since there is no answer to inspect.
-    """
-    return run(
-        _ytdlp_command(extra_args, url, names_one_video=names_one_video),
-        stage="youtube",
-        total_timeout_sec=timeouts.total_sec,
-        idle_timeout_sec=timeouts.idle_sec,
-        check=False,
-        error_code="E_YTDLP",
-    )
-
-
-def _metadata_unavailable() -> WarningRecord:
-    return warning(
-        "youtube",
-        "metadata_unavailable",
-        "yt-dlp could not read YouTube provenance metadata",
-    )
-
-
-def _metadata_text(payload: Mapping[str, Any], name: str) -> str:
-    return str(payload.get(name) or "").strip()
-
-
-def _first_description_paragraph(description: str) -> str:
-    normalized = description.replace("\r\n", "\n").replace("\r", "\u2029")
-    return re.split(r"(?:\u2029|\n[ \t]*\n)", normalized.strip(), maxsplit=1)[0]
-
-
-def youtube_description(url: str) -> tuple[str, list[WarningRecord]]:
-    try:
-        proc = _run_ytdlp(["--skip-download", "--print", "%(description)s"], url)
-    except DistillError as exc:
-        # An absent tool is the capability table's decision here too. The
-        # description being best-effort does not make an absent yt-dlp a
-        # degradation - yt-dlp is a **required capability**, so this raises
-        # (ADR-0002, R-34). Anything else is yt-dlp having run and not answered,
-        # which costs the description and not the run.
-        if exc.code == MISSING_TOOL_CODE:
-            return "", [missing_tool_consequence("youtube", "yt-dlp", cause=exc)]
-        return "", [_metadata_unavailable()]
-    if proc.returncode != 0:
-        return "", [*proc.warnings, _metadata_unavailable()]
-    return proc.stdout.strip(), list(proc.warnings)
-
-
-def youtube_metadata(url: str) -> YouTubeMetadata:
-    try:
-        proc = _run_ytdlp(["--skip-download", "--dump-json"], url)
-    except DistillError:
-        video_id = youtube_fast_path_video_id(url)
-        if video_id is None:
-            raise
-        return YouTubeMetadata(
-            video_id=video_id,
-            description="",
-            warnings=[_metadata_unavailable()],
-        )
-    # Carried whichever branch answers: a metadata invocation that lost part of
-    # its own output (R-33) is the same loss whether or not the document parsed.
-    probe_warnings = list(proc.warnings)
-    if proc.returncode == 0:
-        try:
-            payload = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            payload = {}
-        if isinstance(payload, Mapping):
-            video_id = _validated_youtube_video_id(payload.get("id"))
-            if video_id is not None:
-                channel = _metadata_text(payload, "channel")
-                if not channel:
-                    channel = _metadata_text(payload, "uploader")
-                return YouTubeMetadata(
-                    video_id=video_id,
-                    description=_metadata_text(payload, "description"),
-                    warnings=probe_warnings,
-                    title=_metadata_text(payload, "title") or None,
-                    channel=channel or None,
-                    upload_date=_metadata_text(payload, "upload_date") or None,
-                )
-
-    video_id = youtube_fast_path_video_id(url)
-    if video_id is not None:
-        return YouTubeMetadata(
-            video_id=video_id,
-            description="",
-            warnings=[*probe_warnings, _metadata_unavailable()],
-        )
-    video_id = canonical_youtube_id(url)
-    description, metadata_warnings = youtube_description(url)
-    return YouTubeMetadata(
-        video_id=video_id,
-        description=description,
-        warnings=[*probe_warnings, *metadata_warnings],
-    )
-
-
-def canonical_youtube_id(url: str) -> str:
-    parse_youtube_url(url)
-    proc = _run_ytdlp(["--simulate", "--print", "id"], url)
-    if proc.returncode != 0:
-        raise DistillError(
-            "E_YTDLP",
-            "youtube",
-            "yt-dlp could not resolve video id",
-            {"stderr": proc.stderr.strip()},
-        )
-    raw_video_id = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
-    video_id = _validated_youtube_video_id(raw_video_id)
-    if video_id is None:
-        raise DistillError("E_YTDLP", "youtube", "yt-dlp returned an invalid video id")
-    return video_id
 
 
 def youtube_lock_key(video_id: str) -> str:

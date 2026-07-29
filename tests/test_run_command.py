@@ -1356,9 +1356,11 @@ def test_the_package_has_call_sites_to_check() -> None:
     assert {module for module, _line, _kwargs in call_sites()} == {
         "frame_selection.py",
         "measure.py",
+        "media_inspect.py",
         "ocr.py",
         "source.py",
         "transcript.py",
+        "youtube.py",
     }
 
 
