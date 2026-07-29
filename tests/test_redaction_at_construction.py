@@ -786,7 +786,7 @@ def test_no_file_in_a_published_generation_holds_the_secret(
     )
     monkeypatch.setattr(distill_session, "ocr_frames", ocr_reading(f"API_KEY={SECRET}"))
     monkeypatch.setattr(distill_session, "probe_local_vision", vision_probe)
-    monkeypatch.setattr(distill_session, "try_interpret_image", vision_reading(SECRET))
+    monkeypatch.setattr(distill_session, "try_interpret_image_after_probe", vision_reading(SECRET))
     source = SourceInfo(
         source_type="youtube",
         resolved_path=video,

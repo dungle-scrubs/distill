@@ -57,6 +57,7 @@ SIGNED_MODULES = (
     "options.py",
     "pipeline.py",
     "progress.py",
+    "rapid_mlx.py",
     "redact_secrets.py",
     "release.py",
     "render.py",

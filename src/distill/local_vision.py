@@ -21,24 +21,23 @@ chat-completion requests to ``<base_url>/chat/completions``. Distill does not
 manage the server lifecycle, and it has no dependency on any other local
 runtime shim.
 
-It does own where that client is allowed to talk and how much it will listen to
-(R-43, R-44): the scheme, the loopback rule and its opt-out, the refusal to
-follow a redirect, and the 32 MiB bound on a response body. That policy lives
-here rather than in a transport module of its own because there is one client
-and one endpoint (ADR-0001), and a rule kept next to the requests it governs
-cannot be reached around by adding a caller.
+The transport, the OpenAI-style envelope parsing, and the endpoint policy
+(R-43, R-44: the scheme, the loopback rule and its opt-out, the refusal to
+follow a redirect, the 32 MiB bound) are ``rapid_mlx``'s - the client for the
+one backend Distill supports (ADR-0001). This module drives that client: it
+owns the configuration, decides whether a pass can run, and runs the
+interpretation. The endpoint policy still lives next to the requests it governs,
+because both moved together; splitting them so a caller could reach around the
+policy is the thing that was avoided, not the file they share.
 """
 
 from __future__ import annotations
 
 import base64
-import http.client
-import ipaddress
 import json
 import logging
 import math
 import os
-import socket
 import threading
 import urllib.error
 import urllib.parse
@@ -47,14 +46,97 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
-from .artifacts import FrameArtifact, Interpretation, document_carries_a_reading
+from .artifacts import FrameArtifact, Interpretation
 from .config import config_dir as general_config_dir
 from .errors import DistillError, WarningRecord, aggregate_warnings, occurrences_of, warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
-from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
+from .rapid_mlx import (
+    _OPENER as _OPENER,
+)
+from .rapid_mlx import (  # noqa: F401  re-exported: the client this module drives
+    ALLOWED_ENDPOINT_SCHEMES as ALLOWED_ENDPOINT_SCHEMES,
+)
+from .rapid_mlx import (
+    DEFAULT_SCHEME_PORTS as DEFAULT_SCHEME_PORTS,
+)
+from .rapid_mlx import (
+    ENDPOINT_REJECTED_CODE as ENDPOINT_REJECTED_CODE,
+)
+from .rapid_mlx import (
+    ERROR_BODY_PREVIEW_BYTES as ERROR_BODY_PREVIEW_BYTES,
+)
+from .rapid_mlx import (
+    MAX_RESPONSE_BYTES as MAX_RESPONSE_BYTES,
+)
+from .rapid_mlx import (
+    AddressResolver as AddressResolver,
+)
+from .rapid_mlx import (
+    EndpointRejected as EndpointRejected,
+)
+from .rapid_mlx import (
+    HttpRequestor as HttpRequestor,
+)
+from .rapid_mlx import (
+    LocalVisionFailure as LocalVisionFailure,
+)
+from .rapid_mlx import (
+    _boundary_log as _boundary_log,
+)
+from .rapid_mlx import (
+    _build_opener as _build_opener,
+)
+from .rapid_mlx import (
+    _chat_content as _chat_content,
+)
+from .rapid_mlx import (
+    _check_resolved_address as _check_resolved_address,
+)
+from .rapid_mlx import (
+    _checked_endpoint_url as _checked_endpoint_url,
+)
+from .rapid_mlx import (
+    _completions_url as _completions_url,
+)
+from .rapid_mlx import (
+    _extract_first_json_object as _extract_first_json_object,
+)
+from .rapid_mlx import (
+    _http_get_json as _http_get_json,
+)
+from .rapid_mlx import (
+    _http_post_json as _http_post_json,
+)
+from .rapid_mlx import (
+    _models_url as _models_url,
+)
+from .rapid_mlx import (
+    _normalize_frame_kind as _normalize_frame_kind,
+)
+from .rapid_mlx import (
+    _normalize_text_confidence as _normalize_text_confidence,
+)
+from .rapid_mlx import (
+    _RedirectsAreRejected as _RedirectsAreRejected,
+)
+from .rapid_mlx import (
+    _reject_endpoint as _reject_endpoint,
+)
+from .rapid_mlx import (
+    _resolve_addresses as _resolve_addresses,
+)
+from .rapid_mlx import (
+    _served_model_ids as _served_model_ids,
+)
+from .rapid_mlx import (
+    _urlopen_json as _urlopen_json,
+)
+from .rapid_mlx import (
+    parse_interpretation_json as parse_interpretation_json,
+)
 
 DEFAULT_LOCAL_VISION_BACKEND = "rapid-mlx"
 DEFAULT_LOCAL_VISION_MODEL = "mlx-community/Qwen3-VL-8B-Instruct-8bit"
@@ -87,7 +169,6 @@ TRANSPORT_FAILURE_CODES = frozenset(
 # this side of the wire and says nothing either way.
 DELIVERED_RESPONSE_CODES = frozenset({"local_vision_malformed_response"})
 BREAKER_WARNING_CODE = "local_vision_transport_breaker_open"
-ENDPOINT_REJECTED_CODE = "local_vision_endpoint_rejected"
 FRAME_READ_FAILURE_CODES = frozenset(
     {
         "local_vision_malformed_response",
@@ -99,15 +180,11 @@ FRAME_READ_FAILURE_CODES = frozenset(
 # R-43. The two schemes the OpenAI-compatible API is served over; anything else
 # names a different protocol, and a vision endpoint is not a file or a gopher
 # hole no matter who wrote the config.
-ALLOWED_ENDPOINT_SCHEMES = frozenset({"http", "https"})
-DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
 # R-44. A chat-completion envelope is kilobytes; 32 MiB is orders of magnitude
 # past any real one, and past it the read stops rather than the process growing
 # to whatever the far end decided to send.
-MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 # An HTTP error body is quoted into a message, never parsed, and the quote is
 # 200 characters. This is how much of one is worth reading to produce it.
-ERROR_BODY_PREVIEW_BYTES = 2048
 LOGGER = logging.getLogger(__name__)
 
 
@@ -144,33 +221,11 @@ class LocalVisionProbe:
         return warning("local_vision", self.code, self.message)
 
 
-class LocalVisionFailure(Exception):
-    def __init__(self, code: str, message: str, detail: dict[str, Any] | None = None):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.detail = detail or {}
-
-    def warning(self) -> dict[str, Any]:
-        return warning("local_vision", self.code, self.message)
 
 
-class EndpointRejected(LocalVisionFailure):
-    """R-43: the endpoint the client was about to speak to is not allowed.
-
-    A `LocalVisionFailure` and not a separate hierarchy, because to every
-    caller it is the same event as a timeout: no reading came back and the run
-    continues on OCR-only output. It carries a `reason` so the log and the
-    **warning** both say *which* rule refused, not merely that one did.
-    """
-
-    def __init__(self, reason: str, message: str, detail: dict[str, Any] | None = None) -> None:
-        super().__init__(ENDPOINT_REJECTED_CODE, message, {"reason": reason, **(detail or {})})
-        self.reason = reason
 
 
 ProbeLocalVision = Callable[[LocalVisionConfig], LocalVisionProbe]
-AddressResolver = Callable[[str, int], list[str]]
 """Host and port to the addresses they resolve to, for the loopback check.
 
 Injectable because a test that asked the machine's resolver would be asserting
@@ -349,7 +404,6 @@ class _TransportBreaker:
 # Injectable HTTP entry points. Production uses urllib against the running
 # Rapid-MLX server; hermetic tests monkeypatch these so no real server is
 # required. ``HttpRequestor`` returns the decoded JSON body (or raises).
-HttpRequestor = Callable[..., "dict[str, Any]"]
 
 
 def _debug_enabled(value: bool | None = None) -> bool:
@@ -358,160 +412,14 @@ def _debug_enabled(value: bool | None = None) -> bool:
     return os.environ.get(DEBUG_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _boundary_log(event: str, detail: dict[str, Any]) -> None:
-    LOGGER.debug(
-        json.dumps(
-            {
-                "type": "distill.local_vision",
-                "event": event,
-                "detail": detail,
-            },
-            sort_keys=True,
-        )
-    )
 
 
-def _reject_endpoint(reason: str, message: str, **detail: Any) -> NoReturn:
-    """Refuse an endpoint, saying why, in the log and in the exception alike.
-
-    Every rejection *this module makes* goes through here, so the
-    observability is a property of the rule rather than of whoever wrote the
-    call site: there is one event, it always carries the reason, and no new
-    rule can forget to emit it.
-
-    Not every refusal is one of this module's. urllib turns a 3xx it cannot
-    act on into an `HTTPError` before `_RedirectsAreRejected` sees it, so a
-    redirect with no `Location`, or one naming a scheme urllib will not open,
-    ends the request without an `endpoint_rejected` event. Nothing is followed
-    in either case - which is why the fix there was the message an operator
-    gets, not a handler override to route the refusal back through here.
-    """
-    _boundary_log("endpoint_rejected", {"reason": reason, **detail})
-    raise EndpointRejected(reason, message, detail)
 
 
-def _resolve_addresses(host: str, port: int) -> list[str]:
-    """The addresses `host` answers with - without a lookup when it is one.
-
-    An address literal is already the answer, so the common configuration
-    (`http://127.0.0.1:8000/v1`) never consults a resolver at all.
-    """
-    try:
-        return [str(ipaddress.ip_address(host))]
-    except ValueError:
-        pass
-    try:
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        _reject_endpoint(
-            "unresolvable",
-            f"Local vision endpoint host '{host}' does not resolve; "
-            "continuing with OCR-only output.",
-            host=host,
-            error=str(exc),
-        )
-    return [str(info[4][0]) for info in infos]
 
 
-def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str, int]:
-    """R-43's static half: what can be decided about `url` without asking anyone.
-
-    The scheme, the presence of a host, and - when the host is written as an
-    address - whether that address is loopback. A host written as a *name*
-    cannot be settled here without a lookup, so it is settled per request
-    instead (D-029); this is the check a config can be rejected by, not the
-    authoritative one.
-    """
-    try:
-        # All three raise on a malformed authority, at different moments: a
-        # bracket that never closes stops `urlsplit` itself, a port out of
-        # range is only noticed when `parts.port` is read. Splitting first and
-        # guarding only the reads left the earlier one escaping as
-        # `ValueError("Invalid IPv6 URL")` - a traceback out of the CLI about
-        # something an operator typed in a config file. A rejection saying so
-        # is the answer they can act on.
-        parts = urllib.parse.urlsplit(url)
-        scheme = parts.scheme
-        host, configured_port = parts.hostname, parts.port
-    except ValueError as exc:
-        _reject_endpoint(
-            "unparsable_url",
-            f"Local vision endpoint '{url}' is not a usable URL: {exc}",
-            url=url,
-        )
-    if scheme not in ALLOWED_ENDPOINT_SCHEMES:
-        _reject_endpoint(
-            "scheme",
-            f"Local vision endpoint scheme '{scheme}' is not allowed; "
-            f"use {' or '.join(sorted(ALLOWED_ENDPOINT_SCHEMES))}.",
-            url=url,
-            scheme=scheme,
-        )
-    if not host:
-        _reject_endpoint("host_missing", f"Local vision endpoint '{url}' names no host.", url=url)
-    port = configured_port or DEFAULT_SCHEME_PORTS[scheme]
-    if not allow_remote_endpoint:
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            address = None
-        if address is not None and not address.is_loopback:
-            _reject_endpoint(
-                "non_loopback_host",
-                f"Local vision endpoint host '{host}' is not loopback; set "
-                "local_vision_allow_remote_endpoint to reach one deliberately.",
-                url=url,
-                host=host,
-            )
-    return host, port
 
 
-def _check_resolved_address(
-    host: str,
-    port: int,
-    *,
-    allow_remote_endpoint: bool,
-    resolver: AddressResolver | None = None,
-) -> list[str]:
-    """R-43's authoritative half: every address `host` resolves to is loopback.
-
-    Every address, not the first: a name answering with both 127.0.0.1 and a
-    link-local address is a name that can steer the very next connection off
-    loopback, and which of its answers gets connected to is not this function's
-    to know.
-    """
-    if allow_remote_endpoint:
-        return []
-    addresses = (resolver or _resolve_addresses)(host, port)
-    if not addresses:
-        _reject_endpoint(
-            "unresolvable",
-            f"Local vision endpoint host '{host}' resolved to no address.",
-            host=host,
-        )
-    for address in addresses:
-        try:
-            resolved = ipaddress.ip_address(address)
-        except ValueError:
-            # A resolver that answered with something that is not an address
-            # (a scoped `fe80::1%en0`, a name, anything) has not been shown to
-            # be loopback, and unproven is refused rather than assumed.
-            _reject_endpoint(
-                "unparsable_address",
-                f"Local vision endpoint host '{host}' resolved to '{address}', "
-                "which is not an address.",
-                host=host,
-                address=address,
-            )
-        if not resolved.is_loopback:
-            _reject_endpoint(
-                "non_loopback_address",
-                f"Local vision endpoint host '{host}' resolves to {address}, which is not "
-                "loopback; set local_vision_allow_remote_endpoint to reach one deliberately.",
-                host=host,
-                address=address,
-            )
-    return addresses
 
 
 def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
@@ -866,7 +774,7 @@ class FrameInterpreter:
     config: LocalVisionConfig
     progress: ProgressReporter | None = None
     probe: ProbeLocalVision = probe_local_vision
-    try_interpret: TryInterpretImage = try_interpret_image
+    try_interpret: TryInterpretImage = try_interpret_image_after_probe
     max_parallel: int = DEFAULT_MAX_PARALLEL
     debug: bool | None = None
     _last_probe: LocalVisionProbe | None = None
@@ -1176,13 +1084,12 @@ class FrameInterpreter:
         *,
         prompt_profile: str,
     ) -> tuple[Interpretation | None, WarningRecord | None]:
-        if self.try_interpret is try_interpret_image:
-            return try_interpret_image_after_probe(
-                config,
-                image_path,
-                prompt,
-                prompt_profile=prompt_profile,
-            )
+        # Whatever `try_interpret` is - the probe-skipping default, or a fake a
+        # test injected - it is called the one way. The default already skips
+        # the backend re-check the probe just did, so there is no default to
+        # tell apart from an injection here: the `is try_interpret_image` guard
+        # that used to do that was a test seam reaching into production control
+        # flow, and it is gone.
         return self.try_interpret(
             config,
             image_path,
@@ -1367,220 +1274,24 @@ def _interpret_with_rapid_mlx(
     )
 
 
-def _models_url(base_url: str) -> str:
-    return f"{base_url.rstrip('/')}/models"
 
 
-def _completions_url(base_url: str) -> str:
-    return f"{base_url.rstrip('/')}/chat/completions"
 
 
-def _served_model_ids(payload: Any) -> list[str]:
-    """Best-effort extraction of model ids from an OpenAI-style /v1/models body."""
-    data = payload.get("data", payload) if isinstance(payload, dict) else payload
-    if not isinstance(data, list):
-        return []
-    ids: list[str] = []
-    for entry in data:
-        if isinstance(entry, str):
-            ids.append(entry)
-        elif isinstance(entry, dict):
-            model_id = entry.get("id") or entry.get("model")
-            if isinstance(model_id, str):
-                ids.append(model_id)
-    return ids
 
 
-def _chat_content(envelope: Any) -> str:
-    if not isinstance(envelope, dict):
-        return ""
-    choices = envelope.get("choices", [])
-    if not choices or not isinstance(choices[0], dict):
-        return ""
-    message = choices[0].get("message", {})
-    if not isinstance(message, dict):
-        return ""
-    return str(message.get("content") or "")
 
 
-def _http_get_json(
-    requestor: HttpRequestor | None,
-    url: str,
-    timeout_sec: float,
-    *,
-    allow_remote_endpoint: bool = False,
-) -> dict[str, Any]:
-    if requestor is not None:
-        payload = requestor(method="GET", url=url, timeout=timeout_sec)
-    else:
-        payload = _urlopen_json(
-            "GET",
-            url,
-            body=None,
-            timeout_sec=timeout_sec,
-            allow_remote_endpoint=allow_remote_endpoint,
-        )
-    if not isinstance(payload, dict):
-        raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
-    return payload
 
 
-def _http_post_json(
-    requestor: HttpRequestor | None,
-    url: str,
-    body: dict[str, Any],
-    timeout_sec: float,
-    *,
-    allow_remote_endpoint: bool = False,
-) -> dict[str, Any]:
-    if requestor is not None:
-        payload = requestor(method="POST", url=url, body=body, timeout=timeout_sec)
-    else:
-        payload = _urlopen_json(
-            "POST",
-            url,
-            body=body,
-            timeout_sec=timeout_sec,
-            allow_remote_endpoint=allow_remote_endpoint,
-        )
-    if not isinstance(payload, dict):
-        raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
-    return payload
 
 
-class _RedirectsAreRejected(urllib.request.HTTPRedirectHandler):
-    """R-43 (RV-7): a 3xx ends the request instead of starting another one.
-
-    Validating an endpoint and then following wherever it points validates
-    nothing - the second request is to an address no rule ever saw. Refusing
-    outright, rather than re-validating the target, is the smaller rule: the
-    only endpoint Distill talks to is the one the operator configured.
-    """
-
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: Any,  # noqa: ARG002 - urllib's signature; the body is not read
-        code: int,
-        msg: str,
-        headers: Any,  # noqa: ARG002 - urllib's signature; no header is trusted
-        newurl: str,
-    ) -> NoReturn:
-        _reject_endpoint(
-            "redirect",
-            f"Local vision endpoint answered {code} {msg} redirecting to another "
-            "address; redirects are not followed.",
-            url=req.full_url,
-            status=code,
-            location=newurl,
-        )
 
 
-def _build_opener(*handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
-    """The vision client's opener: the default chain, minus two of its habits.
-
-    Redirects are not followed, and no proxy is consulted. An empty
-    `ProxyHandler` rather than the default one because the default reads
-    `HTTP_PROXY` from the environment: a validated loopback endpoint would
-    still be dialled through whatever that names, which sends the **keyframe**
-    to a host no rule here ever saw. The endpoint is local by rule, so there is
-    nothing for a proxy to do.
-
-    Built by a function so a test can put a fake transport under the *same*
-    chain production uses, instead of asserting against a chain it assembled
-    itself.
-    """
-    return urllib.request.build_opener(
-        _RedirectsAreRejected, urllib.request.ProxyHandler({}), *handlers
-    )
 
 
-_OPENER = _build_opener()
 
 
-def _urlopen_json(
-    method: str,
-    url: str,
-    body: dict[str, Any] | None,
-    timeout_sec: float,
-    *,
-    allow_remote_endpoint: bool = False,
-    resolver: AddressResolver | None = None,
-) -> Any:
-    """One request to the vision endpoint, validated before and bounded after.
-
-    The address is resolved and checked here, on every request, rather than
-    once when the config was read (D-029): a name that answered with 127.0.0.1
-    while the config was being validated is free to answer with something else
-    by the time the **keyframe** is posted, and only the check standing between
-    the resolution and the connection sees that.
-
-    What that does not close, stated so nobody reads it as more: the connection
-    resolves the name again, so a name that changes its answer between this
-    check and that connect is not caught. Closing it means connecting to the
-    address this function validated rather than to the name, which is a socket
-    Distill would have to open itself. The bound here is per request, which is
-    what D-029 asks for; it is not per packet.
-    """
-    host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
-    _check_resolved_address(
-        host, port, allow_remote_endpoint=allow_remote_endpoint, resolver=resolver
-    )
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with _OPENER.open(request, timeout=timeout_sec) as response:
-            # One byte past the cap, so a body that is exactly at it still
-            # arrives and a body over it is recognisable without being read.
-            # The header is not consulted: a Content-Length is the sender's
-            # claim about the sender, and R-44 is a bound on this process.
-            payload = response.read(MAX_RESPONSE_BYTES + 1)
-        if len(payload) > MAX_RESPONSE_BYTES:
-            # A delivered response, in M7.2's sense: it arrived, so it is
-            # evidence the transport works and must not count toward the
-            # breaker's consecutive-failure tally. It is unusable for the same
-            # reason a truncated body is - hence malformed, not unavailable.
-            raise RuntimeError(f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap")
-        raw = payload.decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so
-        # the probe/interpret paths can map them onto warning codes. Bounded
-        # like any other body (R-44), and tighter: only a preview of it is ever
-        # used, so reading a gigabyte to quote 200 characters of it is a cost
-        # with no reader.
-        detail = (
-            exc.read(ERROR_BODY_PREVIEW_BYTES).decode("utf-8", errors="replace")
-            if hasattr(exc, "read")
-            else ""
-        )
-        if 300 <= exc.code < 400:
-            # A redirect this module never got to refuse: urllib turns a 3xx it
-            # cannot act on - no `Location`, or one naming a scheme it will not
-            # open - into an `HTTPError` before `_RedirectsAreRejected` is
-            # consulted. A 3xx carries no body, so quoting one leaves an
-            # operator with `HTTP 302 from …: ` and nothing to act on. Nothing
-            # is followed either way; only the message was the mystery.
-            raise RuntimeError(
-                f"HTTP {exc.code} from {url}: the endpoint answered a redirect that could not "
-                "be followed, and redirects are not followed in any case"
-            ) from exc
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail[:200]}") from exc
-    except http.client.IncompleteRead as exc:
-        # A server that closes the connection mid-body (crash/restart) yields a
-        # truncated read; treat it as a malformed response so we degrade cleanly.
-        raise RuntimeError(f"incomplete response from {url}: {exc}") from exc
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"non-JSON response from {url}: {raw[:200]!r}") from exc
 
 
 def _result_from_payload(
@@ -1611,71 +1322,9 @@ def _result_from_payload(
     )
 
 
-def _normalize_frame_kind(value: Any) -> str:
-    kind = str(value or "").strip().lower()
-    return kind if kind in FRAME_KINDS else ""
 
 
-def _normalize_text_confidence(value: Any) -> str:
-    level = str(value or "").strip().lower()
-    return level if level in TEXT_CONFIDENCE_LEVELS else "none"
 
 
-def parse_interpretation_json(raw_response: str) -> dict[str, Any] | None:
-    """The model's answer as an interpretation payload, or `None` if it is not one.
-
-    `None` means malformed, and covers three things the caller handles
-    identically: text that is not JSON, JSON that is not an object, and an
-    object that carries no reading (R-39). The third is why this is not a bare
-    parser - a server that is up and answers `{}` for every keyframe parses
-    perfectly, and counting that as an interpretation is what makes a dead
-    model look like a working one.
-    """
-    stripped = raw_response.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        stripped = "\n".join(lines).strip()
-    try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError:
-        parsed = _extract_first_json_object(stripped)
-    if not isinstance(parsed, dict) or not document_carries_a_reading(parsed):
-        return None
-    return parsed
 
 
-def _extract_first_json_object(text: str) -> dict[str, Any] | None:
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\":
-            escaped = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    parsed = json.loads(text[start : index + 1])
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None

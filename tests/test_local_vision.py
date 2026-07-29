@@ -492,7 +492,7 @@ def test_interpret_image_reports_unreachable_server(
     # The probe succeeds (server up, model served); generation then fails to
     # connect, which must surface as a transport-unavailable warning.
     monkeypatch.setattr(
-        "distill.local_vision._urlopen_json",
+        "distill.rapid_mlx._urlopen_json",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             urllib.error.URLError("connection refused")
         ),
@@ -515,7 +515,7 @@ def test_interpret_image_reports_timeout(
     image.write_bytes(b"png")
 
     monkeypatch.setattr(
-        "distill.local_vision._urlopen_json",
+        "distill.rapid_mlx._urlopen_json",
         lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("timed out")),
     )
 
@@ -538,7 +538,7 @@ def test_interpret_image_malformed_response_returns_warning(
     # Probe succeeds; the chat completion returns a body whose content is not
     # valid JSON, so both retry attempts are exhausted -> malformed response.
     monkeypatch.setattr(
-        "distill.local_vision._urlopen_json",
+        "distill.rapid_mlx._urlopen_json",
         lambda method, url, body=None, timeout_sec=30.0, **_: (
             _models_body(DEFAULT_MODEL)
             if url.rstrip("/").endswith("/models")
@@ -581,7 +581,7 @@ def test_an_empty_object_is_rejected_rather_than_counted_as_an_interpretation(
     image = tmp_path / "frame.png"
     image.write_bytes(b"png")
     monkeypatch.setattr(
-        "distill.local_vision._urlopen_json",
+        "distill.rapid_mlx._urlopen_json",
         lambda method, url, body=None, timeout_sec=30.0, **_: (
             _models_body(DEFAULT_MODEL)
             if url.rstrip("/").endswith("/models")
@@ -667,7 +667,7 @@ def test_the_response_summary_does_not_claim_an_empty_interpretation(
         content = _frame_json(verbatim_text="frame0", text_confidence="high")
         return _chat_envelope(content if "frame0" in text else "{}")
 
-    monkeypatch.setattr("distill.local_vision._urlopen_json", fake_urlopen)
+    monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
 
     interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe, debug=True)
     frames, warnings = interpreter.interpret(
@@ -763,7 +763,7 @@ def test_a_truncated_json_body_is_rejected(
     assert parse_interpretation_json(truncated) is None
 
     monkeypatch.setattr(
-        "distill.local_vision._urlopen_json",
+        "distill.rapid_mlx._urlopen_json",
         lambda method, url, body=None, timeout_sec=30.0, **_: (
             _models_body(DEFAULT_MODEL)
             if url.rstrip("/").endswith("/models")
@@ -784,7 +784,7 @@ def test_a_truncated_json_body_is_rejected(
     # decode this half is about never runs.
     monkeypatch.undo()
     monkeypatch.setattr(
-        "distill.local_vision._OPENER",
+        "distill.rapid_mlx._OPENER",
         _FakeOpener(b'{"choices": [{"message": {"content": "'),
     )
 
@@ -837,7 +837,7 @@ def test_interpret_image_cancel_returns_warning(
     # Generation is the only network call on the interpret path (interpret_image
     # no longer probes); raising KeyboardInterrupt there exercises the cancel path.
     monkeypatch.setattr(
-        "distill.local_vision._urlopen_json",
+        "distill.rapid_mlx._urlopen_json",
         lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt),
     )
 

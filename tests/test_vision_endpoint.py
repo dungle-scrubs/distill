@@ -209,7 +209,7 @@ def test_the_opt_out_permits_a_non_loopback_host(
             ),
         }
     )
-    monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
 
     probe = probe_local_vision(config)
     assert probe.available is True
@@ -258,7 +258,7 @@ def test_a_redirect_to_a_link_local_address_is_not_followed(
             LINK_LOCAL_URL: _json_response(LINK_LOCAL_URL, {"data": [{"id": "leaked"}]}),
         }
     )
-    monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
 
     with pytest.raises(LocalVisionFailure) as caught:
         _urlopen_json("GET", MODELS_URL, None, 5.0)
@@ -285,7 +285,7 @@ def test_redirects_are_disabled_rather_than_re_validated(
             other_loopback: _json_response(other_loopback, {"data": [{"id": "elsewhere"}]}),
         }
     )
-    monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
 
     with pytest.raises(LocalVisionFailure) as caught:
         _urlopen_json("GET", MODELS_URL, None, 5.0)
@@ -307,7 +307,7 @@ def test_the_resolved_address_is_checked_on_every_request(
     """
     named_url = "http://vision.test:8000/v1/models"
     transport = _FakeTransport({named_url: _json_response(named_url, {"data": []})})
-    monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
     answers = [["127.0.0.1"], ["169.254.169.254"]]
     asked: list[tuple[str, int]] = []
 
@@ -341,7 +341,7 @@ def test_a_redirect_urllib_will_not_act_on_still_tells_the_operator_it_was_one(
     for location in ({"Location": "file:///etc/passwd"}, {}):
         response = _CannedResponse(MODELS_URL, status=302, headers=location)
         transport = _FakeTransport({MODELS_URL: response})
-        monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
 
         with pytest.raises(RuntimeError) as caught:
             _urlopen_json("GET", MODELS_URL, None, 5.0)
@@ -383,7 +383,7 @@ def test_every_address_a_name_answers_with_is_checked_not_only_the_first(
     """
     named_url = "http://vision.test:8000/v1/models"
     transport = _FakeTransport({named_url: _json_response(named_url, {"data": []})})
-    monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
 
     with pytest.raises(LocalVisionFailure) as caught:
         _urlopen_json(
@@ -414,7 +414,7 @@ def test_a_response_body_beyond_the_cap_is_rejected(
     """
     endless = _CannedResponse(MODELS_URL, endless=True)
     monkeypatch.setattr(
-        "distill.local_vision._OPENER", _build_opener(_FakeTransport({MODELS_URL: endless}))
+        "distill.rapid_mlx._OPENER", _build_opener(_FakeTransport({MODELS_URL: endless}))
     )
 
     with pytest.raises(RuntimeError, match=str(MAX_RESPONSE_BYTES)):
@@ -426,7 +426,7 @@ def test_a_response_body_beyond_the_cap_is_rejected(
     image.write_bytes(b"png")
     completions_url = f"{LOOPBACK_URL}/chat/completions"
     monkeypatch.setattr(
-        "distill.local_vision._OPENER",
+        "distill.rapid_mlx._OPENER",
         _build_opener(
             _FakeTransport({completions_url: _CannedResponse(completions_url, endless=True)})
         ),
@@ -454,7 +454,7 @@ def test_every_rejected_endpoint_is_logged_with_its_reason(
     without reproducing the run.
     """
     transport = _FakeTransport({MODELS_URL: _redirect_response(MODELS_URL, LINK_LOCAL_URL)})
-    monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
 
     with caplog.at_level(logging.DEBUG, logger="distill.local_vision"):
         with pytest.raises(DistillError):
@@ -496,7 +496,7 @@ def test_a_rejected_endpoint_degrades_the_probe_instead_of_raising(
     capability that was allowed to be missing.
     """
     monkeypatch.setattr(
-        "distill.local_vision._resolve_addresses",
+        "distill.rapid_mlx._resolve_addresses",
         lambda host, port: ["169.254.169.254"],
     )
 
@@ -560,7 +560,7 @@ def test_an_environment_proxy_cannot_take_the_request_off_the_endpoint(
     monkeypatch.delenv("NO_PROXY", raising=False)
     monkeypatch.delenv("no_proxy", raising=False)
     transport = _FakeTransport({MODELS_URL: _json_response(MODELS_URL, {"data": []})})
-    monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
 
     assert _urlopen_json("GET", MODELS_URL, None, 5.0) == {"data": []}
     assert transport.dialled == ["127.0.0.1:8000"]
@@ -577,7 +577,7 @@ def test_an_error_body_is_read_under_a_bound_too(
     """
     endless = _CannedResponse(MODELS_URL, status=500, endless=True)
     monkeypatch.setattr(
-        "distill.local_vision._OPENER", _build_opener(_FakeTransport({MODELS_URL: endless}))
+        "distill.rapid_mlx._OPENER", _build_opener(_FakeTransport({MODELS_URL: endless}))
     )
 
     with pytest.raises(RuntimeError, match="HTTP 500"):

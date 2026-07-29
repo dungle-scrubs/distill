@@ -40,7 +40,7 @@ from .local_vision import (
     FrameInterpreter,
     local_vision_config_from_args,
     probe_local_vision,
-    try_interpret_image,
+    try_interpret_image_after_probe,
 )
 from .ocr import ocr_frames
 from .options import (
@@ -1162,7 +1162,7 @@ def interpret_frames_with_local_vision(
         config=options.local_vision_config(),
         progress=progress,
         probe=probe_local_vision,
-        try_interpret=try_interpret_image,
+        try_interpret=try_interpret_image_after_probe,
     )
     return interpreter.interpret(frames)
 
