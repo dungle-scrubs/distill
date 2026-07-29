@@ -167,7 +167,12 @@ def test_the_endpoint_scheme_is_restricted_to_http_and_https(tmp_path: Path) -> 
         ).base_url == url.rstrip("/")
 
 
-def test_the_opt_out_permits_a_non_loopback_host(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source_type", ("local", "youtube"))
+def test_the_opt_out_permits_a_non_loopback_host(
+    source_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """R-43: an operator who says so explicitly can point the client elsewhere.
 
     The flag travels with the local-vision policy but not bundle identity. On a
@@ -182,6 +187,40 @@ def test_the_opt_out_permits_a_non_loopback_host(tmp_path: Path) -> None:
 
     assert config.base_url == PRIVATE_URL
     assert config.allow_remote_endpoint is True
+
+    models_url = f"{PRIVATE_URL}/models"
+    completions_url = f"{PRIVATE_URL}/chat/completions"
+    transport = _FakeTransport(
+        {
+            models_url: _json_response(models_url, {"data": [{"id": config.model}]}),
+            completions_url: _json_response(
+                completions_url,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {"visual_summary": "Remote endpoint reached"}
+                                )
+                            }
+                        }
+                    ]
+                },
+            ),
+        }
+    )
+    monkeypatch.setattr("distill.local_vision._OPENER", _build_opener(transport))
+
+    probe = probe_local_vision(config)
+    assert probe.available is True
+
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    interpretation, failure = try_interpret_image(config, image, "Interpret.")
+    assert interpretation is not None
+    assert interpretation.visual_summary == "Remote endpoint reached"
+    assert failure is None
+    assert transport.requested == [models_url, completions_url]
 
     options = DistillOptions.from_args(
         {"local_vision_base_url": PRIVATE_URL, "local_vision_allow_remote_endpoint": True}
@@ -199,7 +238,7 @@ def test_the_opt_out_permits_a_non_loopback_host(tmp_path: Path) -> None:
     # Same loopback endpoint on both sides, so only the policy flag differs.
     permitted = DistillOptions.from_args({"local_vision_allow_remote_endpoint": True})
     assert permitted.local_vision_base_url == DistillOptions.from_args({}).local_vision_base_url
-    assert permitted.opts_hash("local") == DistillOptions.from_args({}).opts_hash("local")
+    assert permitted.opts_hash(source_type) == DistillOptions.from_args({}).opts_hash(source_type)
 
 
 def test_a_redirect_to_a_link_local_address_is_not_followed(

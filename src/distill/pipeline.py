@@ -27,6 +27,7 @@ from .bundle_store import (
     BundleStore,
     PrunePolicy,
     atomic_write_text,
+    confined_path,
     ensure_safe_directory,
 )
 from .cache_doctor import inspect_cache
@@ -333,10 +334,22 @@ class ProcessingRun:
     def _cached_response(self, store: BundleStore, snapshot: BundleSnapshot) -> dict[str, Any]:
         snapshot, progress_summary = cache_hit_progress_summary(store, snapshot)
         manifest = snapshot.manifest
+        frames = [
+            {
+                **frame,
+                "path": str(
+                    confined_path(
+                        snapshot.generation / Path(frame["relative_path"]),
+                        snapshot.generation,
+                    )
+                ),
+            }
+            for frame in manifest.get("frames", [])
+        ]
         return run_response(
             snapshot,
             self.source,
-            list(manifest.get("frames", [])),
+            frames,
             bool(manifest.get("transcript_present")),
             list(manifest.get("warnings", [])),
             cached=True,

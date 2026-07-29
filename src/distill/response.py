@@ -137,10 +137,11 @@ def response_frames(frames: list[FrameArtifact]) -> list[dict[str, Any]]:
 
     This is the one adapter from a **frame artifact** to the document a caller
     reads. `manifest_document` projects the same fields minus the machine-local
-    `path`; a later cache hit therefore returns the durable portable shape.
-    The names overlap with the carrier's without being the carrier's: what a
-    stage passes along and what a reader is served are two schemas, and the
-    second one is this module's to change (D-015).
+    `path`; a later cache hit rehydrates that response-only field from the
+    portable `relative_path` under its active **generation** before calling
+    `run_response`. The names overlap with the carrier's without being the
+    carrier's: what a stage passes along and what a reader is served are two
+    schemas, and the second one is this module's to change (D-015).
 
     A carrier in and a document out, never a document in, and the way out is
     `serialize`. A **manifest** is durable and a response is what a caller
@@ -187,7 +188,8 @@ def run_response(
     a snapshot exists only where the **active generation** was proven to be on
     disk (R-04). `frames` is that same evidence for the frames: documents, which
     a fresh run got from `response_frames` and a cache hit read out of the
-    **manifest** the previous run wrote.
+    **manifest** the previous run wrote, then re-addressed to the active
+    **generation**.
     """
     # Counted on what a reading says, not on a key being present (R-39): a
     # **manifest** written before an empty response was rejected, or by a server

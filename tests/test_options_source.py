@@ -127,22 +127,27 @@ def test_dataclass_defaults_match_option_specs() -> None:
 
 
 def test_local_opts_hash_includes_cache_mode_but_youtube_excludes_it() -> None:
+    """Cache mode moves local identity, while YouTube always excludes it."""
     fingerprint = DistillOptions(cache_mode="fingerprint")
     content = DistillOptions(cache_mode="content")
     assert fingerprint.opts_hash("local") != content.opts_hash("local")
     assert fingerprint.opts_hash("youtube") == content.opts_hash("youtube")
 
 
-def test_output_affecting_local_vision_settings_change_identity() -> None:
+@pytest.mark.parametrize("source_type", ("local", "youtube"))
+def test_output_affecting_local_vision_settings_change_identity(source_type: str) -> None:
     no_caption = DistillOptions(caption_frames=False)
     caption = DistillOptions(caption_frames=True)
     larger_model = DistillOptions(caption_frames=True, local_vision_model="qwen3-vl:32b")
 
-    assert no_caption.opts_hash("local") != caption.opts_hash("local")
-    assert caption.opts_hash("local") != larger_model.opts_hash("local")
+    assert no_caption.opts_hash(source_type) != caption.opts_hash(source_type)
+    assert caption.opts_hash(source_type) != larger_model.opts_hash(source_type)
 
 
-def test_local_vision_server_address_does_not_change_the_bundle_key() -> None:
+@pytest.mark.parametrize("source_type", ("local", "youtube"))
+def test_local_vision_server_address_does_not_change_the_bundle_key(
+    source_type: str,
+) -> None:
     """FAILS FIRST: the address of an equal-output reader entered identity."""
     first = DistillOptions.from_args(
         {"local_vision_base_url": "http://127.0.0.1:8000/v1"}
@@ -152,9 +157,9 @@ def test_local_vision_server_address_does_not_change_the_bundle_key() -> None:
     )
 
     fingerprint = "same-source"
-    assert source_hash(fingerprint, first.opts_hash("local")) == source_hash(
+    assert source_hash(fingerprint, first.opts_hash(source_type)) == source_hash(
         fingerprint,
-        second.opts_hash("local"),
+        second.opts_hash(source_type),
     )
 
 
