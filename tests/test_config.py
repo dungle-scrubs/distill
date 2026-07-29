@@ -14,16 +14,23 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from distill import config, local_vision, pipeline
 from distill.config import OPTION_ENV_VARIABLES, resolve_options
 from distill.errors import DistillError
+from distill.local_vision import DEFAULT_TIMEOUT_SEC
 from distill.options import GENERAL_OPTION_NAMES, DistillOptions
 from distill.source import validate_output_root
+from distill.version import SIGNED_MODULES
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 
 # The DISTILL_* variables that steer diagnosis rather than a run's options: a
 # traceback, a debug dump, the effective timeout, the long-probe opt-in. None of
@@ -320,6 +327,252 @@ def test_local_vision_reads_the_same_config_directory() -> None:
     which file is being read from which.
     """
     assert local_vision.config_dir is config.config_dir
+
+
+# --- What a configured value is refused by, and what a bad file is worth. -----
+#
+# A config file is an operator typing an option a day earlier, so the rules it
+# meets have to be the rules the command line meets: one door, one refusal, one
+# message. The file itself is the other half - a `distill.json` nobody can parse
+# is a file somebody wrote and got wrong, which is not the same thing as a file
+# that is not there.
+
+MALFORMED_JSON = '{"max_keyframes": 5,'
+"""A `distill.json` an operator saved mid-edit: valid up to the point it stops."""
+
+
+def write_text_config(directory: Path, text: str) -> Path:
+    """Plant a `distill.json` holding `text`, whatever `text` is or is not."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "distill.json"
+    path.write_text(text)
+    return path
+
+
+def refusal_site(error: DistillError) -> tuple[str, str]:
+    """The module and function that raised: which door the value was refused at.
+
+    The innermost frame, because that is where the decision was made. A
+    configured value and a typed one refused at the same site are refused by the
+    same code, which is the claim this milestone rests on and the one an
+    equality of two messages cannot make on its own.
+    """
+    traceback = error.__traceback__
+    assert traceback is not None
+    while traceback.tb_next is not None:
+        traceback = traceback.tb_next
+    code = traceback.tb_frame.f_code
+    return Path(code.co_filename).name, code.co_name
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-5, 0, 2.5, "many"],
+    ids=["below-the-floor", "zero", "not-whole", "not-a-number"],
+)
+def test_a_configured_number_is_refused_where_a_typed_one_is(
+    value: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """One door for both, proven by the record and by the frame that raised it.
+
+    A config file that accepted a keyframe cap the command line refuses would be
+    a second, softer set of rules for the same option - and the run that noticed
+    would be the one that produced a **bundle** nobody could ask for again.
+    """
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    write_config(tmp_path, {"max_keyframes": value})
+
+    with pytest.raises(DistillError) as configured:
+        DistillOptions.from_args({})
+    with pytest.raises(DistillError) as typed:
+        DistillOptions.from_args({"max_keyframes": value})
+
+    assert configured.value.code == "E_BAD_OPTIONS"
+    assert configured.value.stage == "options"
+    assert configured.value.to_dict() == typed.value.to_dict()
+    assert refusal_site(configured.value) == refusal_site(typed.value)
+    assert refusal_site(configured.value)[0] == "options.py"
+
+
+def test_a_malformed_general_config_file_is_refused_rather_than_read_as_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST: an unparsable `distill.json` was silently `{}` (D-011).
+
+    Every option in it - the keyframe cap, the output root - was then the
+    default, and the run went ahead and produced a **bundle** configured by
+    nothing the operator wrote. A file that cannot be parsed is not a file
+    without options in it.
+    """
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    write_text_config(tmp_path, MALFORMED_JSON)
+
+    with pytest.raises(DistillError) as refusal:
+        DistillOptions.from_args({})
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.stage == "options"
+
+
+def test_a_malformed_general_config_file_names_the_file_and_the_parse_failure(
+    tmp_path: Path,
+) -> None:
+    """Which file, and where it stopped parsing - the two things a fix needs.
+
+    Config resolution walks four directories, so "your config is broken" without
+    a path sends an operator to look in the one they did not edit.
+    """
+    path = write_text_config(tmp_path, MALFORMED_JSON)
+
+    with pytest.raises(DistillError) as refusal:
+        config.general_config(tmp_path)
+
+    details = refusal.value.details
+    assert details["path"] == str(path)
+    assert "line 1" in details["error"]
+
+
+def test_a_general_config_file_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
+    """A JSON array parses and still names no option.
+
+    Well-formed and unusable is the same mistake as malformed seen a moment
+    later - it reaches the loader as a list and sets nothing - so it is answered
+    the same way rather than passed over as an empty configuration.
+    """
+    write_text_config(tmp_path, '["max_keyframes"]')
+
+    with pytest.raises(DistillError) as refusal:
+        config.general_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.details["received"] == "list"
+
+
+def test_an_unreadable_general_config_file_is_refused_rather_than_treated_as_absent(
+    tmp_path: Path,
+) -> None:
+    """A file this process may not read is a refusal, never a silent default.
+
+    The same discipline `source_path_kind` holds to (D-022): absent is a fact,
+    but "there is no configuration here" about a file whose contents are denied
+    to us is a claim with nothing behind it, and it would run with defaults
+    while the operator's own options sat on disk unread.
+    """
+    path = write_config(tmp_path, {"max_keyframes": 5})
+    path.chmod(0o000)
+    if os.access(path, os.R_OK):  # pragma: no cover - root reads anything
+        pytest.skip("this process can read a mode 000 file")
+
+    with pytest.raises(DistillError) as refusal:
+        config.general_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.stage == "options"
+    assert refusal.value.details == {"path": str(path), "errno": "EACCES"}
+
+
+def test_an_absent_general_config_file_is_not_a_refusal(tmp_path: Path) -> None:
+    """No `distill.json` is the ordinary case, and stays the ordinary case.
+
+    Stated as its own test because the refusals above are one over-eager `except`
+    away from making a machine with no config file unable to run at all.
+    """
+    assert config.general_config(tmp_path) == {}
+
+
+def test_a_local_vision_value_is_coerced_where_a_general_value_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Two owners of one file, keeping the contracts they each had.
+
+    `local_vision.py`'s reader coerces an unusable value to the default, which is
+    right for a section whose failure mode is a slower probe. The general schema
+    refuses, because a keyframe cap silently replaced by 80 is a **bundle** the
+    operator did not ask for. The same file proves both, so the scope of the
+    coercion is the section rather than the file it lives in.
+    """
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    write_config(tmp_path, {"local_vision": {"timeout_sec": "soon"}, "max_keyframes": 5})
+
+    assert local_vision.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
+    assert DistillOptions.from_args({}).max_keyframes == 5
+
+    write_config(tmp_path, {"local_vision": {"timeout_sec": "soon"}, "max_keyframes": "many"})
+
+    with pytest.raises(DistillError) as refusal:
+        DistillOptions.from_args({})
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert local_vision.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
+
+
+def test_a_malformed_local_vision_file_is_still_read_forgivingly(tmp_path: Path) -> None:
+    """The malformed rule is the general schema's, and does not spread.
+
+    `distill.local-vision.json` keeps its own forgiving reader: a broken one
+    leaves the defaults in place and a run captions frames with them. Only the
+    general file is fatal, which is what D-011 decided and what makes the two
+    readers separate rather than duplicated.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(MALFORMED_JSON)
+
+    assert local_vision.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
+
+
+def test_a_configured_option_changes_the_options_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Why this module is signed: what it resolves reaches the **bundle key**.
+
+    A configured `max_keyframes` produces a different **options hash** from the
+    default one, so editing this module can change which **bundle** a run
+    publishes - the property ADR-0003 makes a module signed for.
+    """
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    default_hash = DistillOptions.from_args({}).opts_hash("local")
+
+    write_config(tmp_path, {"max_keyframes": 5})
+
+    assert DistillOptions.from_args({}).opts_hash("local") != default_hash
+    assert "config.py" in SIGNED_MODULES
+
+
+def test_a_malformed_config_file_leaves_the_cli_as_the_error_object(tmp_path: Path) -> None:
+    """The refusal an operator's shell sees: the JSON record on stderr, exit 2.
+
+    Driven through a real child process because the boundary's promise is about
+    the process - an in-process raise proves the code and the stage and says
+    nothing about the exit code, the stream, or whether a traceback came out
+    with it. `cache-doctor` reads config and writes nothing, so this is the
+    cheapest command that has to refuse.
+    """
+    write_text_config(tmp_path, MALFORMED_JSON)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "distill.cli", "cache-doctor"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(PACKAGE_ROOT / "src"),
+            "DISTILL_CONFIG_DIR": str(tmp_path),
+            "HOME": str(home()),
+        },
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    record = json.loads(result.stderr)
+    assert record["code"] == "E_BAD_OPTIONS"
+    assert record["stage"] == "options"
+    assert record["details"]["path"] == str(tmp_path / "distill.json")
 
 
 def test_the_module_comment_states_what_it_owns() -> None:

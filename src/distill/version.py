@@ -40,6 +40,11 @@ SIGNED_MODULES = (
     "bundle_store.py",
     "capabilities.py",
     "cli.py",
+    # Signed because it decides which values a run is configured with: a key it
+    # folds in from `distill.json` or from `DISTILL_OUTPUT_DIR` reaches the
+    # option table, and every processing option there is part of the options
+    # hash. Editing this module can therefore change which bundle a run
+    # publishes without any option being typed differently.
     "config.py",
     "emit.py",
     "errors.py",

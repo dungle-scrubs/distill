@@ -181,6 +181,15 @@ same value typed on the command line is. The nested `local_vision` object, and
 }
 ```
 
+A `distill.json` that cannot be parsed, cannot be read, or does not hold a JSON
+object ends the command with `E_BAD_OPTIONS` naming the file and what was wrong
+with it. It is not treated as an empty file: a run that quietly fell back to the
+defaults for every option you meant to set would produce a bundle you did not
+ask for. A file that is simply not there is the ordinary case and configures
+nothing. `distill.local-vision.json` and the nested `local_vision` object keep
+their own forgiving reader - an unusable value there falls back to the default
+so a broken vision setting costs a run its captions rather than the run.
+
 A value can come from four places, and the first of these that names it wins:
 the command line, then the environment, then the config file, then Distill's
 own defaults. `DISTILL_OUTPUT_DIR` is the only option the environment sets - it

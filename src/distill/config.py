@@ -9,7 +9,11 @@ This module owns three things:
   a particular machine is a value nobody can predict from the file they edited.
 - **The general schema over `distill.json`.** Every top-level key of that file
   except the nested `local_vision` object, which belongs to another owner (see
-  below). A key here names an option; a key naming nothing is passed over.
+  below). A key here names an option; a key naming nothing is passed over. What
+  is *not* passed over is the file: absent is no configuration, but unparsable,
+  unreadable or not-an-object is `E_BAD_OPTIONS` at stage `options` naming the
+  path, because a run that falls back to the defaults for a file somebody wrote
+  produces a **bundle** nobody asked for (D-011).
 - **The resolution order.** CLI > environment > file > default (the environment
   layer being `DISTILL_OUTPUT_DIR`, the one option a machine rather than a run
   decides), applied by
@@ -45,6 +49,8 @@ import os
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
+
+from .errors import DistillError, errno_name
 
 CONFIG_DIR_ENV = "DISTILL_CONFIG_DIR"
 XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
@@ -106,20 +112,54 @@ def config_dir() -> Path:
     return candidates[0]
 
 
-def _read_json(path: Path) -> dict[str, Any]:
-    """The JSON object at `path`, or nothing when there is not one there.
+def _bad_config_file(path: Path, message: str, **details: str) -> DistillError:
+    """The one refusal this module raises, so all three name the same things.
 
-    Absence, unreadability and malformed content all answer the same way here
-    today: no configuration. That is right for a file that is not there and
-    wrong for one an operator wrote and got wrong, which is why this reader is
-    private and separate from `local_vision.py`'s - the two are about to
-    disagree on what a malformed file means.
+    `E_BAD_OPTIONS` at stage `options`, because a config file is an operator
+    typing options a day earlier and the answer they get should not depend on
+    when they typed them. The path is always in the details: resolution walks
+    four directories, and "your config is broken" without a filename sends
+    somebody to look in the one they did not edit.
+    """
+    return DistillError("E_BAD_OPTIONS", "options", message, {"path": str(path), **details})
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    """The JSON object at `path`, or nothing when the file is not there.
+
+    Absence is the only one of these that means no configuration (D-011). A file
+    an operator wrote and got wrong - unparsable, unreadable, or holding
+    something that is not an object - is refused, because the alternative is a
+    run that quietly uses the defaults for every option the file was meant to
+    set and produces a **bundle** nobody asked for.
+
+    Not there is a `stat` this process was allowed to make: `ENOENT` and the
+    `ENOTDIR` of a path whose parent is a file are absence, and every other
+    `OSError` - `EACCES` above all - is a refusal, for the reason
+    `source_path_kind` refuses one (D-022). "There is no configuration here"
+    about a file we were denied is a claim with nothing behind it.
+
+    Separate from `local_vision.py`'s reader rather than shared with it: that
+    one stays forgiving, because a broken local-vision section costs a run its
+    captions and this one costs a run its options.
     """
     try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        text = path.read_text()
+    except (FileNotFoundError, NotADirectoryError):
         return {}
-    return payload if isinstance(payload, dict) else {}
+    except OSError as exc:
+        raise _bad_config_file(
+            path, "config file could not be read", errno=errno_name(exc)
+        ) from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise _bad_config_file(path, "config file is not valid JSON", error=str(exc)) from exc
+    if not isinstance(payload, dict):
+        raise _bad_config_file(
+            path, "config file must hold a JSON object", received=type(payload).__name__
+        )
+    return payload
 
 
 def general_config(base_dir: Path | None = None) -> dict[str, Any]:
@@ -127,7 +167,10 @@ def general_config(base_dir: Path | None = None) -> dict[str, Any]:
 
     Unvalidated because validation belongs at the door every option goes
     through, not at a second one here (a configured number refused by a rule
-    this module invented would be refused differently from a typed one).
+    this module invented would be refused differently from a typed one). The
+    *file* is this module's question and is checked here - whether it can be
+    read and holds an object - because no later door ever sees a file that did
+    not parse.
 
     The nested `local_vision` object is dropped rather than passed on: it is a
     section belonging to another owner, and a file that says
