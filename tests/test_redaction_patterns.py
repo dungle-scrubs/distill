@@ -399,3 +399,30 @@ def test_an_assignment_name_cannot_scan_the_whole_frame() -> None:
 
     assert checked == len(redact_secrets.ASSIGNMENT_PATTERNS)
     assert offenders == [], f"unbounded repeat in an assignment name: {offenders}"
+
+
+def test_url_userinfo_redacts_the_password_only() -> None:
+    result = redact_text("curl https://admin:sk-live-abcdef123456@api.example.com/v1")
+
+    assert "sk-live-abcdef123456" not in result.text
+    assert "admin:" in result.text
+    assert "api.example.com" in result.text
+
+
+def test_url_userinfo_leaves_benign_authority_shapes_intact() -> None:
+    benign = [
+        "git clone ssh://git@github.com/org/repo.git",
+        "mailto:someone@example.com",
+        "http://[::1]:8000/v1",
+        "meet at 12:30@cafe",
+        "image ghcr.io/org/app:1.2@sha256:abcdef",
+        "HTTPS://EXAMPLE.COM/PLAIN/PATH",
+    ]
+    for text in benign:
+        assert redact_text(text).text == text, text
+
+
+def test_url_userinfo_matches_uppercase_schemes() -> None:
+    result = redact_text("HTTPS://USER:SECRET-VALUE-123456@HOST.EXAMPLE.COM")
+
+    assert "SECRET-VALUE-123456" not in result.text

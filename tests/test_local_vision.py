@@ -2135,7 +2135,19 @@ class TestPromptSideRedaction:
                 return super().open(request, timeout)
 
         monkeypatch.setattr("distill.rapid_mlx._OPENER", _CapturingOpener(payload))
-        secret_frame = _frame(1, image, extracted_text="API_KEY=sk-uniform-secret")
+        # DISABLED, not the default: under the default policy the carrier
+        # already redacted extracted_text at construction, so only the
+        # --no-redact-secrets frame exercises the prompt-side sink at all.
+        from distill.artifacts import RedactionState
+
+        secret_frame = FrameArtifact(
+            index=1,
+            timestamp_sec=1.0,
+            path=str(image),
+            relative_path=f"frames/{image.name}",
+            extracted_text="API_KEY=sk-uniform-secret",
+            redaction=RedactionState.DISABLED,
+        )
         local = LocalVisionConfig()
         remote = replace(
             LocalVisionConfig(),

@@ -29,6 +29,7 @@ from pathlib import Path
 
 from distill.grounding import assess_grounding
 from distill.ocr import find_tesseract_command, ocr_frame
+from distill.redact_secrets import redact_for_prompt
 
 EVAL_ROOT = Path(__file__).resolve().parent
 FRAMES_DIR = EVAL_ROOT / "frames"
@@ -277,8 +278,12 @@ def evaluate(
                     _, vision_recall, vision_f1 = token_prf(truth, result.verbatim_text)
                 else:
                     claimed_text = claims_text(result.verbatim_text)
+                # The model read prompt-side-redacted text (M2.6), so the
+                # cross-check compares on the same text. No corpus frame's
+                # OCR changes under redaction today (verified), so recorded
+                # baselines are unaffected.
                 assessment = assess_grounding(
-                    ocr_text=ocr_text,
+                    ocr_text=redact_for_prompt(ocr_text),
                     verbatim_text=result.verbatim_text,
                     text_confidence=result.text_confidence,
                     has_interpretation=result.has_interpretation,

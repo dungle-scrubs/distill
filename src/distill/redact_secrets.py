@@ -108,8 +108,15 @@ ASSIGNMENT_PATTERNS = (
 )
 # A URL whose authority embeds a credential (`scheme://user:secret@host`).
 # The password is the secret; the username can be a key id and the host is
-# what makes the line diagnosable, so only the password is replaced.
-URL_USERINFO_RE = re.compile(r"(?P<prefix>[a-z][a-z0-9+.-]*://[^/@\s:]+:)(?P<value>[^@/\s]+)(?=@)")
+# what makes the line diagnosable, so only the password is replaced. Every
+# run is bounded and the scheme is anchored by a lookbehind, for the same
+# reason the entropy rules above are: unanchored unbounded runs went
+# quadratic on attacker-chosen screen text (measured 25.7s on 256 KiB of
+# 'a's before the bounds, 14ms after).
+URL_USERINFO_RE = re.compile(
+    r"(?P<prefix>(?<![a-zA-Z0-9+.-])(?i:[a-z][a-z0-9+.-]{0,31})://[^/@\s:]{1,256}:)"
+    r"(?P<value>[^@/\s]{1,512})(?=@)"
+)
 TUTORIAL_PLACEHOLDERS = {
     "your_key_here",
     "your_api_key",
@@ -136,9 +143,14 @@ def redact_for_prompt(text: str) -> str:
 
     No flag consults this path - `--no-redact-secrets` governs what the
     operator sees in their own render, never what leaves for a model. Local
-    and remote take the same text so their outputs stay cache-coherent, and
-    the per-secret warnings stay with the response-side sink: one finding per
-    run, not one per frame prompt.
+    and remote take the same text so their outputs stay cache-coherent. The
+    per-secret warnings are dropped here: on the default path the carrier's
+    response-side sink already recorded them for the same text, and under
+    `--no-redact-secrets` the operator asked to see the raw text they are
+    already looking at - a warning that their own screen contains a secret
+    adds noise, not protection. On the default path this is a second,
+    idempotent pass over already-redacted text; its whole value is the
+    flag-off and eval paths.
     """
     return redact_text(text).text
 

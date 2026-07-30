@@ -1422,12 +1422,17 @@ class FrameInterpreter:
         **Grounding** is assessed against the reading the model returned, and
         the reading is then handed to the carrier, which is where the
         **redaction** policy runs over every field of it (R-19). Assessing
-        first is deliberate: grounding compares two readers' words, and a
-        policy that replaced a secret in one of them would make the comparison
-        about what redaction did rather than about what was read.
+        first is deliberate: grounding compares two readers' words on the
+        SAME text. Since M2.6 the model reads prompt-side-redacted text, so
+        the comparison side passes through the same sink - on the default
+        path an idempotent no-op (the carrier already redacted), and under
+        --no-redact-secrets the one change that keeps a secret-bearing frame
+        from being marked uncorroborated for echoing [REDACTED] honestly.
         """
+        from .redact_secrets import redact_for_prompt
+
         assessment = assess_grounding(
-            ocr_text=frame.extracted_text,
+            ocr_text=redact_for_prompt(frame.extracted_text),
             verbatim_text=reading.verbatim_text,
             text_confidence=reading.text_confidence,
             has_interpretation=reading.has_interpretation,
