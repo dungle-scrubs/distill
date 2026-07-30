@@ -44,9 +44,9 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .artifacts import FrameArtifact, Interpretation
 from .config import config_dir as general_config_dir
@@ -188,6 +188,33 @@ FRAME_READ_FAILURE_CODES = frozenset(
 LOGGER = logging.getLogger(__name__)
 
 
+class SecretCredential:
+    """The non-serializable carrier for a vision-endpoint credential (D-007).
+
+    ``reveal()`` is the only door to the value. Every text form redacts, and
+    every generic serialization path - JSON, pickle, deepcopy - is refused
+    rather than redacted, because a copy that silently dropped the secret
+    would *look* safe while a copy that kept it would leak; failing loudly is
+    the only honest behavior for both.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return "SecretCredential(***)"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("SecretCredential cannot be serialized or copied")
+
+
 @dataclass(frozen=True)
 class LocalVisionConfig:
     backend: str = DEFAULT_LOCAL_VISION_BACKEND
@@ -202,9 +229,17 @@ class LocalVisionConfig:
     cap. Those hold wherever the endpoint is, because they are about what the
     client will do with an answer rather than about whose answer it is.
     """
+    credential: SecretCredential | None = field(default=None, repr=False, compare=False)
+    """The endpoint credential, in its non-serializable carrier (D-007).
+
+    Excluded from `public_dict` by name, kept out of `repr` by the field
+    flags, and refused by `asdict`/pickle/deepcopy by the carrier itself.
+    """
 
     def public_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        # By name, not by asdict-then-delete: asdict deep-copies values and
+        # the credential carrier refuses deepcopy, by design.
+        return {f.name: getattr(self, f.name) for f in fields(self) if f.name != "credential"}
 
 
 @dataclass(frozen=True)
@@ -219,10 +254,6 @@ class LocalVisionProbe:
 
     def warning(self) -> dict[str, Any]:
         return warning("local_vision", self.code, self.message)
-
-
-
-
 
 
 ProbeLocalVision = Callable[[LocalVisionConfig], LocalVisionProbe]
@@ -410,16 +441,6 @@ def _debug_enabled(value: bool | None = None) -> bool:
     if value is not None:
         return value
     return os.environ.get(DEBUG_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-
-
-
-
-
-
-
-
 
 
 def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
@@ -1274,26 +1295,6 @@ def _interpret_with_rapid_mlx(
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _result_from_payload(
     interpreted: dict[str, Any],
     config: LocalVisionConfig,
@@ -1320,11 +1321,3 @@ def _result_from_payload(
         verbatim_text=str(interpreted.get("verbatim_text", "")).strip(),
         text_confidence=_normalize_text_confidence(interpreted.get("text_confidence")),
     )
-
-
-
-
-
-
-
-

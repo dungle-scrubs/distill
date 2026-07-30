@@ -165,6 +165,15 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
             f"Local vision endpoint '{url}' is not a usable URL: {exc}",
             url=url,
         )
+    if parts.username is not None or parts.password is not None or parts.query:
+        # D-007: no credential-in-URL. The URL is deliberately NOT echoed into
+        # the message or detail here - the thing being rejected is exactly the
+        # thing that must not appear in an error surface.
+        _reject_endpoint(
+            "credential_in_url",
+            "Local vision endpoint URL embeds userinfo or a query string; "
+            "credentials belong in api_key_env, never in base_url.",
+        )
     if scheme not in ALLOWED_ENDPOINT_SCHEMES:
         _reject_endpoint(
             "scheme",

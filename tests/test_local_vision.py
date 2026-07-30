@@ -1132,3 +1132,60 @@ def _solid_png_bytes() -> bytes:
         + chunk(b"IDAT", zlib.compress(raw))
         + chunk(b"IEND", b"")
     )
+
+
+class TestSecretCredential:
+    """The non-serializable carrier (D-007): reveal() is the only door to the value."""
+
+    def test_carrier_redacts_every_text_form_and_refuses_serialization(self) -> None:
+        import copy
+        import pickle
+
+        from distill.local_vision import SecretCredential
+
+        secret = SecretCredential("sk-super-secret-value")
+
+        assert secret.reveal() == "sk-super-secret-value"
+        assert "sk-super-secret-value" not in repr(secret)
+        assert "sk-super-secret-value" not in str(secret)
+        assert "sk-super-secret-value" not in f"{secret}"
+        with pytest.raises(TypeError):
+            json.dumps(secret)
+        with pytest.raises(TypeError):
+            pickle.dumps(secret)
+        with pytest.raises(TypeError):
+            copy.deepcopy(secret)
+
+    def test_config_never_exposes_the_credential_in_any_serialized_form(self) -> None:
+        from dataclasses import asdict, replace
+
+        from distill.local_vision import SecretCredential
+
+        config = replace(
+            LocalVisionConfig(), credential=SecretCredential("sk-super-secret-value")
+        )
+
+        assert "credential" not in config.public_dict()
+        assert "sk-super-secret-value" not in json.dumps(config.public_dict())
+        assert "sk-super-secret-value" not in repr(config)
+        # asdict deep-copies field values and the carrier refuses deepcopy, so
+        # generic dataclass serialization fails loudly instead of leaking.
+        with pytest.raises(TypeError):
+            asdict(config)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://user:sk-super-secret-value@127.0.0.1:8000/v1",
+            "http://127.0.0.1:8000/v1?api_key=sk-super-secret-value",
+        ],
+    )
+    def test_credential_bearing_base_url_is_rejected_without_echoing_it(self, url: str) -> None:
+        from distill.local_vision import _checked_endpoint_url
+        from distill.rapid_mlx import EndpointRejected
+
+        with pytest.raises(EndpointRejected) as excinfo:
+            _checked_endpoint_url(url, allow_remote_endpoint=True)
+
+        assert "sk-super-secret-value" not in str(excinfo.value)
+        assert "sk-super-secret-value" not in json.dumps(excinfo.value.detail)
