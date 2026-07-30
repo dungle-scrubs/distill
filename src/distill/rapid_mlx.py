@@ -139,6 +139,20 @@ def _resolve_addresses(host: str, port: int) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
+def _safe_url_for_message(url: str) -> str:
+    """The echoable form of an operator-supplied URL: userinfo, query, and
+    fragment stripped. String surgery rather than urlsplit, because this runs
+    precisely when the URL may have failed to parse - and a secret must not
+    survive the echo either way."""
+    trimmed = url.split("#", 1)[0].split("?", 1)[0]
+    scheme, sep, rest = trimmed.partition("://")
+    if not sep:
+        scheme, sep, rest = "", "", trimmed
+    if "@" in rest:
+        rest = rest.rsplit("@", 1)[1]
+    return f"{scheme}{sep}{rest}"
+
+
 def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str, int]:
     """R-43's static half: what can be decided about `url` without asking anyone.
 
@@ -162,17 +176,41 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
     except ValueError as exc:
         _reject_endpoint(
             "unparsable_url",
-            f"Local vision endpoint '{url}' is not a usable URL: {exc}",
-            url=url,
+            f"Local vision endpoint '{_safe_url_for_message(url)}' is not a usable URL: {exc}",
+            url=_safe_url_for_message(url),
         )
-    if parts.username is not None or parts.password is not None or parts.query:
-        # D-007: no credential-in-URL. The URL is deliberately NOT echoed into
-        # the message or detail here - the thing being rejected is exactly the
-        # thing that must not appear in an error surface.
+    if parts.username is not None or parts.password is not None:
+        # D-007: no credential-in-URL. Only the sanitized form is echoed - the
+        # thing being rejected is exactly the thing that must not appear in an
+        # error surface.
         _reject_endpoint(
             "credential_in_url",
-            "Local vision endpoint URL embeds userinfo or a query string; "
-            "credentials belong in api_key_env, never in base_url.",
+            f"Local vision endpoint '{_safe_url_for_message(url)}' embeds "
+            "userinfo; credentials belong in api_key_env, never in base_url.",
+            url=_safe_url_for_message(url),
+        )
+    if parts.query or parts.fragment:
+        # Key names are safe to echo and are what the operator needs to see;
+        # values are exactly what must not be echoed (D-007).
+        keys = [key for key, _ in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)]
+        _reject_endpoint(
+            "query_in_base_url",
+            f"Local vision endpoint '{_safe_url_for_message(url)}' carries a "
+            f"query or fragment ({', '.join(keys) if keys else 'fragment'}); "
+            "a base_url takes no parameters, and credentials belong in "
+            "api_key_env.",
+            url=_safe_url_for_message(url),
+            query_keys=keys,
+        )
+    if host is not None and ("%" in host or "@" in host):
+        # Percent-escaped userinfo survives urlsplit as a "hostname"; a real
+        # hostname never contains '%' or '@'. Rejected without echoing the
+        # host at all - it may be a mangled credential.
+        _reject_endpoint(
+            "invalid_host_characters",
+            "Local vision endpoint host contains characters that do not "
+            "belong in a hostname (percent-escapes or '@'); if this was an "
+            "attempt to embed a credential, use api_key_env instead.",
         )
     if scheme not in ALLOWED_ENDPOINT_SCHEMES:
         _reject_endpoint(

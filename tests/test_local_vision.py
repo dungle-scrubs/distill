@@ -493,9 +493,7 @@ def test_interpret_image_reports_unreachable_server(
     # connect, which must surface as a transport-unavailable warning.
     monkeypatch.setattr(
         "distill.rapid_mlx._urlopen_json",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            urllib.error.URLError("connection refused")
-        ),
+        lambda *args, **kwargs: (_ for _ in ()).throw(urllib.error.URLError("connection refused")),
     )
 
     result, warning = try_interpret_image(
@@ -1085,9 +1083,7 @@ def test_frame_interpreter_records_unavailable_probe_warning() -> None:
             "occurrences": 1,
         }
     ]
-    assert interpreter.debug_info()["warning_counts"] == {
-        "local_vision_rapid_mlx_unavailable": 1
-    }
+    assert interpreter.debug_info()["warning_counts"] == {"local_vision_rapid_mlx_unavailable": 1}
 
 
 def test_frame_interpreter_asserts_frame_path_invariant() -> None:
@@ -1161,9 +1157,7 @@ class TestSecretCredential:
 
         from distill.local_vision import SecretCredential
 
-        config = replace(
-            LocalVisionConfig(), credential=SecretCredential("sk-super-secret-value")
-        )
+        config = replace(LocalVisionConfig(), credential=SecretCredential("sk-super-secret-value"))
 
         assert "credential" not in config.public_dict()
         assert "sk-super-secret-value" not in json.dumps(config.public_dict())
@@ -1189,3 +1183,49 @@ class TestSecretCredential:
 
         assert "sk-super-secret-value" not in str(excinfo.value)
         assert "sk-super-secret-value" not in json.dumps(excinfo.value.detail)
+
+    def test_loader_rejection_of_credential_bearing_url_does_not_echo_it(self) -> None:
+        with pytest.raises(DistillError) as excinfo:
+            local_vision_config_from_args(
+                {"local_vision_base_url": "http://user:sk-super-secret-value@127.0.0.1:8000/v1"}
+            )
+
+        assert "sk-super-secret-value" not in str(excinfo.value)
+        assert "sk-super-secret-value" not in json.dumps(getattr(excinfo.value, "details", {}))
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Port out of range: rejected as unparsable BEFORE the credential
+            # screen can run, so the echo path itself must redact.
+            "http://user:sk-super-secret-value@127.0.0.1:99999/v1",
+            # Percent-encoded userinfo parses as a hostname, evading the
+            # userinfo check; the host echo must not leak it either.
+            "http://user%3Ask-super-secret-value%40127.0.0.1:8000/v1",
+        ],
+    )
+    def test_malformed_credential_bearing_urls_never_echo_the_secret(self, url: str) -> None:
+        from distill.local_vision import _checked_endpoint_url
+        from distill.rapid_mlx import EndpointRejected
+
+        with pytest.raises(EndpointRejected) as excinfo:
+            _checked_endpoint_url(url, allow_remote_endpoint=True)
+
+        assert "sk-super-secret-value" not in str(excinfo.value)
+        assert "sk-super-secret-value" not in json.dumps(excinfo.value.detail)
+
+    def test_configs_differing_only_by_credential_are_not_equal(self) -> None:
+        from dataclasses import replace
+
+        from distill.local_vision import SecretCredential
+
+        base = LocalVisionConfig()
+        with_a = replace(base, credential=SecretCredential("sk-credential-a"))
+        with_b = replace(base, credential=SecretCredential("sk-credential-b"))
+        with_a_again = replace(base, credential=SecretCredential("sk-credential-a"))
+
+        # A future config-keyed cache must never serve a response fetched
+        # under a different credential.
+        assert with_a != with_b
+        assert with_a != base
+        assert with_a == with_a_again

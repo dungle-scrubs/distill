@@ -34,6 +34,7 @@ policy is the thing that was avoided, not the file they share.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import logging
 import math
@@ -214,6 +215,16 @@ class SecretCredential:
     def __reduce__(self) -> NoReturn:
         raise TypeError("SecretCredential cannot be serialized or copied")
 
+    def __eq__(self, other: object) -> bool:
+        # Value equality, constant-time, so a config-keyed cache can never
+        # serve a response fetched under a different credential.
+        if not isinstance(other, SecretCredential):
+            return NotImplemented
+        return hmac.compare_digest(self._value.encode(), other._value.encode())
+
+    def __hash__(self) -> int:
+        return hash(self._value)
+
 
 @dataclass(frozen=True)
 class LocalVisionConfig:
@@ -229,17 +240,26 @@ class LocalVisionConfig:
     cap. Those hold wherever the endpoint is, because they are about what the
     client will do with an answer rather than about whose answer it is.
     """
-    credential: SecretCredential | None = field(default=None, repr=False, compare=False)
+    credential: SecretCredential | None = field(default=None, repr=False, metadata={"secret": True})
     """The endpoint credential, in its non-serializable carrier (D-007).
 
-    Excluded from `public_dict` by name, kept out of `repr` by the field
-    flags, and refused by `asdict`/pickle/deepcopy by the carrier itself.
+    The carrier itself redacts every text form and refuses serialization;
+    `repr=False` and the `public_dict` exclusion are belt-and-braces on top.
+    It participates in equality (the carrier compares by value) so configs
+    differing only by credential are never interchangeable.
     """
 
     def public_dict(self) -> dict[str, Any]:
-        # By name, not by asdict-then-delete: asdict deep-copies values and
-        # the credential carrier refuses deepcopy, by design.
-        return {f.name: getattr(self, f.name) for f in fields(self) if f.name != "credential"}
+        # Excluded by the `secret` metadata flag and by carrier type - a rule
+        # about secrets, not about one field spelling. Built by field access
+        # rather than asdict, which deep-copies into the refusing carrier.
+        public: dict[str, Any] = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if f.metadata.get("secret") or isinstance(value, SecretCredential):
+                continue
+            public[f.name] = value
+        return public
 
 
 @dataclass(frozen=True)
@@ -458,7 +478,11 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
             "E_BAD_OPTIONS",
             "local_vision",
             exc.message,
-            {"base_url": config.base_url, **exc.detail},
+            # The rejection's own detail is the whole story: sites that can
+            # safely name the URL already include a sanitized `url`, and the
+            # ones that omit it do so because the URL may carry a credential
+            # (D-007). Re-adding the raw base_url here defeated exactly that.
+            dict(exc.detail),
         ) from exc
     return config
 
