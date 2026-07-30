@@ -2508,9 +2508,7 @@ class TestSalienceRecording:
         ) -> Any:
             if url.rstrip("/").endswith("/models"):
                 return _models_body(DEFAULT_MODEL)
-            content = _frame_json(
-                adds_information=False, reason="restates the speech"
-            )
+            content = _frame_json(adds_information=False, reason="restates the speech")
             return _chat_envelope(content)
 
         monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
@@ -2578,12 +2576,8 @@ class TestFrameSalienceToggle:
             if url.rstrip("/").endswith("/models"):
                 return _models_body(DEFAULT_MODEL)
             [message] = body["messages"]
-            prompts.append(
-                next(p["text"] for p in message["content"] if p["type"] == "text")
-            )
-            return _chat_envelope(
-                _frame_json(adds_information=True, reason="claims to add")
-            )
+            prompts.append(next(p["text"] for p in message["content"] if p["type"] == "text"))
+            return _chat_envelope(_frame_json(adds_information=True, reason="claims to add"))
 
         monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
         segments = ({"start": 0.0, "end": 20.0, "text": "context"},)
@@ -2597,3 +2591,53 @@ class TestFrameSalienceToggle:
 
         assert "adds_information" not in prompts[0]
         assert frames[0].salience is None
+
+
+class TestFilteredRenderView:
+    """M4.6 (D-006): the stored render always carries every frame plus its
+    salience annotation; the filtered view is read-time, marked
+    non-authoritative, and never written back."""
+
+    def _frames(self, tmp_path: Path) -> list[FrameArtifact]:
+        import dataclasses as dc
+
+        base = _frame(1, tmp_path / "a.png", extracted_text="adds a diagram")
+        adds = dc.replace(
+            base,
+            salience={
+                "adds_information": True,
+                "reason": "shows a diagram",
+                "reason_truncated": False,
+            },
+        )
+        redundant = dc.replace(
+            _frame(2, tmp_path / "b.png", extracted_text="the same words"),
+            salience={
+                "adds_information": False,
+                "reason": "restates the speech",
+                "reason_truncated": False,
+            },
+        )
+        unjudged = _frame(3, tmp_path / "c.png", extracted_text="no judgment")
+        return [adds, redundant, unjudged]
+
+    def test_the_stored_render_keeps_all_frames_with_annotations(self, tmp_path: Path) -> None:
+        from distill.render import render_markdown
+
+        rendered = render_markdown("example.mp4", 30.0, None, self._frames(tmp_path), [])
+
+        assert "adds a diagram" in rendered
+        assert "the same words" in rendered
+        assert "no judgment" in rendered
+        assert "restates the speech" in rendered  # the annotation, not a drop
+
+    def test_the_filtered_view_drops_only_judged_redundant_frames(self, tmp_path: Path) -> None:
+        from distill.render import render_filtered_markdown
+
+        rendered = render_filtered_markdown("example.mp4", 30.0, None, self._frames(tmp_path), [])
+
+        assert "adds a diagram" in rendered
+        assert "the same words" not in rendered  # judged redundant: dropped
+        assert "no judgment" in rendered  # absent salience is not redundancy
+        assert "Non-authoritative" in rendered
+        assert "every frame" in rendered  # points the reader at the stored render

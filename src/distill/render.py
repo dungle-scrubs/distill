@@ -216,8 +216,7 @@ def render_markdown(
             # safe. Escaping text that needed none leaves it unchanged.
             suffix = f" ({EMITTER.link_label(reason)})" if reason else ""
             lines.append(
-                f"- [{EMITTER.link_label(label)}]"
-                f"({EMITTER.link_destination(url)}){suffix}"
+                f"- [{EMITTER.link_label(label)}]({EMITTER.link_destination(url)}){suffix}"
             )
         lines.append("")
     segments = list(transcript.segments) if transcript else []
@@ -369,8 +368,7 @@ def _frame_lines(frame: FrameArtifact, *, include_image_link: bool) -> list[str]
         # and one path for every link is one place to be wrong.
         lines.extend(
             [
-                f"![Frame {frame.index}]"
-                f"({EMITTER.link_destination(frame.relative_path)})",
+                f"![Frame {frame.index}]({EMITTER.link_destination(frame.relative_path)})",
                 "",
             ]
         )
@@ -389,7 +387,66 @@ def _frame_lines(frame: FrameArtifact, *, include_image_link: bool) -> list[str]
         lines.extend(_low_confidence_lines(assessment, NO_OUTPUT_CAVEAT))
     if frame.extracted_text.strip():
         lines.extend(["OCR:", "", *_untrusted_lines(frame.extracted_text.strip())])
+    salience = frame.salience
+    if isinstance(salience, Mapping) and isinstance(salience.get("adds_information"), bool):
+        verdict = (
+            "adds information beyond the surrounding speech"
+            if salience["adds_information"]
+            else "restates the surrounding speech"
+        )
+        lines.extend([f"Salience: {verdict}.", ""])
+        reason = str(salience.get("reason") or "").strip()
+        if reason:
+            # The reason is the model's words about the pixels - untrusted,
+            # rendered on the same terms as every other model sentence.
+            lines.extend(["Salience reason:", "", *_untrusted_lines(reason)])
     return lines
+
+
+FILTERED_VIEW_BANNER = (
+    "> **Non-authoritative filtered view.** Frames the vision model judged "
+    "redundant against the surrounding speech are omitted here. The stored "
+    "generation render contains every frame; this view is produced on demand, "
+    "is never written back, and does not exist under the bundle key (D-006)."
+)
+
+
+def render_filtered_markdown(
+    source_label: str,
+    duration_sec: float,
+    transcript: Transcript | None,
+    frames: list[FrameArtifact],
+    warnings: list[WarningRecord],
+    related_links: list[RelatedLink] | None = None,
+    *,
+    provenance: Provenance | None = None,
+    include_frame_links: bool = True,
+) -> str:
+    """The read-time view that collapses judged-redundant frames (D-006).
+
+    Only a frame the model explicitly judged (`adds_information` is False) is
+    dropped: absent salience is absence of a judgment, not redundancy, so an
+    unjudged frame always stays. The banner says what this is and where the
+    complete account lives.
+    """
+    kept = [
+        frame
+        for frame in frames
+        if not (
+            isinstance(frame.salience, Mapping) and frame.salience.get("adds_information") is False
+        )
+    ]
+    rendered = render_markdown(
+        source_label,
+        duration_sec,
+        transcript,
+        kept,
+        warnings,
+        related_links,
+        provenance=provenance,
+        include_frame_links=include_frame_links,
+    )
+    return f"{FILTERED_VIEW_BANNER}\n\n{rendered}"
 
 
 def _low_confidence_lines(assessment: GroundingAssessment | None, caveat: str) -> list[str]:
