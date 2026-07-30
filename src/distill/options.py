@@ -21,6 +21,7 @@ from .local_vision import (
     MAX_SOCKET_TIMEOUT_SEC,
     LocalVisionConfig,
     SecretCredential,
+    config_is_non_local,
     local_vision_config_from_args,
 )
 from .version import PIPELINE_VERSION
@@ -529,6 +530,11 @@ class DistillOptions:
     def cache_payload(self, source_type: str) -> dict[str, Any]:
         payload = {name: getattr(self, name) for name in CACHE_OPTION_NAMES}
         payload.update({name: getattr(self, name) for name in LOCAL_VISION_IDENTITY_OPTION_NAMES})
+        # D-012 narrows ADR-0004 for exactly one case: WAS this produced via
+        # a (possibly) remote endpoint. The boolean folds into identity so
+        # remote- and local-produced bundles never share a key; the address
+        # and credential stay machine-local claims and never enter the hash.
+        payload["local_vision_non_local"] = config_is_non_local(self.local_vision_config())
         payload["pipeline_version"] = PIPELINE_VERSION
         if source_type == "local":
             payload["cache_mode"] = self.cache_mode

@@ -2166,3 +2166,88 @@ class TestPromptSideRedaction:
         assert captured[0] == captured[1]
         assert "sk-uniform-secret" not in captured[0]
         assert "[REDACTED]" in captured[0]
+
+
+class TestNonLocalProvenance:
+    """M2.7 (D-012): a run that may send keyframes off-machine says so, and
+    'was remote' folds into bundle identity; the address never does."""
+
+    def test_a_remote_opted_run_records_the_non_local_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from dataclasses import replace
+
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _FakeOpener(payload))
+        remote = replace(
+            LocalVisionConfig(),
+            base_url="https://10.0.0.5:8000/v1",
+            allow_remote_endpoint=True,
+        )
+
+        interpreter = FrameInterpreter(remote, probe=_available_probe)
+        _frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        assert "non_local_only_processing" in {w["code"] for w in warnings}
+
+    def test_a_loopback_run_records_no_non_local_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _FakeOpener(payload))
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        _frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        assert "non_local_only_processing" not in {w["code"] for w in warnings}
+
+    def test_was_remote_folds_into_bundle_identity_but_the_address_does_not(
+        self,
+    ) -> None:
+        local = DistillOptions.from_args({})
+        remote = DistillOptions.from_args(
+            {
+                "local_vision_base_url": "https://10.0.0.5:8000/v1",
+                "local_vision_allow_remote_endpoint": True,
+            }
+        )
+        another_remote = DistillOptions.from_args(
+            {
+                "local_vision_base_url": "https://198.51.100.7:9000/v1",
+                "local_vision_allow_remote_endpoint": True,
+            }
+        )
+
+        # Remote- and local-produced bundles never share a key (D-012)...
+        assert local.opts_hash("local") != remote.opts_hash("local")
+        # ...but WHERE the remote endpoint lives stays a machine-local claim:
+        # two different remote addresses produce the same identity, and the
+        # address never enters the hashed payload.
+        assert remote.opts_hash("local") == another_remote.opts_hash("local")
+        assert "10.0.0.5" not in json.dumps(remote.cache_payload("local"))
+        assert "10.0.0.5" not in json.dumps(remote.public_dict("local"))
+
+    def test_the_self_contained_render_carries_the_non_local_warning(self) -> None:
+        from distill.errors import warning as make_warning
+        from distill.render import render_markdown
+
+        non_local = make_warning(
+            "local_vision",
+            "non_local_only_processing",
+            "this run was configured to send keyframes to a non-loopback "
+            "vision endpoint; the generation is not local-only processing.",
+        )
+
+        frame = _frame(1, Path("frames/frame1.png"), extracted_text="on-screen text")
+        render = render_markdown(
+            "example.mp4",
+            12.0,
+            None,
+            [frame],
+            [non_local],
+        )
+
+        assert "## Warnings" in render
+        assert "non_local_only_processing" in render

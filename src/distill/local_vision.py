@@ -287,6 +287,14 @@ class LocalVisionConfig:
         return public
 
 
+def config_is_non_local(config: LocalVisionConfig) -> bool:
+    """D-012's predicate, in one place: this run MAY send keyframes off the
+    producing machine. True when the operator opted into a remote endpoint
+    AND the host is not a literal loopback address (a name counts as remote -
+    it cannot be settled statically, and provenance folds fail closed)."""
+    return config.allow_remote_endpoint and not _static_host_is_loopback(config.base_url)
+
+
 @dataclass(frozen=True)
 class LocalVisionProbe:
     available: bool
@@ -1094,6 +1102,18 @@ class FrameInterpreter:
             return frames, [probe_warning]
 
         warnings: list[WarningRecord] = []
+        if config_is_non_local(self.config):
+            # D-012: the render must say this generation may not have been
+            # produced local-only. Recorded whether or not any frame ends up
+            # interpreted - the opt-in is the provenance fact.
+            non_local = warning(
+                "local_vision",
+                "non_local_only_processing",
+                "this run was configured to send keyframes to a non-loopback "
+                "vision endpoint; the generation is not local-only processing.",
+            )
+            self._record_warning(non_local)
+            warnings.append(non_local)
         if probe.detail.get("model_not_listed"):
             # Available, but on the strength of an attempted completion rather
             # than the catalog (D-008) - the run says so once, out loud.

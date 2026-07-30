@@ -149,12 +149,8 @@ def test_local_vision_server_address_does_not_change_the_bundle_key(
     source_type: str,
 ) -> None:
     """FAILS FIRST: the address of an equal-output reader entered identity."""
-    first = DistillOptions.from_args(
-        {"local_vision_base_url": "http://127.0.0.1:8000/v1"}
-    )
-    second = DistillOptions.from_args(
-        {"local_vision_base_url": "http://127.0.0.1:9000/v1"}
-    )
+    first = DistillOptions.from_args({"local_vision_base_url": "http://127.0.0.1:8000/v1"})
+    second = DistillOptions.from_args({"local_vision_base_url": "http://127.0.0.1:9000/v1"})
 
     fingerprint = "same-source"
     assert source_hash(fingerprint, first.opts_hash(source_type)) == source_hash(
@@ -477,12 +473,8 @@ VALID_ID = "YE7VzlLtp-4"
         pytest.param(
             "https://www.youtube.com/watch?v=Ye7vZLltP-4", "Ye7vZLltP-4", id="case_is_preserved"
         ),
-        pytest.param(
-            f"https://www.youtube.com/watch?v={VALID_ID}x", None, id="twelve_characters"
-        ),
-        pytest.param(
-            "https://www.youtube.com/watch?v=YE7VzlLtp", None, id="nine_characters"
-        ),
+        pytest.param(f"https://www.youtube.com/watch?v={VALID_ID}x", None, id="twelve_characters"),
+        pytest.param("https://www.youtube.com/watch?v=YE7VzlLtp", None, id="nine_characters"),
         pytest.param("https://www.youtube.com/watch?v=YE7VzlLtp-", None, id="ten_characters"),
         pytest.param(f"https://youtu.be/{VALID_ID}/more", None, id="a_segment_after_the_id"),
         pytest.param(
@@ -1068,8 +1060,7 @@ def test_a_counted_option_is_validated_without_being_rewritten() -> None:
 
     assert DistillOptions.from_args({"max_keyframes": beyond_float}).max_keyframes == beyond_float
     assert (
-        DistillOptions.from_args({"max_keyframes": str(beyond_float)}).max_keyframes
-        == beyond_float
+        DistillOptions.from_args({"max_keyframes": str(beyond_float)}).max_keyframes == beyond_float
     )
     assert json.dumps(
         DistillOptions.from_args({"max_keyframes": beyond_float}).cache_payload("local")[
@@ -1161,6 +1152,8 @@ def test_valid_numbers_keep_their_json_types_in_the_current_identity_payload() -
         "local_vision_backend": DEFAULT_LOCAL_VISION_BACKEND,
         "local_vision_model": DEFAULT_LOCAL_VISION_MODEL,
         "local_vision_timeout_sec": DEFAULT_TIMEOUT_SEC,
+        # D-012: 'was (possibly) remote' is identity; the address is not.
+        "local_vision_non_local": False,
         "max_duration_sec": 7200.0,
         "max_keyframes": 80,
         "max_static_window_sec": 90.0,
@@ -1182,12 +1175,15 @@ def test_valid_numbers_keep_their_json_types_in_the_current_identity_payload() -
     assert json.dumps(payload["min_interval_sec"]) == "4.0"
     assert json.dumps(payload["max_duration_sec"]) == "7200.0"
     assert json.dumps(payload, sort_keys=True) == json.dumps(expected, sort_keys=True)
-    assert options.opts_hash("youtube") == hashlib.sha256(
-        json.dumps(expected, sort_keys=True).encode()
-    ).hexdigest()
+    assert (
+        options.opts_hash("youtube")
+        == hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()
+    )
 
 
-def test_a_duration_cap_and_narrow_window_that_would_build_an_unbounded_schedule_are_refused() -> None:
+def test_a_duration_cap_and_narrow_window_that_would_build_an_unbounded_schedule_are_refused() -> (
+    None
+):
     """M7.1/D-009: nothing caps max_duration_sec, so a large cap and a narrow
     static window are a keyframe schedule bounded only by memory. The bound is
     on the candidate count, refused at the options door before generation."""
@@ -1217,7 +1213,5 @@ def test_a_dense_but_bounded_schedule_is_accepted() -> None:
     from distill.frame_selection import MAX_CANDIDATE_SCHEDULE
 
     # 3600 / 0.01 = 360_000 candidates, under the 500_000 ceiling.
-    options = DistillOptions.from_args(
-        {"max_duration_sec": 3600.0, "max_static_window_sec": 0.01}
-    )
+    options = DistillOptions.from_args({"max_duration_sec": 3600.0, "max_static_window_sec": 0.01})
     assert options.max_duration_sec / options.max_static_window_sec < MAX_CANDIDATE_SCHEDULE
