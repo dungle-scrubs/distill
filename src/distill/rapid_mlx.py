@@ -15,6 +15,7 @@ and calls into this module; it does not reimplement any of what is here.
 
 from __future__ import annotations
 
+import hmac
 import http.client
 import ipaddress
 import json
@@ -78,10 +79,56 @@ class EndpointRejected(LocalVisionFailure):
         self.reason = reason
 
 
+class SecretCredential:
+    """The non-serializable carrier for a vision-endpoint credential (D-007).
+
+    ``reveal()`` is the only door to the value. Every text form redacts, and
+    every generic serialization path - JSON, pickle, deepcopy - is refused
+    rather than redacted, because a copy that silently dropped the secret
+    would *look* safe while a copy that kept it would leak; failing loudly is
+    the only honest behavior for both.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return "SecretCredential(***)"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("SecretCredential cannot be serialized or copied")
+
+    def __eq__(self, other: object) -> bool:
+        # Value equality, constant-time, so a config-keyed cache can never
+        # serve a response fetched under a different credential.
+        if not isinstance(other, SecretCredential):
+            return NotImplemented
+        return hmac.compare_digest(self._value.encode(), other._value.encode())
+
+    def __hash__(self) -> int:
+        return hash(self._value)
+
+
 AddressResolver = Callable[[str, int], list[str]]
 
 
 HttpRequestor = Callable[..., "dict[str, Any]"]
+
+
+def _request_headers(credential: SecretCredential | None) -> dict[str, str]:
+    """The request headers, with `Authorization: Bearer` exactly when a
+    credential is carried - never an empty or placeholder header (D-016)."""
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if credential is not None:
+        headers["Authorization"] = f"Bearer {credential.reveal()}"
+    return headers
 
 
 def _boundary_log(event: str, detail: dict[str, Any]) -> None:
@@ -329,6 +376,7 @@ def _http_get_json(
     timeout_sec: float,
     *,
     allow_remote_endpoint: bool = False,
+    credential: SecretCredential | None = None,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="GET", url=url, timeout=timeout_sec)
@@ -339,6 +387,7 @@ def _http_get_json(
             body=None,
             timeout_sec=timeout_sec,
             allow_remote_endpoint=allow_remote_endpoint,
+            credential=credential,
         )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
@@ -352,6 +401,7 @@ def _http_post_json(
     timeout_sec: float,
     *,
     allow_remote_endpoint: bool = False,
+    credential: SecretCredential | None = None,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="POST", url=url, body=body, timeout=timeout_sec)
@@ -362,6 +412,7 @@ def _http_post_json(
             body=body,
             timeout_sec=timeout_sec,
             allow_remote_endpoint=allow_remote_endpoint,
+            credential=credential,
         )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
@@ -426,6 +477,7 @@ def _urlopen_json(
     *,
     allow_remote_endpoint: bool = False,
     resolver: AddressResolver | None = None,
+    credential: SecretCredential | None = None,
 ) -> Any:
     """One request to the vision endpoint, validated before and bounded after.
 
@@ -451,10 +503,7 @@ def _urlopen_json(
         url,
         data=data,
         method=method,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+        headers=_request_headers(credential),
     )
     try:
         with _OPENER.open(request, timeout=timeout_sec) as response:
@@ -481,6 +530,18 @@ def _urlopen_json(
             if hasattr(exc, "read")
             else ""
         )
+        if exc.code in (401, 403):
+            # D-007: an auth failure's error surface carries neither the
+            # credential nor the endpoint's error body - a reflected body is
+            # the provider's text, and quoting it here would hand a hostile
+            # endpoint a channel into Distill's own error output.
+            _boundary_log("auth_rejected", {"status": exc.code, "url": _safe_url_for_message(url)})
+            raise LocalVisionFailure(
+                "local_vision_auth_rejected",
+                f"Local vision endpoint rejected the credential (HTTP {exc.code}); "
+                "continuing with OCR-only output.",
+                {"status": exc.code, "url": _safe_url_for_message(url)},
+            ) from exc
         if 300 <= exc.code < 400:
             # A redirect this module never got to refuse: urllib turns a 3xx it
             # cannot act on - no `Location`, or one naming a scheme it will not

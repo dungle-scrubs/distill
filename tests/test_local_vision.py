@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import logging
 import os
 import struct
 import urllib.error
@@ -20,6 +22,7 @@ from distill.local_vision import (
     DEFAULT_TIMEOUT_SEC,
     FrameInterpreter,
     LocalVisionConfig,
+    LocalVisionFailure,
     LocalVisionProbe,
     _interpret_with_rapid_mlx,
     config_dir,
@@ -1229,3 +1232,195 @@ class TestSecretCredential:
         assert with_a != with_b
         assert with_a != base
         assert with_a == with_a_again
+
+
+class TestCredentialResolution:
+    """D-016: api_key_env preferred over inline api_key, both under local_vision."""
+
+    def test_inline_api_key_resolves_to_a_carried_credential(self, tmp_path: Path) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"api_key": "sk-inline-credential"})
+        )
+
+        config = load_local_vision_config(tmp_path)
+
+        assert config.credential is not None
+        assert config.credential.reveal() == "sk-inline-credential"
+
+    def test_api_key_env_wins_over_inline_api_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"api_key": "sk-inline-loses", "api_key_env": "DISTILL_TEST_VISION_KEY"})
+        )
+        monkeypatch.setenv("DISTILL_TEST_VISION_KEY", "sk-from-env-wins")
+
+        config = load_local_vision_config(tmp_path)
+
+        assert config.credential is not None
+        assert config.credential.reveal() == "sk-from-env-wins"
+
+    def test_credential_survives_the_options_round_trip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"api_key": "sk-round-trip"})
+        )
+        monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+
+        options = DistillOptions.from_args({})
+        config = options.local_vision_config()
+
+        assert config.credential is not None
+        assert config.credential.reveal() == "sk-round-trip"
+        # The identity/cache surfaces stay credential-free and serializable.
+        assert "sk-round-trip" not in json.dumps(options.public_dict("local"))
+        assert "sk-round-trip" not in json.dumps(options.cache_payload("local"))
+
+    def test_bearer_header_present_exactly_when_a_credential_is(self) -> None:
+        from distill.local_vision import SecretCredential
+        from distill.rapid_mlx import _request_headers
+
+        with_credential = _request_headers(SecretCredential("sk-header-secret"))
+        without_credential = _request_headers(None)
+
+        assert with_credential["Authorization"] == "Bearer sk-header-secret"
+        assert "Authorization" not in without_credential
+        assert without_credential["Content-Type"] == "application/json"
+        assert without_credential["Accept"] == "application/json"
+
+    def test_interpret_request_carries_bearer_exactly_when_config_does(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from dataclasses import replace
+
+        from distill.local_vision import SecretCredential
+
+        class _RecordingOpener(_FakeOpener):
+            def __init__(self, payload: bytes) -> None:
+                super().__init__(payload)
+                self.requests: list[Any] = []
+
+            def open(self, request: Any, timeout: float | None = None) -> _FakeHttpResponse:
+                self.requests.append(request)
+                return super().open(request, timeout)
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        recorder = _RecordingOpener(payload)
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", recorder)
+
+        with_credential = replace(
+            LocalVisionConfig(), credential=SecretCredential("sk-wire-secret")
+        )
+        try_interpret_image(with_credential, image, "Interpret.", prompt_profile="technical")
+        try_interpret_image(LocalVisionConfig(), image, "Interpret.", prompt_profile="technical")
+
+        first, second = recorder.requests
+        assert first.get_header("Authorization") == "Bearer sk-wire-secret"
+        assert second.get_header("Authorization") is None
+
+    def test_configured_but_empty_credential_on_remote_endpoint_is_fatal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps(
+                {
+                    "api_key_env": "DISTILL_TEST_UNSET_KEY",
+                    "base_url": "https://vision.example.com/v1",
+                    "allow_remote_endpoint": True,
+                }
+            )
+        )
+        monkeypatch.delenv("DISTILL_TEST_UNSET_KEY", raising=False)
+
+        with pytest.raises(DistillError) as excinfo:
+            load_local_vision_config(tmp_path)
+
+        assert "DISTILL_TEST_UNSET_KEY" in str(excinfo.value)
+
+    def test_no_credential_configured_on_remote_endpoint_is_intentional_no_auth(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"base_url": "https://vision.example.com/v1", "allow_remote_endpoint": True})
+        )
+
+        config = load_local_vision_config(tmp_path)
+
+        assert config.credential is None
+        assert config.credential_configured is False
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_auth_rejection_degrades_without_echoing_body_or_credential(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        status: int,
+    ) -> None:
+        from dataclasses import replace
+        from email.message import Message
+
+        from distill.local_vision import SecretCredential
+
+        class _AuthRejectingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    status,
+                    "denied",
+                    Message(),
+                    io.BytesIO(b'{"error": "server-error-body-text"}'),
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _AuthRejectingOpener())
+        config = replace(LocalVisionConfig(), credential=SecretCredential("sk-auth-secret"))
+
+        with caplog.at_level(logging.DEBUG, logger="distill.local_vision"):
+            result, failure_warning = try_interpret_image(
+                config, image, "Interpret.", prompt_profile="technical"
+            )
+
+        assert result is None
+        assert failure_warning is not None
+        assert failure_warning["code"] == "local_vision_auth_rejected"
+        surface = json.dumps(failure_warning)
+        assert "sk-auth-secret" not in surface
+        assert "server-error-body-text" not in surface
+        assert any('"event": "auth_rejected"' in record.message for record in caplog.records)
+
+    def test_one_auth_rejection_degrades_the_remaining_frames(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        attempts: list[str] = []
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            attempts.append(url)
+            raise LocalVisionFailure(
+                "local_vision_auth_rejected",
+                "Local vision endpoint rejected the credential (HTTP 401); "
+                "continuing with OCR-only output.",
+                {"status": 401},
+            )
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        monkeypatch.setattr("distill.local_vision._urlopen_json", fake_urlopen, raising=False)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe, debug=True)
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        # One attempt, not three: the first 401 degrades the remainder.
+        assert len(attempts) == 1
+        assert all(frame.reading is None for frame in frames)
+        codes = {w["code"] for w in warnings}
+        assert "local_vision_auth_rejected" in codes

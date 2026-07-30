@@ -34,7 +34,6 @@ policy is the thing that was avoided, not the file they share.
 from __future__ import annotations
 
 import base64
-import hmac
 import json
 import logging
 import math
@@ -47,7 +46,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 from .artifacts import FrameArtifact, Interpretation
 from .config import config_dir as general_config_dir
@@ -83,6 +82,9 @@ from .rapid_mlx import (
 )
 from .rapid_mlx import (
     LocalVisionFailure as LocalVisionFailure,
+)
+from .rapid_mlx import (
+    SecretCredential as SecretCredential,
 )
 from .rapid_mlx import (
     _boundary_log as _boundary_log,
@@ -169,12 +171,17 @@ TRANSPORT_FAILURE_CODES = frozenset(
 # code. Everything else (an unreadable image file, a cancelled run) happened on
 # this side of the wire and says nothing either way.
 DELIVERED_RESPONSE_CODES = frozenset({"local_vision_malformed_response"})
+# Failures that condemn every remaining attempt the moment one happens: a
+# rejected credential will be rejected again on the next keyframe, so retrying
+# is sending more keyframes to an endpoint that already said no (D-016).
+IMMEDIATE_FAILURE_CODES = frozenset({"local_vision_auth_rejected"})
 BREAKER_WARNING_CODE = "local_vision_transport_breaker_open"
 FRAME_READ_FAILURE_CODES = frozenset(
     {
         "local_vision_malformed_response",
         "local_vision_timeout",
         "local_vision_image_read_failed",
+        "local_vision_auth_rejected",
         ENDPOINT_REJECTED_CODE,
     }
 )
@@ -187,43 +194,6 @@ FRAME_READ_FAILURE_CODES = frozenset(
 # An HTTP error body is quoted into a message, never parsed, and the quote is
 # 200 characters. This is how much of one is worth reading to produce it.
 LOGGER = logging.getLogger(__name__)
-
-
-class SecretCredential:
-    """The non-serializable carrier for a vision-endpoint credential (D-007).
-
-    ``reveal()`` is the only door to the value. Every text form redacts, and
-    every generic serialization path - JSON, pickle, deepcopy - is refused
-    rather than redacted, because a copy that silently dropped the secret
-    would *look* safe while a copy that kept it would leak; failing loudly is
-    the only honest behavior for both.
-    """
-
-    __slots__ = ("_value",)
-
-    def __init__(self, value: str) -> None:
-        self._value = value
-
-    def reveal(self) -> str:
-        return self._value
-
-    def __repr__(self) -> str:
-        return "SecretCredential(***)"
-
-    __str__ = __repr__
-
-    def __reduce__(self) -> NoReturn:
-        raise TypeError("SecretCredential cannot be serialized or copied")
-
-    def __eq__(self, other: object) -> bool:
-        # Value equality, constant-time, so a config-keyed cache can never
-        # serve a response fetched under a different credential.
-        if not isinstance(other, SecretCredential):
-            return NotImplemented
-        return hmac.compare_digest(self._value.encode(), other._value.encode())
-
-    def __hash__(self) -> int:
-        return hash(self._value)
 
 
 @dataclass(frozen=True)
@@ -241,6 +211,12 @@ class LocalVisionConfig:
     client will do with an answer rather than about whose answer it is.
     """
     credential: SecretCredential | None = field(default=None, repr=False, metadata={"secret": True})
+    # Whether api_key/api_key_env was present in any config layer, and the env
+    # var it named. Neither is secret (a *name* is diagnostics, not a value);
+    # together they let validation tell "intentionally no auth" apart from
+    # "meant to authenticate and the value went missing" (D-016).
+    credential_configured: bool = False
+    credential_env: str = ""
     """The endpoint credential, in its non-serializable carrier (D-007).
 
     The carrier itself redacts every text form and refuses serialization;
@@ -381,6 +357,19 @@ class _TransportBreaker:
                 if code in TRANSPORT_FAILURE_CODES:
                     self._transport_failures += 1
                 return None
+            if code in IMMEDIATE_FAILURE_CODES:
+                # One rejection condemns the rest; no count to accumulate.
+                self._consecutive += 1
+                self._transport_failures += 1
+                self._opened = {
+                    "state": "open",
+                    "consecutive_failures": self._consecutive,
+                    "limit": 1,
+                    "attempt": self._attempts,
+                    "frame": frame_number,
+                    "code": code,
+                }
+                return dict(self._opened)
             if code in TRANSPORT_FAILURE_CODES:
                 self._consecutive += 1
                 self._transport_failures += 1
@@ -484,7 +473,46 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
             # (D-007). Re-adding the raw base_url here defeated exactly that.
             dict(exc.detail),
         ) from exc
+    if (
+        config.credential_configured
+        and config.credential is None
+        and not _static_host_is_loopback(config.base_url)
+    ):
+        # D-016's typo guard: a credential the operator *configured* resolved
+        # to nothing, and the endpoint is not loopback. Sending keyframes
+        # anyway would quietly run unauthenticated against the wrong bar;
+        # having configured no credential at all remains intentional no-auth.
+        named = (
+            f" (env var '{config.credential_env}' is unset or empty)"
+            if config.credential_env
+            else ""
+        )
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            f"local_vision credential is configured but empty{named}; refusing "
+            "to send keyframes to a non-loopback endpoint without it.",
+            {"reason": "credential_configured_but_empty", "api_key_env": config.credential_env},
+        )
     return config
+
+
+def _static_host_is_loopback(url: str) -> bool:
+    """True only when the host is a *literal* loopback address. A hostname
+    cannot be settled without a lookup, so for the fail-closed credential
+    check it counts as non-loopback."""
+    try:
+        host = urllib.parse.urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    try:
+        import ipaddress
+
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 config_dir = general_config_dir
@@ -606,14 +634,38 @@ def local_vision_config_from_args(
     return _with_validated_endpoint(_config_from_payload(overrides, config))
 
 
+def _resolved_credential(
+    payload: dict[str, Any], base: LocalVisionConfig
+) -> tuple[SecretCredential | None, bool, str]:
+    """D-016: `api_key_env` names an env var and wins over inline `api_key`.
+
+    Returns (credential, configured, env_name). `configured` is True whenever
+    either key appeared, even if the resolved value is empty - validation
+    needs that distinction to fail closed on a remote endpoint.
+    """
+    if "api_key" not in payload and "api_key_env" not in payload:
+        return base.credential, base.credential_configured, base.credential_env
+    value = str(payload.get("api_key") or "")
+    env_name = str(payload.get("api_key_env") or "")
+    if env_name:
+        value = os.environ.get(env_name, "")
+    if not value:
+        return None, True, env_name
+    return SecretCredential(value), True, env_name
+
+
 def _config_from_payload(
     payload: dict[str, Any],
     base: LocalVisionConfig,
 ) -> LocalVisionConfig:
     if not payload:
         return base
+    credential, credential_configured, credential_env = _resolved_credential(payload, base)
     return replace(
         base,
+        credential=credential,
+        credential_configured=credential_configured,
+        credential_env=credential_env,
         backend=str(payload.get("backend", base.backend)),
         model=str(payload.get("model", base.model)),
         base_url=str(payload.get("base_url", base.base_url)).rstrip("/"),
@@ -662,6 +714,7 @@ def probe_rapid_mlx_availability(
             models_url,
             config.timeout_sec,
             allow_remote_endpoint=config.allow_remote_endpoint,
+            credential=config.credential,
         )
     except EndpointRejected as exc:
         return LocalVisionProbe(
@@ -672,6 +725,18 @@ def probe_rapid_mlx_availability(
             code=exc.code,
             message=f"{exc.message} Continuing with OCR-only output.",
             detail={**exc.detail, "url": models_url},
+        )
+    except LocalVisionFailure as exc:
+        # Raised typed from the transport (e.g. auth_rejected). Its message
+        # and detail are already credential- and body-free by construction.
+        return LocalVisionProbe(
+            available=False,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code=exc.code,
+            message=exc.message,
+            detail=dict(exc.detail),
         )
     except TimeoutError as exc:
         return LocalVisionProbe(
@@ -1281,6 +1346,7 @@ def _interpret_with_rapid_mlx(
                 body,
                 config.timeout_sec,
                 allow_remote_endpoint=config.allow_remote_endpoint,
+                credential=config.credential,
             )
         except TimeoutError as exc:
             raise LocalVisionFailure(

@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
@@ -20,6 +20,7 @@ from .local_vision import (
     DEFAULT_TIMEOUT_SEC,
     MAX_SOCKET_TIMEOUT_SEC,
     LocalVisionConfig,
+    SecretCredential,
     local_vision_config_from_args,
 )
 from .version import PIPELINE_VERSION
@@ -363,6 +364,13 @@ class DistillOptions:
     local_vision_base_url: str = DEFAULT_LOCAL_VISION_BASE_URL
     local_vision_timeout_sec: float = DEFAULT_TIMEOUT_SEC
     local_vision_allow_remote_endpoint: bool = False
+    # The carrier, not a string: excluded from every cache/identity/public
+    # surface by those surfaces' allowlists, and from repr here. It rides
+    # along only so `local_vision_config()` does not silently reconstruct an
+    # unauthenticated config (D-007).
+    local_vision_credential: SecretCredential | None = field(
+        default=None, repr=False, metadata={"secret": True}
+    )
     job_id: str = ""
     resume_partial: bool = True
 
@@ -420,6 +428,7 @@ class DistillOptions:
                 args.get("local_vision_timeout_sec", local_vision.timeout_sec),
             ),
             local_vision_allow_remote_endpoint=local_vision.allow_remote_endpoint,
+            local_vision_credential=local_vision.credential,
             job_id=str(values["job_id"] or f"distill-{uuid4().hex}"),
             resume_partial=values["resume_partial"],
         )
@@ -476,6 +485,7 @@ class DistillOptions:
             timeout_sec=self.local_vision_timeout_sec,
             caption_frames=self.caption_frames,
             allow_remote_endpoint=self.local_vision_allow_remote_endpoint,
+            credential=self.local_vision_credential,
         )
 
     def transcription_config(self) -> TranscriptionConfig:
@@ -509,9 +519,7 @@ class DistillOptions:
 
     def cache_payload(self, source_type: str) -> dict[str, Any]:
         payload = {name: getattr(self, name) for name in CACHE_OPTION_NAMES}
-        payload.update(
-            {name: getattr(self, name) for name in LOCAL_VISION_IDENTITY_OPTION_NAMES}
-        )
+        payload.update({name: getattr(self, name) for name in LOCAL_VISION_IDENTITY_OPTION_NAMES})
         payload["pipeline_version"] = PIPELINE_VERSION
         if source_type == "local":
             payload["cache_mode"] = self.cache_mode
