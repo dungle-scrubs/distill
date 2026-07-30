@@ -686,6 +686,11 @@ class Interpretation:
             return None
         fields = {field.name for field in dataclasses.fields(cls)}
         values = {key: value for key, value in document.items() if key in fields}
+        # Transport-only: `salience` never appears in a stored document
+        # (document() pops it; the artifact records it top-level), so a
+        # drifted document carrying one is dropped rather than rebuilt into
+        # a frozen mapping that asdict cannot deep-copy.
+        values.pop("salience", None)
         values["detected_elements"] = _declared_elements(values.get("detected_elements"))
         return cls(**values)
 
@@ -902,6 +907,7 @@ class FrameArtifact(Carrier):
                 "extracted_text": self.extracted_text,
                 "interpretation": self.interpretation,
                 "grounding": self.grounding,
+                "salience": self.salience,
                 "redaction": self.redaction,
                 "warnings": self.warnings,
             }

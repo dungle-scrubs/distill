@@ -170,9 +170,7 @@ def test_the_interpretation_field_is_delimited() -> None:
 def test_detected_elements_are_delimited() -> None:
     """One element per line inside the block, so a comma in one is not a boundary."""
     markdown = render(
-        frames=[
-            frame_reading(read(detected_elements=("save button", attack("element"), "title")))
-        ]
+        frames=[frame_reading(read(detected_elements=("save button", attack("element"), "title")))]
     )
 
     assert_delimited(markdown, SENTINEL, "# element")
@@ -272,7 +270,9 @@ def test_the_banner_cannot_open_a_construct_from_its_reason() -> None:
     labelling Distill's words as the source's, and it is lossless, so the
     reason still reads as what it said.
     """
-    reason = f"unreadable: see [docs]({ATTACKER_URL}), <{ATTACKER_URL}>, <b>read this &amp; that</b>"
+    reason = (
+        f"unreadable: see [docs]({ATTACKER_URL}), <{ATTACKER_URL}>, <b>read this &amp; that</b>"
+    )
     frame, _warnings = keyframe().with_interpretation(
         read(visual_summary="A dark slide"),
         grounding={"level": "ungrounded", "text_overlap": None, "reason": reason},
@@ -706,6 +706,11 @@ def test_no_extracted_text_region_of_a_hostile_bundle_reaches_document_structure
         uncertainty=attack("uncertainty"),
         verbatim_text=attack("verbatim"),
         text_confidence=attack("confidence"),
+        salience={
+            "adds_information": True,
+            "reason": attack("salience"),
+            "reason_truncated": False,
+        },
     )
     markdown = render(
         source_label=attack("source"),
@@ -714,8 +719,8 @@ def test_no_extracted_text_region_of_a_hostile_bundle_reaches_document_structure
         warnings=[{"stage": "ocr", "code": "tesseract_failed", "message": attack("warning")}],
         related_links=[
             link(
-                label=f'{attack("label")}](https://attacker.example/evil) [rest <{ATTACKER_URL}>',
-                url=f'{attack("url")}) [pwn](https://attacker.example/evil',
+                label=f"{attack('label')}](https://attacker.example/evil) [rest <{ATTACKER_URL}>",
+                url=f"{attack('url')}) [pwn](https://attacker.example/evil",
             )
         ],
     )
@@ -736,6 +741,7 @@ def test_no_extracted_text_region_of_a_hostile_bundle_reaches_document_structure
         "uncertainty",
         "verbatim",
         "confidence",
+        "salience",
         "warning",
         "label",
         "url",

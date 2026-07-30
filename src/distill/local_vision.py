@@ -1100,7 +1100,7 @@ class FrameInterpreter:
     _frame_count: int = 0
     _interpreted_count: int = 0
     _max_parallel: int = 1
-    _transcript_segments: tuple = ()
+    _transcript_segments: tuple[Any, ...] = ()
     _warning_counts: dict[str, int] = field(default_factory=dict)
     _trace_events: list[dict[str, Any]] = field(default_factory=list)
     _breaker: _TransportBreaker = field(default_factory=_TransportBreaker)
@@ -1111,9 +1111,7 @@ class FrameInterpreter:
         *,
         transcript_segments: Iterable[Any] | None = None,
     ) -> tuple[list[FrameArtifact], list[WarningRecord]]:
-        self._transcript_segments = (
-            tuple(transcript_segments or ()) if self.frame_salience else ()
-        )
+        self._transcript_segments = tuple(transcript_segments or ()) if self.frame_salience else ()
         self._reset_run(frames)
         self._log("interpret.start", {"frames": len(frames), "backend": self.config.backend})
         provenance_warnings: list[WarningRecord] = []
@@ -1413,9 +1411,11 @@ class FrameInterpreter:
             prompt.prompt,
             prompt_profile=prompt.profile,
         )
-        if result is not None and not self.frame_salience:
-            # Disabled means not recorded: a model that volunteers the fields
-            # anyway does not get to write them onto the artifact (D-017).
+        if result is not None and (not self.frame_salience or not window):
+            # Not asked means not recorded: whether the toggle is off or this
+            # frame simply had no transcript window, a model that volunteers
+            # the fields anyway does not get to write a judgment against
+            # speech it was never shown (D-017, D-003).
             result = replace(result, salience=None)
         if frame_warning:
             warnings.append(frame_warning)

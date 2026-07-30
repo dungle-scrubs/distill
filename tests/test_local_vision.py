@@ -2641,3 +2641,59 @@ class TestFilteredRenderView:
         assert "no judgment" in rendered  # absent salience is not redundancy
         assert "Non-authoritative" in rendered
         assert "every frame" in rendered  # points the reader at the stored render
+
+    def test_salience_survives_the_serialize_round_trip(self, tmp_path: Path) -> None:
+        """The judgment must be durable: a resumed run re-renders from
+        deserialized frames, and losing salience there silently strips every
+        annotation while the bundle key still claims salience was on."""
+        import dataclasses as dc
+
+        from distill.artifacts import FrameArtifact, RedactionState, serialize
+
+        frame = dc.replace(
+            _frame(1, tmp_path / "a.png", extracted_text="text"),
+            salience={
+                "adds_information": True,
+                "reason": "shows a diagram",
+                "reason_truncated": False,
+            },
+        )
+
+        document = serialize(frame)
+        rebuilt = FrameArtifact.from_document(document, redaction=RedactionState.APPLIED)
+
+        assert frame.salience is not None
+        assert rebuilt.salience is not None
+        assert dict(rebuilt.salience) == dict(frame.salience)
+
+    def test_volunteered_salience_without_a_window_is_not_recorded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A judgment against speech the model was never shown is not a
+        judgment: no transcript window for this frame means absent salience,
+        whatever the model volunteers (D-003)."""
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            return _chat_envelope(_frame_json(adds_information=False, reason="volunteered"))
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        # Transcript ends at 5s; the frame sits far outside any window.
+        segments = ({"start": 0.0, "end": 5.0, "text": "early speech"},)
+        far_frame = FrameArtifact(
+            index=1,
+            timestamp_sec=900.0,
+            path=str(tmp_path / "frame0.png"),
+            relative_path="frames/frame0.png",
+            extracted_text="",
+        )
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret([far_frame], transcript_segments=segments)
+
+        assert frames[0].reading is not None
+        assert frames[0].salience is None
