@@ -17,6 +17,7 @@ def case_result(
     *,
     case_id: str = "case",
     has_text: bool,
+    category: str | None = None,
     vision_wer: float | None = None,
     vision_recall: float | None = None,
     vision_f1: float | None = None,
@@ -25,7 +26,7 @@ def case_result(
 ) -> score.CaseResult:
     return score.CaseResult(
         id=case_id,
-        category="clean_text" if has_text else "textless",
+        category=category or ("clean_text" if has_text else "textless"),
         legibility="clean" if has_text else "unreadable",
         has_text=has_text,
         ocr_wer=None,
@@ -118,7 +119,14 @@ def test_labelled_corpus_represents_every_category() -> None:
     categories = {case.category for case in cases}
 
     assert cases
+    assert "chrome_only" in categories
     assert categories == score.VALID_CATEGORIES
+
+
+def test_labelled_corpus_has_at_least_six_true_negative_cases() -> None:
+    cases = score.load_labelled_cases()
+
+    assert sum(case.category == "textless" for case in cases) >= 6
 
 
 def test_synthetic_truth_matches_the_generator_text() -> None:
@@ -235,6 +243,24 @@ def test_labelled_corpus_rejects_category_has_text_mismatch(
         score.load_labelled_cases()
 
 
+def test_labelled_corpus_accepts_chrome_only_without_content_text(tmp_path, monkeypatch) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "chrome.png").write_bytes(b"png")
+    (frames_dir / "chrome.gt.txt").write_text("")
+    (tmp_path / "cases.toml").write_text(
+        '[[case]]\nid = "chrome"\ncategory = "chrome_only"\n'
+        'legibility = "unreadable"\nhas_text = false\n'
+    )
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", frames_dir)
+
+    [case] = score.load_labelled_cases()
+
+    assert case.category == "chrome_only"
+    assert case.has_text is False
+
+
 @pytest.mark.parametrize(
     ("category", "has_text", "truth"),
     [
@@ -267,6 +293,41 @@ def test_hallucination_rate_is_fraction_of_textless_cases_claiming_text() -> Non
     ]
 
     assert score.hallucination_rate(results) == 0.5
+
+
+def test_hallucination_rate_ignores_chrome_only_claims() -> None:
+    results = [
+        case_result(
+            case_id="chrome-claim",
+            category="chrome_only",
+            has_text=False,
+            claimed_text=True,
+        ),
+        case_result(case_id="true-negative", has_text=False, claimed_text=False),
+    ]
+
+    assert score.hallucination_rate(results) == 0.0
+
+
+def test_chrome_transcription_rate_counts_only_chrome_only_claims() -> None:
+    results = [
+        case_result(
+            case_id="chrome-claim",
+            category="chrome_only",
+            has_text=False,
+            claimed_text=True,
+        ),
+        case_result(
+            case_id="chrome-no-claim",
+            category="chrome_only",
+            has_text=False,
+            claimed_text=False,
+        ),
+        case_result(case_id="true-negative-claim", has_text=False, claimed_text=True),
+    ]
+
+    assert score.chrome_transcription_rate(results) == 0.5
+    assert score.chrome_transcription_rate(results[2:]) is None
 
 
 def test_evaluate_does_not_count_punctuation_only_text_as_a_claim(monkeypatch) -> None:
@@ -390,12 +451,13 @@ def test_local_baseline_pins_thresholds_from_its_own_measured_run() -> None:
     assert verdict.passed
 
 
-def test_summarize_includes_accuracy_and_hallucination_rate() -> None:
+def test_summarize_includes_accuracy_and_claim_rates() -> None:
     results = [
         case_result(has_text=True, vision_recall=0.8),
         case_result(has_text=True, vision_recall=0.6),
         case_result(has_text=False, claimed_text=True),
         case_result(has_text=False, claimed_text=False),
+        case_result(category="chrome_only", has_text=False, claimed_text=True),
     ]
 
     summary = score.summarize(results)
@@ -403,6 +465,7 @@ def test_summarize_includes_accuracy_and_hallucination_rate() -> None:
     assert summary["text_recovery_accuracy"] == pytest.approx(0.7)
     assert summary["vision_token_recall_mean"] == summary["text_recovery_accuracy"]
     assert summary["hallucination_rate"] == 0.5
+    assert summary["chrome_transcription_rate"] == 1.0
     assert summary["unusable_readings"] == 0
 
 

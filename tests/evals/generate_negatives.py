@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 WIDTH = 1280
 HEIGHT = 720
@@ -180,6 +180,74 @@ def _striped_disagreement(text: str) -> Image.Image:
     return image
 
 
+def _dark_bokeh(_text: str) -> Image.Image:
+    image = Image.new("RGB", FRAME_SIZE, "#080a0d")
+    circles = Image.new("RGBA", FRAME_SIZE, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(circles)
+    for bounds, fill in (
+        ((-170, 80, 310, 560), (28, 40, 50, 150)),
+        ((180, -190, 710, 340), (39, 31, 48, 125)),
+        ((510, 150, 950, 590), (24, 43, 45, 145)),
+        ((850, -80, 1390, 460), (43, 36, 29, 115)),
+        ((920, 360, 1320, 760), (27, 32, 45, 135)),
+        ((310, 430, 650, 770), (34, 29, 39, 105)),
+    ):
+        draw.ellipse(bounds, fill=fill)
+    softened = circles.filter(ImageFilter.GaussianBlur(radius=72))
+    return Image.alpha_composite(image.convert("RGBA"), softened).convert("RGB")
+
+
+def _abstract_geometry(_text: str) -> Image.Image:
+    image = Image.new("RGB", FRAME_SIZE, "#6f7476")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((90, 105, 610, 535), fill="#8c8377")
+    draw.rectangle((475, 55, 1115, 345), fill="#65777a")
+    draw.polygon(((110, 620), (475, 235), (790, 650)), fill="#7d6d70")
+    draw.polygon(((690, 95), (1215, 235), (1010, 680)), fill="#7b816d")
+    draw.rectangle((575, 300, 970, 625), fill="#727083")
+    return image
+
+
+def _blurred_room(_text: str) -> Image.Image:
+    buffer = bytearray(WIDTH * HEIGHT * 3)
+    index = 0
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            horizontal = x / WIDTH
+            vertical = y / HEIGHT
+            noise = ((x * 17 + y * 29 + (x * y) % 31) % 17) - 8
+            red = int(72 + 55 * horizontal + 26 * vertical) + noise
+            green = int(80 + 38 * horizontal + 18 * vertical) + noise
+            blue = int(86 + 22 * horizontal + 34 * (1 - vertical)) + noise
+            buffer[index : index + 3] = (
+                max(0, min(255, red)),
+                max(0, min(255, green)),
+                max(0, min(255, blue)),
+            )
+            index += 3
+    image = Image.frombytes("RGB", FRAME_SIZE, bytes(buffer))
+    draw = ImageDraw.Draw(image, "RGBA")
+    draw.rectangle((0, 0, 410, HEIGHT), fill=(38, 47, 53, 105))
+    draw.ellipse((720, -180, 1380, 480), fill=(196, 166, 128, 90))
+    return image.filter(ImageFilter.GaussianBlur(radius=28))
+
+
+def _gray_wall(_text: str) -> Image.Image:
+    buffer = bytearray(WIDTH * HEIGHT * 3)
+    index = 0
+    highlight_x = 790
+    highlight_y = 285
+    maximum_distance = 520**2
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            distance = (x - highlight_x) ** 2 + (y - highlight_y) ** 2
+            highlight = max(0, 24 * (maximum_distance - distance) // maximum_distance)
+            value = 126 + highlight
+            buffer[index : index + 3] = (value, value, value)
+            index += 3
+    return Image.frombytes("RGB", FRAME_SIZE, bytes(buffer))
+
+
 @dataclass(frozen=True)
 class SyntheticCase:
     text: str
@@ -223,6 +291,10 @@ Independent readers reveal the evidence""",
 Vision should recover this sentence""",
         render=_striped_disagreement,
     ),
+    "23_synth_textless_f01": SyntheticCase(text="", render=_dark_bokeh),
+    "24_synth_textless_f02": SyntheticCase(text="", render=_abstract_geometry),
+    "25_synth_textless_f03": SyntheticCase(text="", render=_blurred_room),
+    "26_synth_textless_f04": SyntheticCase(text="", render=_gray_wall),
 }
 
 SYNTHETIC_CASE_TEXT = {

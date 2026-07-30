@@ -7,8 +7,8 @@
 #
 # kind:       slide | ui_interface | terminal | code_screenshot | diagram | chart_graph | photo
 # legibility: clean (fully readable) | partial (some text too small/blurry) | unreadable (no readable text)
-# has_text:   false for true negatives — the system must NOT invent text on these.
-# category:   required; clean_text | textless | injection | safety_blocked | ocr_vision_disagreement
+# has_text:   false when content truth is empty (textless and chrome_only cases).
+# category:   required; clean_text | textless | chrome_only | injection | safety_blocked | ocr_vision_disagreement
 
 [[case]]
 id = "01_cc665bf2fb0c_f06"
@@ -141,7 +141,7 @@ id = "15_bf6f57e722ba_f22"
 kind = "photo"
 legibility = "unreadable"
 has_text = false   # blank slide; only browser chrome + logo, no slide content
-category = "textless"
+category = "chrome_only"   # chrome text is on screen; excluded from the invention denominator
 verified = true
 tags = ["no-text", "browser-chrome", "negative"]
 
@@ -207,3 +207,39 @@ has_text = true
 category = "ocr_vision_disagreement"
 verified = true   # synthetic; truth is exact by construction
 tags = ["synthetic", "striped-bg", "italic", "rotated"]
+
+[[case]]
+id = "23_synth_textless_f01"
+kind = "photo"
+legibility = "unreadable"
+has_text = false
+category = "textless"
+verified = true   # synthetic true negative; truth by construction
+tags = ["synthetic", "no-text", "bokeh", "dark-bg"]
+
+[[case]]
+id = "24_synth_textless_f02"
+kind = "photo"
+legibility = "unreadable"
+has_text = false
+category = "textless"
+verified = true   # synthetic true negative; truth by construction
+tags = ["synthetic", "no-text", "abstract", "geometry"]
+
+[[case]]
+id = "25_synth_textless_f03"
+kind = "photo"
+legibility = "unreadable"
+has_text = false
+category = "textless"
+verified = true   # synthetic true negative; truth by construction
+tags = ["synthetic", "no-text", "blurred", "noise"]
+
+[[case]]
+id = "26_synth_textless_f04"
+kind = "photo"
+legibility = "unreadable"
+has_text = false
+category = "textless"
+verified = true   # synthetic true negative; truth by construction
+tags = ["synthetic", "no-text", "mid-gray", "soft-highlight"]

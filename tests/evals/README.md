@@ -55,7 +55,9 @@ Every case has a required `category` field. The scorer validates the label and
 the case's `.png` and `.gt.txt` fixtures before doing any OCR:
 
 - `clean_text` - an ordinary text-bearing frame.
-- `textless` - a true negative with no on-screen text.
+- `textless` - a true negative with no text pixels anywhere in the frame.
+- `chrome_only` - the frame's content is empty, but legible browser UI, logos,
+  or banners are present.
 - `injection` - visible text shaped like a prompt injection, which a reader
   must transcribe rather than follow.
 - `safety_blocked` - benign security-conference content styled like material a
@@ -63,19 +65,21 @@ the case's `.png` and `.gt.txt` fixtures before doing any OCR:
 - `ocr_vision_disagreement` - text designed or observed to defeat Tesseract
   while remaining readable to a human or vision model.
 
-## True negatives
+## Empty-content cases
 
-Cases with `has_text = false` (the black frame, the browser-chrome-only frame,
-the podcast shot) have empty `.gt.txt`. They test the *other* failure mode: the
-system must **not** invent text and **should** flag low confidence. Don't delete
-them — an eval of only text-heavy slides would miss false positives entirely.
+All cases with `has_text = false` have empty content truth in `.gt.txt`.
+`textless` cases contain no text pixels at all, so any claimed text is
+invention. The `chrome_only` case has legible browser chrome but no slide
+content. Transcribing that chrome disagrees with the content-only convention,
+but it is not invention and is tracked separately.
 
 ## Synthetic negative cases
 
-Six synthetic slides provide controlled coverage that the source recordings do
-not: two prompt injections, two benign security slides, and two predictable
-OCR/vision disagreements. Their transcriptions are truth by construction: the
-same ordered table drives both rendering and `.gt.txt` generation.
+Ten synthetic frames provide controlled coverage that the source recordings do
+not: two prompt injections, two benign security slides, two predictable
+OCR/vision disagreements, and four true negatives with no text. Their truth is
+fixed by construction: the same ordered table drives both rendering and
+`.gt.txt` generation.
 
 Regenerate them deterministically with:
 
@@ -83,24 +87,26 @@ Regenerate them deterministically with:
 uv run python tests/evals/generate_negatives.py
 ```
 
-Regeneration requires the macOS system fonts used to build the fixtures. The
-committed PNGs are canonical, and byte-identical regeneration is expected only
-on the pinned-Pillow macOS setup; decoded pixels are the meaningful comparison
-across PNG encoders.
+The generator rewrites all ten synthetic fixtures. Regeneration requires the
+macOS system fonts used to build the text-bearing fixtures. The committed PNGs
+are canonical, and a run on the pinned-Pillow macOS setup must leave every
+existing fixture byte-identical. Decoded pixels are the meaningful comparison
+across other PNG encoders.
 
 ## Coverage
 
-22 cases: 16 real frames from 7 recordings plus 6 deterministic synthetic
-slides, spread across:
+26 cases: 16 real frames from 7 recordings plus 10 deterministic synthetic
+frames, spread across:
 
 - **kind**: 16 slides, 2 real UIs (an agent trace viewer, a phone app
-  mockup), 1 diagram, 3 photo/negative.
-- **legibility**: 16 clean, 3 partial, 3 unreadable/no-text.
-- **category**: 12 `clean_text`, 3 `textless`, 2 `injection`, 2
-  `safety_blocked`, and 3 `ocr_vision_disagreement`.
+  mockup), 1 diagram, 7 photo/negative.
+- **legibility**: 16 clean, 3 partial, 7 unreadable/empty-content.
+- **category**: 12 `clean_text`, 6 `textless`, 1 `chrome_only`, 2 `injection`,
+  2 `safety_blocked`, and 3 `ocr_vision_disagreement`.
 - **background**: dark and light slides both represented.
 - Includes the original hallucination case (`04_..._f16`, "We're closer than you
-  think"), three text-free negatives, and six labelled synthetic edge cases.
+  think"), six true invention probes, one chrome-only convention case, and ten
+  labelled synthetic edge cases.
 
 To refresh or extend the pool: `uv run python tests/evals/triage.py`.
 
@@ -125,9 +131,14 @@ uv run python tests/evals/score.py --with-vision --json
 - **`text_recovery_accuracy`**: mean order-insensitive token recall over scored
   text-bearing cases. It is also reported as `vision_token_recall_mean` for
   continuity.
-- **`hallucination_rate`**: fraction of scored textless cases where the vision
-  reader claimed text after normalization; empty and punctuation-only readings
-  do not count as claims, including Unicode punctuation-only readings.
+- **`hallucination_rate`**: invention rate over scored cases whose category is
+  `textless`, the true negatives with no text pixels at all. Empty and
+  punctuation-only readings do not count as claims, including Unicode
+  punctuation-only readings. `chrome_only` cases are excluded because a chrome
+  transcription is a convention disagreement, not invention.
+- **`chrome_transcription_rate`**: informational fraction of scored
+  `chrome_only` cases where the reader claimed text. It is reported separately
+  and is not part of `AcceptanceRule`.
 - **`unusable_readings`**: count of scored cases where the vision reader
   returned no usable interpretation.
 - **`vision_token_recall`** (headline): order-insensitive fraction of truth tokens
@@ -140,11 +151,12 @@ uv run python tests/evals/score.py --with-vision --json
 - **`grounding_precision`/`recall`**: whether `grounding.assess_grounding` flags the
   hard/unreadable frames (recall) without crying wolf on clean ones (precision).
 
-The Gate 2 -> 3 check (plan 02) applies `AcceptanceRule`, which passes only
-when text-recovery accuracy meets its floor and hallucination rate stays at or
-below its ceiling. The thresholds are pinned in `baseline_local.json` from the
-measured local baseline. Both metrics require `--with-vision`; an OCR-only run
-reports them as unmeasured (`None`), which the rule fails closed.
+The Gate 2 -> 3 check (plan 02) applies `AcceptanceRule`, which passes only when
+text-recovery accuracy meets its floor and invention-only hallucination rate
+stays at or below its ceiling. The thresholds are pinned in
+`baseline_local.json` from the measured local baseline. Both gate metrics
+require `--with-vision`; an OCR-only run reports them as unmeasured (`None`),
+which the rule fails closed. `chrome_transcription_rate` remains informational.
 
 Run the gate with:
 
@@ -161,8 +173,9 @@ model is actually worth it — measured, not guessed.
 ## Findings
 
 A record of what's already been measured, so it isn't re-litigated. The
-reader-comparison numbers below are from the original 16-frame set; the plan 02
-baseline is on the full 22-frame corpus. Treat WER/recall deltas under ~0.03 as
+reader-comparison numbers below are from the original 16-frame set; the
+currently recorded plan 02 baseline predates the true-negative expansion and
+uses the then-current 22-frame corpus. Treat WER/recall deltas under ~0.03 as
 run-to-run noise (single run per model). Re-run with
 `score.py --with-vision --model …` after starting Rapid-MLX to reproduce
 current results.
