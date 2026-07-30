@@ -2087,3 +2087,70 @@ class TestBoundedRemoteBehavior:
         assert opened["n"] == 3
         assert all(frame.reading is None for frame in frames)
         assert interpreter.debug_info()["breaker"]["transport_failures"] == 0
+
+
+class TestPromptSideRedaction:
+    """M2.6 (D-010): extracted text is redacted before it enters any vision
+    prompt, regardless of endpoint locality and regardless of the render-side
+    --no-redact-secrets flag."""
+
+    def test_ocr_text_is_redacted_inside_the_built_prompt(self) -> None:
+        from distill.vision_prompts import build_technical_frame_prompt
+
+        prompt = build_technical_frame_prompt(
+            ocr_text="export API_KEY=sk-prompt-secret-value\nplain slide text"
+        )
+
+        assert "sk-prompt-secret-value" not in prompt.prompt
+        assert "[REDACTED]" in prompt.prompt
+        assert "plain slide text" in prompt.prompt
+
+    def test_url_userinfo_credentials_are_redacted(self) -> None:
+        from distill.redact_secrets import redact_text
+
+        result = redact_text(
+            "curl http://admin:sk-userinfo-secret@vision.example.com:8000/v1/models"
+        )
+
+        assert "sk-userinfo-secret" not in result.text
+        assert "vision.example.com" in result.text  # the host stays diagnostic
+
+    def test_prompts_are_identical_local_vs_remote_and_ignore_the_render_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """D-010's cache-coherence half: the prompt depends on the frame, not
+        on where the endpoint lives or what --no-redact-secrets says."""
+        from dataclasses import replace
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        captured: list[str] = []
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+
+        class _CapturingOpener(_FakeOpener):
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                body = json.loads(request.data.decode())
+                [message] = body["messages"]
+                captured.append(next(p["text"] for p in message["content"] if p["type"] == "text"))
+                return super().open(request, timeout)
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _CapturingOpener(payload))
+        secret_frame = _frame(1, image, extracted_text="API_KEY=sk-uniform-secret")
+        local = LocalVisionConfig()
+        remote = replace(
+            LocalVisionConfig(),
+            base_url="https://10.0.0.5:8000/v1",
+            allow_remote_endpoint=True,
+        )
+        # The remote request would resolve/connect; the capture happens at the
+        # opener so the fake serves both. Resolved-address check: 10.0.0.5 is
+        # a literal, allow_remote + https passes the static check, and the
+        # resolved check exempts https with the opt-in.
+        for config in (local, remote):
+            interpreter = FrameInterpreter(config, probe=_available_probe)
+            interpreter.interpret([secret_frame])
+
+        assert len(captured) == 2
+        assert captured[0] == captured[1]
+        assert "sk-uniform-secret" not in captured[0]
+        assert "[REDACTED]" in captured[0]

@@ -106,6 +106,10 @@ ASSIGNMENT_PATTERNS = (
     BEARER_RE,
     WEAK_ASSIGNMENT_RE,
 )
+# A URL whose authority embeds a credential (`scheme://user:secret@host`).
+# The password is the secret; the username can be a key id and the host is
+# what makes the line diagnosable, so only the password is replaced.
+URL_USERINFO_RE = re.compile(r"(?P<prefix>[a-z][a-z0-9+.-]*://[^/@\s:]+:)(?P<value>[^@/\s]+)(?=@)")
 TUTORIAL_PLACEHOLDERS = {
     "your_key_here",
     "your_api_key",
@@ -126,6 +130,19 @@ def normalize_confusables(text: str) -> str:
     return text.translate(CONFUSABLES)
 
 
+def redact_for_prompt(text: str) -> str:
+    """The prompt-side sink (D-010): extracted text headed into a vision
+    prompt, redacted unconditionally.
+
+    No flag consults this path - `--no-redact-secrets` governs what the
+    operator sees in their own render, never what leaves for a model. Local
+    and remote take the same text so their outputs stay cache-coherent, and
+    the per-secret warnings stay with the response-side sink: one finding per
+    run, not one per frame prompt.
+    """
+    return redact_text(text).text
+
+
 def redact_text(text: str) -> RedactionResult:
     warnings: list[WarningRecord] = []
     redacted = text
@@ -144,6 +161,13 @@ def redact_text(text: str) -> RedactionResult:
 
     for assignment in ASSIGNMENT_PATTERNS:
         redacted = assignment.sub(replace_assignment, redacted)
+
+    def replace_userinfo(match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return f"{match.group('prefix')}[REDACTED]"
+
+    redacted = URL_USERINFO_RE.sub(replace_userinfo, redacted)
 
     for pattern in SECRET_PATTERNS:
         matches = pattern.findall(redacted)

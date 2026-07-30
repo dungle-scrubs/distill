@@ -201,7 +201,14 @@ def test_extracted_text_longer_than_the_budget_is_cut_before_it_is_fenced() -> N
     task - inside a block that never ends. Short adversarial fixtures cannot
     see it, because they are never cut.
     """
-    payload = "`" * 40 + "\n" + "A" * MAX_EXTRACTED_TEXT_CHARACTERS + SENTINEL
+    # Lowercase words with spaces, not one long token run: since M2.6 the
+    # text is redacted before it is cut, and a 1200-character unbroken run
+    # reads as a credential to the secret patterns, shortening the payload
+    # and moving the cut.
+    filler = ("lorem ipsum " * (MAX_EXTRACTED_TEXT_CHARACTERS // 12 + 1))[
+        :MAX_EXTRACTED_TEXT_CHARACTERS
+    ]
+    payload = "`" * 40 + "\n" + filler + SENTINEL
 
     prompt = build_technical_frame_prompt("slide", ocr_text=payload).prompt
 
