@@ -703,12 +703,14 @@ def probe_rapid_mlx_availability(
     *,
     requestor: HttpRequestor | None = None,
 ) -> LocalVisionProbe:
-    """Confirm a Rapid-MLX server is reachable and serving the configured model.
+    """Confirm a vision endpoint is reachable and will serve the configured model.
 
-    Probes ``GET <base_url>/models`` (the OpenAI-compatible models list). The
-    probe is satisfied when the server responds and the configured model id is
-    present in its catalog. Transport failures map onto Distill's existing
-    warning codes so the OCR-only fallback behaves as before.
+    Probes ``GET <base_url>/models``. A model present in the catalog satisfies
+    the probe as before; a model the catalog omits is settled by attempting a
+    minimal image-bearing completion (D-008 - /models is advisory, a proxy's
+    catalog is routinely incomplete), so the unlisted path may load the model
+    and costs up to a second timeout. Transport failures map onto Distill's
+    existing warning codes so the OCR-only fallback behaves as before.
     """
     models_url = _models_url(config.base_url)
     try:
@@ -789,22 +791,34 @@ def probe_rapid_mlx_availability(
         # attempting a completion; only a failed attempt makes it unavailable.
         attempt_failure = _attempt_minimal_completion(config, requestor)
         if attempt_failure is not None:
+            if attempt_failure.code == "local_vision_model_unavailable":
+                message = (
+                    f"Rapid-MLX is not serving model '{config.model}' and a "
+                    "completion attempt failed; continuing with OCR-only output."
+                )
+            else:
+                # An auth rejection, endpoint refusal, or transport fault is
+                # its own event; reporting it as a missing model would hide
+                # the one cause the operator can act on.
+                message = attempt_failure.message
             return LocalVisionProbe(
                 available=False,
                 backend=config.backend,
                 model=config.model,
                 base_url=config.base_url,
-                code="local_vision_model_unavailable",
-                message=(
-                    f"Rapid-MLX is not serving model '{config.model}' and a "
-                    "completion attempt failed; continuing with OCR-only output."
-                ),
+                code=attempt_failure.code,
+                message=message,
                 detail={
                     "configured_model": config.model,
                     "served_models": served,
                     "url": models_url,
                     "completion_error": attempt_failure.message,
                     "completion_code": attempt_failure.code,
+                    **{
+                        k: v
+                        for k, v in attempt_failure.detail.items()
+                        if k not in {"configured_model", "served_models", "url"}
+                    },
                 },
             )
         return LocalVisionProbe(
@@ -834,12 +848,28 @@ def _attempt_minimal_completion(
     config: LocalVisionConfig,
     requestor: HttpRequestor | None,
 ) -> LocalVisionFailure | None:
-    """One tiny text-only completion against the configured model, or the
-    typed failure it produced. The cheapest question that actually answers
-    "will this endpoint serve this model" (D-008)."""
+    """One tiny completion carrying a 1x1 PNG image part, or the typed failure
+    it produced. The image part is the point: the probe's question is "will
+    this endpoint read a keyframe for me", and a text-only ping would authorize
+    an image run against an endpoint that only routes text (D-008).
+
+    Failures keep their own class: an auth rejection, a timeout, or a policy
+    refusal must never be reported as a missing model.
+    """
     body = {
         "model": config.model,
-        "messages": [{"role": "user", "content": "ping"}],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "ping"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{_PROBE_PIXEL_B64}"},
+                    },
+                ],
+            }
+        ],
         "max_tokens": 1,
         "stream": False,
     }
@@ -852,16 +882,47 @@ def _attempt_minimal_completion(
             allow_remote_endpoint=config.allow_remote_endpoint,
             credential=config.credential,
         )
-        _chat_content(envelope)
+        if not envelope.get("choices"):
+            # A 200 without a completion envelope (several proxies answer
+            # errors this way) is not evidence the endpoint serves the model.
+            return LocalVisionFailure(
+                "local_vision_model_unavailable",
+                "completion attempt returned no completion envelope",
+                {"envelope_keys": sorted(envelope.keys())},
+            )
     except LocalVisionFailure as exc:
+        # Typed already (auth_rejected, endpoint rejection, transport code):
+        # pass it through untouched so the cause survives to the surface.
         return exc
-    except (TimeoutError, urllib.error.URLError, RuntimeError, ValueError, OSError) as exc:
+    except TimeoutError as exc:
+        return LocalVisionFailure(
+            "local_vision_timeout",
+            "completion attempt timed out; continuing with OCR-only output.",
+            {"error": str(exc)},
+        )
+    except (urllib.error.URLError, OSError) as exc:
+        return LocalVisionFailure(
+            "local_vision_rapid_mlx_unavailable",
+            f"completion attempt could not reach the endpoint: {exc}",
+            {"error": str(exc)},
+        )
+    except (RuntimeError, ValueError) as exc:
+        # An HTTP error or non-envelope answer to a well-formed completion for
+        # this model: the model-shaped failure.
         return LocalVisionFailure(
             "local_vision_model_unavailable",
             f"completion attempt failed: {exc}",
             {"error": str(exc)},
         )
     return None
+
+
+# The smallest valid PNG (1x1 transparent pixel), used only by the probe's
+# attempted completion. A constant, so the probe body is byte-stable.
+_PROBE_PIXEL_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
+    "h6FO1AAAAABJRU5ErkJggg=="
+)
 
 
 def interpret_image(

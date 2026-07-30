@@ -614,18 +614,26 @@ def _urlopen_json(
             # operator with `HTTP 302 from …: ` and nothing to act on. Nothing
             # is followed either way; only the message was the mystery.
             raise RuntimeError(
-                f"HTTP {exc.code} from {url}: the endpoint answered a redirect that could not "
-                "be followed, and redirects are not followed in any case"
+                f"HTTP {exc.code} from {_safe_url_for_message(url)}: the endpoint answered "
+                "a redirect that could not be followed, and redirects are not followed in "
+                "any case"
             ) from exc
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail[:200]}") from exc
+        # The URL is sanitized (authority only) and the endpoint's text is a
+        # bounded 200-char preview: diagnostic enough for "model not loaded",
+        # too small to be a channel.
+        raise RuntimeError(
+            f"HTTP {exc.code} from {_safe_url_for_message(url)}: {detail[:200]}"
+        ) from exc
     except http.client.IncompleteRead as exc:
         # A server that closes the connection mid-body (crash/restart) yields a
         # truncated read; treat it as a malformed response so we degrade cleanly.
-        raise RuntimeError(f"incomplete response from {url}: {exc}") from exc
+        raise RuntimeError(f"incomplete response from {_safe_url_for_message(url)}: {exc}") from exc
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"non-JSON response from {url}: {raw[:200]!r}") from exc
+        raise ValueError(
+            f"non-JSON response from {_safe_url_for_message(url)}: {raw[:200]!r}"
+        ) from exc
 
 
 def _normalize_frame_kind(value: Any) -> str:

@@ -1723,3 +1723,57 @@ class TestAttemptCompletionAvailability:
         assert result is None
         assert failure_warning is not None
         assert failure_warning["code"] == "local_vision_malformed_response"
+
+    def test_the_attempted_completion_is_minimal_and_carries_an_image_part(
+        self,
+    ) -> None:
+        server = FakeRapidMlx(models=["other-model"], chat_content="pong")
+
+        probe_rapid_mlx_availability(LocalVisionConfig(), requestor=server)
+
+        [attempt] = [c for c in server.calls if c["method"] == "POST"]
+        body = attempt["body"]
+        assert body["max_tokens"] == 1
+        assert body["stream"] is False
+        [message] = body["messages"]
+        part_types = [part["type"] for part in message["content"]]
+        # The probe's question is "will this endpoint read a keyframe" - a
+        # text-only ping would authorize an image run against a text router.
+        assert "image_url" in part_types
+
+    def test_an_auth_rejection_during_the_attempt_keeps_its_own_code(self) -> None:
+        server = FakeRapidMlx(
+            models=["other-model"],
+            chat_error=LocalVisionFailure(
+                "local_vision_auth_rejected",
+                "Local vision endpoint rejected the credential (HTTP 401); "
+                "continuing with OCR-only output.",
+                {"status": 401},
+            ),
+        )
+
+        probe = probe_rapid_mlx_availability(LocalVisionConfig(), requestor=server)
+
+        assert probe.available is False
+        # The operator's signal is the credential, not a missing model.
+        assert probe.code == "local_vision_auth_rejected"
+        assert "credential" in probe.message
+
+    def test_a_200_without_a_completion_envelope_is_not_availability(self) -> None:
+        class _ErrorBodyServer(FakeRapidMlx):
+            def __call__(
+                self, *, method: str, url: str, body: Any = None, timeout: float = 30.0
+            ) -> Any:
+                if method == "POST":
+                    self.calls.append(
+                        {"method": method, "url": url, "body": body, "timeout": timeout}
+                    )
+                    return {"error": {"message": "model not found"}}
+                return super().__call__(method=method, url=url, body=body, timeout=timeout)
+
+        server = _ErrorBodyServer(models=["other-model"])
+
+        probe = probe_rapid_mlx_availability(LocalVisionConfig(), requestor=server)
+
+        assert probe.available is False
+        assert probe.code == "local_vision_model_unavailable"
