@@ -784,20 +784,40 @@ def probe_rapid_mlx_availability(
 
     served = _served_model_ids(payload)
     if config.model not in served:
+        # D-008: /models is advisory, not authoritative - a proxy's catalog is
+        # routinely incomplete. A model the catalog omits is settled by
+        # attempting a completion; only a failed attempt makes it unavailable.
+        attempt_failure = _attempt_minimal_completion(config, requestor)
+        if attempt_failure is not None:
+            return LocalVisionProbe(
+                available=False,
+                backend=config.backend,
+                model=config.model,
+                base_url=config.base_url,
+                code="local_vision_model_unavailable",
+                message=(
+                    f"Rapid-MLX is not serving model '{config.model}' and a "
+                    "completion attempt failed; continuing with OCR-only output."
+                ),
+                detail={
+                    "configured_model": config.model,
+                    "served_models": served,
+                    "url": models_url,
+                    "completion_error": attempt_failure.message,
+                    "completion_code": attempt_failure.code,
+                },
+            )
         return LocalVisionProbe(
-            available=False,
+            available=True,
             backend=config.backend,
             model=config.model,
             base_url=config.base_url,
-            code="local_vision_model_unavailable",
+            code="local_vision_available",
             message=(
-                f"Rapid-MLX is not serving model '{config.model}'; continuing with OCR-only output."
+                f"Model '{config.model}' is not in the /models catalog but a "
+                "completion succeeded; proceeding."
             ),
-            detail={
-                "configured_model": config.model,
-                "served_models": served,
-                "url": models_url,
-            },
+            detail={"served_models": served, "url": models_url, "model_not_listed": True},
         )
     return LocalVisionProbe(
         available=True,
@@ -808,6 +828,40 @@ def probe_rapid_mlx_availability(
         message="Rapid-MLX local vision target is available.",
         detail={"served_models": served, "url": models_url},
     )
+
+
+def _attempt_minimal_completion(
+    config: LocalVisionConfig,
+    requestor: HttpRequestor | None,
+) -> LocalVisionFailure | None:
+    """One tiny text-only completion against the configured model, or the
+    typed failure it produced. The cheapest question that actually answers
+    "will this endpoint serve this model" (D-008)."""
+    body = {
+        "model": config.model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    try:
+        envelope = _http_post_json(
+            requestor,
+            _completions_url(config.base_url),
+            body,
+            config.timeout_sec,
+            allow_remote_endpoint=config.allow_remote_endpoint,
+            credential=config.credential,
+        )
+        _chat_content(envelope)
+    except LocalVisionFailure as exc:
+        return exc
+    except (TimeoutError, urllib.error.URLError, RuntimeError, ValueError, OSError) as exc:
+        return LocalVisionFailure(
+            "local_vision_model_unavailable",
+            f"completion attempt failed: {exc}",
+            {"error": str(exc)},
+        )
+    return None
 
 
 def interpret_image(
@@ -918,6 +972,17 @@ class FrameInterpreter:
             return frames, [probe_warning]
 
         warnings: list[WarningRecord] = []
+        if probe.detail.get("model_not_listed"):
+            # Available, but on the strength of an attempted completion rather
+            # than the catalog (D-008) - the run says so once, out loud.
+            advisory = warning(
+                "local_vision",
+                "local_vision_model_not_listed",
+                f"model '{probe.model}' is not in the endpoint's /models "
+                "catalog; proceeding because a completion succeeded.",
+            )
+            self._record_warning(advisory)
+            warnings.append(advisory)
         interpreted_frames = frames
         try:
             if not frames:

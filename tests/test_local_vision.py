@@ -219,14 +219,23 @@ def test_probe_reports_unavailable_when_server_down(
 def test_probe_reports_model_unavailable_when_model_not_served(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Since M2.4 (D-008) an unlisted model alone does not hard-skip: the
+    probe attempts a completion, and only that attempt failing too makes the
+    model unavailable."""
     config = LocalVisionConfig(model="qwen3-vl:32b")
 
-    probe = probe_rapid_mlx_availability(config, requestor=FakeRapidMlx(models=["other"]))
+    probe = probe_rapid_mlx_availability(
+        config,
+        requestor=FakeRapidMlx(
+            models=["other"], chat_error=RuntimeError("HTTP 404: model not found")
+        ),
+    )
 
     assert probe.available is False
     assert probe.code == "local_vision_model_unavailable"
     assert probe.detail["configured_model"] == "qwen3-vl:32b"
     assert probe.detail["served_models"] == ["other"]
+    assert "404" in probe.detail["completion_error"]
 
 
 def test_probe_reports_malformed_models_response(
@@ -1639,3 +1648,78 @@ class TestEndpointPolicyHttps:
             context = handler._context  # noqa: SLF001 - the pin is the point
             assert context.verify_mode is ssl.CERT_REQUIRED
             assert context.check_hostname is True
+
+
+class TestAttemptCompletionAvailability:
+    """M2.4: /models is advisory; a missing listing warns, a completion decides."""
+
+    def test_model_absent_from_catalog_is_available_when_a_completion_succeeds(
+        self,
+    ) -> None:
+        server = FakeRapidMlx(models=["other-model"], chat_content="pong")
+        config = LocalVisionConfig(model=DEFAULT_MODEL)
+
+        probe = probe_rapid_mlx_availability(config, requestor=server)
+
+        assert probe.available is True
+        assert probe.code == "local_vision_available"
+        assert probe.detail["model_not_listed"] is True
+        assert probe.detail["served_models"] == ["other-model"]
+        # The decision came from an attempted completion, not /models alone.
+        assert any(
+            call["method"] == "POST" and call["url"].endswith("/chat/completions")
+            for call in server.calls
+        )
+
+    def test_interpreter_surfaces_an_advisory_warning_for_an_unlisted_model(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body("some-other-model")
+            return _chat_envelope(_frame_json())
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+
+        interpreter = FrameInterpreter(LocalVisionConfig())
+        frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        # The frame is read (no hard-skip), and the run says why that is safe.
+        assert frames[0].reading is not None
+        advisory = [w for w in warnings if w["code"] == "local_vision_model_not_listed"]
+        assert len(advisory) == 1
+        assert "catalog" in advisory[0]["message"]
+
+    def test_a_provider_rejecting_the_image_part_degrades_that_frame(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Off-profile (D-008): an endpoint that 400s the image content part
+        is out of profile for that frame - the frame degrades to OCR-only, the
+        run continues, and the hostile error body is bounded, not parsed."""
+        from email.message import Message
+
+        class _ImageRejectingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    400,
+                    "bad request",
+                    Message(),
+                    io.BytesIO(b'{"error": "image content part not supported"}'),
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _ImageRejectingOpener())
+
+        result, failure_warning = try_interpret_image(
+            LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+        )
+
+        assert result is None
+        assert failure_warning is not None
+        assert failure_warning["code"] == "local_vision_malformed_response"
