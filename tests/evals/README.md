@@ -117,6 +117,12 @@ uv run python tests/evals/score.py --with-vision --json
 
 ## Metrics
 
+- **`text_recovery_accuracy`**: mean order-insensitive token recall over scored
+  text-bearing cases. It is also reported as `vision_token_recall_mean` for
+  continuity.
+- **`hallucination_rate`**: fraction of scored textless cases where the vision
+  reader claimed text after normalization; empty and punctuation-only readings
+  do not count as claims.
 - **`vision_token_recall`** (headline): order-insensitive fraction of truth tokens
   the model captured — "did it read the content?" Robust to word order and to chrome
   the model adds, so it's the fairest transcription-quality signal.
@@ -126,6 +132,9 @@ uv run python tests/evals/score.py --with-vision --json
   multi-region slides where correct words appear in a different order — prefer recall/F1.
 - **`grounding_precision`/`recall`**: whether `grounding.assess_grounding` flags the
   hard/unreadable frames (recall) without crying wolf on clean ones (precision).
+
+Gate 2 -> 3 consumes `AcceptanceRule`, which passes only when text-recovery
+accuracy meets its floor and hallucination rate stays at or below its ceiling.
 
 Use the scores to decide whether a prompt tweak, an OCR setting, or a different vision
 model is actually worth it — measured, not guessed.

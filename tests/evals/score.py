@@ -96,6 +96,7 @@ class CaseResult:
     vision_f1: float | None
     flagged: bool | None  # grounding marked it low-confidence
     should_flag: bool  # human says it is not cleanly legible
+    claimed_text: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,32 @@ class LabelledCase:
     legibility: str
     has_text: bool
     verified: bool
+
+
+@dataclass(frozen=True)
+class AcceptanceVerdict:
+    passed: bool
+    accuracy_ok: bool
+    hallucination_ok: bool
+
+
+@dataclass(frozen=True)
+class AcceptanceRule:
+    accuracy_floor: float
+    hallucination_ceiling: float
+
+    def evaluate(
+        self, accuracy: float | None, hallucination_rate: float | None
+    ) -> AcceptanceVerdict:
+        accuracy_ok = accuracy is not None and accuracy >= self.accuracy_floor
+        hallucination_ok = (
+            hallucination_rate is not None and hallucination_rate <= self.hallucination_ceiling
+        )
+        return AcceptanceVerdict(
+            passed=accuracy_ok and hallucination_ok,
+            accuracy_ok=accuracy_ok,
+            hallucination_ok=hallucination_ok,
+        )
 
 
 def load_labelled_cases() -> list[LabelledCase]:
@@ -183,12 +210,15 @@ def evaluate(
         vision_recall: float | None = None
         vision_f1: float | None = None
         flagged: bool | None = None
+        claimed_text: bool | None = None
         if interpret is not None:
             result = interpret(image, ocr_text)
             if result is not None:
                 if has_text:
                     vision_wer = word_error_rate(truth, result.verbatim_text)
                     _, vision_recall, vision_f1 = token_prf(truth, result.verbatim_text)
+                else:
+                    claimed_text = bool(normalize(result.verbatim_text))
                 assessment = assess_grounding(
                     ocr_text=ocr_text,
                     verbatim_text=result.verbatim_text,
@@ -201,6 +231,8 @@ def evaluate(
                 # The model produced nothing usable: the pipeline now treats this
                 # as a low-confidence (ungrounded) frame, so the eval does too.
                 flagged = True
+                if not has_text:
+                    claimed_text = False
 
         results.append(
             CaseResult(
@@ -214,6 +246,7 @@ def evaluate(
                 vision_f1=vision_f1,
                 flagged=flagged,
                 should_flag=case.legibility != "clean",
+                claimed_text=claimed_text,
             )
         )
     return results
@@ -245,20 +278,32 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def text_recovery_accuracy(results: list[CaseResult]) -> float | None:
+    recalls = [r.vision_recall for r in results if r.has_text and r.vision_recall is not None]
+    return _mean(recalls)
+
+
+def hallucination_rate(results: list[CaseResult]) -> float | None:
+    textless = [r for r in results if not r.has_text and r.claimed_text is not None]
+    return _mean([float(r.claimed_text) for r in textless])
+
+
 def summarize(results: list[CaseResult]) -> dict:
     ocr_wers = [r.ocr_wer for r in results if r.ocr_wer is not None]
     vision_wers = [r.vision_wer for r in results if r.vision_wer is not None]
-    vision_recalls = [r.vision_recall for r in results if r.vision_recall is not None]
     vision_f1s = [r.vision_f1 for r in results if r.vision_f1 is not None]
     flag_known = [r for r in results if r.flagged is not None]
     true_pos = sum(1 for r in flag_known if r.flagged and r.should_flag)
     flagged_total = sum(1 for r in flag_known if r.flagged)
     should_total = sum(1 for r in flag_known if r.should_flag)
+    accuracy = text_recovery_accuracy(results)
     return {
         "cases_scored": len(results),
         "ocr_wer_mean": _mean(ocr_wers),
         "vision_wer_mean": _mean(vision_wers),
-        "vision_token_recall_mean": _mean(vision_recalls),
+        "vision_token_recall_mean": accuracy,
+        "text_recovery_accuracy": accuracy,
+        "hallucination_rate": hallucination_rate(results),
         "vision_token_f1_mean": _mean(vision_f1s),
         "grounding_precision": (true_pos / flagged_total) if flagged_total else None,
         "grounding_recall": (true_pos / should_total) if should_total else None,

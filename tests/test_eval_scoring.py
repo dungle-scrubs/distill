@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
+
 import pytest
 from eval_helpers import load_eval_module, load_score_module
 
@@ -8,6 +11,49 @@ generate_negatives = load_eval_module("generate_negatives")
 SYNTHETIC_CASE_TEXT = generate_negatives.SYNTHETIC_CASE_TEXT
 token_prf = score.token_prf
 word_error_rate = score.word_error_rate
+
+
+def case_result(
+    *,
+    case_id: str = "case",
+    has_text: bool,
+    vision_recall: float | None = None,
+    claimed_text: bool | None = None,
+) -> score.CaseResult:
+    return score.CaseResult(
+        id=case_id,
+        category="clean_text" if has_text else "textless",
+        legibility="clean" if has_text else "unreadable",
+        has_text=has_text,
+        ocr_wer=None,
+        vision_wer=None,
+        vision_recall=vision_recall,
+        vision_f1=None,
+        flagged=None,
+        should_flag=not has_text,
+        claimed_text=claimed_text,
+    )
+
+
+def configure_textless_evaluation(
+    monkeypatch: pytest.MonkeyPatch, interpretation: object | None
+) -> None:
+    case = score.LabelledCase(
+        id="textless",
+        category="textless",
+        legibility="unreadable",
+        has_text=False,
+        verified=True,
+    )
+    monkeypatch.setattr(score, "find_tesseract_command", lambda: "tesseract")
+    monkeypatch.setattr(score, "load_labelled_cases", lambda: [case])
+    monkeypatch.setattr(score, "truth_text", lambda _case_id: "")
+    monkeypatch.setattr(score, "ocr_frame", lambda *_args, **_kwargs: ("", None))
+    monkeypatch.setattr(
+        score,
+        "_vision_interpreter",
+        lambda _model, _backend: lambda _image, _ocr_text: interpretation,
+    )
 
 
 def test_token_prf_is_order_insensitive() -> None:
@@ -95,3 +141,75 @@ def test_labelled_corpus_rejects_invalid_legibility(tmp_path, monkeypatch) -> No
 
     with pytest.raises(ValueError, match="bad-legibility"):
         score.load_labelled_cases()
+
+
+def test_hallucination_rate_is_fraction_of_textless_cases_claiming_text() -> None:
+    results = [
+        case_result(case_id="claimed", has_text=False, claimed_text=True),
+        case_result(case_id="not-claimed", has_text=False, claimed_text=False),
+    ]
+
+    assert score.hallucination_rate(results) == 0.5
+
+
+def test_evaluate_does_not_count_punctuation_only_text_as_a_claim(monkeypatch) -> None:
+    interpretation = SimpleNamespace(
+        verbatim_text="...!!!",
+        text_confidence="none",
+        has_interpretation=False,
+        carries_a_reading=True,
+    )
+    configure_textless_evaluation(monkeypatch, interpretation)
+
+    [result] = score.evaluate(with_vision=True)
+
+    assert result.claimed_text is False
+
+
+def test_evaluate_counts_no_usable_textless_result_as_no_claim(monkeypatch) -> None:
+    configure_textless_evaluation(monkeypatch, None)
+
+    [result] = score.evaluate(with_vision=True)
+
+    assert result.claimed_text is False
+
+
+def test_text_recovery_accuracy_means_scored_text_bearing_recalls() -> None:
+    results = [
+        case_result(has_text=True, vision_recall=0.8),
+        case_result(has_text=True, vision_recall=0.6),
+        case_result(has_text=True),
+        case_result(has_text=False, vision_recall=1.0, claimed_text=False),
+    ]
+
+    assert score.text_recovery_accuracy(results) == pytest.approx(0.7)
+    assert score.text_recovery_accuracy([]) is None
+
+
+def test_acceptance_rule_passes_inclusive_boundaries_and_is_frozen() -> None:
+    rule = score.AcceptanceRule(accuracy_floor=0.9, hallucination_ceiling=0.1)
+
+    verdict = rule.evaluate(accuracy=0.9, hallucination_rate=0.1)
+
+    assert verdict == score.AcceptanceVerdict(
+        passed=True,
+        accuracy_ok=True,
+        hallucination_ok=True,
+    )
+    with pytest.raises(FrozenInstanceError):
+        rule.accuracy_floor = 0.8
+
+
+def test_summarize_includes_accuracy_and_hallucination_rate() -> None:
+    results = [
+        case_result(has_text=True, vision_recall=0.8),
+        case_result(has_text=True, vision_recall=0.6),
+        case_result(has_text=False, claimed_text=True),
+        case_result(has_text=False, claimed_text=False),
+    ]
+
+    summary = score.summarize(results)
+
+    assert summary["text_recovery_accuracy"] == pytest.approx(0.7)
+    assert summary["vision_token_recall_mean"] == summary["text_recovery_accuracy"]
+    assert summary["hallucination_rate"] == 0.5
