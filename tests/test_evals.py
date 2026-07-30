@@ -31,9 +31,16 @@ def _scorer():
 
 
 def test_ocr_recovers_clean_frames() -> None:
-    """Legibility means humans can read it; the OCR floor covers clean_text only."""
+    """The OCR floor covers frames both a human and OCR should read.
+
+    Partial-legibility frames are covered by the vision metrics instead.
+    """
     score = _scorer()
-    results = [r for r in score.evaluate(with_vision=False) if r.category == "clean_text"]
+    results = [
+        result
+        for result in score.evaluate(with_vision=False)
+        if result.category == "clean_text" and result.legibility == "clean"
+    ]
     if not results:
         pytest.skip("no verified clean_text cases yet; confirm ground truth in tests/evals/")
     wers = [r.ocr_wer for r in results if r.ocr_wer is not None]

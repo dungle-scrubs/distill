@@ -17,8 +17,11 @@ def case_result(
     *,
     case_id: str = "case",
     has_text: bool,
+    vision_wer: float | None = None,
     vision_recall: float | None = None,
+    vision_f1: float | None = None,
     claimed_text: bool | None = None,
+    unusable: bool = False,
 ) -> score.CaseResult:
     return score.CaseResult(
         id=case_id,
@@ -26,34 +29,62 @@ def case_result(
         legibility="clean" if has_text else "unreadable",
         has_text=has_text,
         ocr_wer=None,
-        vision_wer=None,
+        vision_wer=vision_wer,
         vision_recall=vision_recall,
-        vision_f1=None,
+        vision_f1=vision_f1,
         flagged=None,
         should_flag=not has_text,
         claimed_text=claimed_text,
+        unusable=unusable,
     )
 
 
-def configure_textless_evaluation(
-    monkeypatch: pytest.MonkeyPatch, interpretation: object | None
+def configure_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+    interpretation: object | None,
+    *,
+    has_text: bool,
 ) -> None:
     case = score.LabelledCase(
-        id="textless",
-        category="textless",
-        legibility="unreadable",
-        has_text=False,
+        id="text-bearing" if has_text else "textless",
+        category="clean_text" if has_text else "textless",
+        legibility="clean" if has_text else "unreadable",
+        has_text=has_text,
         verified=True,
     )
     monkeypatch.setattr(score, "find_tesseract_command", lambda: "tesseract")
     monkeypatch.setattr(score, "load_labelled_cases", lambda: [case])
-    monkeypatch.setattr(score, "truth_text", lambda _case_id: "")
+    monkeypatch.setattr(score, "truth_text", lambda _case_id: "alpha" if has_text else "")
     monkeypatch.setattr(score, "ocr_frame", lambda *_args, **_kwargs: ("", None))
     monkeypatch.setattr(
         score,
         "_vision_interpreter",
         lambda _model, _backend, _base_url: lambda _image, _ocr_text: interpretation,
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("…", []),
+        ("• alpha • beta", ["alpha", "beta"]),
+        ("100%", ["100"]),
+    ],
+)
+def test_normalize_treats_unicode_punctuation_as_typography(text, expected) -> None:
+    assert score.normalize(text) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("…", False),
+        ("•••", False),
+        ("a…", True),
+    ],
+)
+def test_claims_text_requires_an_alphanumeric_token(text, expected) -> None:
+    assert score.claims_text(text) is expected
 
 
 def test_token_prf_is_order_insensitive() -> None:
@@ -143,6 +174,92 @@ def test_labelled_corpus_rejects_invalid_legibility(tmp_path, monkeypatch) -> No
         score.load_labelled_cases()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("has_text", '"false"'),
+        ("verified", '"true"'),
+    ],
+)
+def test_labelled_corpus_rejects_non_boolean_flags(tmp_path, monkeypatch, field, value) -> None:
+    (tmp_path / "cases.toml").write_text(
+        f'[[case]]\nid = "bad-boolean"\ncategory = "clean_text"\n'
+        f'legibility = "clean"\n{field} = {value}\n'
+    )
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", tmp_path / "frames")
+
+    with pytest.raises(ValueError, match="bad-boolean"):
+        score.load_labelled_cases()
+
+
+def test_labelled_corpus_rejects_duplicate_ids(tmp_path, monkeypatch) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "duplicate.png").write_bytes(b"png")
+    (frames_dir / "duplicate.gt.txt").write_text("text")
+    case = (
+        '[[case]]\nid = "duplicate"\ncategory = "clean_text"\n'
+        'legibility = "clean"\nhas_text = true\n'
+    )
+    (tmp_path / "cases.toml").write_text(case + case)
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", frames_dir)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        score.load_labelled_cases()
+
+
+@pytest.mark.parametrize(
+    ("category", "has_text"),
+    [
+        ("textless", True),
+        ("clean_text", False),
+    ],
+)
+def test_labelled_corpus_rejects_category_has_text_mismatch(
+    tmp_path, monkeypatch, category, has_text
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "mismatch.png").write_bytes(b"png")
+    (frames_dir / "mismatch.gt.txt").write_text("")
+    (tmp_path / "cases.toml").write_text(
+        f'[[case]]\nid = "mismatch"\ncategory = "{category}"\n'
+        f'legibility = "clean"\nhas_text = {str(has_text).lower()}\n'
+    )
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", frames_dir)
+
+    with pytest.raises(ValueError, match="mismatch"):
+        score.load_labelled_cases()
+
+
+@pytest.mark.parametrize(
+    ("category", "has_text", "truth"),
+    [
+        ("textless", False, "invented text"),
+        ("clean_text", True, ""),
+    ],
+)
+def test_labelled_corpus_rejects_verified_truth_incoherent_with_has_text(
+    tmp_path, monkeypatch, category, has_text, truth
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "bad-truth.png").write_bytes(b"png")
+    (frames_dir / "bad-truth.gt.txt").write_text(truth)
+    (tmp_path / "cases.toml").write_text(
+        f'[[case]]\nid = "bad-truth"\ncategory = "{category}"\n'
+        f'legibility = "clean"\nhas_text = {str(has_text).lower()}\nverified = true\n'
+    )
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", frames_dir)
+
+    with pytest.raises(ValueError, match="bad-truth"):
+        score.load_labelled_cases()
+
+
 def test_hallucination_rate_is_fraction_of_textless_cases_claiming_text() -> None:
     results = [
         case_result(case_id="claimed", has_text=False, claimed_text=True),
@@ -159,29 +276,41 @@ def test_evaluate_does_not_count_punctuation_only_text_as_a_claim(monkeypatch) -
         has_interpretation=False,
         carries_a_reading=True,
     )
-    configure_textless_evaluation(monkeypatch, interpretation)
+    configure_evaluation(monkeypatch, interpretation, has_text=False)
 
     [result] = score.evaluate(with_vision=True)
 
     assert result.claimed_text is False
 
 
-def test_evaluate_counts_no_usable_textless_result_as_no_claim(monkeypatch) -> None:
-    configure_textless_evaluation(monkeypatch, None)
+def test_evaluate_excludes_no_usable_textless_result_from_claims(monkeypatch) -> None:
+    configure_evaluation(monkeypatch, None, has_text=False)
 
     [result] = score.evaluate(with_vision=True)
 
-    assert result.claimed_text is False
+    assert result.claimed_text is None
+    assert result.unusable is True
 
 
-def test_text_recovery_accuracy_means_scored_text_bearing_recalls() -> None:
+def test_evaluate_counts_no_usable_text_bearing_result_as_total_miss(monkeypatch) -> None:
+    configure_evaluation(monkeypatch, None, has_text=True)
+
+    [result] = score.evaluate(with_vision=True)
+
+    assert result.vision_recall == 0.0
+    assert result.vision_wer == 1.0
+    assert result.vision_f1 == 0.0
+    assert result.unusable is True
+
+
+def test_text_recovery_accuracy_includes_total_misses_in_denominator() -> None:
     results = [
-        case_result(has_text=True, vision_recall=0.8),
-        case_result(has_text=True, vision_recall=0.6),
-        case_result(has_text=True),
+        case_result(has_text=True, vision_recall=1.0),
+        case_result(has_text=True, vision_recall=0.0),
+        case_result(has_text=True, vision_recall=0.0),
     ]
 
-    assert score.text_recovery_accuracy(results) == pytest.approx(0.7)
+    assert score.text_recovery_accuracy(results) == pytest.approx(1 / 3)
     assert score.text_recovery_accuracy([]) is None
 
 
@@ -226,23 +355,39 @@ def test_local_baseline_pins_thresholds_from_its_own_measured_run() -> None:
     on is the corpus on disk, and the inclusive bounds do not exclude the
     reference run itself."""
     baseline = json.loads((score.EVAL_ROOT / "baseline_local.json").read_text())
-    rule = score.AcceptanceRule(**baseline["acceptance_rule"])
+    acceptance_rule = baseline["acceptance_rule"]
+    rule = score.AcceptanceRule(
+        **{key: value for key, value in acceptance_rule.items() if key != "noise_band"}
+    )
+    summary = baseline["summary"]
 
-    assert rule.accuracy_floor == baseline["summary"]["text_recovery_accuracy"]
-    assert rule.hallucination_ceiling == baseline["summary"]["hallucination_rate"]
+    assert rule.accuracy_floor == pytest.approx(
+        summary["text_recovery_accuracy"] - acceptance_rule["noise_band"]
+    )
+    assert rule.hallucination_ceiling == summary["hallucination_rate"]
 
     # A corpus edit silently changes what the pinned floor means; fail loudly
     # so the baseline gets re-recorded instead.
-    verified = [c.id for c in score.load_labelled_cases() if c.verified]
-    assert baseline["summary"]["cases_scored"] == len(verified)
-    assert [c["id"] for c in baseline["cases"]] == verified
+    cases = score.load_labelled_cases()
+    scored_ids = [
+        case.id for case in cases if case.verified and score.truth_text(case.id) is not None
+    ]
+    assert score.corpus_digest(cases) == baseline["corpus_sha256"]
+    assert summary["cases_scored"] == len(scored_ids)
+    assert [case["id"] for case in baseline["cases"]] == scored_ids
+
+    stored_results = [score.CaseResult(**case) for case in baseline["cases"]]
+    assert score.text_recovery_accuracy(stored_results) == pytest.approx(
+        summary["text_recovery_accuracy"]
+    )
+    assert score.hallucination_rate(stored_results) == pytest.approx(summary["hallucination_rate"])
 
     verdict = rule.evaluate(
-        accuracy=baseline["summary"]["text_recovery_accuracy"],
-        hallucination_rate=baseline["summary"]["hallucination_rate"],
+        accuracy=summary["text_recovery_accuracy"],
+        hallucination_rate=summary["hallucination_rate"],
     )
 
-    assert verdict.passed  # inclusive bounds: the reference run is not excluded by its own rule
+    assert verdict.passed
 
 
 def test_summarize_includes_accuracy_and_hallucination_rate() -> None:
@@ -258,3 +403,26 @@ def test_summarize_includes_accuracy_and_hallucination_rate() -> None:
     assert summary["text_recovery_accuracy"] == pytest.approx(0.7)
     assert summary["vision_token_recall_mean"] == summary["text_recovery_accuracy"]
     assert summary["hallucination_rate"] == 0.5
+    assert summary["unusable_readings"] == 0
+
+
+def test_summarize_counts_only_readings_marked_unusable() -> None:
+    results = [
+        case_result(
+            case_id="genuine-total-miss",
+            has_text=True,
+            vision_wer=1.0,
+            vision_recall=0.0,
+            vision_f1=0.0,
+        ),
+        case_result(
+            case_id="unusable",
+            has_text=True,
+            vision_wer=1.0,
+            vision_recall=0.0,
+            vision_f1=0.0,
+            unusable=True,
+        ),
+    ]
+
+    assert score.summarize(results)["unusable_readings"] == 1

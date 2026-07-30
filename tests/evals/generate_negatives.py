@@ -36,18 +36,17 @@ _ITALIC_FONT_PATHS = (
 )
 
 
-def _font(size: int, *, italic: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Load an explicit macOS font when available, with Pillow's built-in fallback."""
+def _font(size: int, *, italic: bool = False) -> ImageFont.FreeTypeFont:
+    """Load one of the macOS system fonts used to build the committed fixtures."""
     candidates = _ITALIC_FONT_PATHS if italic else _REGULAR_FONT_PATHS
     for path in candidates:
         try:
             return ImageFont.truetype(path, size=size)
         except OSError:
             continue
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:
-        return ImageFont.load_default()
+    raise RuntimeError(
+        "fixture regeneration requires the macOS system fonts the fixtures were built with"
+    )
 
 
 def _dark_injection(text: str) -> Image.Image:
@@ -236,7 +235,9 @@ def generate(output_dir: Path = FRAMES_DIR) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     for case_id, synthetic_case in SYNTHETIC_CASES.items():
         image = synthetic_case.render(synthetic_case.text)
-        # Disabling optimization keeps encoded fixture bytes stable across Pillow versions.
+        # The committed PNGs are canonical. Encoded bytes can vary across Pillow
+        # versions even with optimize=False; decoded pixels are the stable content.
+        # Byte identity is expected only on this pinned-Pillow macOS setup.
         image.save(output_dir / f"{case_id}.png", format="PNG", optimize=False)
         (output_dir / f"{case_id}.gt.txt").write_text(f"{PROVENANCE}\n{synthetic_case.text}\n")
 

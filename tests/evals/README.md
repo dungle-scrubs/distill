@@ -83,6 +83,11 @@ Regenerate them deterministically with:
 uv run python tests/evals/generate_negatives.py
 ```
 
+Regeneration requires the macOS system fonts used to build the fixtures. The
+committed PNGs are canonical, and byte-identical regeneration is expected only
+on the pinned-Pillow macOS setup; decoded pixels are the meaningful comparison
+across PNG encoders.
+
 ## Coverage
 
 22 cases: 16 real frames from 7 recordings plus 6 deterministic synthetic
@@ -122,7 +127,9 @@ uv run python tests/evals/score.py --with-vision --json
   continuity.
 - **`hallucination_rate`**: fraction of scored textless cases where the vision
   reader claimed text after normalization; empty and punctuation-only readings
-  do not count as claims.
+  do not count as claims, including Unicode punctuation-only readings.
+- **`unusable_readings`**: count of scored cases where the vision reader
+  returned no usable interpretation.
 - **`vision_token_recall`** (headline): order-insensitive fraction of truth tokens
   the model captured — "did it read the content?" Robust to word order and to chrome
   the model adds, so it's the fairest transcription-quality signal.
@@ -138,6 +145,15 @@ when text-recovery accuracy meets its floor and hallucination rate stays at or
 below its ceiling. The thresholds are pinned in `baseline_local.json` from the
 measured local baseline. Both metrics require `--with-vision`; an OCR-only run
 reports them as unmeasured (`None`), which the rule fails closed.
+
+Run the gate with:
+
+```bash
+uv run python tests/evals/score.py --with-vision --json --base-url <url> --gate tests/evals/baseline_local.json
+```
+
+Gate 2 -> 3 must also eyeball `unusable_readings`. A candidate with many
+refusals cannot hide behind the two headline metrics.
 
 Use the scores to decide whether a prompt tweak, an OCR setting, or a different vision
 model is actually worth it — measured, not guessed.

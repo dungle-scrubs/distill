@@ -19,8 +19,10 @@ malformed case aborts the run rather than being skipped. Run:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import tomllib
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -45,8 +47,18 @@ _PUNCT = str.maketrans(dict.fromkeys("\"'`.,:;!?()[]{}<>|/\\-–—_=+*#", " "))
 
 
 def normalize(text: str) -> list[str]:
-    """Lowercase, drop punctuation, collapse whitespace into comparable tokens."""
-    return text.lower().translate(_PUNCT).split()
+    """Normalize comparable tokens; bullet glyphs and Unicode ellipses are typography."""
+    translated = text.lower().translate(_PUNCT)
+    without_punctuation = "".join(
+        " " if unicodedata.category(character).startswith("P") else character
+        for character in translated
+    )
+    return without_punctuation.split()
+
+
+def claims_text(text: str) -> bool:
+    """Apply a narrower test than normalize: symbol-only output in any script is not a claim."""
+    return any(any(character.isalnum() for character in token) for token in normalize(text))
 
 
 def word_error_rate(truth: str, hypothesis: str) -> float:
@@ -97,6 +109,7 @@ class CaseResult:
     flagged: bool | None  # grounding marked it low-confidence
     should_flag: bool  # human says it is not cleanly legible
     claimed_text: bool | None = None  # textless frame: reader claimed text? None when unscored
+    unusable: bool = False  # vision returned no usable interpretation
 
 
 @dataclass(frozen=True)
@@ -148,27 +161,48 @@ def load_labelled_cases() -> list[LabelledCase]:
     """Load labels, rejecting invalid ids, categories, legibility, or fixtures."""
     data = tomllib.loads((EVAL_ROOT / "cases.toml").read_text())
     cases: list[LabelledCase] = []
+    seen_ids: set[str] = set()
     for raw_case in data.get("case", []):
         case_id = raw_case.get("id")
         if not isinstance(case_id, str):
             raise ValueError(f"case has invalid id: {case_id!r}")
+        if case_id in seen_ids:
+            raise ValueError(f"case {case_id} has a duplicate id")
+        seen_ids.add(case_id)
         category = raw_case.get("category")
         if not isinstance(category, str) or category not in VALID_CATEGORIES:
             raise ValueError(f"case {case_id} has invalid category: {category!r}")
         legibility = raw_case.get("legibility")
         if not isinstance(legibility, str) or legibility not in VALID_LEGIBILITY:
             raise ValueError(f"case {case_id} has invalid legibility: {legibility!r}")
+        has_text = raw_case.get("has_text", True)
+        if not isinstance(has_text, bool):
+            raise ValueError(f"case {case_id} has non-boolean has_text: {has_text!r}")
+        verified = raw_case.get("verified", False)
+        if not isinstance(verified, bool):
+            raise ValueError(f"case {case_id} has non-boolean verified: {verified!r}")
+        if (category == "textless") != (has_text is False):
+            raise ValueError(
+                f"case {case_id} category must be textless exactly when has_text is false"
+            )
         for suffix in (".png", ".gt.txt"):
             path = FRAMES_DIR / f"{case_id}{suffix}"
             if not path.exists():
                 raise ValueError(f"case {case_id} is missing fixture: {path.name}")
+        if verified:
+            truth = truth_text(case_id)
+            if truth is not None:
+                if not has_text and truth:
+                    raise ValueError(f"case {case_id} is textless but has non-empty truth")
+                if has_text and not truth:
+                    raise ValueError(f"case {case_id} is text-bearing but has empty truth")
         cases.append(
             LabelledCase(
                 id=case_id,
                 category=category,
                 legibility=legibility,
-                has_text=bool(raw_case.get("has_text", True)),
-                verified=bool(raw_case.get("verified", False)),
+                has_text=has_text,
+                verified=verified,
             )
         )
     return cases
@@ -189,6 +223,16 @@ def truth_text(case_id: str) -> str | None:
         return None
     body = "\n".join(line for line in contents.splitlines() if not line.lstrip().startswith("#"))
     return body.strip()
+
+
+def corpus_digest(cases: list[LabelledCase]) -> str:
+    """Hash cases.toml bytes, then each case's PNG and ground-truth bytes in corpus order."""
+    digest = hashlib.sha256()
+    digest.update((EVAL_ROOT / "cases.toml").read_bytes())
+    for case in cases:
+        digest.update((FRAMES_DIR / f"{case.id}.png").read_bytes())
+        digest.update((FRAMES_DIR / f"{case.id}.gt.txt").read_bytes())
+    return digest.hexdigest()
 
 
 def evaluate(
@@ -224,6 +268,7 @@ def evaluate(
         vision_f1: float | None = None
         flagged: bool | None = None
         claimed_text: bool | None = None
+        unusable = False
         if interpret is not None:
             result = interpret(image, ocr_text)
             if result is not None:
@@ -231,7 +276,7 @@ def evaluate(
                     vision_wer = word_error_rate(truth, result.verbatim_text)
                     _, vision_recall, vision_f1 = token_prf(truth, result.verbatim_text)
                 else:
-                    claimed_text = bool(normalize(result.verbatim_text))
+                    claimed_text = claims_text(result.verbatim_text)
                 assessment = assess_grounding(
                     ocr_text=ocr_text,
                     verbatim_text=result.verbatim_text,
@@ -244,8 +289,11 @@ def evaluate(
                 # The model produced nothing usable: the pipeline now treats this
                 # as a low-confidence (ungrounded) frame, so the eval does too.
                 flagged = True
-                if not has_text:
-                    claimed_text = False
+                unusable = True
+                if has_text:
+                    vision_wer = 1.0
+                    vision_recall = 0.0
+                    vision_f1 = 0.0
 
         results.append(
             CaseResult(
@@ -260,6 +308,7 @@ def evaluate(
                 flagged=flagged,
                 should_flag=case.legibility != "clean",
                 claimed_text=claimed_text,
+                unusable=unusable,
             )
         )
     return results
@@ -333,6 +382,7 @@ def summarize(results: list[CaseResult]) -> dict:
         "vision_token_recall_mean": accuracy,
         "text_recovery_accuracy": accuracy,
         "hallucination_rate": hallucination_rate(results),
+        "unusable_readings": sum(1 for result in results if result.unusable),
         "vision_token_f1_mean": _mean(vision_f1s),
         "grounding_precision": (true_pos / flagged_total) if flagged_total else None,
         "grounding_recall": (true_pos / should_total) if should_total else None,
@@ -358,10 +408,35 @@ def main() -> None:
         help="vision endpoint override (e.g. http://127.0.0.1:17439/v1); default is the config's",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON for programmatic use")
+    parser.add_argument(
+        "--gate",
+        type=Path,
+        default=None,
+        help="apply the acceptance rule from a recorded baseline JSON",
+    )
     args = parser.parse_args()
+    if args.gate is not None and not args.with_vision:
+        parser.error("--gate requires --with-vision")
 
     results = evaluate(args.with_vision, args.model, args.backend, args.base_url)
     summary = summarize(results)
+    gate: dict[str, object] | None = None
+    if args.gate is not None:
+        baseline = json.loads(args.gate.read_text())
+        acceptance_rule = baseline["acceptance_rule"]
+        rule = AcceptanceRule(
+            **{key: value for key, value in acceptance_rule.items() if key != "noise_band"}
+        )
+        verdict = rule.evaluate(
+            accuracy=summary["text_recovery_accuracy"],
+            hallucination_rate=summary["hallucination_rate"],
+        )
+        gate = {
+            "passed": verdict.passed,
+            "accuracy_ok": verdict.accuracy_ok,
+            "hallucination_ok": verdict.hallucination_ok,
+            "unusable_readings": summary["unusable_readings"],
+        }
     if args.json:
         # The run block makes a stored score self-describing (what model/endpoint
         # produced it), so a committed baseline stays reproducible. It records
@@ -371,11 +446,12 @@ def main() -> None:
             run["vision_config"] = _vision_config(
                 args.model, args.backend, args.base_url
             ).public_dict()
-        print(
-            json.dumps(
-                {"run": run, "summary": summary, "cases": [vars(r) for r in results]}, indent=2
-            )
-        )
+        output = {"run": run, "summary": summary, "cases": [vars(r) for r in results]}
+        if gate is not None:
+            output["gate"] = gate
+        print(json.dumps(output, indent=2))
+        if gate is not None and not gate["passed"]:
+            raise SystemExit(1)
         return
     if not results:
         print("No verified cases yet. Fill in <id>.gt.txt and set verified = true in cases.toml.")
@@ -395,6 +471,14 @@ def main() -> None:
     for key, value in summary.items():
         shown = f"{value:.3f}" if isinstance(value, float) else value
         print(f"  {key}: {shown}")
+    if gate is not None:
+        print()
+        print(f"  gate accuracy: {'pass' if gate['accuracy_ok'] else 'fail'}")
+        print(f"  gate hallucination: {'pass' if gate['hallucination_ok'] else 'fail'}")
+        print(f"  gate unusable_readings: {gate['unusable_readings']}")
+        print(f"  gate verdict: {'pass' if gate['passed'] else 'fail'}")
+        if not gate["passed"]:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

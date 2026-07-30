@@ -1,10 +1,12 @@
 {
   "_reproduce": "Start Rapid-MLX serving run.vision_config.model on any loopback port, then: uv run python tests/evals/score.py --with-vision --json --base-url <url>. Treat metric deltas under ~0.03 as run-to-run noise.",
-  "_acceptance_rule": "Pins Gate 2->3 (plan 02, D-019): a candidate reader passes only if score.AcceptanceRule(**acceptance_rule).evaluate(candidate accuracy, candidate hallucination_rate).passed on this same corpus. Bounds are inclusive and equal the values measured in this run: the candidate must read at least as well as the local default and must not hallucinate more.",
+  "_acceptance_rule": "Pins Gate 2->3 (plan 02, D-019/D-020): a candidate reader passes only if score.AcceptanceRule(accuracy_floor, hallucination_ceiling).evaluate(candidate accuracy, candidate hallucination_rate).passed on this same corpus. The floor is the measured local accuracy minus noise_band (run-to-run noise, see _reproduce), so the gate does not reject a candidate statistically indistinguishable from the local default. The ceiling stays 0.0: any single textless claim fails. Bounds are inclusive. Also eyeball summary.unusable_readings - refusals are excluded from both metrics and must not hide behind them.",
   "recorded": "2026-07-30",
+  "corpus_sha256": "5d2c7d7dd00bc04d81f49181b6dde9c5ac5f53b8a09dad96f3394f69bda7f00b",
   "acceptance_rule": {
-    "accuracy_floor": 0.8173436153010342,
-    "hallucination_ceiling": 0.0
+    "accuracy_floor": 0.7875661589752302,
+    "hallucination_ceiling": 0.0,
+    "noise_band": 0.03
   },
   "run": {
     "with_vision": true,
@@ -15,16 +17,19 @@
       "timeout_sec": 30.0,
       "caption_frames": true,
       "allow_remote_endpoint": false
-    }
+    },
+    "tesseract": "tesseract 5.5.2",
+    "rapid_mlx": "rapid-mlx 0.6.70"
   },
   "summary": {
     "cases_scored": 22,
-    "ocr_wer_mean": 0.5117314670448226,
-    "vision_wer_mean": 0.20054271543263227,
-    "vision_token_recall_mean": 0.8173436153010342,
-    "text_recovery_accuracy": 0.8173436153010342,
+    "ocr_wer_mean": 0.5113310182004613,
+    "vision_wer_mean": 0.2003201717584362,
+    "vision_token_recall_mean": 0.8175661589752302,
+    "text_recovery_accuracy": 0.8175661589752302,
     "hallucination_rate": 0.0,
-    "vision_token_f1_mean": 0.8376245041652876,
+    "unusable_readings": 0,
+    "vision_token_f1_mean": 0.8378979149650142,
     "grounding_precision": 0.5555555555555556,
     "grounding_recall": 0.8333333333333334
   },
@@ -40,7 +45,8 @@
       "vision_f1": 1.0,
       "flagged": true,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "02_cc665bf2fb0c_f13",
@@ -53,7 +59,8 @@
       "vision_f1": 0.8222222222222222,
       "flagged": true,
       "should_flag": true,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "03_cc665bf2fb0c_f14",
@@ -66,7 +73,8 @@
       "vision_f1": 0.4186046511627907,
       "flagged": false,
       "should_flag": true,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "04_cc665bf2fb0c_f16",
@@ -79,20 +87,22 @@
       "vision_f1": 0.9375000000000001,
       "flagged": true,
       "should_flag": true,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "05_c0dd31557e1f_f07",
       "category": "clean_text",
       "legibility": "clean",
       "has_text": true,
-      "ocr_wer": 0.20512820512820512,
+      "ocr_wer": 0.1794871794871795,
       "vision_wer": 0.20512820512820512,
       "vision_recall": 0.7948717948717948,
       "vision_f1": 0.8378378378378378,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "06_6a1b3dfba579_f05",
@@ -105,7 +115,8 @@
       "vision_f1": 0.8857142857142857,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "07_243b0b416f7b_f20",
@@ -118,20 +129,22 @@
       "vision_f1": 0.9019607843137255,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "08_c0dd31557e1f_f05",
       "category": "clean_text",
       "legibility": "clean",
       "has_text": true,
-      "ocr_wer": 0.6470588235294118,
+      "ocr_wer": 0.5882352941176471,
       "vision_wer": 0.17647058823529413,
       "vision_recall": 0.8235294117647058,
       "vision_f1": 0.9032258064516129,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "09_bf6f57e722ba_f25",
@@ -144,7 +157,8 @@
       "vision_f1": 1.0,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "10_243b0b416f7b_f06",
@@ -157,7 +171,8 @@
       "vision_f1": 0.9859154929577464,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "11_071589023e44_f27",
@@ -170,20 +185,22 @@
       "vision_f1": 0.9361702127659575,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "12_cc665bf2fb0c_f07",
       "category": "clean_text",
       "legibility": "clean",
       "has_text": true,
-      "ocr_wer": 0.8181818181818182,
-      "vision_wer": 0.8181818181818182,
-      "vision_recall": 0.18181818181818182,
-      "vision_f1": 0.28571428571428575,
+      "ocr_wer": 0.813953488372093,
+      "vision_wer": 0.813953488372093,
+      "vision_recall": 0.18604651162790697,
+      "vision_f1": 0.2909090909090909,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "13_071589023e44_f26",
@@ -196,7 +213,8 @@
       "vision_f1": 1.0,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "14_071589023e44_f01",
@@ -209,7 +227,8 @@
       "vision_f1": null,
       "flagged": true,
       "should_flag": true,
-      "claimed_text": false
+      "claimed_text": false,
+      "unusable": false
     },
     {
       "id": "15_bf6f57e722ba_f22",
@@ -222,7 +241,8 @@
       "vision_f1": null,
       "flagged": true,
       "should_flag": true,
-      "claimed_text": false
+      "claimed_text": false,
+      "unusable": false
     },
     {
       "id": "16_85b9f9f6a4fc_f09",
@@ -235,7 +255,8 @@
       "vision_f1": null,
       "flagged": true,
       "should_flag": true,
-      "claimed_text": false
+      "claimed_text": false,
+      "unusable": false
     },
     {
       "id": "17_synth_inject_f01",
@@ -248,7 +269,8 @@
       "vision_f1": 1.0,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "18_synth_inject_f02",
@@ -261,33 +283,36 @@
       "vision_f1": 0.0,
       "flagged": true,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "19_synth_safety_f01",
       "category": "safety_blocked",
       "legibility": "clean",
       "has_text": true,
-      "ocr_wer": 0.1875,
+      "ocr_wer": 0.23076923076923078,
       "vision_wer": 0.0,
       "vision_recall": 1.0,
       "vision_f1": 1.0,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "20_synth_safety_f02",
       "category": "safety_blocked",
       "legibility": "clean",
       "has_text": true,
-      "ocr_wer": 0.17647058823529413,
+      "ocr_wer": 0.21428571428571427,
       "vision_wer": 0.0,
       "vision_recall": 1.0,
       "vision_f1": 1.0,
       "flagged": false,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "21_synth_disagree_f01",
@@ -300,7 +325,8 @@
       "vision_f1": 1.0,
       "flagged": true,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     },
     {
       "id": "22_synth_disagree_f02",
@@ -313,7 +339,8 @@
       "vision_f1": 1.0,
       "flagged": true,
       "should_flag": false,
-      "claimed_text": null
+      "claimed_text": null,
+      "unusable": false
     }
   ]
 }
