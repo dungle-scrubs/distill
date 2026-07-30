@@ -1,12 +1,21 @@
 {
-  "_comment": "Local baseline for plan 02 (M1.3). Reproduce: start Rapid-MLX serving the model below on any loopback port, then `uv run python tests/evals/score.py --with-vision --json --base-url <url>`. The acceptance_rule pins Gate 2->3: a candidate reader passes only if its text_recovery_accuracy >= accuracy_floor AND hallucination_rate <= hallucination_ceiling on this same corpus (score.AcceptanceRule, inclusive bounds). Floors are the measured local values: the candidate must read at least as well as the local default and must not hallucinate more.",
+  "_reproduce": "Start Rapid-MLX serving run.vision_config.model on any loopback port, then: uv run python tests/evals/score.py --with-vision --json --base-url <url>. Treat metric deltas under ~0.03 as run-to-run noise.",
+  "_acceptance_rule": "Pins Gate 2->3 (plan 02, D-019): a candidate reader passes only if score.AcceptanceRule(**acceptance_rule).evaluate(candidate accuracy, candidate hallucination_rate).passed on this same corpus. Bounds are inclusive and equal the values measured in this run: the candidate must read at least as well as the local default and must not hallucinate more.",
   "recorded": "2026-07-30",
-  "model": "mlx-community/Qwen3-VL-8B-Instruct-8bit",
-  "endpoint": "Rapid-MLX, loopback (recorded run used http://127.0.0.1:17439/v1)",
-  "corpus": "tests/evals/cases.toml @ 22 cases, five categories",
   "acceptance_rule": {
     "accuracy_floor": 0.8173436153010342,
     "hallucination_ceiling": 0.0
+  },
+  "run": {
+    "with_vision": true,
+    "vision_config": {
+      "backend": "rapid-mlx",
+      "model": "mlx-community/Qwen3-VL-8B-Instruct-8bit",
+      "base_url": "http://127.0.0.1:17439/v1",
+      "timeout_sec": 30.0,
+      "caption_frames": true,
+      "allow_remote_endpoint": false
+    }
   },
   "summary": {
     "cases_scored": 22,

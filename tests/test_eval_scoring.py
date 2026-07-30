@@ -220,18 +220,29 @@ def test_acceptance_rule_fails_out_of_bounds_or_unmeasured_metrics(
     )
 
 
-def test_local_baseline_passes_its_own_acceptance_rule() -> None:
-    """The committed baseline must be self-consistent: the local reader passes
-    the Gate 2->3 bar that was pinned from its own measured numbers."""
+def test_local_baseline_pins_thresholds_from_its_own_measured_run() -> None:
+    """The committed baseline is internally consistent: the pinned rule was
+    derived from the stored run (not typed by hand), the corpus it was measured
+    on is the corpus on disk, and the inclusive bounds do not exclude the
+    reference run itself."""
     baseline = json.loads((score.EVAL_ROOT / "baseline_local.json").read_text())
     rule = score.AcceptanceRule(**baseline["acceptance_rule"])
+
+    assert rule.accuracy_floor == baseline["summary"]["text_recovery_accuracy"]
+    assert rule.hallucination_ceiling == baseline["summary"]["hallucination_rate"]
+
+    # A corpus edit silently changes what the pinned floor means; fail loudly
+    # so the baseline gets re-recorded instead.
+    verified = [c.id for c in score.load_labelled_cases() if c.verified]
+    assert baseline["summary"]["cases_scored"] == len(verified)
+    assert [c["id"] for c in baseline["cases"]] == verified
 
     verdict = rule.evaluate(
         accuracy=baseline["summary"]["text_recovery_accuracy"],
         hallucination_rate=baseline["summary"]["hallucination_rate"],
     )
 
-    assert verdict.passed
+    assert verdict.passed  # inclusive bounds: the reference run is not excluded by its own rule
 
 
 def test_summarize_includes_accuracy_and_hallucination_rate() -> None:

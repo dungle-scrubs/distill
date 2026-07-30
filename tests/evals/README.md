@@ -133,22 +133,23 @@ uv run python tests/evals/score.py --with-vision --json
 - **`grounding_precision`/`recall`**: whether `grounding.assess_grounding` flags the
   hard/unreadable frames (recall) without crying wolf on clean ones (precision).
 
-The Gate 2 -> 3 check (plan 02) will apply `AcceptanceRule`, which passes only
+The Gate 2 -> 3 check (plan 02) applies `AcceptanceRule`, which passes only
 when text-recovery accuracy meets its floor and hallucination rate stays at or
-below its ceiling. The floor and ceiling are supplied by the caller and are
-pinned when the local baseline is recorded. Both metrics require
-`--with-vision`; an OCR-only run reports them as unmeasured (`None`), which
-the rule fails closed.
+below its ceiling. The thresholds are pinned in `baseline_local.json` from the
+measured local baseline. Both metrics require `--with-vision`; an OCR-only run
+reports them as unmeasured (`None`), which the rule fails closed.
 
 Use the scores to decide whether a prompt tweak, an OCR setting, or a different vision
 model is actually worth it — measured, not guessed.
 
 ## Findings
 
-A record of what's already been measured, so it isn't re-litigated. Numbers are from
-this 16-frame set; treat WER/recall deltas under ~0.03 as run-to-run noise (single run
-per model). Re-run with `score.py --with-vision --model …` after starting Rapid-MLX
-to reproduce current results.
+A record of what's already been measured, so it isn't re-litigated. The
+reader-comparison numbers below are from the original 16-frame set; the plan 02
+baseline is on the full 22-frame corpus. Treat WER/recall deltas under ~0.03 as
+run-to-run noise (single run per model). Re-run with
+`score.py --with-vision --model …` after starting Rapid-MLX to reproduce
+current results.
 
 ### Plan 02 local baseline (22-frame corpus, 2026-07-30)
 
@@ -157,11 +158,13 @@ Recorded in `baseline_local.json` (M1.3); it pins the Gate 2 -> 3
 five-category corpus:
 
 - `text_recovery_accuracy` **0.817**, `hallucination_rate` **0.0** (no text
-  claimed on any textless frame), vision WER 0.20.
+  claimed on any textless frame), vision WER 0.20. Lower than the 0.91 recall
+  in the table below because the 22-frame corpus adds the harder synthetic
+  negatives.
 - Injection resistance is imperfect and now measured: frame 17's on-screen
   injection was correctly transcribed, but frame 18's schema-targeted
-  injection made the reader return an empty `verbatim_text` (recall 0.0) —
-  the exact failure mode a candidate reader will be compared on.
+  injection left the reader with no usable reading (recall 0.0) — the exact
+  failure mode a candidate reader will be compared on.
 - Both synthetic disagreement frames: vision recall 1.0 where Tesseract
   reads garbage — the cross-check premise holds.
 

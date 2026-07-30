@@ -265,11 +265,10 @@ def evaluate(
     return results
 
 
-def _vision_interpreter(
+def _vision_config(
     model: str | None = None, backend: str | None = None, base_url: str | None = None
 ):
-    from distill.local_vision import LocalVisionConfig, probe_local_vision, try_interpret_image
-    from distill.vision_prompts import build_technical_frame_prompt
+    from distill.local_vision import LocalVisionConfig
 
     overrides: dict[str, str] = {}
     if model:
@@ -278,7 +277,16 @@ def _vision_interpreter(
         overrides["backend"] = backend
     if base_url:
         overrides["base_url"] = base_url.rstrip("/")
-    config = replace(LocalVisionConfig(), **overrides) if overrides else LocalVisionConfig()
+    return replace(LocalVisionConfig(), **overrides) if overrides else LocalVisionConfig()
+
+
+def _vision_interpreter(
+    model: str | None = None, backend: str | None = None, base_url: str | None = None
+):
+    from distill.local_vision import probe_local_vision, try_interpret_image
+    from distill.vision_prompts import build_technical_frame_prompt
+
+    config = _vision_config(model, backend, base_url)
     probe = probe_local_vision(config)
     if not probe.available:
         raise SystemExit(f"vision backend unavailable ({probe.code}): {probe.message}")
@@ -356,13 +364,13 @@ def main() -> None:
     summary = summarize(results)
     if args.json:
         # The run block makes a stored score self-describing (what model/endpoint
-        # produced it), so a committed baseline stays reproducible.
-        run = {
-            "with_vision": args.with_vision,
-            "model": args.model,
-            "backend": args.backend,
-            "base_url": args.base_url,
-        }
+        # produced it), so a committed baseline stays reproducible. It records
+        # the EFFECTIVE config (defaults resolved), not the flags as typed.
+        run: dict[str, object] = {"with_vision": args.with_vision}
+        if args.with_vision:
+            run["vision_config"] = _vision_config(
+                args.model, args.backend, args.base_url
+            ).public_dict()
         print(
             json.dumps(
                 {"run": run, "summary": summary, "cases": [vars(r) for r in results]}, indent=2
