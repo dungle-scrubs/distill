@@ -525,6 +525,27 @@ class Provenance(Carrier):
 
 
 @dataclass(frozen=True)
+class FrameSalience:
+    """D-003: whether a keyframe adds information beyond the transcript.
+
+    Informational only (D-018) - recorded on the frame artifact, surfaced to
+    readers, never consulted by processing to drop a frame. `reason` is
+    size-capped at parse; `reason_truncated` says when the cap cut it.
+    """
+
+    adds_information: bool
+    reason: str = ""
+    reason_truncated: bool = False
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "adds_information": self.adds_information,
+            "reason": self.reason,
+            "reason_truncated": self.reason_truncated,
+        }
+
+
+@dataclass(frozen=True)
 class Interpretation:
     """The vision model's structured reading of one **keyframe**.
 

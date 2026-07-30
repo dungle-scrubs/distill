@@ -2421,3 +2421,53 @@ def test_end_to_end_credential_budget_and_provenance_compose(
         assert "sk-e2e-secret" not in surface
         assert "10.0.0.5" not in surface
     assert "sk-e2e-secret" not in json.dumps(config.public_dict(), default=str)
+
+
+class TestSalienceSchema:
+    """M4.3 (D-003/D-018): adds_information is a strict boolean; anything
+    else yields absent salience, never a guessed value."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"adds_information": True, "reason": "shows a diagram"},
+            {"adds_information": False, "reason": "restates the speech"},
+        ],
+    )
+    def test_a_strict_boolean_parses(self, payload: dict) -> None:
+        from distill.rapid_mlx import parse_frame_salience
+
+        salience = parse_frame_salience(payload)
+
+        assert salience is not None
+        assert salience.adds_information is payload["adds_information"]
+        assert salience.reason == payload["reason"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"adds_information": "false", "reason": "stringly"},
+            {"adds_information": "true", "reason": "stringly"},
+            {"adds_information": 1, "reason": "inty"},
+            {"adds_information": None, "reason": "nully"},
+            {"reason": "missing the field"},
+            {},
+            "not a mapping",
+            None,
+        ],
+    )
+    def test_anything_else_is_absent_not_guessed(self, payload: object) -> None:
+        from distill.rapid_mlx import parse_frame_salience
+
+        assert parse_frame_salience(payload) is None
+
+    def test_an_oversize_reason_is_truncated_with_a_notice(self) -> None:
+        from distill.rapid_mlx import SALIENCE_REASON_MAX_CHARS, parse_frame_salience
+
+        salience = parse_frame_salience(
+            {"adds_information": True, "reason": "r" * (SALIENCE_REASON_MAX_CHARS + 50)}
+        )
+
+        assert salience is not None
+        assert len(salience.reason) == SALIENCE_REASON_MAX_CHARS
+        assert salience.reason_truncated is True

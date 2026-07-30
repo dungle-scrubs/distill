@@ -30,7 +30,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any, NoReturn
 
-from .artifacts import document_carries_a_reading
+from .artifacts import FrameSalience, document_carries_a_reading
 from .errors import warning
 from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
 
@@ -805,6 +805,31 @@ def _normalize_frame_kind(value: Any) -> str:
 def _normalize_text_confidence(value: Any) -> str:
     level = str(value or "").strip().lower()
     return level if level in TEXT_CONFIDENCE_LEVELS else "none"
+
+
+# The reason a reader sees for a salience judgment; past this it is filler.
+SALIENCE_REASON_MAX_CHARS = 400
+
+
+def parse_frame_salience(payload: Any) -> FrameSalience | None:
+    """The model's salience judgment, strictly validated, or None.
+
+    `adds_information` must be a JSON boolean: a "false" string, a number, a
+    missing field, or a non-mapping payload all yield ABSENT salience rather
+    than a guessed value (D-003) - absence is honest, coercion is invention.
+    """
+    if not isinstance(payload, dict):
+        return None
+    adds_information = payload.get("adds_information")
+    if not isinstance(adds_information, bool):
+        return None
+    reason = str(payload.get("reason") or "")
+    truncated = len(reason) > SALIENCE_REASON_MAX_CHARS
+    if truncated:
+        reason = reason[:SALIENCE_REASON_MAX_CHARS]
+    return FrameSalience(
+        adds_information=adds_information, reason=reason, reason_truncated=truncated
+    )
 
 
 def parse_interpretation_json(raw_response: str) -> dict[str, Any] | None:
