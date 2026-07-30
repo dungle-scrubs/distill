@@ -23,8 +23,9 @@ runtime shim.
 
 The transport, the OpenAI-style envelope parsing, and the endpoint policy
 (R-43, R-44: the scheme, the loopback rule and its opt-out, the refusal to
-follow a redirect, the 32 MiB bound) are ``rapid_mlx``'s - the client for the
-one backend Distill supports (ADR-0001). This module drives that client: it
+follow a redirect, the 32 MiB bound) are ``rapid_mlx``'s - the one
+OpenAI-compatible client, whose default endpoint is a local Rapid-MLX server
+(ADR-0005, superseding ADR-0001). This module drives that client: it
 owns the configuration, decides whether a pass can run, and runs the
 interpretation. The endpoint policy still lives next to the requests it governs,
 because both moved together; splitting them so a caller could reach around the

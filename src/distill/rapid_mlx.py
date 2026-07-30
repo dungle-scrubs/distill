@@ -3,9 +3,10 @@
 This module owns the transport (the HTTP request, the opener that follows no
 redirect and consults no proxy, the 32 MiB read bound), the OpenAI-style
 envelope parsing, and the endpoint policy (scheme, the loopback rule and its
-per-request re-check, the refusal to follow a redirect). It is a client for the
-one backend Distill supports (ADR-0001) - not a provider abstraction, and no
-backend branch belongs here.
+per-request re-check, the refusal to follow a redirect). It is one
+OpenAI-compatible client, not a provider abstraction: `backend` names the wire
+protocol rather than a vendor, Rapid-MLX is the default endpoint rather than the
+only one (ADR-0005, superseding ADR-0001), and no backend branch belongs here.
 
 The endpoint policy lives next to the requests it governs, which is the point:
 a rule kept beside the request it guards cannot be reached around by adding a
