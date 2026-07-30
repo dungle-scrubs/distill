@@ -15,7 +15,7 @@ id = "01_cc665bf2fb0c_f06"
 kind = "slide"
 legibility = "clean"
 has_text = true
-category = "ocr_vision_disagreement"
+category = "ocr_vision_disagreement"   # observed: Tesseract WER ~1.0 on this dark two-column slide; humans read it fine
 verified = true
 tags = ["dark-bg", "red-slide", "two-column"]
 

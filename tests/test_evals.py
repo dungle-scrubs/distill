@@ -31,11 +31,11 @@ def _scorer():
 
 
 def test_ocr_recovers_clean_frames() -> None:
-    """Preprocessed OCR should read cleanly-legible frames with low error."""
+    """Legibility means humans can read it; the OCR floor covers clean_text only."""
     score = _scorer()
-    results = [r for r in score.evaluate(with_vision=False) if r.legibility == "clean"]
+    results = [r for r in score.evaluate(with_vision=False) if r.category == "clean_text"]
     if not results:
-        pytest.skip("no verified clean cases yet — confirm ground truth in tests/evals/")
+        pytest.skip("no verified clean_text cases yet; confirm ground truth in tests/evals/")
     wers = [r.ocr_wer for r in results if r.ocr_wer is not None]
     mean_wer = sum(wers) / len(wers)
     # Floor, not a target: catches a regression that breaks OCR on readable text.

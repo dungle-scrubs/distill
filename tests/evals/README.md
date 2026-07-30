@@ -1,8 +1,8 @@
 # Distill text-recovery eval
 
-A small, human-verified set of real and synthetic frames for measuring how well Distill
-recovers on-screen text — and how reliably it flags frames it *can't* read
-(instead of hallucinating, the failure this eval exists to catch).
+A small, human-verified set of real and synthetic frames for measuring how well
+Distill recovers on-screen text — and how reliably it flags frames it *can't*
+read (instead of hallucinating, the failure this eval exists to catch).
 
 ## Layout
 
@@ -75,7 +75,7 @@ them — an eval of only text-heavy slides would miss false positives entirely.
 Six synthetic slides provide controlled coverage that the source recordings do
 not: two prompt injections, two benign security slides, and two predictable
 OCR/vision disagreements. Their transcriptions are truth by construction: the
-same module-level constants drive both rendering and `.gt.txt` generation.
+same ordered table drives both rendering and `.gt.txt` generation.
 
 Regenerate them deterministically with:
 

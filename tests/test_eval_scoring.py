@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import importlib
-from pathlib import Path
-
-from eval_helpers import load_score_module
+import pytest
+from eval_helpers import load_eval_module, load_score_module
 
 score = load_score_module()
-generate_negatives = importlib.import_module("generate_negatives")
+generate_negatives = load_eval_module("generate_negatives")
 SYNTHETIC_CASE_TEXT = generate_negatives.SYNTHETIC_CASE_TEXT
 token_prf = score.token_prf
 word_error_rate = score.word_error_rate
@@ -38,32 +36,62 @@ def test_token_prf_partial_capture() -> None:
     assert precision == 1.0
 
 
-def test_labelled_corpus_has_only_valid_categories() -> None:
+def test_labelled_corpus_represents_every_category() -> None:
     cases = score.load_labelled_cases()
+    categories = {case.category for case in cases}
 
     assert cases
-    assert all(case.category in score.VALID_CATEGORIES for case in cases)
-
-
-def test_labelled_corpus_represents_every_category() -> None:
-    categories = {case.category for case in score.load_labelled_cases()}
-
     assert categories == score.VALID_CATEGORIES
-
-
-def test_every_labelled_case_has_image_and_truth_fixtures() -> None:
-    for case in score.load_labelled_cases():
-        assert (score.FRAMES_DIR / f"{case.id}.png").is_file()
-        assert (score.FRAMES_DIR / f"{case.id}.gt.txt").is_file()
 
 
 def test_synthetic_truth_matches_the_generator_text() -> None:
     for case_id, expected in SYNTHETIC_CASE_TEXT.items():
-        truth_path = Path(score.FRAMES_DIR) / f"{case_id}.gt.txt"
-        body = "\n".join(
-            line
-            for line in truth_path.read_text().splitlines()
-            if not line.lstrip().startswith("#")
-        ).strip()
+        assert score.truth_text(case_id) == expected
 
-        assert body == expected
+
+def test_labelled_corpus_rejects_unknown_category(tmp_path, monkeypatch) -> None:
+    (tmp_path / "cases.toml").write_text(
+        '[[case]]\nid = "bad-category"\ncategory = "unknown"\nlegibility = "clean"\n'
+    )
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", tmp_path / "frames")
+
+    with pytest.raises(ValueError, match="bad-category"):
+        score.load_labelled_cases()
+
+
+@pytest.mark.parametrize("present_suffix", [".png", ".gt.txt"])
+def test_labelled_corpus_rejects_missing_fixture(tmp_path, monkeypatch, present_suffix) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / f"missing-fixture{present_suffix}").write_bytes(b"fixture")
+    (tmp_path / "cases.toml").write_text(
+        '[[case]]\nid = "missing-fixture"\ncategory = "clean_text"\nlegibility = "clean"\n'
+    )
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", frames_dir)
+
+    with pytest.raises(ValueError, match="missing-fixture"):
+        score.load_labelled_cases()
+
+
+def test_labelled_corpus_rejects_missing_id(tmp_path, monkeypatch) -> None:
+    (tmp_path / "cases.toml").write_text(
+        '[[case]]\ncategory = "clean_text"\nlegibility = "clean"\n'
+    )
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", tmp_path / "frames")
+
+    with pytest.raises(ValueError, match="invalid id"):
+        score.load_labelled_cases()
+
+
+def test_labelled_corpus_rejects_invalid_legibility(tmp_path, monkeypatch) -> None:
+    (tmp_path / "cases.toml").write_text(
+        '[[case]]\nid = "bad-legibility"\ncategory = "clean_text"\nlegibility = "typo"\n'
+    )
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", tmp_path / "frames")
+
+    with pytest.raises(ValueError, match="bad-legibility"):
+        score.load_labelled_cases()

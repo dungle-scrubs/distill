@@ -10,7 +10,8 @@ Reads ``cases.toml`` and each frame's ``<id>.gt.txt`` and reports two things:
    quiet on clean ones — precision/recall over that label.
 
 Unverified or empty cases are skipped, so the score reflects only frames a human
-has actually confirmed. Run:
+has actually confirmed. Labels and fixtures are validated up front, and a
+malformed case aborts the run rather than being skipped. Run:
 
     uv run python tests/evals/score.py [--with-vision] [--json]
 """
@@ -38,6 +39,7 @@ VALID_CATEGORIES = frozenset(
         "ocr_vision_disagreement",
     }
 )
+VALID_LEGIBILITY = frozenset({"clean", "partial", "unreadable"})
 
 _PUNCT = str.maketrans(dict.fromkeys("\"'`.,:;!?()[]{}<>|/\\-–—_=+*#", " "))
 
@@ -106,14 +108,19 @@ class LabelledCase:
 
 
 def load_labelled_cases() -> list[LabelledCase]:
-    """Load corpus labels and reject incomplete or unknown case records."""
+    """Load labels, rejecting invalid ids, categories, legibility, or fixtures."""
     data = tomllib.loads((EVAL_ROOT / "cases.toml").read_text())
     cases: list[LabelledCase] = []
     for raw_case in data.get("case", []):
-        case_id = str(raw_case.get("id", "<missing id>"))
+        case_id = raw_case.get("id")
+        if not isinstance(case_id, str):
+            raise ValueError(f"case has invalid id: {case_id!r}")
         category = raw_case.get("category")
         if not isinstance(category, str) or category not in VALID_CATEGORIES:
             raise ValueError(f"case {case_id} has invalid category: {category!r}")
+        legibility = raw_case.get("legibility")
+        if not isinstance(legibility, str) or legibility not in VALID_LEGIBILITY:
+            raise ValueError(f"case {case_id} has invalid legibility: {legibility!r}")
         for suffix in (".png", ".gt.txt"):
             path = FRAMES_DIR / f"{case_id}{suffix}"
             if not path.exists():
@@ -122,7 +129,7 @@ def load_labelled_cases() -> list[LabelledCase]:
             LabelledCase(
                 id=case_id,
                 category=category,
-                legibility=str(raw_case.get("legibility", "")),
+                legibility=legibility,
                 has_text=bool(raw_case.get("has_text", True)),
                 verified=bool(raw_case.get("verified", False)),
             )
@@ -130,7 +137,7 @@ def load_labelled_cases() -> list[LabelledCase]:
     return cases
 
 
-def _truth(case_id: str) -> str | None:
+def truth_text(case_id: str) -> str | None:
     """Return confirmed truth text, or None if the file is missing/unverified.
 
     Lines starting with ``#`` are notes (e.g. provenance) and are stripped before
@@ -140,11 +147,10 @@ def _truth(case_id: str) -> str | None:
     path = FRAMES_DIR / f"{case_id}.gt.txt"
     if not path.exists():
         return None
-    if "UNVERIFIED" in path.read_text():
+    contents = path.read_text()
+    if "UNVERIFIED" in contents:
         return None
-    body = "\n".join(
-        line for line in path.read_text().splitlines() if not line.lstrip().startswith("#")
-    )
+    body = "\n".join(line for line in contents.splitlines() if not line.lstrip().startswith("#"))
     return body.strip()
 
 
@@ -165,7 +171,7 @@ def evaluate(
         case_id = case.id
         if not case.verified:
             continue
-        truth = _truth(case_id)
+        truth = truth_text(case_id)
         if truth is None:
             continue
         image = FRAMES_DIR / f"{case_id}.png"
@@ -283,13 +289,15 @@ def main() -> None:
     if not results:
         print("No verified cases yet. Fill in <id>.gt.txt and set verified = true in cases.toml.")
         return
+    category_width = max(len(category) for category in VALID_CATEGORIES)
     for r in results:
         vis = f"{r.vision_wer:.2f}" if r.vision_wer is not None else " -  "
         rec = f"{r.vision_recall:.2f}" if r.vision_recall is not None else " -  "
         f1 = f"{r.vision_f1:.2f}" if r.vision_f1 is not None else " -  "
         flag = "?" if r.flagged is None else ("flag" if r.flagged else "ok")
         print(
-            f"  {r.id:30s} category={r.category:23s} legib={r.legibility:10s} "
+            f"  {r.id:30s} category={r.category:{category_width}s} "
+            f"legib={r.legibility:10s} "
             f"vis_wer={vis} recall={rec} f1={f1} grounding={flag}"
         )
     print()
