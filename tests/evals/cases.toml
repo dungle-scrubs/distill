@@ -150,7 +150,8 @@ id = "16_85b9f9f6a4fc_f09"
 kind = "photo"
 legibility = "unreadable"
 has_text = false   # interview/podcast shot, two people, no on-screen text
-category = "textless"
+category = "chrome_only"   # the "UNSUPERVISED LEARNING / Redpoint" logo is legible text, so a
+                           # transcription here is not invention - same reason as frame 15
 verified = true
 tags = ["no-text", "talking-heads", "negative"]
 
@@ -243,3 +244,33 @@ has_text = false
 category = "textless"
 verified = true   # synthetic true negative; truth by construction
 tags = ["synthetic", "no-text", "mid-gray", "soft-highlight"]
+
+[[case]]
+id = "27_synth_textless_f05"
+kind = "photo"
+legibility = "unreadable"
+has_text = false   # synthetic; no glyphs at all, truth empty by construction
+verified = true
+category = "textless"
+tags = ["synthetic", "no-text", "gradient"]
+
+# 28 and 29 are the invention probes that matter: a frame which LOOKS like it
+# should carry text is what tempts a reader to supply some. A flat wall tests
+# almost nothing.
+[[case]]
+id = "28_synth_textless_f06"
+kind = "photo"
+legibility = "unreadable"
+has_text = false   # slide SHAPE - title bar, bullet rows, footer - blurred past legibility, no glyphs
+verified = true
+category = "textless"
+tags = ["synthetic", "no-text", "slide-shaped", "hard-negative"]
+
+[[case]]
+id = "29_synth_textless_f07"
+kind = "photo"
+legibility = "unreadable"
+has_text = false   # terminal SHAPE - panel, title strip, code-line rhythm - no glyphs
+verified = true
+category = "textless"
+tags = ["synthetic", "no-text", "terminal-shaped", "hard-negative"]

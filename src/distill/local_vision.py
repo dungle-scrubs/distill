@@ -1455,7 +1455,7 @@ class FrameInterpreter:
                 )
             )
         if result:
-            return self._interpreted(frame, result, index, warnings), True, read_code
+            return self._interpreted(frame, result, warnings), True, read_code
         if read_code in FRAME_READ_FAILURE_CODES:
             unusable = GroundingAssessment(
                 UNGROUNDED,
@@ -1494,7 +1494,6 @@ class FrameInterpreter:
         self,
         frame: FrameArtifact,
         reading: Interpretation,
-        index: int,
         warnings: list[WarningRecord],
     ) -> FrameArtifact:
         """The frame carrying the model's reading and Distill's grounding of it.
@@ -1522,15 +1521,14 @@ class FrameInterpreter:
             reading, grounding=assessment.public_dict()
         )
         warnings.extend(carrier_warnings)
-        if assessment.level == UNGROUNDED:
-            warnings.append(
-                warning(
-                    "local_vision",
-                    "frame_text_ungrounded",
-                    f"frame {frame.index or index + 1} interpretation is not grounded in "
-                    f"readable text: {assessment.reason}",
-                )
-            )
+        # No ungrounded warning: since M3.1 (D-002) the vision reading is the
+        # authoritative one, so "not grounded in readable text" is not a defect
+        # to report - it is the ordinary case for a frame the image-text reader
+        # could not read. The level is still recorded on the artifact and the
+        # render carries its neutral note; a warning would re-deliver the
+        # retired confidence verdict through a channel consumers read as a
+        # credibility signal, and would reintroduce the document-sourced reason
+        # text the render just stopped printing.
         return carried
 
     def _reset_run(self, frames: list[FrameArtifact]) -> None:

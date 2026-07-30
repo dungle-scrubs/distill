@@ -5,8 +5,10 @@ Supersedes [ADR-0001](0001-rapid-mlx-is-the-only-vision-backend.md).
 Distill speaks to whatever OpenAI-compatible vision endpoint the operator
 configures. A local Rapid-MLX server remains the **default** — an unconfigured
 run is unchanged, still loopback-only, still local-only processing — but it is
-no longer the *only* endpoint. `backend` names the wire protocol, not a
-provider; there is still no provider abstraction and no runtime shim.
+no longer the *only* endpoint. There is still no provider abstraction and no
+runtime shim: `options.py` accepts exactly one `backend` value, and this
+decision widens where that one client may point rather than how many clients
+exist.
 
 ADR-0001 required an eval before its reversal, and its central claim — that a
 frontier cloud reader "is the only thing that would meaningfully beat the local
@@ -17,15 +19,22 @@ evidence in `tests/evals/gate_2_to_3_cloud.json`):
 
 | | local `Qwen3-VL-8B-Instruct-8bit` | `gemini-3.6-flash` |
 |---|---|---|
-| text-recovery accuracy | 0.867 | **0.992** |
-| invention on true negatives | 0.000 | **0.000** |
-| word error rate | 0.151 | **0.062** |
+| text-recovery accuracy | clears the floor | **decisively higher** |
+| invention on true negatives | none | **none** |
+| word error rate | higher | **lower** |
 
-The cloud reader cleared the accuracy floor decisively and invented nothing
-across six textless frames, re-verified over three trials because the reader is
-non-deterministic. It also read every injection-shaped and safety-blocked frame
-correctly, including the schema-targeted injection that defeats the local
-reader entirely.
+The measured values are deliberately not restated here. They live in
+`tests/evals/baseline_local.json` and `tests/evals/gate_2_to_3_cloud.json`,
+which are re-recorded together whenever the corpus or the metric changes; a
+number copied into this document would drift out of agreement with the
+evidence it cites, which is how the first version of this ADR came to claim
+something its own baseline contradicted.
+
+The cloud reader cleared the accuracy floor decisively and invented nothing on
+the true negatives, re-measured over repeated trials because the reader is
+non-deterministic. Per-frame detail lives in the evidence files rather than
+being restated here, where it would drift: both readers are scored on every
+run, and a claim about one frame is only true of the run that produced it.
 
 What ADR-0001 got right is the reason this is an opt-in and not a new default:
 a remote endpoint breaks **local-only processing**. So the capability is

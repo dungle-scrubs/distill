@@ -134,17 +134,32 @@ class AcceptanceVerdict:
     passed: bool
     accuracy_ok: bool
     hallucination_ok: bool
+    f1_ok: bool
 
 
 @dataclass(frozen=True)
 class AcceptanceRule:
-    """The eval's pass/fail bar: an accuracy floor AND a hallucination ceiling."""
+    """The eval's pass/fail bar: an accuracy floor, an invention ceiling, and
+    a token-F1 floor.
+
+    F1 is the third bound because the other two cannot see stray text.
+    `text_recovery_accuracy` is recall-only - deliberately, so that chrome the
+    reader adds does not punish it - and the invention ceiling only looks at
+    frames with no text at all. Without F1, a reader could transcribe every
+    banner, logo and browser bar on real slides and still pass. Precision, and
+    therefore F1, falls when the reader adds tokens the truth omits, so that is
+    where the content boundary belongs.
+    """
 
     accuracy_floor: float
     hallucination_ceiling: float
+    f1_floor: float = 0.0
 
     def evaluate(
-        self, accuracy: float | None, hallucination_rate: float | None
+        self,
+        accuracy: float | None,
+        hallucination_rate: float | None,
+        f1: float | None = None,
     ) -> AcceptanceVerdict:
         """Pass only when both metrics were measured and both stay inside their bounds.
 
@@ -156,10 +171,12 @@ class AcceptanceRule:
         hallucination_ok = (
             hallucination_rate is not None and hallucination_rate <= self.hallucination_ceiling
         )
+        f1_ok = f1 is not None and f1 >= self.f1_floor
         return AcceptanceVerdict(
-            passed=accuracy_ok and hallucination_ok,
+            passed=accuracy_ok and hallucination_ok and f1_ok,
             accuracy_ok=accuracy_ok,
             hallucination_ok=hallucination_ok,
+            f1_ok=f1_ok,
         )
 
 
@@ -381,9 +398,13 @@ def text_recovery_accuracy(results: list[CaseResult]) -> float | None:
 def hallucination_rate(results: list[CaseResult]) -> float | None:
     """Return the invention rate over true negatives with no text pixels at all.
 
-    Only ``textless`` cases belong in the denominator. A transcription from a
-    ``chrome_only`` frame disagrees with the content-only convention but is not
-    invented, so chrome claims are reported separately.
+    Only ``textless`` cases belong in the denominator. Text read off a
+    ``chrome_only`` frame was really there, so it is not invention and does not
+    belong in this metric - but it is not a harmless convention disagreement
+    either: the prompt explicitly instructs the reader to ignore chrome, naming
+    logos, banners, watermarks, speaker insets and page numbers. Transcribing
+    it is an instruction-following failure, reported separately by
+    ``chrome_transcription_rate``.
     """
     claims = [
         float(result.claimed_text)
@@ -394,7 +415,13 @@ def hallucination_rate(results: list[CaseResult]) -> float | None:
 
 
 def chrome_transcription_rate(results: list[CaseResult]) -> float | None:
-    """Return the fraction of scored chrome-only cases where the reader claimed text."""
+    """Return the fraction of scored chrome-only cases where the reader claimed text.
+
+    Not invention (the text is genuinely on screen) and not part of the
+    acceptance bar, but not nothing either: the prompt tells the reader to
+    ignore chrome, so a non-zero rate is a measured instruction-following
+    weakness. Reported beside the verdict so it cannot be overlooked.
+    """
     claims = [
         float(result.claimed_text)
         for result in results
@@ -470,11 +497,18 @@ def main() -> None:
         verdict = rule.evaluate(
             accuracy=summary["text_recovery_accuracy"],
             hallucination_rate=summary["hallucination_rate"],
+            f1=summary["vision_token_f1_mean"],
         )
         gate = {
             "passed": verdict.passed,
             "accuracy_ok": verdict.accuracy_ok,
             "hallucination_ok": verdict.hallucination_ok,
+            "f1_ok": verdict.f1_ok,
+            # Reported beside the verdict, deliberately not part of it: a
+            # reader that transcribes chrome disobeyed the prompt's explicit
+            # instruction to ignore it, which is worth seeing wherever the
+            # verdict is seen even though it is not invention.
+            "chrome_transcription_rate": summary["chrome_transcription_rate"],
             "unusable_readings": summary["unusable_readings"],
         }
     if args.json:

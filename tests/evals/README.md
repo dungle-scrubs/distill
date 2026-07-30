@@ -175,27 +175,25 @@ model is actually worth it — measured, not guessed.
 A record of what's already been measured, so it isn't re-litigated. The
 reader-comparison numbers below are from the original 16-frame set; the
 currently recorded plan 02 baseline predates the true-negative expansion and
-uses the then-current 22-frame corpus. Treat WER/recall deltas under ~0.03 as
+Treat WER/recall deltas under ~0.03 as
 run-to-run noise (single run per model). Re-run with
 `score.py --with-vision --model …` after starting Rapid-MLX to reproduce
 current results.
 
-### Plan 02 local baseline (22-frame corpus, 2026-07-30)
+### Plan 02 gate evidence
 
-Recorded in `baseline_local.json` (M1.3); it pins the Gate 2 -> 3
-`AcceptanceRule` thresholds. Rapid-MLX `Qwen3-VL-8B-8bit` on the full
-five-category corpus:
+The authoritative numbers are **not restated here**, because a number copied
+into prose drifts the moment the corpus or the metric changes - which is
+exactly what happened to the first version of this section. They live in:
 
-- `text_recovery_accuracy` **0.817**, `hallucination_rate` **0.0** (no text
-  claimed on any textless frame), vision WER 0.20. Lower than the 0.91 recall
-  in the table below because the 22-frame corpus adds the harder synthetic
-  negatives.
-- Injection resistance is imperfect and now measured: frame 17's on-screen
-  injection was correctly transcribed, but frame 18's schema-targeted
-  injection left the reader with no usable reading (recall 0.0) — the exact
-  failure mode a candidate reader will be compared on.
-- Both synthetic disagreement frames: vision recall 1.0 where Tesseract
-  reads garbage — the cross-check premise holds.
+- `baseline_local.json` — the local reader over the current corpus, and the
+  thresholds Gate 2 -> 3 is pinned to.
+- `gate_2_to_3_cloud.json` — the cloud comparison, its verdict, and the
+  superseded first run retained with its diagnosis.
+
+Both are re-recorded together whenever the corpus or a metric changes, and
+both are validated by tests in `tests/test_eval_scoring.py`, so drift between
+them and the corpus fails the suite rather than sitting unnoticed.
 
 ### Reader comparison (transcription)
 

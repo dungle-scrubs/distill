@@ -488,18 +488,6 @@ def _corroboration_lines(assessment: GroundingAssessment | None) -> list[str]:
     return [f"> {note}", ""]
 
 
-def _one_line(text: str) -> str:
-    """`text` with every run of whitespace, line endings included, made a space.
-
-    Legibility rather than safety, now that the banner's reason is escaped: the
-    escape is what stops a line ending from ending the *document* line, and this
-    is what keeps the result a sentence. The escape preserves the line ending
-    rather than removing it, so a reader given the reason uncollapsed would read
-    a banner broken across lines it does not occupy.
-    """
-    return " ".join(text.split())
-
-
 def _reading_lines(reading: Interpretation) -> list[str]:
     """One labelled block per field of an **interpretation** the model filled in.
 

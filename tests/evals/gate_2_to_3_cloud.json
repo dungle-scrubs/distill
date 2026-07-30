@@ -1,52 +1,160 @@
 {
-  "_what": "Gate 2->3 evidence (plan 02, assumption A-001): the cloud-vs-local reader comparison ADR-0001's reversal requires. The candidate was reached through Distill's own remote endpoint path - bearer auth, https-for-remote, run-wide budget - not a bypass.",
+  "_what": "Gate 2->3 evidence (plan 02, A-001): the cloud-vs-local comparison ADR-0001's reversal requires. The candidate was reached through Distill's own remote endpoint path - bearer auth, https-for-remote, run-wide budget - not a bypass.",
+  "_how_measured": "Both readers run the full corpus `trials` times. The verdict is judged on the MEAN accuracy and F1 but the WORST-trial invention rate: a safety ceiling that a lucky draw can satisfy is not a ceiling. The local reader was deterministic across trials; this one is not, which is the whole reason for the repetition - see chrome_transcription_rate below.",
   "recorded": "2026-07-30",
+  "trials": 3,
   "verdict": {
     "passed": true,
     "accuracy_ok": true,
     "hallucination_ok": true,
-    "unusable_readings": 0
+    "f1_ok": true
   },
   "candidate": {
     "provider": "OpenRouter -> Google AI Studio",
     "model": "google/gemini-3.6-flash",
     "endpoint": "https://openrouter.ai/api/v1"
   },
-  "comparison": {
-    "corpus": "26 frames, six categories, six true negatives",
-    "local_model": "mlx-community/Qwen3-VL-8B-Instruct-8bit",
+  "spread": {
     "text_recovery_accuracy": {
-      "local": 0.8671902191256062,
-      "cloud": 0.9917127166384029,
-      "floor": 0.8371902191256062
+      "mean": 0.9925039363101572,
+      "min": 0.9917127166384029,
+      "max": 0.9934366030740689,
+      "trials": 3
     },
     "hallucination_rate": {
-      "local": 0.0,
-      "cloud": 0.0,
-      "ceiling": 0.0
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0,
+      "trials": 3
+    },
+    "chrome_transcription_rate": {
+      "mean": 0.16666666666666666,
+      "min": 0.0,
+      "max": 0.5,
+      "trials": 3
+    },
+    "vision_token_f1_mean": {
+      "mean": 0.9917588795243337,
+      "min": 0.991135727387733,
+      "max": 0.9923472890606931,
+      "trials": 3
     },
     "vision_wer_mean": {
-      "local": 0.15069611160806026,
-      "cloud": 0.062277655847025215
+      "mean": 0.046822447009810635,
+      "min": 0.04588978024589909,
+      "max": 0.04761366668156498,
+      "trials": 3
+    },
+    "unusable_readings": {
+      "mean": 0.0,
+      "min": 0,
+      "max": 0,
+      "trials": 3
     }
   },
-  "stability_check": {
-    "_what": "The candidate is non-deterministic (the chrome frame was transcribed 2 of 5 runs), so the safety-critical half of the bar was re-measured rather than trusted from a single pass.",
-    "trials": 3,
-    "true_negatives_per_trial": 6,
-    "invention_claims": 0
+  "chrome_transcription": {
+    "_what": "Not invention and not part of the bar - the text is genuinely on screen - but the prompt names logos, banners, watermarks, speaker insets and page numbers as things to ignore, so a non-zero rate is a measured instruction-following weakness of this candidate. It varied across trials, which is precisely why a single run must not be the record.",
+    "per_trial_max": 0.5,
+    "per_trial_min": 0.0,
+    "mean": 0.16666666666666666
+  },
+  "comparison": {
+    "corpus": "29 frames, six categories, eight true negatives (two shaped to look text-bearing)",
+    "local_model": "mlx-community/Qwen3-VL-8B-Instruct-8bit",
+    "local_spread": {
+      "text_recovery_accuracy": {
+        "mean": 0.8671902191256061,
+        "min": 0.8671902191256062,
+        "max": 0.8671902191256062,
+        "trials": 3
+      },
+      "hallucination_rate": {
+        "mean": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "trials": 3
+      },
+      "chrome_transcription_rate": {
+        "mean": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "trials": 3
+      },
+      "vision_token_f1_mean": {
+        "mean": 0.8888045934258723,
+        "min": 0.8888045934258723,
+        "max": 0.8888045934258723,
+        "trials": 3
+      },
+      "vision_wer_mean": {
+        "mean": 0.15069611160806026,
+        "min": 0.15069611160806026,
+        "max": 0.15069611160806026,
+        "trials": 3
+      },
+      "unusable_readings": {
+        "mean": 0.0,
+        "min": 0,
+        "max": 0,
+        "trials": 3
+      }
+    },
+    "cloud_spread": {
+      "text_recovery_accuracy": {
+        "mean": 0.9925039363101572,
+        "min": 0.9917127166384029,
+        "max": 0.9934366030740689,
+        "trials": 3
+      },
+      "hallucination_rate": {
+        "mean": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "trials": 3
+      },
+      "chrome_transcription_rate": {
+        "mean": 0.16666666666666666,
+        "min": 0.0,
+        "max": 0.5,
+        "trials": 3
+      },
+      "vision_token_f1_mean": {
+        "mean": 0.9917588795243337,
+        "min": 0.991135727387733,
+        "max": 0.9923472890606931,
+        "trials": 3
+      },
+      "vision_wer_mean": {
+        "mean": 0.046822447009810635,
+        "min": 0.04588978024589909,
+        "max": 0.04761366668156498,
+        "trials": 3
+      },
+      "unusable_readings": {
+        "mean": 0.0,
+        "min": 0,
+        "max": 0,
+        "trials": 3
+      }
+    },
+    "bar": {
+      "accuracy_floor": 0.8371902191256061,
+      "hallucination_ceiling": 0.0,
+      "f1_floor": 0.8588045934258722,
+      "noise_band": 0.03
+    }
   },
   "summary": {
-    "cases_scored": 26,
+    "cases_scored": 29,
     "ocr_wer_mean": 0.5113310182004613,
-    "vision_wer_mean": 0.062277655847025215,
-    "vision_token_recall_mean": 0.9917127166384029,
-    "text_recovery_accuracy": 0.9917127166384029,
+    "vision_wer_mean": 0.046963894101967836,
+    "vision_token_recall_mean": 0.9923624892180002,
+    "text_recovery_accuracy": 0.9923624892180002,
     "hallucination_rate": 0.0,
-    "chrome_transcription_rate": 0.0,
+    "chrome_transcription_rate": 0.5,
     "unusable_readings": 0,
-    "vision_token_f1_mean": 0.9839558162652174,
-    "grounding_precision": 0.7142857142857143,
+    "vision_token_f1_mean": 0.9917936221245751,
+    "grounding_precision": 0.7647058823529411,
     "grounding_recall": 1.0
   },
   "cases": [
@@ -70,9 +178,9 @@
       "legibility": "partial",
       "has_text": true,
       "ocr_wer": 0.8775510204081632,
-      "vision_wer": 0.10204081632653061,
+      "vision_wer": 0.04081632653061224,
       "vision_recall": 0.9591836734693877,
-      "vision_f1": 0.9306930693069307,
+      "vision_f1": 0.9690721649484536,
       "flagged": true,
       "should_flag": true,
       "claimed_text": null,
@@ -98,9 +206,9 @@
       "legibility": "partial",
       "has_text": true,
       "ocr_wer": 1.0,
-      "vision_wer": 0.037037037037037035,
-      "vision_recall": 0.9629629629629629,
-      "vision_f1": 0.975,
+      "vision_wer": 0.024691358024691357,
+      "vision_recall": 0.9753086419753086,
+      "vision_f1": 0.9875,
       "flagged": true,
       "should_flag": true,
       "claimed_text": null,
@@ -140,9 +248,9 @@
       "legibility": "clean",
       "has_text": true,
       "ocr_wer": 0.43478260869565216,
-      "vision_wer": 0.21739130434782608,
+      "vision_wer": 0.0,
       "vision_recall": 1.0,
-      "vision_f1": 0.9019607843137255,
+      "vision_f1": 1.0,
       "flagged": false,
       "should_flag": false,
       "claimed_text": null,
@@ -257,12 +365,12 @@
       "vision_f1": null,
       "flagged": true,
       "should_flag": true,
-      "claimed_text": false,
+      "claimed_text": true,
       "unusable": false
     },
     {
       "id": "16_85b9f9f6a4fc_f09",
-      "category": "textless",
+      "category": "chrome_only",
       "legibility": "unreadable",
       "has_text": false,
       "ocr_wer": null,
@@ -402,6 +510,48 @@
     },
     {
       "id": "26_synth_textless_f04",
+      "category": "textless",
+      "legibility": "unreadable",
+      "has_text": false,
+      "ocr_wer": null,
+      "vision_wer": null,
+      "vision_recall": null,
+      "vision_f1": null,
+      "flagged": true,
+      "should_flag": true,
+      "claimed_text": false,
+      "unusable": false
+    },
+    {
+      "id": "27_synth_textless_f05",
+      "category": "textless",
+      "legibility": "unreadable",
+      "has_text": false,
+      "ocr_wer": null,
+      "vision_wer": null,
+      "vision_recall": null,
+      "vision_f1": null,
+      "flagged": true,
+      "should_flag": true,
+      "claimed_text": false,
+      "unusable": false
+    },
+    {
+      "id": "28_synth_textless_f06",
+      "category": "textless",
+      "legibility": "unreadable",
+      "has_text": false,
+      "ocr_wer": null,
+      "vision_wer": null,
+      "vision_recall": null,
+      "vision_f1": null,
+      "flagged": true,
+      "should_flag": true,
+      "claimed_text": false,
+      "unusable": false
+    },
+    {
+      "id": "29_synth_textless_f07",
       "category": "textless",
       "legibility": "unreadable",
       "has_text": false,

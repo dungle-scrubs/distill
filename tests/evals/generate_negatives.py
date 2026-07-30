@@ -248,6 +248,65 @@ def _gray_wall(_text: str) -> Image.Image:
     return Image.frombytes("RGB", FRAME_SIZE, bytes(buffer))
 
 
+def _soft_gradient(_text: str) -> Image.Image:
+    """A calm horizontal gradient with deterministic grain. The easy end of the
+    true-negative range: nothing here suggests text at all."""
+    buffer = bytearray(WIDTH * HEIGHT * 3)
+    index = 0
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            across = x / WIDTH
+            grain = ((x * 13 + y * 7) % 11) - 5
+            red = int(58 + 96 * across) + grain
+            green = int(66 + 74 * across) + grain
+            blue = int(88 + 52 * across) + grain
+            buffer[index : index + 3] = (
+                max(0, min(255, red)),
+                max(0, min(255, green)),
+                max(0, min(255, blue)),
+            )
+            index += 3
+    return Image.frombytes("RGB", FRAME_SIZE, bytes(buffer))
+
+
+def _blurred_slide_shape(_text: str) -> Image.Image:
+    """A slide's SHAPE with no glyphs: a title bar, bullet rows and a footer,
+    blurred past legibility.
+
+    The hard end of the true-negative range, and the reason it exists: a frame
+    that looks like it should carry text is what actually induces a reader to
+    invent some. A flat gray wall tests almost nothing.
+    """
+    image = Image.new("RGB", FRAME_SIZE, "#f2efe9")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((110, 92, 880, 152), fill="#8f9aa6")
+    for row in range(4):
+        top = 250 + row * 88
+        width = (760, 640, 700, 520)[row]
+        draw.ellipse((116, top + 14, 140, top + 38), fill="#9aa4ae")
+        draw.rectangle((170, top, 170 + width, top + 46), fill="#a7b0b9")
+    draw.rectangle((110, 640, 430, 676), fill="#c3c8cd")
+    return image.filter(ImageFilter.GaussianBlur(radius=17))
+
+
+def _terminal_shape(_text: str) -> Image.Image:
+    """A terminal window's shape - dark panel, title strip, rows of short bars
+    at code-line rhythm - with no glyphs. The 'screenshot too low-resolution to
+    read' case, and the second frame built to tempt invention."""
+    image = Image.new("RGB", FRAME_SIZE, "#0d1117")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((150, 70, 1130, 660), fill="#161b22")
+    draw.rectangle((150, 70, 1130, 118), fill="#21262d")
+    for dot_x, fill in ((178, "#e06c5a"), (206, "#d9b45c"), (234, "#63b862")):
+        draw.ellipse((dot_x, 84, dot_x + 18, 102), fill=fill)
+    rhythm = (320, 180, 470, 250, 390, 150, 430, 300, 210, 360)
+    for row, width in enumerate(rhythm):
+        top = 156 + row * 46
+        indent = 190 + (40 if row % 3 == 1 else 0)
+        draw.rectangle((indent, top, indent + width, top + 16), fill="#3f4a57")
+    return image.filter(ImageFilter.GaussianBlur(radius=9))
+
+
 @dataclass(frozen=True)
 class SyntheticCase:
     text: str
@@ -295,6 +354,9 @@ Vision should recover this sentence""",
     "24_synth_textless_f02": SyntheticCase(text="", render=_abstract_geometry),
     "25_synth_textless_f03": SyntheticCase(text="", render=_blurred_room),
     "26_synth_textless_f04": SyntheticCase(text="", render=_gray_wall),
+    "27_synth_textless_f05": SyntheticCase(text="", render=_soft_gradient),
+    "28_synth_textless_f06": SyntheticCase(text="", render=_blurred_slide_shape),
+    "29_synth_textless_f07": SyntheticCase(text="", render=_terminal_shape),
 }
 
 SYNTHETIC_CASE_TEXT = {
