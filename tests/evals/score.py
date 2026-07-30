@@ -192,7 +192,10 @@ def truth_text(case_id: str) -> str | None:
 
 
 def evaluate(
-    with_vision: bool, model: str | None = None, backend: str | None = None
+    with_vision: bool,
+    model: str | None = None,
+    backend: str | None = None,
+    base_url: str | None = None,
 ) -> list[CaseResult]:
     # The same lookup that gates this function must also drive the OCR call.
     # find_tesseract_command() falls back to well-known install paths that are
@@ -202,7 +205,7 @@ def evaluate(
     tesseract_cmd = find_tesseract_command()
     if not tesseract_cmd:
         raise SystemExit("tesseract not found; install it before scoring OCR")
-    interpret = _vision_interpreter(model, backend) if with_vision else None
+    interpret = _vision_interpreter(model, backend, base_url) if with_vision else None
     results: list[CaseResult] = []
     for case in load_labelled_cases():
         case_id = case.id
@@ -262,7 +265,9 @@ def evaluate(
     return results
 
 
-def _vision_interpreter(model: str | None = None, backend: str | None = None):
+def _vision_interpreter(
+    model: str | None = None, backend: str | None = None, base_url: str | None = None
+):
     from distill.local_vision import LocalVisionConfig, probe_local_vision, try_interpret_image
     from distill.vision_prompts import build_technical_frame_prompt
 
@@ -271,6 +276,8 @@ def _vision_interpreter(model: str | None = None, backend: str | None = None):
         overrides["model"] = model
     if backend:
         overrides["backend"] = backend
+    if base_url:
+        overrides["base_url"] = base_url.rstrip("/")
     config = replace(LocalVisionConfig(), **overrides) if overrides else LocalVisionConfig()
     probe = probe_local_vision(config)
     if not probe.available:
@@ -337,13 +344,30 @@ def main() -> None:
         default=None,
         help="optional vision model override; default is the eval-chosen Qwen3-VL-8B-8bit",
     )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="vision endpoint override (e.g. http://127.0.0.1:17439/v1); default is the config's",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON for programmatic use")
     args = parser.parse_args()
 
-    results = evaluate(args.with_vision, args.model, args.backend)
+    results = evaluate(args.with_vision, args.model, args.backend, args.base_url)
     summary = summarize(results)
     if args.json:
-        print(json.dumps({"summary": summary, "cases": [vars(r) for r in results]}, indent=2))
+        # The run block makes a stored score self-describing (what model/endpoint
+        # produced it), so a committed baseline stays reproducible.
+        run = {
+            "with_vision": args.with_vision,
+            "model": args.model,
+            "backend": args.backend,
+            "base_url": args.base_url,
+        }
+        print(
+            json.dumps(
+                {"run": run, "summary": summary, "cases": [vars(r) for r in results]}, indent=2
+            )
+        )
         return
     if not results:
         print("No verified cases yet. Fill in <id>.gt.txt and set verified = true in cases.toml.")

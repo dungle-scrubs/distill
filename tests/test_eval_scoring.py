@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -51,7 +52,7 @@ def configure_textless_evaluation(
     monkeypatch.setattr(
         score,
         "_vision_interpreter",
-        lambda _model, _backend: lambda _image, _ocr_text: interpretation,
+        lambda _model, _backend, _base_url: lambda _image, _ocr_text: interpretation,
     )
 
 
@@ -217,6 +218,20 @@ def test_acceptance_rule_fails_out_of_bounds_or_unmeasured_metrics(
         accuracy_ok=accuracy_ok,
         hallucination_ok=hallucination_ok,
     )
+
+
+def test_local_baseline_passes_its_own_acceptance_rule() -> None:
+    """The committed baseline must be self-consistent: the local reader passes
+    the Gate 2->3 bar that was pinned from its own measured numbers."""
+    baseline = json.loads((score.EVAL_ROOT / "baseline_local.json").read_text())
+    rule = score.AcceptanceRule(**baseline["acceptance_rule"])
+
+    verdict = rule.evaluate(
+        accuracy=baseline["summary"]["text_recovery_accuracy"],
+        hallucination_rate=baseline["summary"]["hallucination_rate"],
+    )
+
+    assert verdict.passed
 
 
 def test_summarize_includes_accuracy_and_hallucination_rate() -> None:
