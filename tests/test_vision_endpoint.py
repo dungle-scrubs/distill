@@ -70,6 +70,7 @@ class _CannedResponse:
             self.headers[name] = value
         self._body = body
         self._endless = endless
+        self._offset = 0
         self.read_sizes: list[int] = []
 
     def read(self, size: int = -1) -> bytes:
@@ -78,7 +79,12 @@ class _CannedResponse:
             if size < 0:
                 raise AssertionError("an unbounded read of an endless body never returns")
             return b"a" * size
-        return self._body if size < 0 else self._body[:size]
+        if size < 0:
+            chunk, self._offset = self._body[self._offset :], len(self._body)
+            return chunk
+        chunk = self._body[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
     def close(self) -> None:
         return None
@@ -425,7 +431,10 @@ def test_a_response_body_beyond_the_cap_is_rejected(
     with pytest.raises(RuntimeError, match=str(MAX_RESPONSE_BYTES)):
         _urlopen_json("GET", MODELS_URL, None, 5.0)
 
-    assert endless.read_sizes == [MAX_RESPONSE_BYTES + 1]
+    # Chunked since M2.5 (the absolute deadline is enforced between chunks):
+    # the reads still stop at exactly one byte past the cap, never beyond.
+    assert sum(endless.read_sizes) == MAX_RESPONSE_BYTES + 1
+    assert all(size > 0 for size in endless.read_sizes)
 
     image = tmp_path / "frame.png"
     image.write_bytes(b"png")
@@ -576,16 +585,28 @@ def test_an_error_body_is_read_under_a_bound_too(
 ) -> None:
     """R-44 on the path that quotes the body instead of parsing it.
 
-    A `500` whose body never ends is read to build the message a **warning**
+    A `404` whose body never ends is read to build the message a **warning**
     carries. Only a preview of it is ever used, so the read stops long before
-    the response cap - the endless body proves it stopped at all.
+    the response cap - the endless body proves it stopped at all. A `500` is
+    retryable since M2.5 and reads no body at all: the strongest bound is the
+    read that never happens.
     """
-    endless = _CannedResponse(MODELS_URL, status=500, endless=True)
+    endless = _CannedResponse(MODELS_URL, status=404, endless=True)
     monkeypatch.setattr(
         "distill.rapid_mlx._OPENER", _build_opener(_FakeTransport({MODELS_URL: endless}))
     )
 
-    with pytest.raises(RuntimeError, match="HTTP 500"):
+    with pytest.raises(RuntimeError, match="HTTP 404"):
         _urlopen_json("GET", MODELS_URL, None, 5.0)
 
     assert endless.read_sizes == [ERROR_BODY_PREVIEW_BYTES]
+
+    retryable = _CannedResponse(MODELS_URL, status=500, endless=True)
+    monkeypatch.setattr(
+        "distill.rapid_mlx._OPENER", _build_opener(_FakeTransport({MODELS_URL: retryable}))
+    )
+
+    with pytest.raises(LocalVisionFailure, match="HTTP 500"):
+        _urlopen_json("GET", MODELS_URL, None, 5.0)
+
+    assert retryable.read_sizes == []

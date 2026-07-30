@@ -813,6 +813,7 @@ class _FakeHttpResponse:
 
     def __init__(self, payload: bytes) -> None:
         self._payload = payload
+        self._offset = 0
 
     def __enter__(self) -> _FakeHttpResponse:
         return self
@@ -821,7 +822,12 @@ class _FakeHttpResponse:
         return None
 
     def read(self, size: int = -1) -> bytes:
-        return self._payload if size < 0 else self._payload[:size]
+        if size < 0:
+            chunk, self._offset = self._payload[self._offset :], len(self._payload)
+            return chunk
+        chunk = self._payload[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
 
 
 class _FakeOpener:
@@ -1777,3 +1783,154 @@ class TestAttemptCompletionAvailability:
 
         assert probe.available is False
         assert probe.code == "local_vision_model_unavailable"
+
+
+class TestBoundedRemoteBehavior:
+    """M2.5: stream off, absolute deadline, run-wide budget, bounded retries."""
+
+    def test_the_interpret_request_sets_stream_false(self) -> None:
+        server = FakeRapidMlx(chat_content=_frame_json())
+
+        result = _interpret_with_rapid_mlx(
+            LocalVisionConfig(),
+            Path(__file__),
+            "Interpret.",
+            "technical",
+            requestor=server,
+        )
+
+        assert result is not None
+        [attempt] = [c for c in server.calls if c["method"] == "POST"]
+        assert attempt["body"]["stream"] is False
+
+    def test_a_slow_drip_trips_the_absolute_deadline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """urllib's timeout is per socket operation; a body arriving one chunk
+        at a time never trips it. The deadline is absolute: the whole answer
+        arrives within timeout_sec or the request is a timeout."""
+        from distill.rapid_mlx import _urlopen_json
+
+        clock = {"now": 0.0}
+        monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: clock["now"])
+
+        class _DrippingResponse:
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *exc_info: object) -> None:
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                # Each chunk costs 10 simulated seconds and never finishes.
+                clock["now"] += 10.0
+                return b"x" * min(size if size > 0 else 65536, 65536)
+
+        class _DrippingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                return _DrippingResponse()
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _DrippingOpener())
+
+        with pytest.raises(TimeoutError):
+            _urlopen_json(
+                "POST",
+                "http://127.0.0.1:8000/v1/chat/completions",
+                {"model": "m"},
+                timeout_sec=30.0,
+            )
+
+    def test_the_byte_budget_degrades_the_remainder_and_keeps_prior_frames(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        opened = {"n": 0}
+
+        class _CountingOpener(_FakeOpener):
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                opened["n"] += 1
+                return super().open(request, timeout)
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _CountingOpener(payload))
+
+        interpreter = FrameInterpreter(
+            LocalVisionConfig(),
+            probe=_available_probe,
+            # Enough for one response, not two: the second request must find
+            # the budget spent and the third must never be attempted.
+            budget_bytes=len(payload) + 10,
+        )
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        assert frames[0].reading is not None  # already-interpreted frames kept
+        assert frames[1].reading is None
+        assert frames[2].reading is None
+        assert opened["n"] <= 2  # the third frame was never attempted
+        codes = {w["code"] for w in warnings}
+        assert "local_vision_budget_exhausted" in codes
+
+    def test_the_wall_clock_budget_degrades_the_remainder(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        clock = {"now": 0.0}
+        monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: clock["now"])
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+
+        class _SlowFrameOpener(_FakeOpener):
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                clock["now"] += 100.0  # each frame costs 100 simulated seconds
+                return super().open(request, timeout)
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _SlowFrameOpener(payload))
+
+        interpreter = FrameInterpreter(
+            LocalVisionConfig(timeout_sec=1000.0),
+            probe=_available_probe,
+            budget_sec=150.0,
+        )
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        assert frames[0].reading is not None
+        assert frames[1].reading is None
+        assert frames[2].reading is None
+        assert "local_vision_budget_exhausted" in {w["code"] for w in warnings}
+
+    def test_a_429_honors_retry_after_with_bounded_retries_then_degrades(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from email.message import Message
+
+        opened = {"n": 0}
+        sleeps: list[float] = []
+
+        class _RateLimitingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                opened["n"] += 1
+                headers = Message()
+                headers["Retry-After"] = "3"
+                raise urllib.error.HTTPError(
+                    request.full_url, 429, "too many requests", headers, io.BytesIO(b"{}")
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _RateLimitingOpener())
+        monkeypatch.setattr("distill.local_vision._sleep", sleeps.append)
+
+        result, failure_warning = try_interpret_image(
+            LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+        )
+
+        assert result is None
+        assert failure_warning is not None
+        assert failure_warning["code"] == "local_vision_retry_exhausted"
+        # One original attempt plus two bounded retries, each honoring the
+        # server's requested pause.
+        assert opened["n"] == 3
+        assert sleeps == [3.0, 3.0]

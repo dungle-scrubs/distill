@@ -39,6 +39,7 @@ import logging
 import math
 import os
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -85,6 +86,9 @@ from .rapid_mlx import (
 )
 from .rapid_mlx import (
     SecretCredential as SecretCredential,
+)
+from .rapid_mlx import (
+    VisionStageBudget as VisionStageBudget,
 )
 from .rapid_mlx import (
     _boundary_log as _boundary_log,
@@ -173,20 +177,44 @@ TRANSPORT_FAILURE_CODES = frozenset(
 # evidence it works. A success is the other member of this class and needs no
 # code. Everything else (an unreadable image file, a cancelled run) happened on
 # this side of the wire and says nothing either way.
-DELIVERED_RESPONSE_CODES = frozenset({"local_vision_malformed_response"})
+DELIVERED_RESPONSE_CODES = frozenset(
+    {"local_vision_malformed_response", "local_vision_retry_exhausted"}
+)
+# 429/5xx handling (D-008): the server asked for a pause, so honor it - but
+# bounded on both axes, attempts and seconds, because Retry-After is the
+# endpoint's claim about the endpoint and the run's time is this process's.
+RETRYABLE_MAX_RETRIES = 2
+RETRY_AFTER_CAP_SEC = 10.0
+DEFAULT_RETRY_BACKOFF_SEC = 1.0
+# Injectable so tests assert the pause without sleeping through it.
+_sleep = time.sleep
 # Failures that condemn every remaining attempt the moment one happens: a
 # rejected credential will be rejected again on the next keyframe, and a
 # rejected endpoint is a property of the config, not of the frame - retrying
 # either is sending more keyframes to an endpoint that already said no
 # (D-016, D-008).
-IMMEDIATE_FAILURE_CODES = frozenset({"local_vision_auth_rejected", ENDPOINT_REJECTED_CODE})
+IMMEDIATE_FAILURE_CODES = frozenset(
+    {
+        "local_vision_auth_rejected",
+        ENDPOINT_REJECTED_CODE,
+        VisionStageBudget.CODE,
+    }
+)
 BREAKER_WARNING_CODE = "local_vision_transport_breaker_open"
+# Run-wide vision-stage budget defaults (D-008): generous enough that a local
+# run never notices them, small enough that a remote endpoint cannot drip a
+# run into unbounded cost. Wall clock covers the whole stage; bytes are the
+# received response bodies.
+DEFAULT_VISION_STAGE_BUDGET_SEC = 600.0
+DEFAULT_VISION_STAGE_BUDGET_BYTES = 256 * 1024 * 1024
 FRAME_READ_FAILURE_CODES = frozenset(
     {
         "local_vision_malformed_response",
+        "local_vision_retry_exhausted",
         "local_vision_timeout",
         "local_vision_image_read_failed",
         "local_vision_auth_rejected",
+        VisionStageBudget.CODE,
         ENDPOINT_REJECTED_CODE,
     }
 )
@@ -231,6 +259,12 @@ class LocalVisionConfig:
     # "meant to authenticate and the value went missing" (D-016).
     credential_configured: bool = False
     credential_env: str = ""
+    budget: VisionStageBudget | None = field(
+        default=None, repr=False, compare=False, metadata={"runtime": True}
+    )
+    """The run's vision-stage budget, attached by the interpreter to its
+    per-run resolved config. Runtime state, not configuration: excluded from
+    identity, `repr`, and `public_dict`."""
 
     def public_dict(self) -> dict[str, Any]:
         # Excluded by the `secret` metadata flag and by carrier type - a rule
@@ -239,7 +273,11 @@ class LocalVisionConfig:
         public: dict[str, Any] = {}
         for f in fields(self):
             value = getattr(self, f.name)
-            if f.metadata.get("secret") or isinstance(value, SecretCredential):
+            if (
+                f.metadata.get("secret")
+                or f.metadata.get("runtime")
+                or isinstance(value, SecretCredential)
+            ):
                 continue
             public[f.name] = value
         return public
@@ -1005,6 +1043,8 @@ class FrameInterpreter:
     try_interpret: TryInterpretImage = try_interpret_image_after_probe
     max_parallel: int = DEFAULT_MAX_PARALLEL
     debug: bool | None = None
+    budget_sec: float = DEFAULT_VISION_STAGE_BUDGET_SEC
+    budget_bytes: int = DEFAULT_VISION_STAGE_BUDGET_BYTES
     _last_probe: LocalVisionProbe | None = None
     _frame_count: int = 0
     _interpreted_count: int = 0
@@ -1085,13 +1125,19 @@ class FrameInterpreter:
             pass
 
     def _resolved_config(self, probe: LocalVisionProbe) -> LocalVisionConfig:
+        # The budget starts when the stage does and rides the per-run resolved
+        # config, so the transport can charge each chunk as it arrives (D-008).
+        budget = VisionStageBudget(
+            wall_clock_sec=float(self.budget_sec), max_bytes=int(self.budget_bytes)
+        )
         if probe.backend != DEFAULT_LOCAL_VISION_BACKEND or not (probe.base_url and probe.model):
-            return self.config
+            return replace(self.config, budget=budget)
         return replace(
             self.config,
             backend=DEFAULT_LOCAL_VISION_BACKEND,
             model=probe.model,
             base_url=probe.base_url,
+            budget=budget,
         )
 
     def _interpret_frames(
@@ -1428,6 +1474,52 @@ class FrameInterpreter:
             raise AssertionError(f"frame at index {index} is missing required 'path'")
 
 
+def _post_completion_with_retries(
+    requestor: HttpRequestor | None,
+    completions_url: str,
+    body: dict[str, Any],
+    config: LocalVisionConfig,
+) -> dict[str, Any]:
+    """One completion POST, honoring 429/5xx Retry-After within bounds.
+
+    The server's requested pause is honored but capped, the retries are
+    counted, and when both are spent the frame degrades with its own code -
+    a rate limit is a delivered response, so it must not look like a
+    transport fault to the breaker (D-008).
+    """
+    retries_left = RETRYABLE_MAX_RETRIES
+    while True:
+        try:
+            return _http_post_json(
+                requestor,
+                completions_url,
+                body,
+                config.timeout_sec,
+                allow_remote_endpoint=config.allow_remote_endpoint,
+                credential=config.credential,
+                budget=config.budget,
+            )
+        except LocalVisionFailure as exc:
+            if exc.code != "local_vision_retryable":
+                raise
+            status = exc.detail.get("status")
+            if retries_left <= 0:
+                raise LocalVisionFailure(
+                    "local_vision_retry_exhausted",
+                    f"Local vision endpoint kept answering HTTP {status} after "
+                    f"{RETRYABLE_MAX_RETRIES} retries; continuing with OCR-only "
+                    "output for this keyframe.",
+                    {"status": status, "retries": RETRYABLE_MAX_RETRIES},
+                ) from exc
+            retries_left -= 1
+            retry_after = exc.detail.get("retry_after")
+            pause = min(
+                float(retry_after) if retry_after else DEFAULT_RETRY_BACKOFF_SEC,
+                RETRY_AFTER_CAP_SEC,
+            )
+            _sleep(pause)
+
+
 def _interpret_with_rapid_mlx(
     config: LocalVisionConfig,
     image_path: Path,
@@ -1464,18 +1556,20 @@ def _interpret_with_rapid_mlx(
         ],
         "temperature": 0,
         "response_format": {"type": "json_object"},
+        # D-008: never a stream. A streamed answer defeats the absolute
+        # deadline and the response cap alike - the bound is on the whole
+        # answer, not on each drip of it.
+        "stream": False,
     }
     completions_url = _completions_url(config.base_url)
     last_preview = ""
     for _attempt in range(DEFAULT_MAX_ATTEMPTS):
         try:
-            envelope = _http_post_json(
+            envelope = _post_completion_with_retries(
                 requestor,
                 completions_url,
                 body,
-                config.timeout_sec,
-                allow_remote_endpoint=config.allow_remote_endpoint,
-                credential=config.credential,
+                config,
             )
         except TimeoutError as exc:
             raise LocalVisionFailure(

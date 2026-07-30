@@ -21,6 +21,8 @@ import ipaddress
 import json
 import logging
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,6 +54,64 @@ MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 
 
 ERROR_BODY_PREVIEW_BYTES = 2048
+
+
+# Injectable clock for the absolute deadline, so a test can drip a body
+# through simulated time instead of real sleeps.
+_monotonic = time.monotonic
+
+# The absolute deadline is enforced between chunk reads, so the chunk is how
+# often a dripping response gets measured against the clock.
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+class VisionStageBudget:
+    """Run-wide bounds for the vision stage: wall clock and received bytes.
+
+    Charged by the transport as chunks arrive, checked before each request.
+    Exhaustion raises the typed budget failure, which the interpreter treats
+    as immediate: the remainder degrades to OCR-only and every frame already
+    interpreted is kept (D-008).
+    """
+
+    CODE = "local_vision_budget_exhausted"
+
+    def __init__(self, *, wall_clock_sec: float, max_bytes: int) -> None:
+        self._deadline = _monotonic() + wall_clock_sec
+        self._wall_clock_sec = wall_clock_sec
+        self._max_bytes = max_bytes
+        self._remaining = max_bytes
+        self._lock = threading.Lock()
+
+    def _exhaust(self, why: str) -> NoReturn:
+        _boundary_log(
+            "budget_exhausted",
+            {"why": why, "wall_clock_sec": self._wall_clock_sec, "max_bytes": self._max_bytes},
+        )
+        raise LocalVisionFailure(
+            self.CODE,
+            f"the vision stage's run-wide budget is spent ({why}); remaining "
+            "keyframes continue with OCR-only output.",
+            {"why": why, "wall_clock_sec": self._wall_clock_sec, "max_bytes": self._max_bytes},
+        )
+
+    def check(self) -> None:
+        with self._lock:
+            if _monotonic() > self._deadline:
+                self._exhaust("wall clock")
+            if self._remaining <= 0:
+                self._exhaust("bytes")
+
+    def charge(self, received_bytes: int) -> None:
+        # Both bounds, per chunk: crossing either mid-body cuts the response
+        # off in flight - the bound is on the run, not on how the endpoint
+        # chunks it or how long it takes to drip.
+        with self._lock:
+            self._remaining -= received_bytes
+            if self._remaining < 0:
+                self._exhaust("bytes")
+            if _monotonic() > self._deadline:
+                self._exhaust("wall clock")
 
 
 class LocalVisionFailure(Exception):
@@ -436,6 +496,7 @@ def _http_get_json(
     *,
     allow_remote_endpoint: bool = False,
     credential: SecretCredential | None = None,
+    budget: VisionStageBudget | None = None,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="GET", url=url, timeout=timeout_sec)
@@ -447,6 +508,7 @@ def _http_get_json(
             timeout_sec=timeout_sec,
             allow_remote_endpoint=allow_remote_endpoint,
             credential=credential,
+            budget=budget,
         )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
@@ -461,6 +523,7 @@ def _http_post_json(
     *,
     allow_remote_endpoint: bool = False,
     credential: SecretCredential | None = None,
+    budget: VisionStageBudget | None = None,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="POST", url=url, body=body, timeout=timeout_sec)
@@ -472,6 +535,7 @@ def _http_post_json(
             timeout_sec=timeout_sec,
             allow_remote_endpoint=allow_remote_endpoint,
             credential=credential,
+            budget=budget,
         )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
@@ -537,6 +601,7 @@ def _urlopen_json(
     allow_remote_endpoint: bool = False,
     resolver: AddressResolver | None = None,
     credential: SecretCredential | None = None,
+    budget: VisionStageBudget | None = None,
 ) -> Any:
     """One request to the vision endpoint, validated before and bounded after.
 
@@ -568,13 +633,34 @@ def _urlopen_json(
         method=method,
         headers=_request_headers(credential),
     )
+    # The deadline is absolute and covers the whole request - connect, send,
+    # and every chunk of the answer. urllib's timeout is per socket operation,
+    # so without this a body arriving one drip at a time never times out
+    # (D-008).
+    if budget is not None:
+        budget.check()
+    deadline = _monotonic() + timeout_sec
     try:
         with _OPENER.open(request, timeout=timeout_sec) as response:
             # One byte past the cap, so a body that is exactly at it still
             # arrives and a body over it is recognisable without being read.
             # The header is not consulted: a Content-Length is the sender's
             # claim about the sender, and R-44 is a bound on this process.
-            payload = response.read(MAX_RESPONSE_BYTES + 1)
+            chunks: list[bytes] = []
+            received = 0
+            while received <= MAX_RESPONSE_BYTES:
+                if _monotonic() > deadline:
+                    raise TimeoutError(f"response did not complete within {timeout_sec} seconds")
+                chunk = response.read(min(_READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - received))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+                if budget is not None:
+                    # Charged as it arrives, so a dripping over-budget body is
+                    # cut off mid-flight, not billed after the fact.
+                    budget.charge(len(chunk))
+            payload = b"".join(chunks)
         if len(payload) > MAX_RESPONSE_BYTES:
             # A delivered response, in M7.2's sense: it arrived, so it is
             # evidence the transport works and must not count toward the
@@ -594,6 +680,22 @@ def _urlopen_json(
                 f"Local vision endpoint rejected the credential (HTTP {exc.code}); "
                 "continuing with OCR-only output.",
                 {"status": exc.code, "url": _safe_url_for_message(url)},
+            ) from exc
+        if exc.code == 429 or 500 <= exc.code < 600:
+            retry_after_header = ""
+            if getattr(exc, "headers", None) is not None:
+                retry_after_header = str(exc.headers.get("Retry-After") or "")
+            try:
+                retry_after: float | None = float(retry_after_header)
+            except ValueError:
+                # The http-date form (or junk) is not worth parsing; the
+                # caller's default backoff covers it.
+                retry_after = None
+            raise LocalVisionFailure(
+                "local_vision_retryable",
+                f"Local vision endpoint answered HTTP {exc.code}; retrying is "
+                "allowed within bounds.",
+                {"status": exc.code, "retry_after": retry_after},
             ) from exc
         # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so
         # the probe/interpret paths can map them onto warning codes. Bounded
