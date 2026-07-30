@@ -2251,3 +2251,59 @@ class TestNonLocalProvenance:
 
         assert "## Warnings" in render
         assert "non_local_only_processing" in render
+
+    @pytest.mark.parametrize(
+        ("base_url", "allow_remote", "expected"),
+        [
+            # A hostname WITHOUT the opt-in never folds: the per-request
+            # resolved check keeps it loopback-or-rejected.
+            ("https://vision.example.com/v1", False, False),
+            # The same hostname WITH the opt-in fails closed as remote.
+            ("https://vision.example.com/v1", True, True),
+            # http can never leave the machine (proved per request, opt-in
+            # or not), so localhost-over-http is not a non-local claim.
+            ("http://localhost:8000/v1", True, False),
+            ("https://10.0.0.5:8000/v1", True, True),
+            ("http://127.0.0.1:8000/v1", True, False),
+        ],
+    )
+    def test_the_non_local_predicate_terms(
+        self, base_url: str, allow_remote: bool, expected: bool
+    ) -> None:
+        from dataclasses import replace
+
+        from distill.local_vision import config_is_non_local
+
+        config = replace(LocalVisionConfig(), base_url=base_url, allow_remote_endpoint=allow_remote)
+
+        assert config_is_non_local(config) is expected
+
+    def test_the_warning_survives_an_unavailable_endpoint(self, tmp_path: Path) -> None:
+        """The fold is computed from options before any I/O; the disclosure
+        must reach the render even when the endpoint never answers."""
+        from dataclasses import replace
+
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def unavailable_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+            return LocalVisionProbe(
+                available=False,
+                backend=config.backend,
+                model=config.model,
+                base_url=config.base_url,
+                code="local_vision_rapid_mlx_unavailable",
+                message="down",
+                detail={},
+            )
+
+        remote = replace(
+            LocalVisionConfig(),
+            base_url="https://10.0.0.5:8000/v1",
+            allow_remote_endpoint=True,
+        )
+        interpreter = FrameInterpreter(remote, probe=unavailable_probe)
+        _frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        codes = {w["code"] for w in warnings}
+        assert "non_local_only_processing" in codes
+        assert "local_vision_rapid_mlx_unavailable" in codes

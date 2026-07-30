@@ -534,7 +534,9 @@ class DistillOptions:
         # a (possibly) remote endpoint. The boolean folds into identity so
         # remote- and local-produced bundles never share a key; the address
         # and credential stay machine-local claims and never enter the hash.
-        payload["local_vision_non_local"] = config_is_non_local(self.local_vision_config())
+        payload["local_vision_non_local"] = self.caption_frames and config_is_non_local(
+            self.local_vision_config()
+        )
         payload["pipeline_version"] = PIPELINE_VERSION
         if source_type == "local":
             payload["cache_mode"] = self.cache_mode

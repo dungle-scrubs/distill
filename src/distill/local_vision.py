@@ -289,10 +289,20 @@ class LocalVisionConfig:
 
 def config_is_non_local(config: LocalVisionConfig) -> bool:
     """D-012's predicate, in one place: this run MAY send keyframes off the
-    producing machine. True when the operator opted into a remote endpoint
-    AND the host is not a literal loopback address (a name counts as remote -
-    it cannot be settled statically, and provenance folds fail closed)."""
-    return config.allow_remote_endpoint and not _static_host_is_loopback(config.base_url)
+    producing machine. True when the operator opted into a remote endpoint,
+    the scheme is not `http` (which the transport proves loopback on every
+    request, opt-in or not - D-008), and the host is not a literal loopback
+    address. An `https` hostname counts as remote: it cannot be settled
+    statically, and provenance folds fail closed."""
+    if not config.allow_remote_endpoint:
+        return False
+    try:
+        scheme = urllib.parse.urlsplit(config.base_url).scheme.lower()
+    except ValueError:
+        return True  # unparsable fails closed, like an unsettleable name
+    if scheme == "http":
+        return False
+    return not _static_host_is_loopback(config.base_url)
 
 
 @dataclass(frozen=True)
@@ -541,12 +551,7 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
             # (D-007). Re-adding the raw base_url here defeated exactly that.
             dict(exc.detail),
         ) from exc
-    if (
-        config.credential_configured
-        and config.credential is None
-        and config.allow_remote_endpoint
-        and not _static_host_is_loopback(config.base_url)
-    ):
+    if config.credential_configured and config.credential is None and config_is_non_local(config):
         # D-016's typo guard: a credential the operator *configured* resolved
         # to nothing, on a config that says remote is intended and whose host
         # is not literally loopback. Without allow_remote_endpoint the
@@ -1093,27 +1098,30 @@ class FrameInterpreter:
         # max_parallel<=1 keeps interpretation serial — the config fallback if
         # parallel-vs-serial is not a measured win (A-004).
         self._max_parallel = max(int(self.max_parallel), 1)
+        provenance_warnings: list[WarningRecord] = []
+        if config_is_non_local(self.config):
+            # D-012: both provenance surfaces - this warning and the identity
+            # fold in options.cache_payload - read the SAME predicate on the
+            # same input, before any I/O, so a bundle keyed non-local always
+            # carries the disclosure even when the endpoint never answers.
+            non_local = warning(
+                "local_vision",
+                "non_local_only_processing",
+                "this run was configured to send keyframes to a non-loopback "
+                "vision endpoint; the generation may not be local-only "
+                "processing.",
+            )
+            self._record_warning(non_local)
+            provenance_warnings.append(non_local)
         if not probe.available:
             if self.progress:
                 self.progress.skip_cached("local_vision", detail={"reason": probe.code})
             probe_warning = probe.warning()
             self._record_warning(probe_warning)
             self._log("interpret.unavailable", {"code": probe.code})
-            return frames, [probe_warning]
+            return frames, [*provenance_warnings, probe_warning]
 
-        warnings: list[WarningRecord] = []
-        if config_is_non_local(self.config):
-            # D-012: the render must say this generation may not have been
-            # produced local-only. Recorded whether or not any frame ends up
-            # interpreted - the opt-in is the provenance fact.
-            non_local = warning(
-                "local_vision",
-                "non_local_only_processing",
-                "this run was configured to send keyframes to a non-loopback "
-                "vision endpoint; the generation is not local-only processing.",
-            )
-            self._record_warning(non_local)
-            warnings.append(non_local)
+        warnings: list[WarningRecord] = [*provenance_warnings]
         if probe.detail.get("model_not_listed"):
             # Available, but on the strength of an attempted completion rather
             # than the catalog (D-008) - the run says so once, out loud.
