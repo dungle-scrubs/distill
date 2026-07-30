@@ -5,9 +5,11 @@ Reads ``cases.toml`` and each frame's ``<id>.gt.txt`` and reports two things:
 1. Word-error-rate (WER) of recovered text vs. truth, for text-bearing frames.
    Preprocessed OCR is always scored; the vision model's ``verbatim_text`` is
    scored too when ``--with-vision`` is set and Rapid-MLX is running.
-2. Grounding-flag accuracy: whether ``grounding.assess_grounding`` flags the
-   frames a human marked hard/unreadable (``legibility != "clean"``) and stays
-   quiet on clean ones — precision/recall over that label.
+2. Grounding-flag accuracy: whether ``grounding.assess_grounding`` leaves the
+   frames a human marked hard/unreadable (``legibility != "clean"``)
+   uncorroborated and corroborates the clean ones — precision/recall over that
+   label. Since M3.1 the assessment states agreement rather than confidence,
+   so "flagged" here means "not corroborated".
 
 Unverified or empty cases are skipped, so the score reflects only frames a human
 has actually confirmed. Labels and fixtures are validated up front, and a
@@ -293,7 +295,7 @@ def evaluate(
                     has_interpretation=result.has_interpretation,
                     carries_a_reading=result.carries_a_reading,
                 )
-                flagged = assessment.is_low_confidence
+                flagged = not assessment.is_corroborated
             else:
                 # The model produced nothing usable: the pipeline now treats this
                 # as a low-confidence (ungrounded) frame, so the eval does too.

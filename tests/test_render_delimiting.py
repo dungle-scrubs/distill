@@ -29,7 +29,7 @@ import re
 from typing import Any
 
 import pytest
-from commonmark_ast import autolinks, destinations, inline_text, links, raw_html
+from commonmark_ast import autolinks, destinations, links
 from untrusted_blocks import (
     SENTINEL,
     assert_delimited,
@@ -41,7 +41,7 @@ from untrusted_blocks import (
 from distill.artifacts import FrameArtifact, Interpretation, Provenance, Transcript
 from distill.emit import EMITTER, UNTRUSTED_TEXT_LABEL
 from distill.links import RelatedLink
-from distill.render import render_markdown
+from distill.render import UNCORROBORATED_NOTE, render_markdown
 
 
 def keyframe(**overrides: Any) -> FrameArtifact:
@@ -198,97 +198,35 @@ def test_verbatim_text_is_delimited() -> None:
     assert_delimited(markdown, SENTINEL, "# verbatim")
 
 
-def test_the_low_confidence_banner_is_bounded_to_one_line() -> None:
-    """The banner is Distill's own voice, and it is held to being one line.
+def test_the_grounding_note_carries_nothing_from_the_document() -> None:
+    """Since M3.1 (D-002) the note is a fixed literal, so a hostile assessment
+    has no channel into it at all.
 
-    A **grounding** is Distill's assessment and its level and reason are
-    literals in `grounding.py`, so the banner is not delimited - the render is
-    speaking. But a `GroundingAssessment` rebuilt from a document takes what the
-    document held, and "another module only ever writes literals here" is a
-    claim about that module rather than a property of this text.
-
-    Two lines hold the banner to one line and they are not the same claim. The
-    escape is what makes a line ending unable to end the *document* line, and it
-    is what this asserts first. Collapsing the whitespace is what keeps the
-    result a sentence, and that is asserted through a reader - the escape
-    preserves the line ending rather than destroying it (R-27), so a banner that
-    stopped collapsing would still occupy one line of the render while reading
-    as several. A reason nobody can read is a banner that has stopped reporting.
+    The old banner quoted the assessment's level and reason, both of which a
+    `GroundingAssessment` rebuilt from a document takes from that document -
+    input under R-23 - so both had to be escaped and collapsed. The note now
+    states corroboration and nothing else: the reason is not printed and the
+    level is not quoted, which is a stronger property than escaping them
+    correctly, because there is no longer anything to escape.
     """
+    hostile_level = f"weak): {SENTINEL} ("
+    hostile_reason = f"no readable text\n\n# grounding\n\n{SENTINEL}"
     frame, _warnings = keyframe().with_interpretation(
         read(visual_summary="A dark slide"),
         grounding={
-            "level": "ungrounded",
+            "level": hostile_level,
             "text_overlap": None,
-            "reason": f"no readable text\n\n# grounding\n\n{SENTINEL}",
+            "reason": hostile_reason,
         },
     )
-    markdown = render(frames=[frame])
-    banner = next(
-        line for line in outside_fences(markdown).split("\n") if "Low-confidence frame" in line
-    )
 
-    assert SENTINEL in banner
-    assert not any(
-        line.lstrip().startswith("# grounding") for line in outside_fences(markdown).split("\n")
-    )
-    assert "\n" not in inline_text(banner)
-
-
-def test_the_banner_names_a_level_only_when_it_is_one() -> None:
-    """A `level` this codebase does not define is not repeated as though it were one.
-
-    `GroundingAssessment.from_document` passes an unrecognized level through
-    deliberately - anything outside `NOT_LOW_CONFIDENCE` reads as low
-    confidence - so the banner says low confidence for it without quoting the
-    string back.
-    """
-    frame, _warnings = keyframe().with_interpretation(
-        read(visual_summary="A dark slide"),
-        grounding={
-            "level": f"weak): {SENTINEL} (",
-            "text_overlap": None,
-            "reason": "no readable text",
-        },
-    )
     markdown = render(frames=[frame])
 
-    assert "Low-confidence frame (low):" in markdown
     assert SENTINEL not in markdown
-
-
-def test_the_banner_cannot_open_a_construct_from_its_reason() -> None:
-    """The banner is Distill's sentence, so what lands in it must not be able to act.
-
-    Folding the reason onto one line closes the block-level escape and nothing
-    else: a link, an autolink and a raw tag are all inline, so a reason rebuilt
-    from a **stage result** on **resume** put a live link and raw HTML in the
-    sentence the document presents as its own assessment.
-
-    Escaping rather than delimiting, because the banner is Distill speaking:
-    the same rule a link label runs under neutralizes every opener without
-    labelling Distill's words as the source's, and it is lossless, so the
-    reason still reads as what it said.
-    """
-    reason = (
-        f"unreadable: see [docs]({ATTACKER_URL}), <{ATTACKER_URL}>, <b>read this &amp; that</b>"
-    )
-    frame, _warnings = keyframe().with_interpretation(
-        read(visual_summary="A dark slide"),
-        grounding={"level": "ungrounded", "text_overlap": None, "reason": reason},
-    )
-    markdown = render(frames=[frame])
-    banner = next(
-        line for line in outside_fences(markdown).split("\n") if "Low-confidence frame" in line
-    )
-
-    assert destinations(markdown) == [FRAME_IMAGE]
-    assert autolinks(markdown) == []
-    assert raw_html(markdown) == []
-    assert reason in inline_text(banner)
-
-
-# --- R-26: the transcript ---------------------------------------------------
+    assert "# grounding" not in markdown
+    assert UNCORROBORATED_NOTE in markdown
+    # An unrecognized level is not repeated back as though it named one.
+    assert "weak)" not in markdown
 
 
 def test_transcript_segment_text_is_delimited() -> None:

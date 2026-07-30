@@ -44,13 +44,13 @@ as one, or an interpretation over text neither reader recovered.
 UNGROUNDED = "ungrounded"
 """An interpretation exists and no reader recovered text that could support it."""
 
-NOT_LOW_CONFIDENCE = frozenset({CORROBORATED})
-"""The levels a reader may take at face value.
+CORROBORATED_LEVELS = frozenset({CORROBORATED})
+"""The levels that mean a second reader recovered the same text.
 
-A set of one, and stated as a set anyway: `is_low_confidence` is a question
+A set of one, and stated as a set anyway: `is_corroborated` is a question
 about the level rather than an inequality against a particular string, so a
 level added later is a decision made here instead of an operator quietly
-inverted somewhere else.
+inverting it somewhere else.
 """
 
 # Overlap of vision-transcribed tokens that also appear in OCR. Above STRONG the
@@ -82,8 +82,15 @@ class GroundingAssessment:
     reason: str
 
     @property
-    def is_low_confidence(self) -> bool:
-        return self.level not in NOT_LOW_CONFIDENCE
+    def is_corroborated(self) -> bool:
+        """Whether a second reader recovered the same text (D-002).
+
+        A fact about agreement, not a verdict on the reading. Since the vision
+        model became the authoritative reader, an uncorroborated frame is not
+        a doubted one - it is a frame the image-text reader did not confirm,
+        which is what the render says in plain words.
+        """
+        return self.level in CORROBORATED_LEVELS
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -100,9 +107,9 @@ class GroundingAssessment:
         neither was asked.
 
         A `level` this module does not define is passed through rather than
-        refused. `is_low_confidence` is stated against `NOT_LOW_CONFIDENCE`, so
-        an unrecognized level reads as low confidence, which is the answer that
-        does not vouch for text nobody checked.
+        refused. `is_corroborated` is stated against `CORROBORATED_LEVELS`, so
+        an unrecognized level reads as uncorroborated, which is the answer that
+        does not claim agreement nobody established.
         """
         if document is None:
             return None
