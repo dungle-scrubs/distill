@@ -383,6 +383,9 @@ __all__ = [
 # 30s of speech either side is enough to say whether the frame adds anything
 # beyond what is being said, without dragging in a different topic.
 SALIENCE_WINDOW_RADIUS_SEC = 30.0
+# ~4x the prompt's 1200-char cap: room for redaction to shorten text before
+# the authoritative cut, without unbounded accumulation.
+_WINDOW_CHAR_BOUND = 4800
 
 
 def select_transcript_window(
@@ -405,7 +408,14 @@ def select_transcript_window(
     """
     low, high = timestamp_sec - radius_sec, timestamp_sec + radius_sec
     parts: list[str] = []
+    accumulated = 0
     for segment in segments:
+        if accumulated > _WINDOW_CHAR_BOUND:
+            # Enough: the prompt applies its own authoritative cap after
+            # redaction; accumulating an adversarial many-segment transcript
+            # past several multiples of it is work with no reader (the same
+            # bounded-work discipline as the redaction patterns).
+            break
         if not isinstance(segment, Mapping) or "start" not in segment or "end" not in segment:
             continue
         try:
@@ -418,4 +428,5 @@ def select_transcript_window(
             text = str(segment.get("text", "")).strip()
             if text:
                 parts.append(text)
+                accumulated += len(text)
     return " ".join(parts)

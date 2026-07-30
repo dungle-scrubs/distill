@@ -30,8 +30,13 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any, NoReturn
 
-from .artifacts import FrameSalience, document_carries_a_reading
+from .artifacts import (
+    SALIENCE_REASON_MAX_CHARS,
+    FrameSalience,
+    document_carries_a_reading,
+)
 from .errors import warning
+from .redact_secrets import redact_for_prompt
 from .vision_prompts import FRAME_KINDS, TEXT_CONFIDENCE_LEVELS
 
 # The boundary events (`endpoint_rejected`, and every `_boundary_log` record)
@@ -807,10 +812,6 @@ def _normalize_text_confidence(value: Any) -> str:
     return level if level in TEXT_CONFIDENCE_LEVELS else "none"
 
 
-# The reason a reader sees for a salience judgment; past this it is filler.
-SALIENCE_REASON_MAX_CHARS = 400
-
-
 def parse_frame_salience(payload: Any) -> FrameSalience | None:
     """The model's salience judgment, strictly validated, or None.
 
@@ -826,8 +827,10 @@ def parse_frame_salience(payload: Any) -> FrameSalience | None:
     raw_reason = payload.get("reason")
     # A non-string reason is refused, not stringified: repr()ing a structure
     # into a reader-facing sentence is the coercion this parser exists to
-    # avoid. Stripped before measuring so padding cannot spend the cap.
-    reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+    # avoid. REDACTED before the cap is measured (D-010's ordering, same as
+    # the prompt path): cutting first can split a credential mid-syntax so
+    # the carrier's redactor no longer matches it, storing the secret whole.
+    reason = redact_for_prompt(raw_reason).strip() if isinstance(raw_reason, str) else ""
     truncated = len(reason) > SALIENCE_REASON_MAX_CHARS
     if truncated:
         reason = reason[:SALIENCE_REASON_MAX_CHARS]

@@ -329,8 +329,10 @@ naming which of those it was.
 
 ### Which endpoint Distill will speak to
 
-A vision endpoint is handed **extracted text** and images from your sources, so
-where it points is a decision rather than a default:
+A vision endpoint is handed images from your sources and the **extracted
+text** around them - on-screen text read off each keyframe and, when frame
+salience is on, the transcript window surrounding it - so where it points is a
+decision rather than a default:
 
 - **Loopback only, unless you say otherwise.** Every address the host resolves
   to must be loopback, checked per request rather than once at configuration
@@ -382,7 +384,7 @@ honored. Distill talks only to Rapid-MLX - no other runtime shims.
 ## Extracted text is data, not instruction
 
 A render is written to be fed to an LLM agent, and everything recovered from a
-source - transcript text, image text, vision interpretations, link labels - was
+source - transcript text, image text, vision interpretations, salience judgments, link labels - was
 chosen by whoever produced that source. Distill therefore treats it as untrusted
 data at both places it becomes durable:
 

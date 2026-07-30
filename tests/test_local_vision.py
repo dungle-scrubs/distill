@@ -2465,7 +2465,10 @@ class TestSalienceSchema:
         from distill.rapid_mlx import SALIENCE_REASON_MAX_CHARS, parse_frame_salience
 
         salience = parse_frame_salience(
-            {"adds_information": True, "reason": "r" * (SALIENCE_REASON_MAX_CHARS + 50)}
+            {
+                "adds_information": True,
+                "reason": ("reason words " * 40)[: SALIENCE_REASON_MAX_CHARS + 50],
+            }
         )
 
         assert salience is not None
@@ -2697,3 +2700,100 @@ class TestFilteredRenderView:
 
         assert frames[0].reading is not None
         assert frames[0].salience is None
+
+    def test_a_credential_straddling_the_reason_cap_does_not_survive(self) -> None:
+        """Redact-then-cap (D-010): cutting first can split a credential
+        mid-syntax so the redactor no longer matches it, storing the secret
+        whole - the live-repro'd landing-review finding."""
+        from distill.rapid_mlx import SALIENCE_REASON_MAX_CHARS, parse_frame_salience
+
+        filler = ("visible words " * 40)[: SALIENCE_REASON_MAX_CHARS - 20]
+        secret_url = "https://user:correct-horse-battery-staple@example.com"
+
+        salience = parse_frame_salience({"adds_information": True, "reason": filler + secret_url})
+
+        assert salience is not None
+        assert "correct-horse-battery-staple" not in salience.reason
+
+    def test_the_composed_request_body_asks_for_salience_exactly_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The prompt builder owns the response schema. The transport used to
+        append a second, closed field list - the LAST thing the model read -
+        which omitted the salience fields, so no run ever recorded one."""
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        request_texts: list[str] = []
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            [message] = body["messages"]
+            request_texts.append(next(p["text"] for p in message["content"] if p["type"] == "text"))
+            return _chat_envelope(_frame_json(adds_information=True, reason="adds"))
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        segments = ({"start": 0.0, "end": 20.0, "text": "spoken context"},)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret(
+            [_frame(1, tmp_path / "frame0.png")], transcript_segments=segments
+        )
+
+        [request_text] = request_texts
+        assert "adds_information" in request_text
+        assert request_text.count("Return compact JSON") == 1
+        assert frames[0].salience is not None
+
+    def test_an_all_redundant_filtered_view_returns_prose_not_an_error(
+        self, tmp_path: Path
+    ) -> None:
+        import dataclasses as dc
+
+        from distill.render import render_filtered_markdown
+
+        redundant = dc.replace(
+            _frame(1, tmp_path / "a.png", extracted_text="words"),
+            salience={
+                "adds_information": False,
+                "reason": "restates",
+                "reason_truncated": False,
+            },
+        )
+
+        rendered = render_filtered_markdown("example.mp4", 10.0, None, [redundant], [])
+
+        assert "Non-authoritative" in rendered
+        assert "judged redundant" in rendered
+
+    def test_the_pipeline_seam_passes_the_transcript_to_the_interpreter(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from distill.artifacts import RedactionState, Transcript
+        from distill.pipeline import interpret_frames_with_local_vision
+
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            return _chat_envelope(_frame_json(adds_information=True, reason="adds"))
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        transcript = Transcript(
+            language="en",
+            segments=({"start": 0.0, "end": 20.0, "text": "spoken"},),
+            redaction=RedactionState.APPLIED,
+        )
+
+        frames, _warnings = interpret_frames_with_local_vision(
+            [_frame(1, tmp_path / "frame0.png")],
+            DistillOptions.from_args({}),
+            None,
+            transcript=transcript,
+        )
+
+        assert frames[0].salience is not None

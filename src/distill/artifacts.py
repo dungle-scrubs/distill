@@ -522,6 +522,10 @@ class Provenance(Carrier):
         return MappingProxyType({key: value for key, value in fields.items() if value is not None})
 
 
+# The reason a reader sees for a salience judgment; past this it is filler.
+SALIENCE_REASON_MAX_CHARS = 400
+
+
 @dataclass(frozen=True)
 class FrameSalience:
     """D-003: whether a keyframe adds information beyond the transcript.
@@ -566,11 +570,19 @@ class FrameSalience:
         adds_information = document.get("adds_information")
         if not isinstance(adds_information, bool):
             return None
-        reason = document.get("reason")
+        raw_reason = document.get("reason")
+        reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+        # The same invariants as the live parse, re-applied: a forged or
+        # drifted document does not get to resume an oversized reason or a
+        # stringly truncation flag.
+        recapped = len(reason) > SALIENCE_REASON_MAX_CHARS
+        if recapped:
+            reason = reason[:SALIENCE_REASON_MAX_CHARS]
+        stored_flag = document.get("reason_truncated")
         return cls(
             adds_information=adds_information,
-            reason=reason if isinstance(reason, str) else "",
-            reason_truncated=bool(document.get("reason_truncated", False)),
+            reason=reason,
+            reason_truncated=(stored_flag is True) or recapped,
         )
 
 
@@ -890,6 +902,11 @@ class FrameArtifact(Carrier):
         values = {key: value for key, value in document.items() if key in fields}
         values["redaction"] = redaction
         values["warnings"] = tuple(values.get("warnings", ()))
+        if values.get("salience") is not None:
+            # One invariant owner: a stored judgment re-enters through the
+            # same strictness as the live parse, or not at all.
+            rebuilt = FrameSalience.from_document(values["salience"])
+            values["salience"] = None if rebuilt is None else rebuilt.document()
         artifact = cls(**values)
         if artifact.interpretation is not None:
             Interpretation.from_document(artifact.interpretation)

@@ -1101,6 +1101,8 @@ class FrameInterpreter:
     _interpreted_count: int = 0
     _max_parallel: int = 1
     _transcript_segments: tuple[Any, ...] = ()
+    _salience_requested: int = 0
+    _salience_recorded: int = 0
     _warning_counts: dict[str, int] = field(default_factory=dict)
     _trace_events: list[dict[str, Any]] = field(default_factory=list)
     _breaker: _TransportBreaker = field(default_factory=_TransportBreaker)
@@ -1123,9 +1125,9 @@ class FrameInterpreter:
             non_local = warning(
                 "local_vision",
                 "non_local_only_processing",
-                "this run was configured to send keyframes to a non-loopback "
-                "vision endpoint; the generation may not be local-only "
-                "processing.",
+                "this run was configured to send keyframes and surrounding "
+                "transcript text to a non-loopback vision endpoint; the "
+                "generation may not be local-only processing.",
             )
             self._record_warning(non_local)
             provenance_warnings.append(non_local)
@@ -1359,6 +1361,8 @@ class FrameInterpreter:
                 "model": self._last_probe.model,
             },
             "frame_count": self._frame_count,
+            "salience_requested": self._salience_requested,
+            "salience_recorded": self._salience_recorded,
             "interpreted_count": self._interpreted_count,
             "max_parallel": self._max_parallel,
             "warning_counts": dict(sorted(self._warning_counts.items())),
@@ -1411,6 +1415,10 @@ class FrameInterpreter:
             prompt.prompt,
             prompt_profile=prompt.profile,
         )
+        if window:
+            self._salience_requested += 1
+        if result is not None and result.salience is not None and self.frame_salience and window:
+            self._salience_recorded += 1
         if result is not None and (not self.frame_salience or not window):
             # Not asked means not recorded: whether the toggle is off or this
             # frame simply had no transcript window, a model that volunteers
@@ -1640,12 +1648,11 @@ def _interpret_with_rapid_mlx(
             "Local vision could not read the frame image; continuing with OCR-only output.",
             {"path": str(image_path), "error": str(exc)},
         ) from exc
-    request_prompt = (
-        f"{prompt}\n\n"
-        "Return compact JSON with string fields frame_kind, verbatim_text, text_confidence, "
-        "visual_summary, interpretation, uncertainty, and detected_elements as an array of strings. "
-        'Leave verbatim_text empty and set text_confidence to "none" if you cannot read the text.'
-    )
+    # The prompt builder owns the response schema (it already names every
+    # field, salience included when a window exists); a second field list
+    # appended here was the LAST thing the model read, and it omitted the
+    # salience fields - so no run ever recorded one.
+    request_prompt = prompt
     data_uri = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"
     body = {
         "model": config.model,
