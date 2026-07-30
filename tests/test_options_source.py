@@ -1154,6 +1154,7 @@ def test_valid_numbers_keep_their_json_types_in_the_current_identity_payload() -
         "local_vision_timeout_sec": DEFAULT_TIMEOUT_SEC,
         # D-012: 'was (possibly) remote' is identity; the address is not.
         "local_vision_non_local": False,
+        "frame_salience": True,
         "max_duration_sec": 7200.0,
         "max_keyframes": 80,
         "max_static_window_sec": 90.0,

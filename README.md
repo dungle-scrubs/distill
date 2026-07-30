@@ -264,7 +264,9 @@ stdout's contents survives a descriptor the caller broke.
 The processing commands (`process-local-video`, `process-youtube-video`,
 `process-video-directory`, `process-youtube-playlist`) share these options: `--whisper-model`,
 `--whisper-language`, `--ocr`/`--no-ocr`, `--ocr-language`, `--ocr-preprocess`,
-`--redact-secrets`/`--no-redact-secrets`, `--max-keyframes`, `--min-interval-sec`,
+`--redact-secrets`/`--no-redact-secrets`, `--frame-salience`/`--no-frame-salience`
+(whether keyframes are judged against the surrounding speech; on by default, and
+part of bundle identity), `--max-keyframes`, `--min-interval-sec`,
 `--max-duration-sec`, `--vad-filter`/`--no-vad-filter`, `--max-static-window-sec`,
 `--output-dir`, `--force-reprocess`, `--job-id`, `--resume-partial`,
 `--caption-frames`/`--no-caption-frames`, `--local-vision-backend`,

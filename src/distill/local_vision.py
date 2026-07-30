@@ -43,7 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
@@ -151,8 +151,12 @@ from .rapid_mlx import (
     _urlopen_json as _urlopen_json,
 )
 from .rapid_mlx import (
+    parse_frame_salience as parse_frame_salience,
+)
+from .rapid_mlx import (
     parse_interpretation_json as parse_interpretation_json,
 )
+from .transcript import select_transcript_window
 
 DEFAULT_LOCAL_VISION_BACKEND = "rapid-mlx"
 DEFAULT_LOCAL_VISION_MODEL = "mlx-community/Qwen3-VL-8B-Instruct-8bit"
@@ -1089,17 +1093,27 @@ class FrameInterpreter:
     debug: bool | None = None
     budget_sec: float = DEFAULT_VISION_STAGE_BUDGET_SEC
     budget_bytes: int = DEFAULT_VISION_STAGE_BUDGET_BYTES
+    # D-017: the toggle gates window construction, so a disabled run never
+    # asks the model for a judgment and records no salience at all.
+    frame_salience: bool = True
     _last_probe: LocalVisionProbe | None = None
     _frame_count: int = 0
     _interpreted_count: int = 0
     _max_parallel: int = 1
+    _transcript_segments: tuple = ()
     _warning_counts: dict[str, int] = field(default_factory=dict)
     _trace_events: list[dict[str, Any]] = field(default_factory=list)
     _breaker: _TransportBreaker = field(default_factory=_TransportBreaker)
 
     def interpret(
-        self, frames: list[FrameArtifact]
+        self,
+        frames: list[FrameArtifact],
+        *,
+        transcript_segments: Iterable[Any] | None = None,
     ) -> tuple[list[FrameArtifact], list[WarningRecord]]:
+        self._transcript_segments = (
+            tuple(transcript_segments or ()) if self.frame_salience else ()
+        )
         self._reset_run(frames)
         self._log("interpret.start", {"frames": len(frames), "backend": self.config.backend})
         provenance_warnings: list[WarningRecord] = []
@@ -1384,13 +1398,25 @@ class FrameInterpreter:
         from .vision_prompts import build_technical_frame_prompt
 
         self._ensure_frame_invariants(index, frame, frame_count)
-        prompt = build_technical_frame_prompt(ocr_text=frame.extracted_text or None)
+        window = (
+            select_transcript_window(self._transcript_segments, frame.timestamp_sec)
+            if self._transcript_segments
+            else ""
+        )
+        prompt = build_technical_frame_prompt(
+            ocr_text=frame.extracted_text or None,
+            transcript_window=window or None,
+        )
         result, frame_warning = self._try_interpret_frame(
             config,
             Path(frame.path),
             prompt.prompt,
             prompt_profile=prompt.profile,
         )
+        if result is not None and not self.frame_salience:
+            # Disabled means not recorded: a model that volunteers the fields
+            # anyway does not get to write them onto the artifact (D-017).
+            result = replace(result, salience=None)
         if frame_warning:
             warnings.append(frame_warning)
         read_code = frame_warning.get("code") if frame_warning else None
@@ -1697,6 +1723,7 @@ def _result_from_payload(
     for one that is not (R-39): what is missing from a validated payload is a
     field the model left out, not an answer that said nothing.
     """
+    salience = parse_frame_salience(interpreted)
     elements = interpreted.get("detected_elements", [])
     if not isinstance(elements, list):
         elements = []
@@ -1711,4 +1738,5 @@ def _result_from_payload(
         frame_kind=_normalize_frame_kind(interpreted.get("frame_kind")),
         verbatim_text=str(interpreted.get("verbatim_text", "")).strip(),
         text_confidence=_normalize_text_confidence(interpreted.get("text_confidence")),
+        salience=None if salience is None else salience.document(),
     )

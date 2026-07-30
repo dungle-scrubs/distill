@@ -631,6 +631,10 @@ class Interpretation:
     frame_kind: str = ""
     verbatim_text: str = ""
     text_confidence: str = "none"
+    # Transport-only (D-003): the parsed salience rides the reading from the
+    # parser to the frame artifact, which records it as its own top-level
+    # field; document() excludes it so the judgment is stored once.
+    salience: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         # On the same terms as a carrier, and for the same reason: a reading is
@@ -660,10 +664,13 @@ class Interpretation:
 
     def document(self) -> dict[str, Any]:
         """This reading as the plain mapping a **frame artifact** carries."""
-        return {
+        document = {
             **dataclasses.asdict(self),
             "detected_elements": list(self.detected_elements),
         }
+        # Stored once, on the frame artifact's own `salience` field.
+        document.pop("salience", None)
+        return document
 
     @classmethod
     def from_document(cls, document: Mapping[str, Any] | None) -> Interpretation | None:
@@ -761,7 +768,11 @@ class FrameArtifact(Carrier):
     stage without each stage being told about it separately.
     """
 
-    EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = ("extracted_text", "interpretation")
+    EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = (
+        "extracted_text",
+        "interpretation",
+        "salience",
+    )
 
     index: int
     timestamp_sec: float
@@ -772,6 +783,11 @@ class FrameArtifact(Carrier):
     extracted_text: str = ""
     interpretation: Mapping[str, Any] | None = None
     grounding: Mapping[str, Any] | None = None
+    # D-003/D-018: the model's judgment of what this frame adds beyond the
+    # surrounding speech. Model output (its `reason` can echo the pixels), so
+    # it lives in the extracted-text region; informational only - nothing in
+    # processing consults it to drop a frame.
+    salience: Mapping[str, Any] | None = None
 
     @property
     def reading(self) -> Interpretation | None:
@@ -815,6 +831,7 @@ class FrameArtifact(Carrier):
             self,
             interpretation=None if reading is None else reading.document(),
             grounding=grounding,
+            salience=None if reading is None else reading.salience,
         )
         return added, added._raised_since(self)
 

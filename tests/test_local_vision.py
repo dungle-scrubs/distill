@@ -2491,3 +2491,109 @@ class TestSalienceSchema:
 
         assert salience is not None
         assert salience.reason == ""
+
+
+class TestSalienceRecording:
+    """M4.4 (D-003/D-018): validated salience lands on the frame artifact;
+    processing never drops a frame because of it."""
+
+    def test_validated_salience_is_recorded_on_every_frame_kept(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for index in range(2):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            content = _frame_json(
+                adds_information=False, reason="restates the speech"
+            )
+            return _chat_envelope(content)
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        segments = ({"start": 0.0, "end": 20.0, "text": "the speaker explains"},)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(2)],
+            transcript_segments=segments,
+        )
+
+        # Never dropped, and every kept frame carries the judgment.
+        assert len(frames) == 2
+        for frame in frames:
+            assert frame.salience is not None
+            assert frame.salience["adds_information"] is False
+            assert frame.salience["reason"] == "restates the speech"
+
+    def test_invalid_salience_stays_absent_on_the_frame(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            return _chat_envelope(_frame_json(adds_information="false", reason="stringly"))
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        segments = ({"start": 0.0, "end": 20.0, "text": "context"},)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret(
+            [_frame(1, tmp_path / "frame0.png")], transcript_segments=segments
+        )
+
+        assert frames[0].reading is not None  # the reading itself is fine
+        assert frames[0].salience is None  # absent, never guessed
+
+
+class TestFrameSalienceToggle:
+    """M4.5 (D-017): top-level frame_salience, default on, user-disableable,
+    cache_key=True - on and off yield different bundle keys."""
+
+    def test_defaults_on_and_is_disableable_and_keys_the_cache(self) -> None:
+        default = DistillOptions.from_args({})
+        disabled = DistillOptions.from_args({"frame_salience": False})
+
+        assert default.frame_salience is True
+        assert disabled.frame_salience is False
+        assert default.opts_hash("local") != disabled.opts_hash("local")
+        assert default.cache_payload("local")["frame_salience"] is True
+
+    def test_disabled_salience_builds_no_window_and_records_none(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        prompts: list[str] = []
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            [message] = body["messages"]
+            prompts.append(
+                next(p["text"] for p in message["content"] if p["type"] == "text")
+            )
+            return _chat_envelope(
+                _frame_json(adds_information=True, reason="claims to add")
+            )
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        segments = ({"start": 0.0, "end": 20.0, "text": "context"},)
+
+        interpreter = FrameInterpreter(
+            LocalVisionConfig(), probe=_available_probe, frame_salience=False
+        )
+        frames, _warnings = interpreter.interpret(
+            [_frame(1, tmp_path / "frame0.png")], transcript_segments=segments
+        )
+
+        assert "adds_information" not in prompts[0]
+        assert frames[0].salience is None
