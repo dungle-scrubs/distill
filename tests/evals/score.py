@@ -10,7 +10,8 @@ Reads ``cases.toml`` and each frame's ``<id>.gt.txt`` and reports two things:
    quiet on clean ones — precision/recall over that label.
 
 Unverified or empty cases are skipped, so the score reflects only frames a human
-has actually confirmed. Run:
+has actually confirmed. Labels and fixtures are validated up front, and a
+malformed case aborts the run rather than being skipped. Run:
 
     uv run python tests/evals/score.py [--with-vision] [--json]
 """
@@ -18,8 +19,10 @@ has actually confirmed. Run:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import tomllib
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -29,13 +32,33 @@ from distill.ocr import find_tesseract_command, ocr_frame
 
 EVAL_ROOT = Path(__file__).resolve().parent
 FRAMES_DIR = EVAL_ROOT / "frames"
+VALID_CATEGORIES = frozenset(
+    {
+        "clean_text",
+        "textless",
+        "injection",
+        "safety_blocked",
+        "ocr_vision_disagreement",
+    }
+)
+VALID_LEGIBILITY = frozenset({"clean", "partial", "unreadable"})
 
 _PUNCT = str.maketrans(dict.fromkeys("\"'`.,:;!?()[]{}<>|/\\-–—_=+*#", " "))
 
 
 def normalize(text: str) -> list[str]:
-    """Lowercase, drop punctuation, collapse whitespace into comparable tokens."""
-    return text.lower().translate(_PUNCT).split()
+    """Normalize comparable tokens; bullet glyphs and Unicode ellipses are typography."""
+    translated = text.lower().translate(_PUNCT)
+    without_punctuation = "".join(
+        " " if unicodedata.category(character).startswith("P") else character
+        for character in translated
+    )
+    return without_punctuation.split()
+
+
+def claims_text(text: str) -> bool:
+    """Apply a narrower test than normalize: symbol-only output in any script is not a claim."""
+    return any(any(character.isalnum() for character in token) for token in normalize(text))
 
 
 def word_error_rate(truth: str, hypothesis: str) -> float:
@@ -76,6 +99,7 @@ def token_prf(truth: str, hypothesis: str) -> tuple[float, float, float]:
 @dataclass
 class CaseResult:
     id: str
+    category: str
     legibility: str
     has_text: bool
     ocr_wer: float | None
@@ -84,14 +108,107 @@ class CaseResult:
     vision_f1: float | None
     flagged: bool | None  # grounding marked it low-confidence
     should_flag: bool  # human says it is not cleanly legible
+    claimed_text: bool | None = None  # textless frame: reader claimed text? None when unscored
+    unusable: bool = False  # vision returned no usable interpretation
 
 
-def _load_cases() -> list[dict]:
+@dataclass(frozen=True)
+class LabelledCase:
+    id: str
+    category: str
+    legibility: str
+    has_text: bool
+    verified: bool
+
+
+@dataclass(frozen=True)
+class AcceptanceVerdict:
+    """Per-condition outcome of an `AcceptanceRule`; `passed` is the single pass/fail."""
+
+    passed: bool
+    accuracy_ok: bool
+    hallucination_ok: bool
+
+
+@dataclass(frozen=True)
+class AcceptanceRule:
+    """The eval's pass/fail bar: an accuracy floor AND a hallucination ceiling."""
+
+    accuracy_floor: float
+    hallucination_ceiling: float
+
+    def evaluate(
+        self, accuracy: float | None, hallucination_rate: float | None
+    ) -> AcceptanceVerdict:
+        """Pass only when both metrics were measured and both stay inside their bounds.
+
+        A missing metric (``None`` - a run without ``--with-vision``, or a corpus
+        with no textless cases) fails its condition: an unmeasured gate is not a
+        passed gate. Both bounds are inclusive.
+        """
+        accuracy_ok = accuracy is not None and accuracy >= self.accuracy_floor
+        hallucination_ok = (
+            hallucination_rate is not None and hallucination_rate <= self.hallucination_ceiling
+        )
+        return AcceptanceVerdict(
+            passed=accuracy_ok and hallucination_ok,
+            accuracy_ok=accuracy_ok,
+            hallucination_ok=hallucination_ok,
+        )
+
+
+def load_labelled_cases() -> list[LabelledCase]:
+    """Load labels, rejecting invalid ids, categories, legibility, or fixtures."""
     data = tomllib.loads((EVAL_ROOT / "cases.toml").read_text())
-    return data.get("case", [])
+    cases: list[LabelledCase] = []
+    seen_ids: set[str] = set()
+    for raw_case in data.get("case", []):
+        case_id = raw_case.get("id")
+        if not isinstance(case_id, str):
+            raise ValueError(f"case has invalid id: {case_id!r}")
+        if case_id in seen_ids:
+            raise ValueError(f"case {case_id} has a duplicate id")
+        seen_ids.add(case_id)
+        category = raw_case.get("category")
+        if not isinstance(category, str) or category not in VALID_CATEGORIES:
+            raise ValueError(f"case {case_id} has invalid category: {category!r}")
+        legibility = raw_case.get("legibility")
+        if not isinstance(legibility, str) or legibility not in VALID_LEGIBILITY:
+            raise ValueError(f"case {case_id} has invalid legibility: {legibility!r}")
+        has_text = raw_case.get("has_text", True)
+        if not isinstance(has_text, bool):
+            raise ValueError(f"case {case_id} has non-boolean has_text: {has_text!r}")
+        verified = raw_case.get("verified", False)
+        if not isinstance(verified, bool):
+            raise ValueError(f"case {case_id} has non-boolean verified: {verified!r}")
+        if (category == "textless") != (has_text is False):
+            raise ValueError(
+                f"case {case_id} category must be textless exactly when has_text is false"
+            )
+        for suffix in (".png", ".gt.txt"):
+            path = FRAMES_DIR / f"{case_id}{suffix}"
+            if not path.exists():
+                raise ValueError(f"case {case_id} is missing fixture: {path.name}")
+        if verified:
+            truth = truth_text(case_id)
+            if truth is not None:
+                if not has_text and truth:
+                    raise ValueError(f"case {case_id} is textless but has non-empty truth")
+                if has_text and not truth:
+                    raise ValueError(f"case {case_id} is text-bearing but has empty truth")
+        cases.append(
+            LabelledCase(
+                id=case_id,
+                category=category,
+                legibility=legibility,
+                has_text=has_text,
+                verified=verified,
+            )
+        )
+    return cases
 
 
-def _truth(case_id: str) -> str | None:
+def truth_text(case_id: str) -> str | None:
     """Return confirmed truth text, or None if the file is missing/unverified.
 
     Lines starting with ``#`` are notes (e.g. provenance) and are stripped before
@@ -101,16 +218,28 @@ def _truth(case_id: str) -> str | None:
     path = FRAMES_DIR / f"{case_id}.gt.txt"
     if not path.exists():
         return None
-    if "UNVERIFIED" in path.read_text():
+    contents = path.read_text()
+    if "UNVERIFIED" in contents:
         return None
-    body = "\n".join(
-        line for line in path.read_text().splitlines() if not line.lstrip().startswith("#")
-    )
+    body = "\n".join(line for line in contents.splitlines() if not line.lstrip().startswith("#"))
     return body.strip()
 
 
+def corpus_digest(cases: list[LabelledCase]) -> str:
+    """Hash cases.toml bytes, then each case's PNG and ground-truth bytes in corpus order."""
+    digest = hashlib.sha256()
+    digest.update((EVAL_ROOT / "cases.toml").read_bytes())
+    for case in cases:
+        digest.update((FRAMES_DIR / f"{case.id}.png").read_bytes())
+        digest.update((FRAMES_DIR / f"{case.id}.gt.txt").read_bytes())
+    return digest.hexdigest()
+
+
 def evaluate(
-    with_vision: bool, model: str | None = None, backend: str | None = None
+    with_vision: bool,
+    model: str | None = None,
+    backend: str | None = None,
+    base_url: str | None = None,
 ) -> list[CaseResult]:
     # The same lookup that gates this function must also drive the OCR call.
     # find_tesseract_command() falls back to well-known install paths that are
@@ -120,30 +249,34 @@ def evaluate(
     tesseract_cmd = find_tesseract_command()
     if not tesseract_cmd:
         raise SystemExit("tesseract not found; install it before scoring OCR")
-    interpret = _vision_interpreter(model, backend) if with_vision else None
+    interpret = _vision_interpreter(model, backend, base_url) if with_vision else None
     results: list[CaseResult] = []
-    for case in _load_cases():
-        case_id = str(case["id"])
-        if not bool(case.get("verified", False)):
+    for case in load_labelled_cases():
+        case_id = case.id
+        if not case.verified:
             continue
-        truth = _truth(case_id)
+        truth = truth_text(case_id)
         if truth is None:
             continue
         image = FRAMES_DIR / f"{case_id}.png"
         ocr_text, _ = ocr_frame(image, "eng", tesseract_cmd=tesseract_cmd)
-        has_text = bool(case.get("has_text", True))
+        has_text = case.has_text
         ocr_wer = word_error_rate(truth, ocr_text) if has_text else None
 
         vision_wer: float | None = None
         vision_recall: float | None = None
         vision_f1: float | None = None
         flagged: bool | None = None
+        claimed_text: bool | None = None
+        unusable = False
         if interpret is not None:
             result = interpret(image, ocr_text)
             if result is not None:
                 if has_text:
                     vision_wer = word_error_rate(truth, result.verbatim_text)
                     _, vision_recall, vision_f1 = token_prf(truth, result.verbatim_text)
+                else:
+                    claimed_text = claims_text(result.verbatim_text)
                 assessment = assess_grounding(
                     ocr_text=ocr_text,
                     verbatim_text=result.verbatim_text,
@@ -156,33 +289,53 @@ def evaluate(
                 # The model produced nothing usable: the pipeline now treats this
                 # as a low-confidence (ungrounded) frame, so the eval does too.
                 flagged = True
+                unusable = True
+                if has_text:
+                    vision_wer = 1.0
+                    vision_recall = 0.0
+                    vision_f1 = 0.0
 
         results.append(
             CaseResult(
                 id=case_id,
-                legibility=str(case.get("legibility", "")),
+                category=case.category,
+                legibility=case.legibility,
                 has_text=has_text,
                 ocr_wer=ocr_wer,
                 vision_wer=vision_wer,
                 vision_recall=vision_recall,
                 vision_f1=vision_f1,
                 flagged=flagged,
-                should_flag=str(case.get("legibility", "")) != "clean",
+                should_flag=case.legibility != "clean",
+                claimed_text=claimed_text,
+                unusable=unusable,
             )
         )
     return results
 
 
-def _vision_interpreter(model: str | None = None, backend: str | None = None):
-    from distill.local_vision import LocalVisionConfig, probe_local_vision, try_interpret_image
-    from distill.vision_prompts import build_technical_frame_prompt
+def _vision_config(
+    model: str | None = None, backend: str | None = None, base_url: str | None = None
+):
+    from distill.local_vision import LocalVisionConfig
 
     overrides: dict[str, str] = {}
     if model:
         overrides["model"] = model
     if backend:
         overrides["backend"] = backend
-    config = replace(LocalVisionConfig(), **overrides) if overrides else LocalVisionConfig()
+    if base_url:
+        overrides["base_url"] = base_url.rstrip("/")
+    return replace(LocalVisionConfig(), **overrides) if overrides else LocalVisionConfig()
+
+
+def _vision_interpreter(
+    model: str | None = None, backend: str | None = None, base_url: str | None = None
+):
+    from distill.local_vision import probe_local_vision, try_interpret_image
+    from distill.vision_prompts import build_technical_frame_prompt
+
+    config = _vision_config(model, backend, base_url)
     probe = probe_local_vision(config)
     if not probe.available:
         raise SystemExit(f"vision backend unavailable ({probe.code}): {probe.message}")
@@ -199,20 +352,37 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def text_recovery_accuracy(results: list[CaseResult]) -> float | None:
+    recalls = [r.vision_recall for r in results if r.has_text and r.vision_recall is not None]
+    return _mean(recalls)
+
+
+def hallucination_rate(results: list[CaseResult]) -> float | None:
+    claims = [
+        float(r.claimed_text) for r in results if not r.has_text and r.claimed_text is not None
+    ]
+    return _mean(claims)
+
+
 def summarize(results: list[CaseResult]) -> dict:
     ocr_wers = [r.ocr_wer for r in results if r.ocr_wer is not None]
     vision_wers = [r.vision_wer for r in results if r.vision_wer is not None]
-    vision_recalls = [r.vision_recall for r in results if r.vision_recall is not None]
     vision_f1s = [r.vision_f1 for r in results if r.vision_f1 is not None]
     flag_known = [r for r in results if r.flagged is not None]
     true_pos = sum(1 for r in flag_known if r.flagged and r.should_flag)
     flagged_total = sum(1 for r in flag_known if r.flagged)
     should_total = sum(1 for r in flag_known if r.should_flag)
+    accuracy = text_recovery_accuracy(results)
     return {
         "cases_scored": len(results),
         "ocr_wer_mean": _mean(ocr_wers),
         "vision_wer_mean": _mean(vision_wers),
-        "vision_token_recall_mean": _mean(vision_recalls),
+        # Same value as text_recovery_accuracy; kept for continuity with recorded
+        # runs (the README Findings tables are keyed on token recall).
+        "vision_token_recall_mean": accuracy,
+        "text_recovery_accuracy": accuracy,
+        "hallucination_rate": hallucination_rate(results),
+        "unusable_readings": sum(1 for result in results if result.unusable),
         "vision_token_f1_mean": _mean(vision_f1s),
         "grounding_precision": (true_pos / flagged_total) if flagged_total else None,
         "grounding_recall": (true_pos / should_total) if should_total else None,
@@ -232,29 +402,83 @@ def main() -> None:
         default=None,
         help="optional vision model override; default is the eval-chosen Qwen3-VL-8B-8bit",
     )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="vision endpoint override (e.g. http://127.0.0.1:17439/v1); default is the config's",
+    )
     parser.add_argument("--json", action="store_true", help="emit JSON for programmatic use")
+    parser.add_argument(
+        "--gate",
+        type=Path,
+        default=None,
+        help="apply the acceptance rule from a recorded baseline JSON",
+    )
     args = parser.parse_args()
+    if args.gate is not None and not args.with_vision:
+        parser.error("--gate requires --with-vision")
 
-    results = evaluate(args.with_vision, args.model, args.backend)
+    results = evaluate(args.with_vision, args.model, args.backend, args.base_url)
     summary = summarize(results)
+    gate: dict[str, object] | None = None
+    if args.gate is not None:
+        baseline = json.loads(args.gate.read_text())
+        acceptance_rule = baseline["acceptance_rule"]
+        rule = AcceptanceRule(
+            **{key: value for key, value in acceptance_rule.items() if key != "noise_band"}
+        )
+        verdict = rule.evaluate(
+            accuracy=summary["text_recovery_accuracy"],
+            hallucination_rate=summary["hallucination_rate"],
+        )
+        gate = {
+            "passed": verdict.passed,
+            "accuracy_ok": verdict.accuracy_ok,
+            "hallucination_ok": verdict.hallucination_ok,
+            "unusable_readings": summary["unusable_readings"],
+        }
     if args.json:
-        print(json.dumps({"summary": summary, "cases": [vars(r) for r in results]}, indent=2))
+        # The run block makes a stored score self-describing (what model/endpoint
+        # produced it), so a committed baseline stays reproducible. It records
+        # the EFFECTIVE config (defaults resolved), not the flags as typed.
+        run: dict[str, object] = {"with_vision": args.with_vision}
+        if args.with_vision:
+            run["vision_config"] = _vision_config(
+                args.model, args.backend, args.base_url
+            ).public_dict()
+        output = {"run": run, "summary": summary, "cases": [vars(r) for r in results]}
+        if gate is not None:
+            output["gate"] = gate
+        print(json.dumps(output, indent=2))
+        if gate is not None and not gate["passed"]:
+            raise SystemExit(1)
         return
     if not results:
         print("No verified cases yet. Fill in <id>.gt.txt and set verified = true in cases.toml.")
         return
+    category_width = max(len(category) for category in VALID_CATEGORIES)
     for r in results:
         vis = f"{r.vision_wer:.2f}" if r.vision_wer is not None else " -  "
         rec = f"{r.vision_recall:.2f}" if r.vision_recall is not None else " -  "
         f1 = f"{r.vision_f1:.2f}" if r.vision_f1 is not None else " -  "
         flag = "?" if r.flagged is None else ("flag" if r.flagged else "ok")
         print(
-            f"  {r.id:30s} legib={r.legibility:10s} vis_wer={vis} recall={rec} f1={f1} grounding={flag}"
+            f"  {r.id:30s} category={r.category:{category_width}s} "
+            f"legib={r.legibility:10s} "
+            f"vis_wer={vis} recall={rec} f1={f1} grounding={flag}"
         )
     print()
     for key, value in summary.items():
         shown = f"{value:.3f}" if isinstance(value, float) else value
         print(f"  {key}: {shown}")
+    if gate is not None:
+        print()
+        print(f"  gate accuracy: {'pass' if gate['accuracy_ok'] else 'fail'}")
+        print(f"  gate hallucination: {'pass' if gate['hallucination_ok'] else 'fail'}")
+        print(f"  gate unusable_readings: {gate['unusable_readings']}")
+        print(f"  gate verdict: {'pass' if gate['passed'] else 'fail'}")
+        if not gate["passed"]:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
