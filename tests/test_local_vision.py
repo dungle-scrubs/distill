@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import logging
 import os
 import struct
 import urllib.error
@@ -15,11 +17,13 @@ from distill.artifacts import FrameArtifact, Interpretation
 from distill.errors import DistillError
 from distill.grounding import UNGROUNDED
 from distill.local_vision import (
+    BREAKER_WARNING_CODE,
     DEFAULT_LOCAL_VISION_BASE_URL,
     DEFAULT_LOCAL_VISION_MODEL,
     DEFAULT_TIMEOUT_SEC,
     FrameInterpreter,
     LocalVisionConfig,
+    LocalVisionFailure,
     LocalVisionProbe,
     _interpret_with_rapid_mlx,
     config_dir,
@@ -215,26 +219,50 @@ def test_probe_reports_unavailable_when_server_down(
 def test_probe_reports_model_unavailable_when_model_not_served(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Since M2.4 (D-008) an unlisted model alone does not hard-skip: the
+    probe attempts a completion, and only that attempt failing too makes the
+    model unavailable."""
     config = LocalVisionConfig(model="qwen3-vl:32b")
 
-    probe = probe_rapid_mlx_availability(config, requestor=FakeRapidMlx(models=["other"]))
+    probe = probe_rapid_mlx_availability(
+        config,
+        requestor=FakeRapidMlx(
+            models=["other"], chat_error=RuntimeError("HTTP 404: model not found")
+        ),
+    )
 
     assert probe.available is False
     assert probe.code == "local_vision_model_unavailable"
     assert probe.detail["configured_model"] == "qwen3-vl:32b"
     assert probe.detail["served_models"] == ["other"]
+    assert "404" in probe.detail["completion_error"]
 
 
 def test_probe_reports_malformed_models_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def requestor(*, method: str, url: str, body: Any = None, timeout: float = 30.0) -> Any:
-        raise RuntimeError("HTTP 500 from server: internal error")
-
-    probe = probe_rapid_mlx_availability(LocalVisionConfig(), requestor=requestor)
+    """Since the Phase 2 landing review, a bad /models answer no longer vetoes
+    the endpoint (many providers serve no catalog): the catalog becomes
+    advisory-absent and the attempted completion decides. Both failing is
+    what reports unavailable."""
+    probe = probe_rapid_mlx_availability(
+        LocalVisionConfig(),
+        requestor=FakeRapidMlx(
+            models_error=ValueError("non-JSON response"),
+            chat_error=RuntimeError("HTTP 404: no completions either"),
+        ),
+    )
 
     assert probe.available is False
-    assert probe.code == "local_vision_rapid_mlx_malformed_response"
+    assert probe.code == "local_vision_model_unavailable"
+
+    working = probe_rapid_mlx_availability(
+        LocalVisionConfig(),
+        requestor=FakeRapidMlx(models_error=ValueError("non-JSON response"), chat_content="pong"),
+    )
+
+    assert working.available is True
+    assert working.detail["model_not_listed"] is True
 
 
 def test_probe_reports_timeout() -> None:
@@ -493,9 +521,7 @@ def test_interpret_image_reports_unreachable_server(
     # connect, which must surface as a transport-unavailable warning.
     monkeypatch.setattr(
         "distill.rapid_mlx._urlopen_json",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            urllib.error.URLError("connection refused")
-        ),
+        lambda *args, **kwargs: (_ for _ in ()).throw(urllib.error.URLError("connection refused")),
     )
 
     result, warning = try_interpret_image(
@@ -802,6 +828,7 @@ class _FakeHttpResponse:
 
     def __init__(self, payload: bytes) -> None:
         self._payload = payload
+        self._offset = 0
 
     def __enter__(self) -> _FakeHttpResponse:
         return self
@@ -810,7 +837,14 @@ class _FakeHttpResponse:
         return None
 
     def read(self, size: int = -1) -> bytes:
-        return self._payload if size < 0 else self._payload[:size]
+        if size < 0:
+            chunk, self._offset = self._payload[self._offset :], len(self._payload)
+            return chunk
+        chunk = self._payload[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+    read1 = read
 
 
 class _FakeOpener:
@@ -1085,9 +1119,7 @@ def test_frame_interpreter_records_unavailable_probe_warning() -> None:
             "occurrences": 1,
         }
     ]
-    assert interpreter.debug_info()["warning_counts"] == {
-        "local_vision_rapid_mlx_unavailable": 1
-    }
+    assert interpreter.debug_info()["warning_counts"] == {"local_vision_rapid_mlx_unavailable": 1}
 
 
 def test_frame_interpreter_asserts_frame_path_invariant() -> None:
@@ -1132,3 +1164,1260 @@ def _solid_png_bytes() -> bytes:
         + chunk(b"IDAT", zlib.compress(raw))
         + chunk(b"IEND", b"")
     )
+
+
+class TestSecretCredential:
+    """The non-serializable carrier (D-007): reveal() is the only door to the value."""
+
+    def test_carrier_redacts_every_text_form_and_refuses_serialization(self) -> None:
+        import copy
+        import pickle
+
+        from distill.local_vision import SecretCredential
+
+        secret = SecretCredential("sk-super-secret-value")
+
+        assert secret.reveal() == "sk-super-secret-value"
+        assert "sk-super-secret-value" not in repr(secret)
+        assert "sk-super-secret-value" not in str(secret)
+        assert "sk-super-secret-value" not in f"{secret}"
+        with pytest.raises(TypeError):
+            json.dumps(secret)
+        with pytest.raises(TypeError):
+            pickle.dumps(secret)
+        with pytest.raises(TypeError):
+            copy.deepcopy(secret)
+
+    def test_config_never_exposes_the_credential_in_any_serialized_form(self) -> None:
+        from dataclasses import asdict, replace
+
+        from distill.local_vision import SecretCredential
+
+        config = replace(LocalVisionConfig(), credential=SecretCredential("sk-super-secret-value"))
+
+        assert "credential" not in config.public_dict()
+        assert "sk-super-secret-value" not in json.dumps(config.public_dict())
+        assert "sk-super-secret-value" not in repr(config)
+        # asdict deep-copies field values and the carrier refuses deepcopy, so
+        # generic dataclass serialization fails loudly instead of leaking.
+        with pytest.raises(TypeError):
+            asdict(config)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://user:sk-super-secret-value@127.0.0.1:8000/v1",
+            "http://127.0.0.1:8000/v1?api_key=sk-super-secret-value",
+        ],
+    )
+    def test_credential_bearing_base_url_is_rejected_without_echoing_it(self, url: str) -> None:
+        from distill.local_vision import _checked_endpoint_url
+        from distill.rapid_mlx import EndpointRejected
+
+        with pytest.raises(EndpointRejected) as excinfo:
+            _checked_endpoint_url(url, allow_remote_endpoint=True)
+
+        assert "sk-super-secret-value" not in str(excinfo.value)
+        assert "sk-super-secret-value" not in json.dumps(excinfo.value.detail)
+
+    def test_loader_rejection_of_credential_bearing_url_does_not_echo_it(self) -> None:
+        with pytest.raises(DistillError) as excinfo:
+            local_vision_config_from_args(
+                {"local_vision_base_url": "http://user:sk-super-secret-value@127.0.0.1:8000/v1"}
+            )
+
+        assert "sk-super-secret-value" not in str(excinfo.value)
+        assert "sk-super-secret-value" not in json.dumps(getattr(excinfo.value, "details", {}))
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Port out of range: rejected as unparsable BEFORE the credential
+            # screen can run, so the echo path itself must redact.
+            "http://user:sk-super-secret-value@127.0.0.1:99999/v1",
+            # Percent-encoded userinfo parses as a hostname, evading the
+            # userinfo check; the host echo must not leak it either.
+            "http://user%3Ask-super-secret-value%40127.0.0.1:8000/v1",
+        ],
+    )
+    def test_malformed_credential_bearing_urls_never_echo_the_secret(self, url: str) -> None:
+        from distill.local_vision import _checked_endpoint_url
+        from distill.rapid_mlx import EndpointRejected
+
+        with pytest.raises(EndpointRejected) as excinfo:
+            _checked_endpoint_url(url, allow_remote_endpoint=True)
+
+        assert "sk-super-secret-value" not in str(excinfo.value)
+        assert "sk-super-secret-value" not in json.dumps(excinfo.value.detail)
+
+    def test_configs_differing_only_by_credential_are_not_equal(self) -> None:
+        from dataclasses import replace
+
+        from distill.local_vision import SecretCredential
+
+        base = LocalVisionConfig()
+        with_a = replace(base, credential=SecretCredential("sk-credential-a"))
+        with_b = replace(base, credential=SecretCredential("sk-credential-b"))
+        with_a_again = replace(base, credential=SecretCredential("sk-credential-a"))
+
+        # A future config-keyed cache must never serve a response fetched
+        # under a different credential.
+        assert with_a != with_b
+        assert with_a != base
+        assert with_a == with_a_again
+
+
+class TestCredentialResolution:
+    """D-016: api_key_env preferred over inline api_key, both under local_vision."""
+
+    def test_inline_api_key_resolves_to_a_carried_credential(self, tmp_path: Path) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"api_key": "sk-inline-credential"})
+        )
+
+        config = load_local_vision_config(tmp_path)
+
+        assert config.credential is not None
+        assert config.credential.reveal() == "sk-inline-credential"
+
+    def test_api_key_env_wins_over_inline_api_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"api_key": "sk-inline-loses", "api_key_env": "DISTILL_TEST_VISION_KEY"})
+        )
+        monkeypatch.setenv("DISTILL_TEST_VISION_KEY", "sk-from-env-wins")
+
+        config = load_local_vision_config(tmp_path)
+
+        assert config.credential is not None
+        assert config.credential.reveal() == "sk-from-env-wins"
+
+    def test_credential_survives_the_options_round_trip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"api_key": "sk-round-trip"})
+        )
+        monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+
+        options = DistillOptions.from_args({})
+        config = options.local_vision_config()
+
+        assert config.credential is not None
+        assert config.credential.reveal() == "sk-round-trip"
+        # The identity/cache surfaces stay credential-free and serializable.
+        assert "sk-round-trip" not in json.dumps(options.public_dict("local"))
+        assert "sk-round-trip" not in json.dumps(options.cache_payload("local"))
+
+    def test_bearer_header_present_exactly_when_a_credential_is(self) -> None:
+        from distill.local_vision import SecretCredential
+        from distill.rapid_mlx import _request_headers
+
+        with_credential = _request_headers(SecretCredential("sk-header-secret"))
+        without_credential = _request_headers(None)
+
+        assert with_credential["Authorization"] == "Bearer sk-header-secret"
+        assert "Authorization" not in without_credential
+        assert without_credential["Content-Type"] == "application/json"
+        assert without_credential["Accept"] == "application/json"
+
+    def test_interpret_request_carries_bearer_exactly_when_config_does(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from dataclasses import replace
+
+        from distill.local_vision import SecretCredential
+
+        class _RecordingOpener(_FakeOpener):
+            def __init__(self, payload: bytes) -> None:
+                super().__init__(payload)
+                self.requests: list[Any] = []
+
+            def open(self, request: Any, timeout: float | None = None) -> _FakeHttpResponse:
+                self.requests.append(request)
+                return super().open(request, timeout)
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        recorder = _RecordingOpener(payload)
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", recorder)
+
+        with_credential = replace(
+            LocalVisionConfig(), credential=SecretCredential("sk-wire-secret")
+        )
+        try_interpret_image(with_credential, image, "Interpret.", prompt_profile="technical")
+        try_interpret_image(LocalVisionConfig(), image, "Interpret.", prompt_profile="technical")
+
+        first, second = recorder.requests
+        assert first.get_header("Authorization") == "Bearer sk-wire-secret"
+        assert second.get_header("Authorization") is None
+
+    def test_configured_but_empty_credential_on_remote_endpoint_is_fatal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps(
+                {
+                    "api_key_env": "DISTILL_TEST_UNSET_KEY",
+                    "base_url": "https://vision.example.com/v1",
+                    "allow_remote_endpoint": True,
+                }
+            )
+        )
+        monkeypatch.delenv("DISTILL_TEST_UNSET_KEY", raising=False)
+
+        with pytest.raises(DistillError) as excinfo:
+            load_local_vision_config(tmp_path)
+
+        assert "DISTILL_TEST_UNSET_KEY" in str(excinfo.value)
+
+    def test_no_credential_configured_on_remote_endpoint_is_intentional_no_auth(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"base_url": "https://vision.example.com/v1", "allow_remote_endpoint": True})
+        )
+
+        config = load_local_vision_config(tmp_path)
+
+        assert config.credential is None
+        assert config.credential_configured is False
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_auth_rejection_degrades_without_echoing_body_or_credential(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        status: int,
+    ) -> None:
+        from dataclasses import replace
+        from email.message import Message
+
+        from distill.local_vision import SecretCredential
+
+        class _AuthRejectingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    status,
+                    "denied",
+                    Message(),
+                    io.BytesIO(b'{"error": "server-error-body-text"}'),
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _AuthRejectingOpener())
+        config = replace(LocalVisionConfig(), credential=SecretCredential("sk-auth-secret"))
+
+        with caplog.at_level(logging.DEBUG, logger="distill.local_vision"):
+            result, failure_warning = try_interpret_image(
+                config, image, "Interpret.", prompt_profile="technical"
+            )
+
+        assert result is None
+        assert failure_warning is not None
+        assert failure_warning["code"] == "local_vision_auth_rejected"
+        surface = json.dumps(failure_warning)
+        assert "sk-auth-secret" not in surface
+        assert "server-error-body-text" not in surface
+        assert any('"event": "auth_rejected"' in record.message for record in caplog.records)
+
+    def test_one_auth_rejection_degrades_the_remaining_frames(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        attempts: list[str] = []
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            attempts.append(url)
+            raise LocalVisionFailure(
+                "local_vision_auth_rejected",
+                "Local vision endpoint rejected the credential (HTTP 401); "
+                "continuing with OCR-only output.",
+                {"status": 401},
+            )
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        monkeypatch.setattr("distill.local_vision._urlopen_json", fake_urlopen, raising=False)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe, debug=True)
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        # One attempt, not three: the first 401 degrades the remainder.
+        assert len(attempts) == 1
+        assert all(frame.reading is None for frame in frames)
+        codes = {w["code"] for w in warnings}
+        assert "local_vision_auth_rejected" in codes
+
+    def test_auth_rejected_frame_carries_the_ungrounded_assessment(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(*_args: Any, **_kwargs: Any) -> Any:
+            raise LocalVisionFailure(
+                "local_vision_auth_rejected",
+                "Local vision endpoint rejected the credential (HTTP 401); "
+                "continuing with OCR-only output.",
+                {"status": 401},
+            )
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        # FRAME_READ_FAILURE_CODES membership is what attaches the explicit
+        # "vision produced no usable output" grounding to the failed frame.
+        assert frames[0].reading is None
+        assert frames[0].grounding is not None
+        assert frames[0].grounding.get("level") == UNGROUNDED
+
+    def test_probe_request_carries_the_bearer_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dataclasses import replace
+
+        from distill.local_vision import SecretCredential
+
+        captured: dict[str, Any] = {}
+
+        def fake_get(requestor, url, timeout_sec, **kwargs):  # noqa: ANN001
+            captured.update(kwargs)
+            return _models_body(DEFAULT_MODEL)
+
+        monkeypatch.setattr("distill.local_vision._http_get_json", fake_get)
+        config = replace(LocalVisionConfig(), credential=SecretCredential("sk-probe-secret"))
+
+        probe = probe_rapid_mlx_availability(config)
+
+        assert probe.available is True
+        assert captured["credential"] is config.credential
+
+    def test_probe_auth_rejection_yields_unavailable_probe_with_auth_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from email.message import Message
+
+        class _AuthRejectingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                raise urllib.error.HTTPError(
+                    request.full_url, 401, "denied", Message(), io.BytesIO(b"{}")
+                )
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _AuthRejectingOpener())
+
+        probe = probe_rapid_mlx_availability(LocalVisionConfig())
+
+        assert probe.available is False
+        assert probe.code == "local_vision_auth_rejected"
+
+    def test_empty_inline_api_key_is_the_same_typo_guard(self, tmp_path: Path) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps(
+                {
+                    "api_key": "",
+                    "base_url": "https://vision.example.com/v1",
+                    "allow_remote_endpoint": True,
+                }
+            )
+        )
+
+        with pytest.raises(DistillError):
+            load_local_vision_config(tmp_path)
+
+    def test_configured_but_empty_credential_on_loopback_is_not_fatal(self, tmp_path: Path) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"api_key": "", "base_url": "http://localhost:8000/v1"})
+        )
+
+        config = load_local_vision_config(tmp_path)
+
+        # allow_remote_endpoint is False, so the per-request resolved-address
+        # check owns locality; the typo guard must not punish the local default.
+        assert config.credential is None
+        assert config.credential_configured is True
+
+
+class TestEndpointPolicyHttps:
+    """M2.3: http only ever speaks to loopback; a remote endpoint requires https."""
+
+    def test_http_to_a_non_loopback_literal_is_rejected_even_with_remote_allowed(
+        self,
+    ) -> None:
+        from distill.local_vision import _checked_endpoint_url
+        from distill.rapid_mlx import EndpointRejected
+
+        with pytest.raises(EndpointRejected) as excinfo:
+            _checked_endpoint_url("http://203.0.113.7:8000/v1", allow_remote_endpoint=True)
+
+        assert excinfo.value.reason == "http_off_loopback"
+        assert "https" in excinfo.value.message
+
+    def test_http_name_resolving_off_machine_is_rejected_even_with_remote_allowed(
+        self,
+    ) -> None:
+        from distill.local_vision import _check_resolved_address
+        from distill.rapid_mlx import EndpointRejected
+
+        with pytest.raises(EndpointRejected) as excinfo:
+            _check_resolved_address(
+                "plain.example.com",
+                8000,
+                allow_remote_endpoint=True,
+                scheme="http",
+                resolver=lambda _host, _port: ["203.0.113.7"],
+            )
+
+        assert excinfo.value.reason == "http_off_loopback"
+
+    def test_https_name_resolving_off_machine_is_permitted_with_remote_allowed(
+        self,
+    ) -> None:
+        from distill.local_vision import _check_resolved_address
+
+        addresses = _check_resolved_address(
+            "vision.example.com",
+            443,
+            allow_remote_endpoint=True,
+            scheme="https",
+            resolver=lambda _host, _port: ["203.0.113.7"],
+        )
+
+        assert addresses == []
+
+    def test_one_endpoint_rejection_degrades_the_remaining_frames(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from distill.rapid_mlx import EndpointRejected
+
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        attempts: list[str] = []
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            attempts.append(url)
+            # A rebind is the rejection that actually reaches a frame: the
+            # config validated, the probe passed, and the name changed its
+            # answer mid-run (D-029).
+            raise EndpointRejected(
+                "non_loopback_address",
+                "Local vision endpoint host resolves to 203.0.113.7, which is "
+                "not loopback; set local_vision_allow_remote_endpoint to reach "
+                "one deliberately.",
+            )
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        # The same config produces the same rejection on every frame; one is
+        # enough to condemn the rest.
+        assert len(attempts) == 1
+        assert all(frame.reading is None for frame in frames)
+        summary = next(w for w in warnings if w["code"] == BREAKER_WARNING_CODE)
+        assert "the endpoint was rejected" in summary["message"]
+        assert "consecutive transport failures" not in summary["message"]
+
+    def test_a_transient_dns_failure_gets_transport_strikes_not_condemnation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unresolvable name is unavailability, not a policy verdict: it
+        must carry the transport-failure code (3-strike breaker), never the
+        rejection code that condemns the run on the first flap."""
+        import distill.rapid_mlx as rapid_mlx_module
+        from distill.rapid_mlx import EndpointRejected, _resolve_addresses
+
+        def failing_getaddrinfo(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("temporary failure in name resolution")
+
+        monkeypatch.setattr(rapid_mlx_module.socket, "getaddrinfo", failing_getaddrinfo)
+
+        with pytest.raises(LocalVisionFailure) as excinfo:
+            _resolve_addresses("vision.test", 8000)
+
+        assert excinfo.value.code == "local_vision_rapid_mlx_unavailable"
+        assert not isinstance(excinfo.value, EndpointRejected)
+
+    def test_the_production_opener_verifies_tls(self) -> None:
+        """M2.3's premise is TLS for anything remote; pin that the opener's
+        HTTPS handler actually verifies certificates and hostnames, so a
+        future _build_opener change cannot silently turn verification off."""
+        import ssl
+        import urllib.request as _ur
+
+        from distill.rapid_mlx import _build_opener
+
+        opener = _build_opener()
+        handlers = getattr(opener, "handlers", [])
+        https_handlers = [h for h in handlers if isinstance(h, _ur.HTTPSHandler)]
+
+        assert https_handlers, "the opener must have an HTTPS handler"
+        for handler in https_handlers:
+            context = handler._context  # noqa: SLF001 - the pin is the point
+            assert context.verify_mode is ssl.CERT_REQUIRED
+            assert context.check_hostname is True
+
+
+class TestAttemptCompletionAvailability:
+    """M2.4: /models is advisory; a missing listing warns, a completion decides."""
+
+    def test_model_absent_from_catalog_is_available_when_a_completion_succeeds(
+        self,
+    ) -> None:
+        server = FakeRapidMlx(models=["other-model"], chat_content="pong")
+        config = LocalVisionConfig(model=DEFAULT_MODEL)
+
+        probe = probe_rapid_mlx_availability(config, requestor=server)
+
+        assert probe.available is True
+        assert probe.code == "local_vision_available"
+        assert probe.detail["model_not_listed"] is True
+        assert probe.detail["served_models"] == ["other-model"]
+        # The decision came from an attempted completion, not /models alone.
+        assert any(
+            call["method"] == "POST" and call["url"].endswith("/chat/completions")
+            for call in server.calls
+        )
+
+    def test_interpreter_surfaces_an_advisory_warning_for_an_unlisted_model(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body("some-other-model")
+            return _chat_envelope(_frame_json())
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+
+        interpreter = FrameInterpreter(LocalVisionConfig())
+        frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        # The frame is read (no hard-skip), and the run says why that is safe.
+        assert frames[0].reading is not None
+        advisory = [w for w in warnings if w["code"] == "local_vision_model_not_listed"]
+        assert len(advisory) == 1
+        assert "catalog" in advisory[0]["message"]
+
+    def test_a_provider_rejecting_the_image_part_degrades_that_frame(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Off-profile (D-008): an endpoint that 400s the image content part
+        is out of profile for that frame - the frame degrades to OCR-only, the
+        run continues, and the hostile error body is bounded, not parsed."""
+        from email.message import Message
+
+        class _ImageRejectingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    400,
+                    "bad request",
+                    Message(),
+                    io.BytesIO(b'{"error": "image content part not supported"}'),
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _ImageRejectingOpener())
+
+        result, failure_warning = try_interpret_image(
+            LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+        )
+
+        assert result is None
+        assert failure_warning is not None
+        assert failure_warning["code"] == "local_vision_malformed_response"
+
+    def test_the_attempted_completion_is_minimal_and_carries_an_image_part(
+        self,
+    ) -> None:
+        server = FakeRapidMlx(models=["other-model"], chat_content="pong")
+
+        probe_rapid_mlx_availability(LocalVisionConfig(), requestor=server)
+
+        [attempt] = [c for c in server.calls if c["method"] == "POST"]
+        body = attempt["body"]
+        assert body["max_tokens"] == 1
+        assert body["stream"] is False
+        [message] = body["messages"]
+        part_types = [part["type"] for part in message["content"]]
+        # The probe's question is "will this endpoint read a keyframe" - a
+        # text-only ping would authorize an image run against a text router.
+        assert "image_url" in part_types
+
+    def test_an_auth_rejection_during_the_attempt_keeps_its_own_code(self) -> None:
+        server = FakeRapidMlx(
+            models=["other-model"],
+            chat_error=LocalVisionFailure(
+                "local_vision_auth_rejected",
+                "Local vision endpoint rejected the credential (HTTP 401); "
+                "continuing with OCR-only output.",
+                {"status": 401},
+            ),
+        )
+
+        probe = probe_rapid_mlx_availability(LocalVisionConfig(), requestor=server)
+
+        assert probe.available is False
+        # The operator's signal is the credential, not a missing model.
+        assert probe.code == "local_vision_auth_rejected"
+        assert "credential" in probe.message
+
+    def test_a_200_without_a_completion_envelope_is_not_availability(self) -> None:
+        class _ErrorBodyServer(FakeRapidMlx):
+            def __call__(
+                self, *, method: str, url: str, body: Any = None, timeout: float = 30.0
+            ) -> Any:
+                if method == "POST":
+                    self.calls.append(
+                        {"method": method, "url": url, "body": body, "timeout": timeout}
+                    )
+                    return {"error": {"message": "model not found"}}
+                return super().__call__(method=method, url=url, body=body, timeout=timeout)
+
+        server = _ErrorBodyServer(models=["other-model"])
+
+        probe = probe_rapid_mlx_availability(LocalVisionConfig(), requestor=server)
+
+        assert probe.available is False
+        assert probe.code == "local_vision_model_unavailable"
+
+
+class TestBoundedRemoteBehavior:
+    """M2.5: stream off, absolute deadline, run-wide budget, bounded retries."""
+
+    def test_the_interpret_request_sets_stream_false(self) -> None:
+        server = FakeRapidMlx(chat_content=_frame_json())
+
+        result = _interpret_with_rapid_mlx(
+            LocalVisionConfig(),
+            Path(__file__),
+            "Interpret.",
+            "technical",
+            requestor=server,
+        )
+
+        assert result is not None
+        [attempt] = [c for c in server.calls if c["method"] == "POST"]
+        assert attempt["body"]["stream"] is False
+
+    def test_a_slow_drip_trips_the_absolute_deadline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """urllib's timeout is per socket operation; a body arriving one chunk
+        at a time never trips it. The deadline is absolute: the whole answer
+        arrives within timeout_sec or the request is a timeout."""
+        from distill.rapid_mlx import _urlopen_json
+
+        clock = {"now": 0.0}
+        monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: clock["now"])
+
+        class _DrippingResponse:
+            def __enter__(self) -> Any:
+                return self
+
+            def __exit__(self, *exc_info: object) -> None:
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                # Each chunk costs 10 simulated seconds and never finishes.
+                clock["now"] += 10.0
+                return b"x" * min(size if size > 0 else 65536, 65536)
+
+            read1 = read
+
+        class _DrippingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                return _DrippingResponse()
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _DrippingOpener())
+
+        with pytest.raises(TimeoutError):
+            _urlopen_json(
+                "POST",
+                "http://127.0.0.1:8000/v1/chat/completions",
+                {"model": "m"},
+                timeout_sec=30.0,
+            )
+
+    def test_the_byte_budget_degrades_the_remainder_and_keeps_prior_frames(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        opened = {"n": 0}
+
+        class _CountingOpener(_FakeOpener):
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                opened["n"] += 1
+                return super().open(request, timeout)
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _CountingOpener(payload))
+
+        interpreter = FrameInterpreter(
+            # The budget bounds remote cost, so it attaches only to a config
+            # that opted into a remote endpoint (loopback + opt-in is legal).
+            LocalVisionConfig(allow_remote_endpoint=True),
+            probe=_available_probe,
+            # Enough for one response, not two: the second request must find
+            # the budget spent and the third must never be attempted.
+            budget_bytes=len(payload) + 10,
+        )
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        assert frames[0].reading is not None  # already-interpreted frames kept
+        assert frames[1].reading is None
+        assert frames[2].reading is None
+        assert opened["n"] <= 2  # the third frame was never attempted
+        codes = {w["code"] for w in warnings}
+        assert "local_vision_budget_exhausted" in codes
+        summary = next(w for w in warnings if w["code"] == BREAKER_WARNING_CODE)
+        # The R-40 sentence is the operator's whole account: a spent budget
+        # must never read as "0 consecutive transport failures".
+        assert "budget was spent" in summary["message"]
+        assert "consecutive transport failures" not in summary["message"]
+
+    def test_the_wall_clock_budget_degrades_the_remainder(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        clock = {"now": 0.0}
+        monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: clock["now"])
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+
+        class _SlowFrameOpener(_FakeOpener):
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                clock["now"] += 100.0  # each frame costs 100 simulated seconds
+                return super().open(request, timeout)
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _SlowFrameOpener(payload))
+
+        interpreter = FrameInterpreter(
+            LocalVisionConfig(timeout_sec=1000.0, allow_remote_endpoint=True),
+            probe=_available_probe,
+            budget_sec=150.0,
+        )
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        assert frames[0].reading is not None
+        assert frames[1].reading is None
+        assert frames[2].reading is None
+        assert "local_vision_budget_exhausted" in {w["code"] for w in warnings}
+
+    def test_a_429_honors_retry_after_with_bounded_retries_then_degrades(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from email.message import Message
+
+        opened = {"n": 0}
+        sleeps: list[float] = []
+
+        class _RateLimitingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                opened["n"] += 1
+                headers = Message()
+                headers["Retry-After"] = "3"
+                raise urllib.error.HTTPError(
+                    request.full_url, 429, "too many requests", headers, io.BytesIO(b"{}")
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _RateLimitingOpener())
+        monkeypatch.setattr("distill.local_vision._sleep", sleeps.append)
+
+        result, failure_warning = try_interpret_image(
+            LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+        )
+
+        assert result is None
+        assert failure_warning is not None
+        assert failure_warning["code"] == "local_vision_retry_exhausted"
+        # One original attempt plus two bounded retries, each honoring the
+        # server's requested pause.
+        assert opened["n"] == 3
+        assert sleeps == [3.0, 3.0]
+
+    def test_a_local_run_carries_no_budget(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The budget bounds remote cost (D-008); a slow-but-working local
+        model must never be half-degraded by a run-wide clock."""
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _FakeOpener(payload))
+
+        interpreter = FrameInterpreter(
+            LocalVisionConfig(),  # no remote opt-in
+            probe=_available_probe,
+            budget_bytes=1,  # would exhaust instantly if it applied
+            budget_sec=0.000001,
+        )
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        assert all(frame.reading is not None for frame in frames)
+        assert "local_vision_budget_exhausted" not in {w["code"] for w in warnings}
+
+    def test_an_exhausted_budget_blocks_the_request_before_it_is_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """check() runs before open: a spent budget never sends the request,
+        which is the only thing that stops traffic once the run is over
+        budget (the breaker covers the interpreter path; this covers every
+        path that carries a budget)."""
+        from distill.rapid_mlx import VisionStageBudget, _urlopen_json
+
+        clock = {"now": 0.0}
+        monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: clock["now"])
+        opened = {"n": 0}
+
+        class _NeverOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                opened["n"] += 1
+                raise AssertionError("a spent budget must not send a request")
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _NeverOpener())
+        budget = VisionStageBudget(wall_clock_sec=5.0, max_bytes=1024)
+        clock["now"] = 100.0
+
+        with pytest.raises(LocalVisionFailure) as excinfo:
+            _urlopen_json(
+                "POST",
+                "http://127.0.0.1:8000/v1/chat/completions",
+                {"model": "m"},
+                timeout_sec=30.0,
+                budget=budget,
+            )
+
+        assert excinfo.value.code == "local_vision_budget_exhausted"
+        assert opened["n"] == 0
+
+    def test_a_429_without_retry_after_uses_the_default_backoff(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from email.message import Message
+
+        sleeps: list[float] = []
+
+        class _RateLimitingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                raise urllib.error.HTTPError(
+                    request.full_url, 503, "busy", Message(), io.BytesIO(b"{}")
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _RateLimitingOpener())
+        monkeypatch.setattr("distill.local_vision._sleep", sleeps.append)
+
+        result, failure_warning = try_interpret_image(
+            LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+        )
+
+        assert result is None
+        assert failure_warning is not None
+        assert failure_warning["code"] == "local_vision_retry_exhausted"
+        assert sleeps == [1.0, 1.0]
+
+    @pytest.mark.parametrize("retry_after", ["-1", "nan", "0"])
+    def test_hostile_retry_after_values_never_crash_the_pause(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, retry_after: str
+    ) -> None:
+        from email.message import Message
+
+        sleeps: list[float] = []
+
+        class _HostileOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                headers = Message()
+                headers["Retry-After"] = retry_after
+                raise urllib.error.HTTPError(
+                    request.full_url, 429, "limited", headers, io.BytesIO(b"{}")
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _HostileOpener())
+        monkeypatch.setattr("distill.local_vision._sleep", sleeps.append)
+
+        result, failure_warning = try_interpret_image(
+            LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+        )
+
+        assert result is None
+        assert failure_warning is not None
+        # The endpoint's bug stays the endpoint's: still a rate-limit story,
+        # never a crash misreported as malformed JSON.
+        assert failure_warning["code"] == "local_vision_retry_exhausted"
+        assert all(0.0 <= pause <= 10.0 for pause in sleeps)
+
+    def test_one_rate_limited_frame_degrades_the_remaining_frames(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from email.message import Message
+
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        opened = {"n": 0}
+
+        class _RateLimitingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                opened["n"] += 1
+                raise urllib.error.HTTPError(
+                    request.full_url, 429, "limited", Message(), io.BytesIO(b"{}")
+                )
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _RateLimitingOpener())
+        monkeypatch.setattr("distill.local_vision._sleep", lambda _pause: None)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe, debug=True)
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        # Frame 1 spends its bounded retries (3 requests); frames 2-3 are
+        # never attempted - retrying a run into a rate limiter is the
+        # amplification the immediate trip prevents.
+        assert opened["n"] == 3
+        assert all(frame.reading is None for frame in frames)
+        assert interpreter.debug_info()["breaker"]["transport_failures"] == 0
+        summary = next(w for w in warnings if w["code"] == BREAKER_WARNING_CODE)
+        assert "rate-limiting" in summary["message"]
+        assert "consecutive transport failures" not in summary["message"]
+
+
+class TestPromptSideRedaction:
+    """M2.6 (D-010): extracted text is redacted before it enters any vision
+    prompt, regardless of endpoint locality and regardless of the render-side
+    --no-redact-secrets flag."""
+
+    def test_ocr_text_is_redacted_inside_the_built_prompt(self) -> None:
+        from distill.vision_prompts import build_technical_frame_prompt
+
+        prompt = build_technical_frame_prompt(
+            ocr_text="export API_KEY=sk-prompt-secret-value\nplain slide text"
+        )
+
+        assert "sk-prompt-secret-value" not in prompt.prompt
+        assert "[REDACTED]" in prompt.prompt
+        assert "plain slide text" in prompt.prompt
+
+    def test_url_userinfo_credentials_are_redacted(self) -> None:
+        from distill.redact_secrets import redact_text
+
+        result = redact_text(
+            "curl http://admin:sk-userinfo-secret@vision.example.com:8000/v1/models"
+        )
+
+        assert "sk-userinfo-secret" not in result.text
+        assert "vision.example.com" in result.text  # the host stays diagnostic
+
+    def test_prompts_are_identical_local_vs_remote_and_ignore_the_render_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """D-010's cache-coherence half: the prompt depends on the frame, not
+        on where the endpoint lives or what --no-redact-secrets says."""
+        from dataclasses import replace
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        captured: list[str] = []
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+
+        class _CapturingOpener(_FakeOpener):
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                body = json.loads(request.data.decode())
+                [message] = body["messages"]
+                captured.append(next(p["text"] for p in message["content"] if p["type"] == "text"))
+                return super().open(request, timeout)
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _CapturingOpener(payload))
+        # DISABLED, not the default: under the default policy the carrier
+        # already redacted extracted_text at construction, so only the
+        # --no-redact-secrets frame exercises the prompt-side sink at all.
+        from distill.artifacts import RedactionState
+
+        secret_frame = FrameArtifact(
+            index=1,
+            timestamp_sec=1.0,
+            path=str(image),
+            relative_path=f"frames/{image.name}",
+            extracted_text="API_KEY=sk-uniform-secret",
+            redaction=RedactionState.DISABLED,
+        )
+        local = LocalVisionConfig()
+        remote = replace(
+            LocalVisionConfig(),
+            base_url="https://10.0.0.5:8000/v1",
+            allow_remote_endpoint=True,
+        )
+        # The remote request would resolve/connect; the capture happens at the
+        # opener so the fake serves both. Resolved-address check: 10.0.0.5 is
+        # a literal, allow_remote + https passes the static check, and the
+        # resolved check exempts https with the opt-in.
+        for config in (local, remote):
+            interpreter = FrameInterpreter(config, probe=_available_probe)
+            interpreter.interpret([secret_frame])
+
+        assert len(captured) == 2
+        assert captured[0] == captured[1]
+        assert "sk-uniform-secret" not in captured[0]
+        assert "[REDACTED]" in captured[0]
+
+
+class TestNonLocalProvenance:
+    """M2.7 (D-012): a run that may send keyframes off-machine says so, and
+    'was remote' folds into bundle identity; the address never does."""
+
+    def test_a_remote_opted_run_records_the_non_local_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from dataclasses import replace
+
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _FakeOpener(payload))
+        remote = replace(
+            LocalVisionConfig(),
+            base_url="https://10.0.0.5:8000/v1",
+            allow_remote_endpoint=True,
+        )
+
+        interpreter = FrameInterpreter(remote, probe=_available_probe)
+        _frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        assert "non_local_only_processing" in {w["code"] for w in warnings}
+
+    def test_a_loopback_run_records_no_non_local_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _FakeOpener(payload))
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        _frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        assert "non_local_only_processing" not in {w["code"] for w in warnings}
+
+    def test_was_remote_folds_into_bundle_identity_but_the_address_does_not(
+        self,
+    ) -> None:
+        local = DistillOptions.from_args({})
+        remote = DistillOptions.from_args(
+            {
+                "local_vision_base_url": "https://10.0.0.5:8000/v1",
+                "local_vision_allow_remote_endpoint": True,
+            }
+        )
+        another_remote = DistillOptions.from_args(
+            {
+                "local_vision_base_url": "https://198.51.100.7:9000/v1",
+                "local_vision_allow_remote_endpoint": True,
+            }
+        )
+
+        # Remote- and local-produced bundles never share a key (D-012)...
+        assert local.opts_hash("local") != remote.opts_hash("local")
+        # ...but WHERE the remote endpoint lives stays a machine-local claim:
+        # two different remote addresses produce the same identity, and the
+        # address never enters the hashed payload.
+        assert remote.opts_hash("local") == another_remote.opts_hash("local")
+        assert "10.0.0.5" not in json.dumps(remote.cache_payload("local"))
+        assert "10.0.0.5" not in json.dumps(remote.public_dict("local"))
+
+    def test_the_self_contained_render_carries_the_non_local_warning(self) -> None:
+        from distill.errors import warning as make_warning
+        from distill.render import render_markdown
+
+        non_local = make_warning(
+            "local_vision",
+            "non_local_only_processing",
+            "this run was configured to send keyframes to a non-loopback "
+            "vision endpoint; the generation may not be local-only "
+            "processing.",
+        )
+
+        frame = _frame(1, Path("frames/frame1.png"), extracted_text="on-screen text")
+        render = render_markdown(
+            "example.mp4",
+            12.0,
+            None,
+            [frame],
+            [non_local],
+        )
+
+        assert "## Warnings" in render
+        assert "non_local_only_processing" in render
+
+    @pytest.mark.parametrize(
+        ("base_url", "allow_remote", "expected"),
+        [
+            # A hostname WITHOUT the opt-in never folds: the per-request
+            # resolved check keeps it loopback-or-rejected.
+            ("https://vision.example.com/v1", False, False),
+            # The same hostname WITH the opt-in fails closed as remote.
+            ("https://vision.example.com/v1", True, True),
+            # http can never leave the machine (proved per request, opt-in
+            # or not), so localhost-over-http is not a non-local claim.
+            ("http://localhost:8000/v1", True, False),
+            ("https://10.0.0.5:8000/v1", True, True),
+            ("http://127.0.0.1:8000/v1", True, False),
+        ],
+    )
+    def test_the_non_local_predicate_terms(
+        self, base_url: str, allow_remote: bool, expected: bool
+    ) -> None:
+        from dataclasses import replace
+
+        from distill.local_vision import config_is_non_local
+
+        config = replace(LocalVisionConfig(), base_url=base_url, allow_remote_endpoint=allow_remote)
+
+        assert config_is_non_local(config) is expected
+
+    def test_the_warning_survives_an_unavailable_endpoint(self, tmp_path: Path) -> None:
+        """The fold is computed from options before any I/O; the disclosure
+        must reach the render even when the endpoint never answers."""
+        from dataclasses import replace
+
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def unavailable_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+            return LocalVisionProbe(
+                available=False,
+                backend=config.backend,
+                model=config.model,
+                base_url=config.base_url,
+                code="local_vision_rapid_mlx_unavailable",
+                message="down",
+                detail={},
+            )
+
+        remote = replace(
+            LocalVisionConfig(),
+            base_url="https://10.0.0.5:8000/v1",
+            allow_remote_endpoint=True,
+        )
+        interpreter = FrameInterpreter(remote, probe=unavailable_probe)
+        _frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        codes = {w["code"] for w in warnings}
+        assert "non_local_only_processing" in codes
+        assert "local_vision_rapid_mlx_unavailable" in codes
+
+
+def test_end_to_end_credential_budget_and_provenance_compose(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The composed remote path, config file to wire: api_key_env resolves
+    into a bearer on BOTH the probe and the frame request, the run-wide
+    budget rides both, the non-local disclosure lands in the warnings, the
+    fold lands in identity, and neither credential nor address reaches the
+    bundle surfaces."""
+
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "api_key_env": "DISTILL_E2E_VISION_KEY",
+                "base_url": "https://10.0.0.5:8000/v1",
+                "allow_remote_endpoint": True,
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_E2E_VISION_KEY", "sk-e2e-secret")
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path / "config"))
+    (tmp_path / "frame0.png").write_bytes(b"png")
+
+    options = DistillOptions.from_args({})
+    config = options.local_vision_config()
+
+    auth_headers: list[str | None] = []
+    budgets_seen: list[object] = []
+
+    class _RecordingOpener:
+        def open(self, request: Any, timeout: float | None = None) -> Any:
+            auth_headers.append(request.get_header("Authorization"))
+            body = (
+                json.dumps(_models_body(DEFAULT_MODEL))
+                if request.full_url.rstrip("/").endswith("/models")
+                else json.dumps(_chat_envelope(_frame_json()))
+            ).encode()
+
+            class _Resp:
+                def __enter__(self) -> Any:
+                    return self
+
+                def __exit__(self, *exc: object) -> None:
+                    return None
+
+                def __init__(self) -> None:
+                    self._offset = 0
+
+                def read1(self, size: int = -1) -> bytes:
+                    chunk = body[self._offset : self._offset + (size if size > 0 else len(body))]
+                    self._offset += len(chunk)
+                    return chunk
+
+                read = read1
+
+            return _Resp()
+
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _RecordingOpener())
+
+    original_post = __import__("distill.rapid_mlx", fromlist=["_http_post_json"])._http_post_json
+
+    def spying_post(*args: Any, **kwargs: Any) -> Any:
+        budgets_seen.append(kwargs.get("budget"))
+        return original_post(*args, **kwargs)
+
+    monkeypatch.setattr("distill.local_vision._http_post_json", spying_post)
+
+    interpreter = FrameInterpreter(config)
+    frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+    # Both requests authenticated with the resolved credential.
+    assert auth_headers and all(h == "Bearer sk-e2e-secret" for h in auth_headers)
+    # The frame request carried the run's budget (remote-opted config).
+    assert budgets_seen and budgets_seen[-1] is not None
+    assert frames[0].reading is not None
+    assert "non_local_only_processing" in {w["code"] for w in warnings}
+    # Identity folds; the credential reaches NO surface, and the address
+    # stays out of the bundle surfaces (it remains a machine-local claim in
+    # the local diagnostics view, per ADR-0004).
+    assert options.cache_payload("local")["local_vision_non_local"] is True
+    bundle_surfaces = (
+        json.dumps(options.cache_payload("local")),
+        json.dumps(options.public_dict("local")),
+    )
+    for surface in bundle_surfaces:
+        assert "sk-e2e-secret" not in surface
+        assert "10.0.0.5" not in surface
+    assert "sk-e2e-secret" not in json.dumps(config.public_dict(), default=str)

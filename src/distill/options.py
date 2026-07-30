@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
@@ -20,6 +20,8 @@ from .local_vision import (
     DEFAULT_TIMEOUT_SEC,
     MAX_SOCKET_TIMEOUT_SEC,
     LocalVisionConfig,
+    SecretCredential,
+    config_is_non_local,
     local_vision_config_from_args,
 )
 from .version import PIPELINE_VERSION
@@ -363,6 +365,18 @@ class DistillOptions:
     local_vision_base_url: str = DEFAULT_LOCAL_VISION_BASE_URL
     local_vision_timeout_sec: float = DEFAULT_TIMEOUT_SEC
     local_vision_allow_remote_endpoint: bool = False
+    # The carrier, not a string: excluded from every cache/identity/public
+    # surface by those surfaces' allowlists, and from repr here. It rides
+    # along only so `local_vision_config()` does not silently reconstruct an
+    # unauthenticated config (D-007).
+    local_vision_credential: SecretCredential | None = field(
+        default=None, repr=False, metadata={"secret": True}
+    )
+    # The fail-closed metadata rides with the credential so a reconstructed
+    # config still knows "meant to authenticate" from "intentionally no auth"
+    # (D-016); neither is secret, neither enters the cache allowlists.
+    local_vision_credential_configured: bool = False
+    local_vision_credential_env: str = ""
     job_id: str = ""
     resume_partial: bool = True
 
@@ -420,6 +434,9 @@ class DistillOptions:
                 args.get("local_vision_timeout_sec", local_vision.timeout_sec),
             ),
             local_vision_allow_remote_endpoint=local_vision.allow_remote_endpoint,
+            local_vision_credential=local_vision.credential,
+            local_vision_credential_configured=local_vision.credential_configured,
+            local_vision_credential_env=local_vision.credential_env,
             job_id=str(values["job_id"] or f"distill-{uuid4().hex}"),
             resume_partial=values["resume_partial"],
         )
@@ -476,6 +493,9 @@ class DistillOptions:
             timeout_sec=self.local_vision_timeout_sec,
             caption_frames=self.caption_frames,
             allow_remote_endpoint=self.local_vision_allow_remote_endpoint,
+            credential=self.local_vision_credential,
+            credential_configured=self.local_vision_credential_configured,
+            credential_env=self.local_vision_credential_env,
         )
 
     def transcription_config(self) -> TranscriptionConfig:
@@ -509,8 +529,13 @@ class DistillOptions:
 
     def cache_payload(self, source_type: str) -> dict[str, Any]:
         payload = {name: getattr(self, name) for name in CACHE_OPTION_NAMES}
-        payload.update(
-            {name: getattr(self, name) for name in LOCAL_VISION_IDENTITY_OPTION_NAMES}
+        payload.update({name: getattr(self, name) for name in LOCAL_VISION_IDENTITY_OPTION_NAMES})
+        # D-012 narrows ADR-0004 for exactly one case: WAS this produced via
+        # a (possibly) remote endpoint. The boolean folds into identity so
+        # remote- and local-produced bundles never share a key; the address
+        # and credential stay machine-local claims and never enter the hash.
+        payload["local_vision_non_local"] = self.caption_frames and config_is_non_local(
+            self.local_vision_config()
         )
         payload["pipeline_version"] = PIPELINE_VERSION
         if source_type == "local":

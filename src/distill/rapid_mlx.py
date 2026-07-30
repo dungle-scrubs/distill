@@ -15,11 +15,15 @@ and calls into this module; it does not reimplement any of what is here.
 
 from __future__ import annotations
 
+import hmac
 import http.client
 import ipaddress
 import json
 import logging
+import math
 import socket
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +57,83 @@ MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 ERROR_BODY_PREVIEW_BYTES = 2048
 
 
+# Injectable clock for the absolute deadline, so a test can drip a body
+# through simulated time instead of real sleeps.
+_monotonic = time.monotonic
+
+# The absolute deadline is enforced between chunk reads, so the chunk is how
+# often a dripping response gets measured against the clock.
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+# Run-wide vision-stage budget defaults (D-008). They exist to bound REMOTE
+# cost - the interpreter only attaches a budget when the config opts into a
+# remote endpoint, because a slow local model is not the threat and must not
+# be half-degraded by a run-wide clock. The probe runs before the budget is
+# created, so its two requests are bounded by timeout_sec alone.
+# 3600s clears the run's own worst case (default 80 keyframes x 30s
+# timeout = 2400s) with margin; the bound exists for runaway remote cost,
+# not to race a working endpoint.
+DEFAULT_VISION_STAGE_BUDGET_SEC = 3600.0
+DEFAULT_VISION_STAGE_BUDGET_BYTES = 256 * 1024 * 1024
+
+
+class VisionStageBudget:
+    """Run-wide bounds for the vision stage: wall clock and received bytes.
+
+    Charged by the transport as chunks arrive, checked before each request.
+    Exhaustion raises the typed budget failure, which the interpreter treats
+    as immediate: the remainder degrades to OCR-only and every frame already
+    interpreted is kept (D-008).
+    """
+
+    CODE = "local_vision_budget_exhausted"
+
+    def __init__(self, *, wall_clock_sec: float, max_bytes: int) -> None:
+        if wall_clock_sec <= 0 or max_bytes <= 0:
+            raise ValueError("vision stage budget bounds must be positive")
+        self._deadline = _monotonic() + wall_clock_sec
+        self._wall_clock_sec = wall_clock_sec
+        self._max_bytes = max_bytes
+        self._remaining = max_bytes
+        self._lock = threading.Lock()
+        self._exhausted = False
+
+    def _exhaust(self, why: str) -> NoReturn:
+        if not self._exhausted:
+            # Latched: one run, one budget_exhausted event, however many
+            # threads cross the line together.
+            self._exhausted = True
+            _boundary_log(
+                "budget_exhausted",
+                {"why": why, "wall_clock_sec": self._wall_clock_sec, "max_bytes": self._max_bytes},
+            )
+        raise LocalVisionFailure(
+            self.CODE,
+            f"the vision stage's run-wide budget is spent ({why}); remaining "
+            "keyframes continue with OCR-only output.",
+            {"why": why, "wall_clock_sec": self._wall_clock_sec, "max_bytes": self._max_bytes},
+        )
+
+    def check(self) -> None:
+        with self._lock:
+            if _monotonic() > self._deadline:
+                self._exhaust("wall clock")
+            if self._remaining <= 0:
+                self._exhaust("bytes")
+
+    def charge(self, received_bytes: int) -> None:
+        # Both bounds, per chunk: crossing either mid-body cuts the response
+        # off in flight - the bound is on the run, not on how the endpoint
+        # chunks it or how long it takes to drip.
+        with self._lock:
+            self._remaining -= received_bytes
+            if self._remaining < 0:
+                self._exhaust("bytes")
+            if _monotonic() > self._deadline:
+                self._exhaust("wall clock")
+
+
 class LocalVisionFailure(Exception):
     def __init__(self, code: str, message: str, detail: dict[str, Any] | None = None):
         super().__init__(message)
@@ -78,10 +159,62 @@ class EndpointRejected(LocalVisionFailure):
         self.reason = reason
 
 
+class SecretCredential:
+    """The non-serializable carrier for a vision-endpoint credential (D-007).
+
+    ``reveal()`` is the only door to the value. Every text form redacts, and
+    every generic serialization path - JSON, pickle, deepcopy - is refused
+    rather than redacted, because a copy that silently dropped the secret
+    would *look* safe while a copy that kept it would leak; failing loudly is
+    the only honest behavior for both.
+    """
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def reveal(self) -> str:
+        return self._value
+
+    def __repr__(self) -> str:
+        return "SecretCredential(***)"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> NoReturn:
+        raise TypeError("SecretCredential cannot be serialized or copied")
+
+    def __eq__(self, other: object) -> bool:
+        # Value equality (constant-time out of caution): two configs differing
+        # only by credential must never compare interchangeable. Cache keys
+        # deliberately exclude the credential; this is about equality, not
+        # about putting secrets in a key.
+        if not isinstance(other, SecretCredential):
+            return NotImplemented
+        return hmac.compare_digest(self._value.encode(), other._value.encode())
+
+    def __hash__(self) -> int:
+        return hash(self._value)
+
+
 AddressResolver = Callable[[str, int], list[str]]
 
 
+# The injectable request seam is credential-blind by design: a fake server
+# fed through `requestor` never sees headers, so credential behavior MUST be
+# tested at the opener level (patch `_OPENER`), never through this seam - a
+# credential test written against it passes vacuously.
 HttpRequestor = Callable[..., "dict[str, Any]"]
+
+
+def _request_headers(credential: SecretCredential | None) -> dict[str, str]:
+    """The request headers, with `Authorization: Bearer` exactly when a
+    credential is carried - never an empty or placeholder header (D-016)."""
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if credential is not None:
+        headers["Authorization"] = f"Bearer {credential.reveal()}"
+    return headers
 
 
 def _boundary_log(event: str, detail: dict[str, Any]) -> None:
@@ -112,6 +245,12 @@ def _reject_endpoint(reason: str, message: str, **detail: Any) -> NoReturn:
     in either case - which is why the fix there was the message an operator
     gets, not a handler override to route the refusal back through here.
     """
+    for url_key in ("url", "location"):
+        # Centrally, so no rejection site can forget: an echoed URL never
+        # carries userinfo, query, fragment, or path (D-007). `location` is a
+        # server-chosen value and gets the same treatment.
+        if url_key in detail:
+            detail[url_key] = _safe_url_for_message(str(detail[url_key]))
     _boundary_log("endpoint_rejected", {"reason": reason, **detail})
     raise EndpointRejected(reason, message, detail)
 
@@ -129,17 +268,80 @@ def _resolve_addresses(host: str, port: int) -> list[str]:
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
-        _reject_endpoint(
-            "unresolvable",
+        # Unavailability, not a policy verdict: nothing was rejected, the host
+        # could not be FOUND. The transport-failure code routes this to the
+        # 3-strike breaker like a refused TCP connect - a transient DNS flap
+        # must not condemn a whole run the way a real rejection does.
+        _boundary_log("endpoint_unresolvable", {"host": host, "error": str(exc)})
+        raise LocalVisionFailure(
+            "local_vision_rapid_mlx_unavailable",
             f"Local vision endpoint host '{host}' does not resolve; "
             "continuing with OCR-only output.",
-            host=host,
-            error=str(exc),
-        )
+            {"host": host, "error": str(exc)},
+        ) from exc
     return [str(info[4][0]) for info in infos]
 
 
-def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str, int]:
+def _parse_retry_after(header: str) -> float | None:
+    """RFC 9110 Retry-After: delay-seconds or an HTTP-date, else None.
+
+    Non-finite and unparsable values are None - the caller's default backoff
+    covers them, and an endpoint's arithmetic is never this process's crash.
+    """
+    if not header:
+        return None
+    try:
+        seconds = float(header)
+        return seconds if math.isfinite(seconds) else None
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        target = parsedate_to_datetime(header)
+    except (TypeError, ValueError):
+        return None
+    if target.tzinfo is None:
+        return None
+    import datetime as _dt
+
+    return (target - _dt.datetime.now(_dt.UTC)).total_seconds()
+
+
+def _safe_url_for_message(url: str) -> str:
+    """The echoable form of an operator-supplied URL: userinfo, query, and
+    fragment stripped. String surgery rather than urlsplit, because this runs
+    precisely when the URL may have failed to parse - and a secret must not
+    survive the echo either way."""
+    trimmed = url.split("#", 1)[0].split("?", 1)[0]
+    scheme, sep, rest = trimmed.partition("://")
+    if not sep:
+        scheme, sep, rest = "", "", trimmed
+    if "@" in rest:
+        rest = rest.rsplit("@", 1)[1]
+    # Authority only: a path can carry a key too (`/v1/sk-...`), and the
+    # diagnostic value of an echoed URL is the scheme, host, and port.
+    rest = rest.split("/", 1)[0]
+    return f"{scheme}{sep}{rest}"
+
+
+def _static_host_is_loopback(url: str) -> bool:
+    """True only when the host is a *literal* loopback address. A hostname
+    cannot be settled without a lookup, so callers deciding statically must
+    treat a name as potentially remote."""
+    try:
+        host = urllib.parse.urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str, str, int]:
     """R-43's static half: what can be decided about `url` without asking anyone.
 
     The scheme, the presence of a host, and - when the host is written as an
@@ -162,8 +364,41 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
     except ValueError as exc:
         _reject_endpoint(
             "unparsable_url",
-            f"Local vision endpoint '{url}' is not a usable URL: {exc}",
-            url=url,
+            f"Local vision endpoint '{_safe_url_for_message(url)}' is not a usable URL: {exc}",
+            url=_safe_url_for_message(url),
+        )
+    if parts.username is not None or parts.password is not None:
+        # D-007: no credential-in-URL. Only the sanitized form is echoed - the
+        # thing being rejected is exactly the thing that must not appear in an
+        # error surface.
+        _reject_endpoint(
+            "credential_in_url",
+            f"Local vision endpoint '{_safe_url_for_message(url)}' embeds "
+            "userinfo; credentials belong in api_key_env, never in base_url.",
+            url=_safe_url_for_message(url),
+        )
+    if parts.query or parts.fragment:
+        # Key names are safe to echo and are what the operator needs to see;
+        # values are exactly what must not be echoed (D-007).
+        keys = [key for key, _ in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)]
+        _reject_endpoint(
+            "query_in_base_url",
+            f"Local vision endpoint '{_safe_url_for_message(url)}' carries a "
+            f"query or fragment ({', '.join(keys) if keys else 'fragment'}); "
+            "a base_url takes no parameters, and credentials belong in "
+            "api_key_env.",
+            url=_safe_url_for_message(url),
+            query_keys=keys,
+        )
+    if host is not None and ("%" in host or "@" in host):
+        # Percent-escaped userinfo survives urlsplit as a "hostname"; a real
+        # hostname never contains '%' or '@'. Rejected without echoing the
+        # host at all - it may be a mangled credential.
+        _reject_endpoint(
+            "invalid_host_characters",
+            "Local vision endpoint host contains characters that do not "
+            "belong in a hostname (percent-escapes or '@'); if this was an "
+            "attempt to embed a credential, use api_key_env instead.",
         )
     if scheme not in ALLOWED_ENDPOINT_SCHEMES:
         _reject_endpoint(
@@ -174,13 +409,17 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
             scheme=scheme,
         )
     if not host:
-        _reject_endpoint("host_missing", f"Local vision endpoint '{url}' names no host.", url=url)
+        _reject_endpoint(
+            "host_missing",
+            f"Local vision endpoint '{_safe_url_for_message(url)}' names no host.",
+            url=url,
+        )
     port = configured_port or DEFAULT_SCHEME_PORTS[scheme]
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
     if not allow_remote_endpoint:
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            address = None
         if address is not None and not address.is_loopback:
             _reject_endpoint(
                 "non_loopback_host",
@@ -189,7 +428,18 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
                 url=url,
                 host=host,
             )
-    return host, port
+    elif scheme == "http" and address is not None and not address.is_loopback:
+        # A remote endpoint requires https: a bearer credential (or a keyframe)
+        # must never cross the network in cleartext. `http` exists for loopback
+        # only, wherever the opt-in stands (D-008).
+        _reject_endpoint(
+            "http_off_loopback",
+            f"Local vision endpoint host '{host}' is not loopback and the "
+            "scheme is http; a remote endpoint requires https.",
+            url=url,
+            host=host,
+        )
+    return scheme, host, port
 
 
 def _check_resolved_address(
@@ -197,6 +447,7 @@ def _check_resolved_address(
     port: int,
     *,
     allow_remote_endpoint: bool,
+    scheme: str,
     resolver: AddressResolver | None = None,
 ) -> list[str]:
     """R-43's authoritative half: every address `host` resolves to is loopback.
@@ -205,16 +456,30 @@ def _check_resolved_address(
     link-local address is a name that can steer the very next connection off
     loopback, and which of its answers gets connected to is not this function's
     to know.
+
+    The remote opt-in exempts only `https` (D-008): `http` must prove every
+    resolved address loopback wherever the opt-in stands, because a bearer
+    credential or a keyframe must never cross the network in cleartext.
     """
-    if allow_remote_endpoint:
+    if allow_remote_endpoint and scheme != "http":
         return []
     addresses = (resolver or _resolve_addresses)(host, port)
     if not addresses:
-        _reject_endpoint(
-            "unresolvable",
-            f"Local vision endpoint host '{host}' resolved to no address.",
-            host=host,
+        _boundary_log("endpoint_unresolvable", {"host": host})
+        raise LocalVisionFailure(
+            "local_vision_rapid_mlx_unavailable",
+            f"Local vision endpoint host '{host}' resolved to no address; "
+            "continuing with OCR-only output.",
+            {"host": host},
         )
+    reject_reason, reject_hint = (
+        ("http_off_loopback", "a remote endpoint requires https")
+        if allow_remote_endpoint
+        else (
+            "non_loopback_address",
+            "set local_vision_allow_remote_endpoint to reach one deliberately",
+        )
+    )
     for address in addresses:
         try:
             resolved = ipaddress.ip_address(address)
@@ -231,9 +496,9 @@ def _check_resolved_address(
             )
         if not resolved.is_loopback:
             _reject_endpoint(
-                "non_loopback_address",
+                reject_reason,
                 f"Local vision endpoint host '{host}' resolves to {address}, which is not "
-                "loopback; set local_vision_allow_remote_endpoint to reach one deliberately.",
+                f"loopback; {reject_hint}.",
                 host=host,
                 address=address,
             )
@@ -282,6 +547,8 @@ def _http_get_json(
     timeout_sec: float,
     *,
     allow_remote_endpoint: bool = False,
+    credential: SecretCredential | None = None,
+    budget: VisionStageBudget | None = None,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="GET", url=url, timeout=timeout_sec)
@@ -292,6 +559,8 @@ def _http_get_json(
             body=None,
             timeout_sec=timeout_sec,
             allow_remote_endpoint=allow_remote_endpoint,
+            credential=credential,
+            budget=budget,
         )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
@@ -305,6 +574,8 @@ def _http_post_json(
     timeout_sec: float,
     *,
     allow_remote_endpoint: bool = False,
+    credential: SecretCredential | None = None,
+    budget: VisionStageBudget | None = None,
 ) -> dict[str, Any]:
     if requestor is not None:
         payload = requestor(method="POST", url=url, body=body, timeout=timeout_sec)
@@ -315,6 +586,8 @@ def _http_post_json(
             body=body,
             timeout_sec=timeout_sec,
             allow_remote_endpoint=allow_remote_endpoint,
+            credential=credential,
+            budget=budget,
         )
     if not isinstance(payload, dict):
         raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
@@ -379,6 +652,8 @@ def _urlopen_json(
     *,
     allow_remote_endpoint: bool = False,
     resolver: AddressResolver | None = None,
+    credential: SecretCredential | None = None,
+    budget: VisionStageBudget | None = None,
 ) -> Any:
     """One request to the vision endpoint, validated before and bounded after.
 
@@ -395,27 +670,59 @@ def _urlopen_json(
     Distill would have to open itself. The bound here is per request, which is
     what D-029 asks for; it is not per packet.
     """
-    host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
+    # The deadline is absolute from entry: policy resolution (which may hit
+    # DNS), connect, send, and every chunk of the answer all charge it. One
+    # caveat stated rather than hidden: a single blocked socket operation is
+    # bounded by the per-op timeout, so the true worst case is deadline plus
+    # one socket operation (D-008).
+    deadline = _monotonic() + timeout_sec
+    scheme, host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
     _check_resolved_address(
-        host, port, allow_remote_endpoint=allow_remote_endpoint, resolver=resolver
+        host,
+        port,
+        allow_remote_endpoint=allow_remote_endpoint,
+        scheme=scheme,
+        resolver=resolver,
     )
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=data,
         method=method,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+        headers=_request_headers(credential),
     )
+    # The deadline is absolute and covers the whole request - connect, send,
+    # and every chunk of the answer. urllib's timeout is per socket operation,
+    # so without this a body arriving one drip at a time never times out
+    # (D-008).
+    if budget is not None:
+        budget.check()
+    deadline = _monotonic() + timeout_sec
     try:
         with _OPENER.open(request, timeout=timeout_sec) as response:
             # One byte past the cap, so a body that is exactly at it still
             # arrives and a body over it is recognisable without being read.
             # The header is not consulted: a Content-Length is the sender's
             # claim about the sender, and R-44 is a bound on this process.
-            payload = response.read(MAX_RESPONSE_BYTES + 1)
+            chunks: list[bytes] = []
+            received = 0
+            while received <= MAX_RESPONSE_BYTES:
+                if _monotonic() > deadline:
+                    raise TimeoutError(f"response did not complete within {timeout_sec} seconds")
+                # read1, not read: BufferedIOBase.read(n) blocks until n bytes
+                # accumulate, so a dripping body would never return to the
+                # deadline check. read1 yields whatever one raw read produces,
+                # keeping the clock honest per drip.
+                chunk = response.read1(min(_READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - received))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+                if budget is not None:
+                    # Charged as it arrives, so a dripping over-budget body is
+                    # cut off mid-flight, not billed after the fact.
+                    budget.charge(len(chunk))
+            payload = b"".join(chunks)
         if len(payload) > MAX_RESPONSE_BYTES:
             # A delivered response, in M7.2's sense: it arrived, so it is
             # evidence the transport works and must not count toward the
@@ -424,16 +731,41 @@ def _urlopen_json(
             raise RuntimeError(f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap")
         raw = payload.decode("utf-8")
     except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            # D-007: an auth failure's error surface carries neither the
+            # credential nor the endpoint's error body - a reflected body is
+            # the provider's text, and quoting it here would hand a hostile
+            # endpoint a channel into Distill's own error output.
+            _boundary_log("auth_rejected", {"status": exc.code, "url": _safe_url_for_message(url)})
+            raise LocalVisionFailure(
+                "local_vision_auth_rejected",
+                f"Local vision endpoint rejected the credential (HTTP {exc.code}); "
+                "continuing with OCR-only output.",
+                {"status": exc.code, "url": _safe_url_for_message(url)},
+            ) from exc
+        if exc.code == 429 or 500 <= exc.code < 600:
+            retry_after_header = ""
+            if getattr(exc, "headers", None) is not None:
+                retry_after_header = str(exc.headers.get("Retry-After") or "")
+            retry_after = _parse_retry_after(retry_after_header)
+            raise LocalVisionFailure(
+                "local_vision_retryable",
+                f"Local vision endpoint answered HTTP {exc.code}; retrying is "
+                "allowed within bounds.",
+                {"status": exc.code, "retry_after": retry_after},
+            ) from exc
         # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so
         # the probe/interpret paths can map them onto warning codes. Bounded
         # like any other body (R-44), and tighter: only a preview of it is ever
-        # used, so reading a gigabyte to quote 200 characters of it is a cost
-        # with no reader.
-        detail = (
-            exc.read(ERROR_BODY_PREVIEW_BYTES).decode("utf-8", errors="replace")
-            if hasattr(exc, "read")
-            else ""
-        )
+        # used. Read only after the auth branch, and NEVER on an authenticated
+        # request: a server that echoes the Authorization header into its
+        # error body would otherwise reflect the credential into diagnostics.
+        if credential is not None:
+            detail = "<error body withheld: authenticated request>"
+        elif hasattr(exc, "read"):
+            detail = exc.read(ERROR_BODY_PREVIEW_BYTES).decode("utf-8", errors="replace")
+        else:
+            detail = ""
         if 300 <= exc.code < 400:
             # A redirect this module never got to refuse: urllib turns a 3xx it
             # cannot act on - no `Location`, or one naming a scheme it will not
@@ -442,18 +774,27 @@ def _urlopen_json(
             # operator with `HTTP 302 from …: ` and nothing to act on. Nothing
             # is followed either way; only the message was the mystery.
             raise RuntimeError(
-                f"HTTP {exc.code} from {url}: the endpoint answered a redirect that could not "
-                "be followed, and redirects are not followed in any case"
+                f"HTTP {exc.code} from {_safe_url_for_message(url)}: the endpoint answered "
+                "a redirect that could not be followed, and redirects are not followed in "
+                "any case"
             ) from exc
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail[:200]}") from exc
+        # The URL is sanitized (authority only) and the endpoint's text is a
+        # bounded 200-char preview: diagnostic enough for "model not loaded",
+        # too small to be a channel.
+        raise RuntimeError(
+            f"HTTP {exc.code} from {_safe_url_for_message(url)}: {detail[:200]}"
+        ) from exc
     except http.client.IncompleteRead as exc:
         # A server that closes the connection mid-body (crash/restart) yields a
         # truncated read; treat it as a malformed response so we degrade cleanly.
-        raise RuntimeError(f"incomplete response from {url}: {exc}") from exc
+        raise RuntimeError(f"incomplete response from {_safe_url_for_message(url)}: {exc}") from exc
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"non-JSON response from {url}: {raw[:200]!r}") from exc
+        preview = "<body withheld: authenticated request>" if credential is not None else raw[:200]
+        raise ValueError(
+            f"non-JSON response from {_safe_url_for_message(url)}: {preview!r}"
+        ) from exc
 
 
 def _normalize_frame_kind(value: Any) -> str:

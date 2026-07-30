@@ -106,6 +106,30 @@ ASSIGNMENT_PATTERNS = (
     BEARER_RE,
     WEAK_ASSIGNMENT_RE,
 )
+# A URL whose authority embeds a credential (`scheme://user:secret@host`).
+# The password is the secret; the username can be a key id and the host is
+# what makes the line diagnosable, so only the password is replaced. Every
+# run is bounded and the scheme is anchored by a lookbehind, for the same
+# reason the entropy rules above are: unanchored unbounded runs went
+# quadratic on attacker-chosen screen text (measured 25.7s on 256 KiB of
+# 'a's before the bounds, 14ms after).
+URL_USERINFO_RE = re.compile(
+    r"(?P<prefix>(?<![a-zA-Z0-9+.-])(?i:[a-z][a-z0-9+.-]{0,31})://[^/@\s:]{1,256}:)"
+    r"(?P<value>[^@/\s]{1,512})(?=@)"
+)
+# The escape hatches the bounded rule above leaves open, each replaced
+# whole. User-only opaque tokens (`https://tok_abc123@host`): the 16-char
+# floor keeps `ssh://git@github.com` and friends intact - a short service
+# username is not a credential shape. And passwords past the primary rule's
+# 512 cap: still bounded, still linear.
+URL_USERINFO_TOKEN_RE = re.compile(
+    r"(?P<prefix>(?<![a-zA-Z0-9+.-])(?i:[a-z][a-z0-9+.-]{0,31})://)"
+    r"(?P<value>[^@/:\s]{16,2048})(?=@)"
+)
+URL_USERINFO_OVERLONG_RE = re.compile(
+    r"(?P<prefix>(?<![a-zA-Z0-9+.-])(?i:[a-z][a-z0-9+.-]{0,31})://)"
+    r"(?P<value>[^/@\s:]{1,256}:[^@/\s]{513,2048})(?=@)"
+)
 TUTORIAL_PLACEHOLDERS = {
     "your_key_here",
     "your_api_key",
@@ -126,6 +150,24 @@ def normalize_confusables(text: str) -> str:
     return text.translate(CONFUSABLES)
 
 
+def redact_for_prompt(text: str) -> str:
+    """The prompt-side sink (D-010): extracted text headed into a vision
+    prompt, redacted unconditionally.
+
+    No flag consults this path - `--no-redact-secrets` governs what the
+    operator sees in their own render, never what leaves for a model. Local
+    and remote take the same text so their outputs stay cache-coherent. The
+    per-secret warnings are dropped here: on the default path the carrier's
+    response-side sink already recorded them for the same text, and under
+    `--no-redact-secrets` the operator asked to see the raw text they are
+    already looking at - a warning that their own screen contains a secret
+    adds noise, not protection. On the default path this is a second,
+    idempotent pass over already-redacted text; its whole value is the
+    flag-off and eval paths.
+    """
+    return redact_text(text).text
+
+
 def redact_text(text: str) -> RedactionResult:
     warnings: list[WarningRecord] = []
     redacted = text
@@ -144,6 +186,15 @@ def redact_text(text: str) -> RedactionResult:
 
     for assignment in ASSIGNMENT_PATTERNS:
         redacted = assignment.sub(replace_assignment, redacted)
+
+    def replace_userinfo(match: re.Match[str]) -> str:
+        nonlocal count
+        count += 1
+        return f"{match.group('prefix')}[REDACTED]"
+
+    redacted = URL_USERINFO_RE.sub(replace_userinfo, redacted)
+    redacted = URL_USERINFO_TOKEN_RE.sub(replace_userinfo, redacted)
+    redacted = URL_USERINFO_OVERLONG_RE.sub(replace_userinfo, redacted)
 
     for pattern in SECRET_PATTERNS:
         matches = pattern.findall(redacted)

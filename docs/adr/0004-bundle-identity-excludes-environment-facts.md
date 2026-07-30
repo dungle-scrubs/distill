@@ -35,3 +35,11 @@ output — not that it is unimportant.
 - **Keep the URL but normalize it** (strip port, resolve host) — rejected: it
   keeps an environment fact in identity and only narrows how often it misfires,
   while making the rule harder to state.
+
+## Amendment (plan 02, D-012)
+
+Narrowed for exactly one case: *"this run was configured to send keyframes to
+a non-loopback vision endpoint"* is a production-provenance fact, not an
+environment fact, and folds into bundle identity as the boolean
+`local_vision_non_local`. The endpoint's address and credential remain
+machine-local claims and stay out of identity, as this ADR requires.

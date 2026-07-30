@@ -201,7 +201,14 @@ def test_extracted_text_longer_than_the_budget_is_cut_before_it_is_fenced() -> N
     task - inside a block that never ends. Short adversarial fixtures cannot
     see it, because they are never cut.
     """
-    payload = "`" * 40 + "\n" + "A" * MAX_EXTRACTED_TEXT_CHARACTERS + SENTINEL
+    # Lowercase words with spaces, not one long token run: since M2.6 the
+    # text is redacted before it is cut, and a 1200-character unbroken run
+    # reads as a credential to the secret patterns, shortening the payload
+    # and moving the cut.
+    filler = ("lorem ipsum " * (MAX_EXTRACTED_TEXT_CHARACTERS // 12 + 1))[
+        :MAX_EXTRACTED_TEXT_CHARACTERS
+    ]
+    payload = "`" * 40 + "\n" + filler + SENTINEL
 
     prompt = build_technical_frame_prompt("slide", ocr_text=payload).prompt
 
@@ -245,3 +252,16 @@ def test_prompt_is_deterministic() -> None:
 
     assert first == second
     assert build_technical_frame_prompt("ui_interface").profile == TECHNICAL_PROMPT_PROFILE
+
+
+def test_a_secret_straddling_the_truncation_boundary_does_not_leak_a_prefix() -> None:
+    """Redact-then-truncate, pinned: an assignment whose value crosses the
+    1200-character budget must be [REDACTED] before the cut, or the cut
+    itself publishes the token's prefix."""
+    filler_len = MAX_EXTRACTED_TEXT_CHARACTERS - len("API_KEY=") - 10
+    ocr = ("x " * (filler_len // 2)) + "API_KEY=sk-straddle-secret-abcdefghijklmnop"
+
+    prompt = build_technical_frame_prompt("slide", ocr_text=ocr).prompt
+
+    assert "sk-straddle" not in prompt
+    assert "[REDACTED]" in prompt

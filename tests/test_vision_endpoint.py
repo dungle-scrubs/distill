@@ -36,7 +36,10 @@ from distill.local_vision import (
 from distill.options import DistillOptions
 
 LOOPBACK_URL = "http://127.0.0.1:8000/v1"
-PRIVATE_URL = "http://10.0.0.5:8000/v1"
+# https, not http: since M2.3 (D-008) a non-loopback endpoint requires TLS
+# even with the remote opt-in, so the URL every opt-in test reaches for is
+# one the policy actually permits.
+PRIVATE_URL = "https://10.0.0.5:8000/v1"
 MODELS_URL = f"{LOOPBACK_URL}/models"
 LINK_LOCAL_URL = "http://169.254.169.254/latest/meta-data/"
 
@@ -67,6 +70,7 @@ class _CannedResponse:
             self.headers[name] = value
         self._body = body
         self._endless = endless
+        self._offset = 0
         self.read_sizes: list[int] = []
 
     def read(self, size: int = -1) -> bytes:
@@ -75,7 +79,14 @@ class _CannedResponse:
             if size < 0:
                 raise AssertionError("an unbounded read of an endless body never returns")
             return b"a" * size
-        return self._body if size < 0 else self._body[:size]
+        if size < 0:
+            chunk, self._offset = self._body[self._offset :], len(self._body)
+            return chunk
+        chunk = self._body[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+    read1 = read
 
     def close(self) -> None:
         return None
@@ -96,12 +107,14 @@ class _CannedResponse:
         return None
 
 
-class _FakeTransport(urllib.request.HTTPHandler):
+class _FakeTransport(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
     """A transport that serves canned responses and records what was asked for.
 
-    An `HTTPHandler` subclass so `build_opener` installs it *instead of* the
-    real one: everything above it in the handler chain - redirects included -
-    is the production chain, and nothing below it is a socket.
+    An `HTTPHandler`/`HTTPSHandler` subclass so `build_opener` installs it
+    *instead of* the real ones: everything above it in the handler chain -
+    redirects included - is the production chain, and nothing below it is a
+    socket. Both schemes, because since M2.3 the opt-in tests reach for https
+    URLs (a remote endpoint requires TLS).
     """
 
     def __init__(self, responses: dict[str, _CannedResponse]) -> None:
@@ -117,6 +130,8 @@ class _FakeTransport(urllib.request.HTTPHandler):
         if req.full_url not in self.responses:
             raise AssertionError(f"unexpected request: {req.full_url}")
         return self.responses[req.full_url]
+
+    https_open = http_open
 
 
 def _json_response(url: str, payload: Any) -> _CannedResponse:
@@ -199,9 +214,7 @@ def test_the_opt_out_permits_a_non_loopback_host(
                     "choices": [
                         {
                             "message": {
-                                "content": json.dumps(
-                                    {"visual_summary": "Remote endpoint reached"}
-                                )
+                                "content": json.dumps({"visual_summary": "Remote endpoint reached"})
                             }
                         }
                     ]
@@ -291,7 +304,9 @@ def test_redirects_are_disabled_rather_than_re_validated(
         _urlopen_json("GET", MODELS_URL, None, 5.0)
 
     assert caught.value.detail["reason"] == "redirect"
-    assert caught.value.detail["location"] == other_loopback
+    # Sanitized to authority-only: a Location is a server-chosen value and a
+    # path can carry a token, so only scheme://host:port is echoed.
+    assert caught.value.detail["location"] == "http://127.0.0.1:9999"
     assert transport.requested == [MODELS_URL]
 
 
@@ -420,7 +435,10 @@ def test_a_response_body_beyond_the_cap_is_rejected(
     with pytest.raises(RuntimeError, match=str(MAX_RESPONSE_BYTES)):
         _urlopen_json("GET", MODELS_URL, None, 5.0)
 
-    assert endless.read_sizes == [MAX_RESPONSE_BYTES + 1]
+    # Chunked since M2.5 (the absolute deadline is enforced between chunks):
+    # the reads still stop at exactly one byte past the cap, never beyond.
+    assert sum(endless.read_sizes) == MAX_RESPONSE_BYTES + 1
+    assert all(size > 0 for size in endless.read_sizes)
 
     image = tmp_path / "frame.png"
     image.write_bytes(b"png")
@@ -479,7 +497,7 @@ def test_every_rejected_endpoint_is_logged_with_its_reason(
         "non_loopback_address",
     ]
     assert rejected[0]["detail"]["host"] == "10.0.0.5"
-    assert rejected[1]["detail"]["location"] == LINK_LOCAL_URL
+    assert rejected[1]["detail"]["location"] == "http://169.254.169.254"
     assert rejected[2]["detail"]["address"] == "169.254.169.254"
     assert all(event["type"] == "distill.local_vision" for event in rejected)
 
@@ -571,16 +589,28 @@ def test_an_error_body_is_read_under_a_bound_too(
 ) -> None:
     """R-44 on the path that quotes the body instead of parsing it.
 
-    A `500` whose body never ends is read to build the message a **warning**
+    A `404` whose body never ends is read to build the message a **warning**
     carries. Only a preview of it is ever used, so the read stops long before
-    the response cap - the endless body proves it stopped at all.
+    the response cap - the endless body proves it stopped at all. A `500` is
+    retryable since M2.5 and reads no body at all: the strongest bound is the
+    read that never happens.
     """
-    endless = _CannedResponse(MODELS_URL, status=500, endless=True)
+    endless = _CannedResponse(MODELS_URL, status=404, endless=True)
     monkeypatch.setattr(
         "distill.rapid_mlx._OPENER", _build_opener(_FakeTransport({MODELS_URL: endless}))
     )
 
-    with pytest.raises(RuntimeError, match="HTTP 500"):
+    with pytest.raises(RuntimeError, match="HTTP 404"):
         _urlopen_json("GET", MODELS_URL, None, 5.0)
 
     assert endless.read_sizes == [ERROR_BODY_PREVIEW_BYTES]
+
+    retryable = _CannedResponse(MODELS_URL, status=500, endless=True)
+    monkeypatch.setattr(
+        "distill.rapid_mlx._OPENER", _build_opener(_FakeTransport({MODELS_URL: retryable}))
+    )
+
+    with pytest.raises(LocalVisionFailure, match="HTTP 500"):
+        _urlopen_json("GET", MODELS_URL, None, 5.0)
+
+    assert retryable.read_sizes == []

@@ -195,7 +195,7 @@ def test_local_vision_diagnostics_dispatch_runs_with_every_override(
             "--local-vision-model",
             "mlx-community/Qwen3-VL-8B-Instruct-8bit",
             "--local-vision-base-url",
-            "http://10.0.0.5:8000/v1",
+            "https://10.0.0.5:8000/v1",
             "--local-vision-timeout-sec",
             "45",
             "--local-vision-allow-remote-endpoint",
@@ -206,7 +206,7 @@ def test_local_vision_diagnostics_dispatch_runs_with_every_override(
     payload = json.loads(out)
     # The opt-out reached the config rather than only the namespace: without it
     # a non-loopback base_url is a fatal E_BAD_OPTIONS before any probe runs.
-    assert payload["config"]["base_url"] == "http://10.0.0.5:8000/v1"
+    assert payload["config"]["base_url"] == "https://10.0.0.5:8000/v1"
     assert payload["probe"]["available"] is True
 
 

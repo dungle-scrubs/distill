@@ -39,12 +39,13 @@ import logging
 import math
 import os
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,12 @@ from .rapid_mlx import (  # noqa: F401  re-exported: the client this module driv
 )
 from .rapid_mlx import (
     DEFAULT_SCHEME_PORTS as DEFAULT_SCHEME_PORTS,
+)
+from .rapid_mlx import (
+    DEFAULT_VISION_STAGE_BUDGET_BYTES as DEFAULT_VISION_STAGE_BUDGET_BYTES,
+)
+from .rapid_mlx import (
+    DEFAULT_VISION_STAGE_BUDGET_SEC as DEFAULT_VISION_STAGE_BUDGET_SEC,
 )
 from .rapid_mlx import (
     ENDPOINT_REJECTED_CODE as ENDPOINT_REJECTED_CODE,
@@ -82,6 +89,12 @@ from .rapid_mlx import (
 )
 from .rapid_mlx import (
     LocalVisionFailure as LocalVisionFailure,
+)
+from .rapid_mlx import (
+    SecretCredential as SecretCredential,
+)
+from .rapid_mlx import (
+    VisionStageBudget as VisionStageBudget,
 )
 from .rapid_mlx import (
     _boundary_log as _boundary_log,
@@ -132,6 +145,9 @@ from .rapid_mlx import (
     _served_model_ids as _served_model_ids,
 )
 from .rapid_mlx import (
+    _static_host_is_loopback as _static_host_is_loopback,
+)
+from .rapid_mlx import (
     _urlopen_json as _urlopen_json,
 )
 from .rapid_mlx import (
@@ -167,13 +183,42 @@ TRANSPORT_FAILURE_CODES = frozenset(
 # evidence it works. A success is the other member of this class and needs no
 # code. Everything else (an unreadable image file, a cancelled run) happened on
 # this side of the wire and says nothing either way.
-DELIVERED_RESPONSE_CODES = frozenset({"local_vision_malformed_response"})
+DELIVERED_RESPONSE_CODES = frozenset(
+    {"local_vision_malformed_response", "local_vision_retry_exhausted"}
+)
+# 429/5xx handling (D-008): the server asked for a pause, so honor it - but
+# bounded on both axes, attempts and seconds, because Retry-After is the
+# endpoint's claim about the endpoint and the run's time is this process's.
+RETRYABLE_MAX_RETRIES = 2
+RETRY_AFTER_CAP_SEC = 10.0
+DEFAULT_RETRY_BACKOFF_SEC = 1.0
+# Injectable so tests assert the pause without sleeping through it.
+_sleep = time.sleep
+# Failures that condemn every remaining attempt the moment one happens: a
+# rejected credential will be rejected again on the next keyframe, and a
+# rejected endpoint is a property of the config, not of the frame - retrying
+# either is sending more keyframes to an endpoint that already said no
+# (D-016, D-008).
+IMMEDIATE_FAILURE_CODES = frozenset(
+    {
+        "local_vision_auth_rejected",
+        # An endpoint that kept answering 429/5xx through the bounded retries
+        # will do it again for the next keyframe; retrying the run into a
+        # rate limiter is the amplification D-008 exists to prevent.
+        "local_vision_retry_exhausted",
+        ENDPOINT_REJECTED_CODE,
+        VisionStageBudget.CODE,
+    }
+)
 BREAKER_WARNING_CODE = "local_vision_transport_breaker_open"
 FRAME_READ_FAILURE_CODES = frozenset(
     {
         "local_vision_malformed_response",
+        "local_vision_retry_exhausted",
         "local_vision_timeout",
         "local_vision_image_read_failed",
+        "local_vision_auth_rejected",
+        VisionStageBudget.CODE,
         ENDPOINT_REJECTED_CODE,
     }
 )
@@ -200,11 +245,64 @@ class LocalVisionConfig:
 
     It does not widen the scheme, re-enable redirects, or lift the response
     cap. Those hold wherever the endpoint is, because they are about what the
-    client will do with an answer rather than about whose answer it is.
+    client will do with an answer rather than about whose answer it is. And
+    the widened host narrows the scheme: a non-loopback endpoint must speak
+    `https` (D-008) - plain `http` is loopback-only, opt-out or not.
     """
+    credential: SecretCredential | None = field(default=None, repr=False, metadata={"secret": True})
+    """The endpoint credential, in its non-serializable carrier (D-007).
+
+    The carrier itself redacts every text form and refuses serialization;
+    `repr=False` and the `public_dict` exclusion are belt-and-braces on top.
+    It participates in equality (the carrier compares by value) so configs
+    differing only by credential are never interchangeable.
+    """
+    # Whether api_key/api_key_env was present in any config layer, and the env
+    # var it named. Neither is secret (a *name* is diagnostics, not a value);
+    # together they let validation tell "intentionally no auth" apart from
+    # "meant to authenticate and the value went missing" (D-016).
+    credential_configured: bool = False
+    credential_env: str = ""
+    budget: VisionStageBudget | None = field(
+        default=None, repr=False, compare=False, metadata={"runtime": True}
+    )
+    """The run's vision-stage budget, attached by the interpreter to its
+    per-run resolved config. Runtime state, not configuration: excluded from
+    identity, `repr`, and `public_dict`."""
 
     def public_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        # Excluded by the `secret` metadata flag and by carrier type - a rule
+        # about secrets, not about one field spelling. Built by field access
+        # rather than asdict, which deep-copies into the refusing carrier.
+        public: dict[str, Any] = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if (
+                f.metadata.get("secret")
+                or f.metadata.get("runtime")
+                or isinstance(value, SecretCredential)
+            ):
+                continue
+            public[f.name] = value
+        return public
+
+
+def config_is_non_local(config: LocalVisionConfig) -> bool:
+    """D-012's predicate, in one place: this run MAY send keyframes off the
+    producing machine. True when the operator opted into a remote endpoint,
+    the scheme is not `http` (which the transport proves loopback on every
+    request, opt-in or not - D-008), and the host is not a literal loopback
+    address. An `https` hostname counts as remote: it cannot be settled
+    statically, and provenance folds fail closed."""
+    if not config.allow_remote_endpoint:
+        return False
+    try:
+        scheme = urllib.parse.urlsplit(config.base_url).scheme.lower()
+    except ValueError:
+        return True  # unparsable fails closed, like an unsettleable name
+    if scheme == "http":
+        return False
+    return not _static_host_is_loopback(config.base_url)
 
 
 @dataclass(frozen=True)
@@ -219,10 +317,6 @@ class LocalVisionProbe:
 
     def warning(self) -> dict[str, Any]:
         return warning("local_vision", self.code, self.message)
-
-
-
-
 
 
 ProbeLocalVision = Callable[[LocalVisionConfig], LocalVisionProbe]
@@ -330,6 +424,19 @@ class _TransportBreaker:
                 if code in TRANSPORT_FAILURE_CODES:
                     self._transport_failures += 1
                 return None
+            if code in IMMEDIATE_FAILURE_CODES:
+                # One rejection condemns the rest. It arrived AS a response,
+                # so it is not a transport failure and is not counted as one;
+                # the taxonomy at DELIVERED_RESPONSE_CODES stays true.
+                self._opened = {
+                    "state": "open",
+                    "consecutive_failures": self._consecutive,
+                    "limit": 1,
+                    "attempt": self._attempts,
+                    "frame": frame_number,
+                    "code": code,
+                }
+                return dict(self._opened)
             if code in TRANSPORT_FAILURE_CODES:
                 self._consecutive += 1
                 self._transport_failures += 1
@@ -379,11 +486,24 @@ class _TransportBreaker:
             skipped = self._skipped
         if opened is None or not skipped:
             return None
+        immediate_phrases = {
+            "local_vision_auth_rejected": "the endpoint rejected the credential",
+            ENDPOINT_REJECTED_CODE: "the endpoint was rejected",
+            VisionStageBudget.CODE: "the vision stage's run-wide budget was spent",
+            "local_vision_retry_exhausted": "the endpoint kept rate-limiting",
+        }
+        phrase = immediate_phrases.get(opened["code"])
+        if phrase is not None:
+            reason = f"{phrase} ({opened['code']})"
+        else:
+            reason = (
+                f"{opened['consecutive_failures']} consecutive transport failures "
+                f"({opened['code']})"
+            )
         return warning(
             "local_vision",
             BREAKER_WARNING_CODE,
-            f"local vision stopped after {opened['consecutive_failures']} consecutive "
-            f"transport failures ({opened['code']}) at keyframe {opened['frame']}; "
+            f"local vision stopped after {reason} at keyframe {opened['frame']}; "
             f"{skipped} of {frame_count} keyframes were not attempted and continue "
             "with OCR-only output.",
         )
@@ -412,16 +532,6 @@ def _debug_enabled(value: bool | None = None) -> bool:
     return os.environ.get(DEBUG_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-
-
-
-
-
-
-
-
-
-
 def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     """The same config, once its `base_url` is one Distill will speak to.
 
@@ -437,8 +547,36 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
             "E_BAD_OPTIONS",
             "local_vision",
             exc.message,
-            {"base_url": config.base_url, **exc.detail},
+            # The rejection's own detail is the whole story: sites that can
+            # safely name the URL already include a sanitized `url`, and the
+            # ones that omit it do so because the URL may carry a credential
+            # (D-007). Re-adding the raw base_url here defeated exactly that.
+            dict(exc.detail),
         ) from exc
+    if (
+        config.caption_frames
+        and config.credential_configured
+        and config.credential is None
+        and config_is_non_local(config)
+    ):
+        # D-016's typo guard: a credential the operator *configured* resolved
+        # to nothing, on a config that says remote is intended and whose host
+        # is not literally loopback. Without allow_remote_endpoint the
+        # per-request resolved-address check already proves the endpoint
+        # local (D-029), so a hostname like `localhost` is not punished.
+        # Configuring no credential at all remains intentional no-auth.
+        named = (
+            f" (env var '{config.credential_env}' is unset or empty)"
+            if config.credential_env
+            else ""
+        )
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            f"local_vision credential is configured but empty{named}; refusing "
+            "to send keyframes to a non-loopback endpoint without it.",
+            {"reason": "credential_configured_but_empty", "api_key_env": config.credential_env},
+        )
     return config
 
 
@@ -561,14 +699,38 @@ def local_vision_config_from_args(
     return _with_validated_endpoint(_config_from_payload(overrides, config))
 
 
+def _resolved_credential(
+    payload: dict[str, Any], base: LocalVisionConfig
+) -> tuple[SecretCredential | None, bool, str]:
+    """D-016: `api_key_env` names an env var and wins over inline `api_key`.
+
+    Returns (credential, configured, env_name). `configured` is True whenever
+    either key appeared, even if the resolved value is empty - validation
+    needs that distinction to fail closed on a remote endpoint.
+    """
+    if "api_key" not in payload and "api_key_env" not in payload:
+        return base.credential, base.credential_configured, base.credential_env
+    value = str(payload.get("api_key") or "")
+    env_name = str(payload.get("api_key_env") or "")
+    if env_name:
+        value = os.environ.get(env_name, "")
+    if not value:
+        return None, True, env_name
+    return SecretCredential(value), True, env_name
+
+
 def _config_from_payload(
     payload: dict[str, Any],
     base: LocalVisionConfig,
 ) -> LocalVisionConfig:
     if not payload:
         return base
+    credential, credential_configured, credential_env = _resolved_credential(payload, base)
     return replace(
         base,
+        credential=credential,
+        credential_configured=credential_configured,
+        credential_env=credential_env,
         backend=str(payload.get("backend", base.backend)),
         model=str(payload.get("model", base.model)),
         base_url=str(payload.get("base_url", base.base_url)).rstrip("/"),
@@ -603,12 +765,14 @@ def probe_rapid_mlx_availability(
     *,
     requestor: HttpRequestor | None = None,
 ) -> LocalVisionProbe:
-    """Confirm a Rapid-MLX server is reachable and serving the configured model.
+    """Confirm a vision endpoint is reachable and will serve the configured model.
 
-    Probes ``GET <base_url>/models`` (the OpenAI-compatible models list). The
-    probe is satisfied when the server responds and the configured model id is
-    present in its catalog. Transport failures map onto Distill's existing
-    warning codes so the OCR-only fallback behaves as before.
+    Probes ``GET <base_url>/models``. A model present in the catalog satisfies
+    the probe as before; a model the catalog omits is settled by attempting a
+    minimal image-bearing completion (D-008 - /models is advisory, a proxy's
+    catalog is routinely incomplete), so the unlisted path may load the model
+    and costs up to a second timeout. Transport failures map onto Distill's
+    existing warning codes so the OCR-only fallback behaves as before.
     """
     models_url = _models_url(config.base_url)
     try:
@@ -617,6 +781,8 @@ def probe_rapid_mlx_availability(
             models_url,
             config.timeout_sec,
             allow_remote_endpoint=config.allow_remote_endpoint,
+            credential=config.credential,
+            budget=config.budget,
         )
     except EndpointRejected as exc:
         return LocalVisionProbe(
@@ -626,7 +792,32 @@ def probe_rapid_mlx_availability(
             base_url=config.base_url,
             code=exc.code,
             message=f"{exc.message} Continuing with OCR-only output.",
-            detail={**exc.detail, "url": models_url},
+            # The rejection's own detail already carries a SANITIZED url when
+            # one is safe to echo; overriding it with the raw models_url
+            # defeated exactly that.
+            detail=dict(exc.detail),
+        )
+    except LocalVisionFailure as exc:
+        # Raised typed from the transport (e.g. auth_rejected). Its message
+        # and detail are already credential- and body-free by construction.
+        # A retryable (429/5xx) has no retry loop on the probe path: the
+        # server erroring IS the probe's answer, reported as unavailable
+        # with the status - "try again shortly" is the operator action.
+        code, message = exc.code, exc.message
+        if exc.code == "local_vision_retryable":
+            code = "local_vision_rapid_mlx_unavailable"
+            message = (
+                f"Rapid-MLX answered HTTP {exc.detail.get('status')} to the "
+                "probe; continuing with OCR-only output."
+            )
+        return LocalVisionProbe(
+            available=False,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code=code,
+            message=message,
+            detail=dict(exc.detail),
         )
     except TimeoutError as exc:
         return LocalVisionProbe(
@@ -659,32 +850,62 @@ def probe_rapid_mlx_availability(
             detail={"error": str(exc), "url": models_url},
         )
     except (ValueError, RuntimeError) as exc:
-        return LocalVisionProbe(
-            available=False,
-            backend=config.backend,
-            model=config.model,
-            base_url=config.base_url,
-            code="local_vision_rapid_mlx_malformed_response",
-            message="Rapid-MLX returned a malformed models response; continuing with OCR-only output.",
-            detail={"error": str(exc), "url": models_url},
-        )
+        # An HTTP error or a non-envelope answer from /models says nothing
+        # about completions (D-008: many providers and proxies serve no
+        # catalog at all). The catalog becomes advisory-absent and the
+        # attempted completion decides; only a transport-level failure above
+        # stops the probe, because both endpoints share a server.
+        _boundary_log("models_catalog_unavailable", {"error": str(exc)[:200], "url": models_url})
+        payload = {"data": []}
 
     served = _served_model_ids(payload)
     if config.model not in served:
+        # D-008: /models is advisory, not authoritative - a proxy's catalog is
+        # routinely incomplete. A model the catalog omits is settled by
+        # attempting a completion; only a failed attempt makes it unavailable.
+        attempt_failure = _attempt_minimal_completion(config, requestor)
+        if attempt_failure is not None:
+            if attempt_failure.code == "local_vision_model_unavailable":
+                message = (
+                    f"Rapid-MLX is not serving model '{config.model}' and a "
+                    "completion attempt failed; continuing with OCR-only output."
+                )
+            else:
+                # An auth rejection, endpoint refusal, or transport fault is
+                # its own event; reporting it as a missing model would hide
+                # the one cause the operator can act on.
+                message = attempt_failure.message
+            return LocalVisionProbe(
+                available=False,
+                backend=config.backend,
+                model=config.model,
+                base_url=config.base_url,
+                code=attempt_failure.code,
+                message=message,
+                detail={
+                    "configured_model": config.model,
+                    "served_models": served,
+                    "url": models_url,
+                    "completion_error": attempt_failure.message,
+                    "completion_code": attempt_failure.code,
+                    **{
+                        k: v
+                        for k, v in attempt_failure.detail.items()
+                        if k not in {"configured_model", "served_models", "url"}
+                    },
+                },
+            )
         return LocalVisionProbe(
-            available=False,
+            available=True,
             backend=config.backend,
             model=config.model,
             base_url=config.base_url,
-            code="local_vision_model_unavailable",
+            code="local_vision_available",
             message=(
-                f"Rapid-MLX is not serving model '{config.model}'; continuing with OCR-only output."
+                f"Model '{config.model}' is not in the /models catalog but a "
+                "completion succeeded; proceeding."
             ),
-            detail={
-                "configured_model": config.model,
-                "served_models": served,
-                "url": models_url,
-            },
+            detail={"served_models": served, "url": models_url, "model_not_listed": True},
         )
     return LocalVisionProbe(
         available=True,
@@ -695,6 +916,95 @@ def probe_rapid_mlx_availability(
         message="Rapid-MLX local vision target is available.",
         detail={"served_models": served, "url": models_url},
     )
+
+
+def _attempt_minimal_completion(
+    config: LocalVisionConfig,
+    requestor: HttpRequestor | None,
+) -> LocalVisionFailure | None:
+    """One tiny completion carrying a 1x1 PNG image part, or the typed failure
+    it produced. The image part is the point: the probe's question is "will
+    this endpoint read a keyframe for me", and a text-only ping would authorize
+    an image run against an endpoint that only routes text (D-008).
+
+    Failures keep their own class: an auth rejection, a timeout, or a policy
+    refusal must never be reported as a missing model.
+    """
+    body = {
+        "model": config.model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "ping"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{_PROBE_PIXEL_B64}"},
+                    },
+                ],
+            }
+        ],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    try:
+        envelope = _http_post_json(
+            requestor,
+            _completions_url(config.base_url),
+            body,
+            config.timeout_sec,
+            allow_remote_endpoint=config.allow_remote_endpoint,
+            credential=config.credential,
+            budget=config.budget,
+        )
+        if not envelope.get("choices"):
+            # A 200 without a completion envelope (several proxies answer
+            # errors this way) is not evidence the endpoint serves the model.
+            return LocalVisionFailure(
+                "local_vision_model_unavailable",
+                "completion attempt returned no completion envelope",
+                {"envelope_keys": sorted(envelope.keys())},
+            )
+    except LocalVisionFailure as exc:
+        # Typed already (auth_rejected, endpoint rejection, transport code):
+        # pass it through untouched so the cause survives to the surface. A
+        # retryable becomes unavailability: the attempt has no retry loop.
+        if exc.code == "local_vision_retryable":
+            return LocalVisionFailure(
+                "local_vision_rapid_mlx_unavailable",
+                f"completion attempt answered HTTP {exc.detail.get('status')}",
+                dict(exc.detail),
+            )
+        return exc
+    except TimeoutError as exc:
+        return LocalVisionFailure(
+            "local_vision_timeout",
+            "completion attempt timed out; continuing with OCR-only output.",
+            {"error": str(exc)},
+        )
+    except (urllib.error.URLError, OSError) as exc:
+        return LocalVisionFailure(
+            "local_vision_rapid_mlx_unavailable",
+            f"completion attempt could not reach the endpoint: {exc}",
+            {"error": str(exc)},
+        )
+    except (RuntimeError, ValueError) as exc:
+        # An HTTP error or non-envelope answer to a well-formed completion for
+        # this model: the model-shaped failure.
+        return LocalVisionFailure(
+            "local_vision_model_unavailable",
+            f"completion attempt failed: {exc}",
+            {"error": str(exc)},
+        )
+    return None
+
+
+# The smallest valid PNG (1x1 transparent pixel), used only by the probe's
+# attempted completion. A constant, so the probe body is byte-stable.
+_PROBE_PIXEL_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQAB"
+    "h6FO1AAAAABJRU5ErkJggg=="
+)
 
 
 def interpret_image(
@@ -777,6 +1087,8 @@ class FrameInterpreter:
     try_interpret: TryInterpretImage = try_interpret_image_after_probe
     max_parallel: int = DEFAULT_MAX_PARALLEL
     debug: bool | None = None
+    budget_sec: float = DEFAULT_VISION_STAGE_BUDGET_SEC
+    budget_bytes: int = DEFAULT_VISION_STAGE_BUDGET_BYTES
     _last_probe: LocalVisionProbe | None = None
     _frame_count: int = 0
     _interpreted_count: int = 0
@@ -790,7 +1102,23 @@ class FrameInterpreter:
     ) -> tuple[list[FrameArtifact], list[WarningRecord]]:
         self._reset_run(frames)
         self._log("interpret.start", {"frames": len(frames), "backend": self.config.backend})
-        probe = self.probe(self.config)
+        provenance_warnings: list[WarningRecord] = []
+        if config_is_non_local(self.config):
+            # D-012: both provenance surfaces - this warning and the identity
+            # fold in options.cache_payload - read the SAME predicate on the
+            # same input, before any I/O (including the probe's), so a bundle
+            # keyed non-local always carries the disclosure.
+            non_local = warning(
+                "local_vision",
+                "non_local_only_processing",
+                "this run was configured to send keyframes to a non-loopback "
+                "vision endpoint; the generation may not be local-only "
+                "processing.",
+            )
+            self._record_warning(non_local)
+            provenance_warnings.append(non_local)
+        probing_config = self._probing_config()
+        probe = self.probe(probing_config)
         self._last_probe = probe
         # Cap the worker pool at the configured admission limit; never unbounded.
         # max_parallel<=1 keeps interpretation serial — the config fallback if
@@ -802,9 +1130,20 @@ class FrameInterpreter:
             probe_warning = probe.warning()
             self._record_warning(probe_warning)
             self._log("interpret.unavailable", {"code": probe.code})
-            return frames, [probe_warning]
+            return frames, [*provenance_warnings, probe_warning]
 
-        warnings: list[WarningRecord] = []
+        warnings: list[WarningRecord] = [*provenance_warnings]
+        if probe.detail.get("model_not_listed"):
+            # Available, but on the strength of an attempted completion rather
+            # than the catalog (D-008) - the run says so once, out loud.
+            advisory = warning(
+                "local_vision",
+                "local_vision_model_not_listed",
+                f"model '{probe.model}' is not in the endpoint's /models "
+                "catalog; proceeding because a completion succeeded.",
+            )
+            self._record_warning(advisory)
+            warnings.append(advisory)
         interpreted_frames = frames
         try:
             if not frames:
@@ -816,7 +1155,7 @@ class FrameInterpreter:
             # Resolve the target once via the probe, then interpret each frame
             # against that endpoint without re-probing. Use the resolved
             # model/base_url when the probe reported them.
-            resolved = self._resolved_config(probe)
+            resolved = self._resolved_config(probe, probing_config)
             self._log(
                 "interpret.pool",
                 {"frames": len(frames), "max_parallel": self._max_parallel},
@@ -845,11 +1184,30 @@ class FrameInterpreter:
             # the prior leasing path without leaking a no-op callback.
             pass
 
-    def _resolved_config(self, probe: LocalVisionProbe) -> LocalVisionConfig:
+    def _probing_config(self) -> LocalVisionConfig:
+        # The budget starts when the STAGE does - before the probe - and one
+        # instance rides every request the stage makes, so the probe's GET
+        # and attempted completion charge the same bounds as the frames
+        # (D-008: run-wide means the run, not the run minus its first two
+        # requests). Attached only when the config opts into a remote
+        # endpoint: remote cost is the threat, and a slow-but-working local
+        # model must not be half-degraded by a run-wide clock.
+        if self.config.budget is None and self.config.allow_remote_endpoint:
+            budget = VisionStageBudget(
+                wall_clock_sec=float(self.budget_sec), max_bytes=int(self.budget_bytes)
+            )
+            return replace(self.config, budget=budget)
+        return self.config
+
+    def _resolved_config(
+        self, probe: LocalVisionProbe, probing: LocalVisionConfig
+    ) -> LocalVisionConfig:
+        # `probing` is the config the probe actually used - the SAME budget
+        # instance keeps charging through the frames (one run, one budget).
         if probe.backend != DEFAULT_LOCAL_VISION_BACKEND or not (probe.base_url and probe.model):
-            return self.config
+            return probing
         return replace(
-            self.config,
+            probing,
             backend=DEFAULT_LOCAL_VISION_BACKEND,
             model=probe.model,
             base_url=probe.base_url,
@@ -1109,13 +1467,18 @@ class FrameInterpreter:
         **Grounding** is assessed against the reading the model returned, and
         the reading is then handed to the carrier, which is where the
         **redaction** policy runs over every field of it (R-19). Assessing
-        first is deliberate: grounding compares two readers' words, and a
-        policy that replaced a secret in one of them would make the comparison
-        about what redaction did rather than about what was read.
+        first is deliberate: grounding compares two readers' words on the
+        SAME text. Since M2.6 the model reads prompt-side-redacted text, so
+        the comparison side passes through the same sink - on the default
+        path an idempotent no-op (the carrier already redacted), and under
+        --no-redact-secrets the one change that keeps a secret-bearing frame
+        from being marked uncorroborated for echoing [REDACTED] honestly.
         """
+        from .redact_secrets import redact_for_prompt
+
         assessment = assess_grounding(
-            ocr_text=frame.extracted_text,
-            verbatim_text=reading.verbatim_text,
+            ocr_text=redact_for_prompt(frame.extracted_text),
+            verbatim_text=redact_for_prompt(reading.verbatim_text),
             text_confidence=reading.text_confidence,
             has_interpretation=reading.has_interpretation,
             carries_a_reading=reading.carries_a_reading,
@@ -1189,6 +1552,52 @@ class FrameInterpreter:
             raise AssertionError(f"frame at index {index} is missing required 'path'")
 
 
+def _post_completion_with_retries(
+    requestor: HttpRequestor | None,
+    completions_url: str,
+    body: dict[str, Any],
+    config: LocalVisionConfig,
+) -> dict[str, Any]:
+    """One completion POST, honoring 429/5xx Retry-After within bounds.
+
+    The server's requested pause is honored but capped, the retries are
+    counted, and when both are spent the frame degrades with its own code -
+    a rate limit is a delivered response, so it must not look like a
+    transport fault to the breaker (D-008).
+    """
+    retries_left = RETRYABLE_MAX_RETRIES
+    while True:
+        try:
+            return _http_post_json(
+                requestor,
+                completions_url,
+                body,
+                config.timeout_sec,
+                allow_remote_endpoint=config.allow_remote_endpoint,
+                credential=config.credential,
+                budget=config.budget,
+            )
+        except LocalVisionFailure as exc:
+            if exc.code != "local_vision_retryable":
+                raise
+            if retries_left <= 0:
+                status = exc.detail.get("status")
+                raise LocalVisionFailure(
+                    "local_vision_retry_exhausted",
+                    f"Local vision endpoint kept answering HTTP {status} after "
+                    f"{RETRYABLE_MAX_RETRIES} retries; continuing with OCR-only "
+                    "output for this keyframe.",
+                    {"status": status, "retries": RETRYABLE_MAX_RETRIES},
+                ) from exc
+            retries_left -= 1
+            retry_after = exc.detail.get("retry_after")
+            requested = float(retry_after) if retry_after is not None else DEFAULT_RETRY_BACKOFF_SEC
+            # Clamped on both ends: a negative or NaN Retry-After is the
+            # endpoint's bug, not a crash in this process, and zero means
+            # "retry now", not "use the default".
+            _sleep(max(0.0, min(requested, RETRY_AFTER_CAP_SEC)))
+
+
 def _interpret_with_rapid_mlx(
     config: LocalVisionConfig,
     image_path: Path,
@@ -1225,17 +1634,20 @@ def _interpret_with_rapid_mlx(
         ],
         "temperature": 0,
         "response_format": {"type": "json_object"},
+        # D-008: never a stream. A streamed answer defeats the absolute
+        # deadline and the response cap alike - the bound is on the whole
+        # answer, not on each drip of it.
+        "stream": False,
     }
     completions_url = _completions_url(config.base_url)
     last_preview = ""
     for _attempt in range(DEFAULT_MAX_ATTEMPTS):
         try:
-            envelope = _http_post_json(
+            envelope = _post_completion_with_retries(
                 requestor,
                 completions_url,
                 body,
-                config.timeout_sec,
-                allow_remote_endpoint=config.allow_remote_endpoint,
+                config,
             )
         except TimeoutError as exc:
             raise LocalVisionFailure(
@@ -1274,26 +1686,6 @@ def _interpret_with_rapid_mlx(
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _result_from_payload(
     interpreted: dict[str, Any],
     config: LocalVisionConfig,
@@ -1320,11 +1712,3 @@ def _result_from_payload(
         verbatim_text=str(interpreted.get("verbatim_text", "")).strip(),
         text_confidence=_normalize_text_confidence(interpreted.get("text_confidence")),
     )
-
-
-
-
-
-
-
-

@@ -30,6 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .emit import EMITTER, UNTRUSTED_TEXT_LABEL
+from .redact_secrets import redact_for_prompt
 
 TECHNICAL_PROMPT_PROFILE = "technical"
 FRAME_KINDS = (
@@ -187,6 +188,11 @@ def build_technical_frame_prompt(
         ]
     )
     if ocr_text:
+        # Redacted before the cut: a secret whose assignment straddles the
+        # truncation boundary must not survive it (D-010). Redaction lives
+        # HERE, inside the builder, so no caller - pipeline, eval, or future
+        # transcript window - can forget it.
+        ocr_text = redact_for_prompt(ocr_text)
         carried = ocr_text[:MAX_EXTRACTED_TEXT_CHARACTERS]
         parts.append(UNTRUSTED_TEXT_INSTRUCTION)
         parts.extend(EMITTER.delimit(carried))
