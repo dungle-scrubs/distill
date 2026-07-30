@@ -29,6 +29,15 @@ from distill.ocr import find_tesseract_command, ocr_frame
 
 EVAL_ROOT = Path(__file__).resolve().parent
 FRAMES_DIR = EVAL_ROOT / "frames"
+VALID_CATEGORIES = frozenset(
+    {
+        "clean_text",
+        "textless",
+        "injection",
+        "safety_blocked",
+        "ocr_vision_disagreement",
+    }
+)
 
 _PUNCT = str.maketrans(dict.fromkeys("\"'`.,:;!?()[]{}<>|/\\-–—_=+*#", " "))
 
@@ -76,6 +85,7 @@ def token_prf(truth: str, hypothesis: str) -> tuple[float, float, float]:
 @dataclass
 class CaseResult:
     id: str
+    category: str
     legibility: str
     has_text: bool
     ocr_wer: float | None
@@ -86,9 +96,38 @@ class CaseResult:
     should_flag: bool  # human says it is not cleanly legible
 
 
-def _load_cases() -> list[dict]:
+@dataclass(frozen=True)
+class LabelledCase:
+    id: str
+    category: str
+    legibility: str
+    has_text: bool
+    verified: bool
+
+
+def load_labelled_cases() -> list[LabelledCase]:
+    """Load corpus labels and reject incomplete or unknown case records."""
     data = tomllib.loads((EVAL_ROOT / "cases.toml").read_text())
-    return data.get("case", [])
+    cases: list[LabelledCase] = []
+    for raw_case in data.get("case", []):
+        case_id = str(raw_case.get("id", "<missing id>"))
+        category = raw_case.get("category")
+        if not isinstance(category, str) or category not in VALID_CATEGORIES:
+            raise ValueError(f"case {case_id} has invalid category: {category!r}")
+        for suffix in (".png", ".gt.txt"):
+            path = FRAMES_DIR / f"{case_id}{suffix}"
+            if not path.exists():
+                raise ValueError(f"case {case_id} is missing fixture: {path.name}")
+        cases.append(
+            LabelledCase(
+                id=case_id,
+                category=category,
+                legibility=str(raw_case.get("legibility", "")),
+                has_text=bool(raw_case.get("has_text", True)),
+                verified=bool(raw_case.get("verified", False)),
+            )
+        )
+    return cases
 
 
 def _truth(case_id: str) -> str | None:
@@ -122,16 +161,16 @@ def evaluate(
         raise SystemExit("tesseract not found; install it before scoring OCR")
     interpret = _vision_interpreter(model, backend) if with_vision else None
     results: list[CaseResult] = []
-    for case in _load_cases():
-        case_id = str(case["id"])
-        if not bool(case.get("verified", False)):
+    for case in load_labelled_cases():
+        case_id = case.id
+        if not case.verified:
             continue
         truth = _truth(case_id)
         if truth is None:
             continue
         image = FRAMES_DIR / f"{case_id}.png"
         ocr_text, _ = ocr_frame(image, "eng", tesseract_cmd=tesseract_cmd)
-        has_text = bool(case.get("has_text", True))
+        has_text = case.has_text
         ocr_wer = word_error_rate(truth, ocr_text) if has_text else None
 
         vision_wer: float | None = None
@@ -160,14 +199,15 @@ def evaluate(
         results.append(
             CaseResult(
                 id=case_id,
-                legibility=str(case.get("legibility", "")),
+                category=case.category,
+                legibility=case.legibility,
                 has_text=has_text,
                 ocr_wer=ocr_wer,
                 vision_wer=vision_wer,
                 vision_recall=vision_recall,
                 vision_f1=vision_f1,
                 flagged=flagged,
-                should_flag=str(case.get("legibility", "")) != "clean",
+                should_flag=case.legibility != "clean",
             )
         )
     return results
@@ -249,7 +289,8 @@ def main() -> None:
         f1 = f"{r.vision_f1:.2f}" if r.vision_f1 is not None else " -  "
         flag = "?" if r.flagged is None else ("flag" if r.flagged else "ok")
         print(
-            f"  {r.id:30s} legib={r.legibility:10s} vis_wer={vis} recall={rec} f1={f1} grounding={flag}"
+            f"  {r.id:30s} category={r.category:23s} legib={r.legibility:10s} "
+            f"vis_wer={vis} recall={rec} f1={f1} grounding={flag}"
         )
     print()
     for key, value in summary.items():

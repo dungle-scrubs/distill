@@ -1,6 +1,6 @@
 # Distill text-recovery eval
 
-A small, human-verified set of real frames for measuring how well Distill
+A small, human-verified set of real and synthetic frames for measuring how well Distill
 recovers on-screen text — and how reliably it flags frames it *can't* read
 (instead of hallucinating, the failure this eval exists to catch).
 
@@ -8,9 +8,10 @@ recovers on-screen text — and how reliably it flags frames it *can't* read
 
 ```
 tests/evals/
-  cases.toml            # one [[case]] per frame: kind, legibility, has_text, verified, tags
+  cases.toml            # one [[case]] per frame, including its labelled category
   frames/<id>.png       # the frame image (committed fixture)
   frames/<id>.gt.txt    # the ground-truth transcription you confirm
+  generate_negatives.py # dev tool: deterministically regenerate synthetic cases
   triage.py             # dev tool: survey the cache and propose a stratified set
   score.py              # the scorer (OCR + optional vision WER, grounding precision/recall)
 ```
@@ -48,6 +49,20 @@ the word `UNVERIFIED`, so you can verify the set incrementally.
 - Lines starting with `#` are notes (provenance, caveats) and are ignored by the
   scorer.
 
+## Labelled categories
+
+Every case has a required `category` field. The scorer validates the label and
+the case's `.png` and `.gt.txt` fixtures before doing any OCR:
+
+- `clean_text` - an ordinary text-bearing frame.
+- `textless` - a true negative with no on-screen text.
+- `injection` - visible text shaped like a prompt injection, which a reader
+  must transcribe rather than follow.
+- `safety_blocked` - benign security-conference content styled like material a
+  refusal-prone cloud reader might block.
+- `ocr_vision_disagreement` - text designed or observed to defeat Tesseract
+  while remaining readable to a human or vision model.
+
 ## True negatives
 
 Cases with `has_text = false` (the black frame, the browser-chrome-only frame,
@@ -55,16 +70,32 @@ the podcast shot) have empty `.gt.txt`. They test the *other* failure mode: the
 system must **not** invent text and **should** flag low confidence. Don't delete
 them — an eval of only text-heavy slides would miss false positives entirely.
 
+## Synthetic negative cases
+
+Six synthetic slides provide controlled coverage that the source recordings do
+not: two prompt injections, two benign security slides, and two predictable
+OCR/vision disagreements. Their transcriptions are truth by construction: the
+same module-level constants drive both rendering and `.gt.txt` generation.
+
+Regenerate them deterministically with:
+
+```bash
+uv run python tests/evals/generate_negatives.py
+```
+
 ## Coverage
 
-16 frames from 7 different recordings, spread across:
+22 cases: 16 real frames from 7 recordings plus 6 deterministic synthetic
+slides, spread across:
 
-- **kind**: ~10 slides (4 talks), 2 real UIs (an agent trace viewer, a phone app
+- **kind**: 16 slides, 2 real UIs (an agent trace viewer, a phone app
   mockup), 1 diagram, 3 photo/negative.
-- **legibility**: ~11 clean, 2 partial, 3 unreadable/no-text.
+- **legibility**: 16 clean, 3 partial, 3 unreadable/no-text.
+- **category**: 12 `clean_text`, 3 `textless`, 2 `injection`, 2
+  `safety_blocked`, and 3 `ocr_vision_disagreement`.
 - **background**: dark and light slides both represented.
 - Includes the original hallucination case (`04_..._f16`, "We're closer than you
-  think") and three text-free negatives.
+  think"), three text-free negatives, and six labelled synthetic edge cases.
 
 To refresh or extend the pool: `uv run python tests/evals/triage.py`.
 
