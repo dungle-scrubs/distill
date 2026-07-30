@@ -54,9 +54,7 @@ EXTRACTED_TEXT_LIMIT_BYTES = 256 * 1024
 WARNING_STAGE = "artifacts"
 TRUNCATION_WARNING_CODE = "extracted_text_truncated"
 REDACTION_POLICY_NOT_APPLIED_CODE = "E_REDACTION_POLICY_NOT_APPLIED"
-_RFC3339_UTC_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
-)
+_RFC3339_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z")
 
 
 class RedactionState(StrEnum):
@@ -138,7 +136,9 @@ class _PolicyText:
         return cls(text)
 
 
-def _cap_extracted_text(text: _PolicyText, *, path: str, warnings: list[FrozenWarningRecord]) -> str:
+def _cap_extracted_text(
+    text: _PolicyText, *, path: str, warnings: list[FrozenWarningRecord]
+) -> str:
     """Return `text` within the per-field cap, recording a **warning** if it was cut.
 
     The budget is bytes, because KiB is a byte unit and a character is not a
@@ -243,9 +243,7 @@ def _freeze(
         return value
     if isinstance(value, str):
         text = (
-            _redact(value, warnings=warnings)
-            if redact
-            else _PolicyText.policy_did_not_run(value)
+            _redact(value, warnings=warnings) if redact else _PolicyText.policy_did_not_run(value)
         )
         return _cap_extracted_text(text, path=path, warnings=warnings) if cap else text.text
     if isinstance(value, Mapping):
@@ -531,18 +529,49 @@ class FrameSalience:
     Informational only (D-018) - recorded on the frame artifact, surfaced to
     readers, never consulted by processing to drop a frame. `reason` is
     size-capped at parse; `reason_truncated` says when the cap cut it.
+
+    `reason` is MODEL OUTPUT - the same trust class as `visual_summary`, and
+    it can echo text read straight off the pixels that no prompt-side sink
+    ever saw. It therefore serializes via `document()` (the model-authored
+    convention) and MUST land inside a `FrameArtifact` region named in
+    `EXTRACTED_TEXT_FIELDS`, never in a Distill-authored region like
+    `grounding`. Carriers cannot hold the dataclass itself: always the
+    mapping.
     """
 
     adds_information: bool
     reason: str = ""
     reason_truncated: bool = False
 
-    def public_dict(self) -> dict[str, Any]:
+    def __post_init__(self) -> None:
+        _refuse_undeclared_values(self)
+
+    def document(self) -> dict[str, Any]:
         return {
             "adds_information": self.adds_information,
             "reason": self.reason,
             "reason_truncated": self.reason_truncated,
         }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> FrameSalience | None:
+        """Rebuild from a stored mapping, re-applying parse-time strictness.
+
+        The resume path reads mappings off disk; a document whose
+        `adds_information` is not a boolean yields None on the way back in,
+        exactly as it would have at parse (D-003).
+        """
+        if not isinstance(document, Mapping):
+            return None
+        adds_information = document.get("adds_information")
+        if not isinstance(adds_information, bool):
+            return None
+        reason = document.get("reason")
+        return cls(
+            adds_information=adds_information,
+            reason=reason if isinstance(reason, str) else "",
+            reason_truncated=bool(document.get("reason_truncated", False)),
+        )
 
 
 @dataclass(frozen=True)

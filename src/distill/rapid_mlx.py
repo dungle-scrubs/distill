@@ -823,7 +823,11 @@ def parse_frame_salience(payload: Any) -> FrameSalience | None:
     adds_information = payload.get("adds_information")
     if not isinstance(adds_information, bool):
         return None
-    reason = str(payload.get("reason") or "")
+    raw_reason = payload.get("reason")
+    # A non-string reason is refused, not stringified: repr()ing a structure
+    # into a reader-facing sentence is the coercion this parser exists to
+    # avoid. Stripped before measuring so padding cannot spend the cap.
+    reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
     truncated = len(reason) > SALIENCE_REASON_MAX_CHARS
     if truncated:
         reason = reason[:SALIENCE_REASON_MAX_CHARS]

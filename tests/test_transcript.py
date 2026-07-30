@@ -535,3 +535,31 @@ class TestTranscriptWindow:
         assert select_transcript_window((), 10.0, radius_sec=30.0) == ""
         whitespace = ({"start": 5.0, "end": 15.0, "text": "   \n\t"},)
         assert select_transcript_window(whitespace, 10.0, radius_sec=30.0) == ""
+
+    def test_straddling_segments_overlap_the_window(self) -> None:
+        from distill.transcript import select_transcript_window
+
+        segments = (
+            {"start": 40.0, "end": 50.0, "text": "straddles the low edge"},
+            {"start": 100.0, "end": 110.0, "text": "straddles the high edge"},
+        )
+
+        window = select_transcript_window(segments, 75.0, radius_sec=30.0)
+
+        assert window == "straddles the low edge straddles the high edge"
+
+    def test_unplaceable_segments_are_skipped_not_defaulted(self) -> None:
+        from distill.transcript import select_transcript_window
+
+        segments = (
+            {"end": 1000.0, "text": "no start"},
+            {"text": "no timing at all"},
+            {"start": float("nan"), "end": 12.0, "text": "nan start"},
+            {"start": "abc", "end": 12.0, "text": "unparsable"},
+            "not a mapping",
+            {"start": 5.0, "end": 15.0, "text": "the one real segment"},
+        )
+
+        assert select_transcript_window(segments, 10.0, radius_sec=30.0) == (
+            "the one real segment"
+        )

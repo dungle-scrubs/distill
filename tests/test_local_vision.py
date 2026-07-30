@@ -2471,3 +2471,23 @@ class TestSalienceSchema:
         assert salience is not None
         assert len(salience.reason) == SALIENCE_REASON_MAX_CHARS
         assert salience.reason_truncated is True
+
+    def test_a_reason_exactly_at_the_cap_is_not_flagged_truncated(self) -> None:
+        from distill.rapid_mlx import SALIENCE_REASON_MAX_CHARS, parse_frame_salience
+
+        salience = parse_frame_salience(
+            {"adds_information": True, "reason": "r" * SALIENCE_REASON_MAX_CHARS}
+        )
+
+        assert salience is not None
+        assert salience.reason_truncated is False
+
+    def test_a_non_string_reason_is_refused_not_stringified(self) -> None:
+        from distill.rapid_mlx import parse_frame_salience
+
+        salience = parse_frame_salience(
+            {"adds_information": True, "reason": {"why": "a structure"}}
+        )
+
+        assert salience is not None
+        assert salience.reason == ""
