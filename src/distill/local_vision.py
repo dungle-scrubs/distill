@@ -175,9 +175,11 @@ TRANSPORT_FAILURE_CODES = frozenset(
 # this side of the wire and says nothing either way.
 DELIVERED_RESPONSE_CODES = frozenset({"local_vision_malformed_response"})
 # Failures that condemn every remaining attempt the moment one happens: a
-# rejected credential will be rejected again on the next keyframe, so retrying
-# is sending more keyframes to an endpoint that already said no (D-016).
-IMMEDIATE_FAILURE_CODES = frozenset({"local_vision_auth_rejected"})
+# rejected credential will be rejected again on the next keyframe, and a
+# rejected endpoint is a property of the config, not of the frame - retrying
+# either is sending more keyframes to an endpoint that already said no
+# (D-016, D-008).
+IMMEDIATE_FAILURE_CODES = frozenset({"local_vision_auth_rejected", ENDPOINT_REJECTED_CODE})
 BREAKER_WARNING_CODE = "local_vision_transport_breaker_open"
 FRAME_READ_FAILURE_CODES = frozenset(
     {
@@ -422,8 +424,10 @@ class _TransportBreaker:
             skipped = self._skipped
         if opened is None or not skipped:
             return None
-        if opened["code"] in IMMEDIATE_FAILURE_CODES:
+        if opened["code"] == "local_vision_auth_rejected":
             reason = f"the endpoint rejected the credential ({opened['code']})"
+        elif opened["code"] in IMMEDIATE_FAILURE_CODES:
+            reason = f"the endpoint was rejected ({opened['code']})"
         else:
             reason = (
                 f"{opened['consecutive_failures']} consecutive transport failures "

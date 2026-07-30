@@ -36,7 +36,10 @@ from distill.local_vision import (
 from distill.options import DistillOptions
 
 LOOPBACK_URL = "http://127.0.0.1:8000/v1"
-PRIVATE_URL = "http://10.0.0.5:8000/v1"
+# https, not http: since M2.3 (D-008) a non-loopback endpoint requires TLS
+# even with the remote opt-in, so the URL every opt-in test reaches for is
+# one the policy actually permits.
+PRIVATE_URL = "https://10.0.0.5:8000/v1"
 MODELS_URL = f"{LOOPBACK_URL}/models"
 LINK_LOCAL_URL = "http://169.254.169.254/latest/meta-data/"
 
@@ -96,12 +99,14 @@ class _CannedResponse:
         return None
 
 
-class _FakeTransport(urllib.request.HTTPHandler):
+class _FakeTransport(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
     """A transport that serves canned responses and records what was asked for.
 
-    An `HTTPHandler` subclass so `build_opener` installs it *instead of* the
-    real one: everything above it in the handler chain - redirects included -
-    is the production chain, and nothing below it is a socket.
+    An `HTTPHandler`/`HTTPSHandler` subclass so `build_opener` installs it
+    *instead of* the real ones: everything above it in the handler chain -
+    redirects included - is the production chain, and nothing below it is a
+    socket. Both schemes, because since M2.3 the opt-in tests reach for https
+    URLs (a remote endpoint requires TLS).
     """
 
     def __init__(self, responses: dict[str, _CannedResponse]) -> None:
@@ -117,6 +122,8 @@ class _FakeTransport(urllib.request.HTTPHandler):
         if req.full_url not in self.responses:
             raise AssertionError(f"unexpected request: {req.full_url}")
         return self.responses[req.full_url]
+
+    https_open = http_open
 
 
 def _json_response(url: str, payload: Any) -> _CannedResponse:
@@ -199,9 +206,7 @@ def test_the_opt_out_permits_a_non_loopback_host(
                     "choices": [
                         {
                             "message": {
-                                "content": json.dumps(
-                                    {"visual_summary": "Remote endpoint reached"}
-                                )
+                                "content": json.dumps({"visual_summary": "Remote endpoint reached"})
                             }
                         }
                     ]

@@ -292,11 +292,11 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
     if not host:
         _reject_endpoint("host_missing", f"Local vision endpoint '{url}' names no host.", url=url)
     port = configured_port or DEFAULT_SCHEME_PORTS[scheme]
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
     if not allow_remote_endpoint:
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            address = None
         if address is not None and not address.is_loopback:
             _reject_endpoint(
                 "non_loopback_host",
@@ -305,6 +305,17 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
                 url=url,
                 host=host,
             )
+    elif scheme == "http" and address is not None and not address.is_loopback:
+        # A remote endpoint requires https: a bearer credential (or a keyframe)
+        # must never cross the network in cleartext. `http` exists for loopback
+        # only, wherever the opt-in stands (D-008).
+        _reject_endpoint(
+            "http_off_loopback",
+            f"Local vision endpoint host '{host}' is not loopback and the "
+            "scheme is http; a remote endpoint requires https.",
+            url=url,
+            host=host,
+        )
     return host, port
 
 
@@ -313,6 +324,7 @@ def _check_resolved_address(
     port: int,
     *,
     allow_remote_endpoint: bool,
+    scheme: str = "http",
     resolver: AddressResolver | None = None,
 ) -> list[str]:
     """R-43's authoritative half: every address `host` resolves to is loopback.
@@ -321,8 +333,12 @@ def _check_resolved_address(
     link-local address is a name that can steer the very next connection off
     loopback, and which of its answers gets connected to is not this function's
     to know.
+
+    The remote opt-in exempts only `https` (D-008): `http` must prove every
+    resolved address loopback wherever the opt-in stands, because a bearer
+    credential or a keyframe must never cross the network in cleartext.
     """
-    if allow_remote_endpoint:
+    if allow_remote_endpoint and scheme != "http":
         return []
     addresses = (resolver or _resolve_addresses)(host, port)
     if not addresses:
@@ -331,6 +347,14 @@ def _check_resolved_address(
             f"Local vision endpoint host '{host}' resolved to no address.",
             host=host,
         )
+    reject_reason, reject_hint = (
+        ("http_off_loopback", "a remote endpoint requires https")
+        if allow_remote_endpoint
+        else (
+            "non_loopback_address",
+            "set local_vision_allow_remote_endpoint to reach one deliberately",
+        )
+    )
     for address in addresses:
         try:
             resolved = ipaddress.ip_address(address)
@@ -347,9 +371,9 @@ def _check_resolved_address(
             )
         if not resolved.is_loopback:
             _reject_endpoint(
-                "non_loopback_address",
+                reject_reason,
                 f"Local vision endpoint host '{host}' resolves to {address}, which is not "
-                "loopback; set local_vision_allow_remote_endpoint to reach one deliberately.",
+                f"loopback; {reject_hint}.",
                 host=host,
                 address=address,
             )
@@ -518,7 +542,11 @@ def _urlopen_json(
     """
     host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
     _check_resolved_address(
-        host, port, allow_remote_endpoint=allow_remote_endpoint, resolver=resolver
+        host,
+        port,
+        allow_remote_endpoint=allow_remote_endpoint,
+        scheme=urllib.parse.urlsplit(url).scheme,
+        resolver=resolver,
     )
     data = None if body is None else json.dumps(body).encode("utf-8")
     request = urllib.request.Request(

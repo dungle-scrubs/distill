@@ -1513,3 +1513,82 @@ class TestCredentialResolution:
         # check owns locality; the typo guard must not punish the local default.
         assert config.credential is None
         assert config.credential_configured is True
+
+
+class TestEndpointPolicyHttps:
+    """M2.3: http only ever speaks to loopback; a remote endpoint requires https."""
+
+    def test_http_to_a_non_loopback_literal_is_rejected_even_with_remote_allowed(
+        self,
+    ) -> None:
+        from distill.local_vision import _checked_endpoint_url
+        from distill.rapid_mlx import EndpointRejected
+
+        with pytest.raises(EndpointRejected) as excinfo:
+            _checked_endpoint_url("http://203.0.113.7:8000/v1", allow_remote_endpoint=True)
+
+        assert excinfo.value.reason == "http_off_loopback"
+        assert "https" in excinfo.value.message
+
+    def test_http_name_resolving_off_machine_is_rejected_even_with_remote_allowed(
+        self,
+    ) -> None:
+        from distill.local_vision import _check_resolved_address
+        from distill.rapid_mlx import EndpointRejected
+
+        with pytest.raises(EndpointRejected) as excinfo:
+            _check_resolved_address(
+                "plain.example.com",
+                8000,
+                allow_remote_endpoint=True,
+                scheme="http",
+                resolver=lambda _host, _port: ["203.0.113.7"],
+            )
+
+        assert excinfo.value.reason == "http_off_loopback"
+
+    def test_https_name_resolving_off_machine_is_permitted_with_remote_allowed(
+        self,
+    ) -> None:
+        from distill.local_vision import _check_resolved_address
+
+        addresses = _check_resolved_address(
+            "vision.example.com",
+            443,
+            allow_remote_endpoint=True,
+            scheme="https",
+            resolver=lambda _host, _port: ["203.0.113.7"],
+        )
+
+        assert addresses == []
+
+    def test_one_endpoint_rejection_degrades_the_remaining_frames(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from distill.rapid_mlx import EndpointRejected
+
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        attempts: list[str] = []
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            attempts.append(url)
+            raise EndpointRejected(
+                "http_off_loopback",
+                "Local vision endpoint host resolves off loopback; a remote "
+                "endpoint requires https.",
+            )
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        # The same config produces the same rejection on every frame; one is
+        # enough to condemn the rest.
+        assert len(attempts) == 1
+        assert all(frame.reading is None for frame in frames)
