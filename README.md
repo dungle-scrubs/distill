@@ -342,8 +342,23 @@ where it points is a decision rather than a default:
 - **Redirects are not followed**, and a response body beyond 32 MiB is refused.
   Both hold wherever the endpoint is: they are about what the client does with
   an answer, not about whose answer it is.
+- **Credentials.** Set `"api_key_env"` (the name of an environment variable -
+  preferred, and it wins over an inline value) or `"api_key"` in the
+  local-vision config; the value is sent as `Authorization: Bearer` and never
+  appears in logs, errors, renders, or bundles. A credential that is
+  *configured but empty* on a non-loopback endpoint is a fatal config error
+  (the typo guard); configuring none at all is intentional no-auth.
+- **Remote runs are bounded.** With the opt-out set, the vision stage carries
+  a run-wide budget (wall clock and received bytes) and 429/5xx answers are
+  retried within `Retry-After` bounds, then the remainder of the run degrades
+  to OCR-only. A run that may send keyframes off-machine also records a
+  `non_local_only_processing` warning in its render, and that fact becomes
+  part of bundle identity - the endpoint's address never does.
 
-A refused endpoint is a warning and OCR-only output, not a failed run.
+A *misconfigured* endpoint (bad scheme, credential in the URL, remote without
+the opt-out, configured-but-empty credential) is a fatal error at startup: the
+config was ignored otherwise. An endpoint that is merely *unavailable at run
+time* degrades to OCR-only output with a warning instead.
 
 ### Model
 
@@ -378,8 +393,11 @@ data at both places it becomes durable:
   placed into a render - bearer tokens, `token:`/`apikey:` assignments, GitHub,
   GitLab, npm and HuggingFace token formats, and private-key headers. This is
   pattern matching over recovered text and nothing more: a secret in a shape no
-  pattern names survives it, and `--no-redact-secrets` turns it off entirely. It
-  reduces what leaks into a bundle; it does not make a bundle safe to publish.
+  pattern names survives it. `--no-redact-secrets` turns it off for *your own
+  render and disk output only* - text entering a vision prompt is always
+  redacted, wherever the endpoint lives, so the model reads `[REDACTED]` in
+  place of a secret either way. It reduces what leaks into a bundle; it does
+  not make a bundle safe to publish.
 
 ## Testing
 

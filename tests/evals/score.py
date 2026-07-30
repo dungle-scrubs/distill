@@ -284,7 +284,7 @@ def evaluate(
                 # baselines are unaffected.
                 assessment = assess_grounding(
                     ocr_text=redact_for_prompt(ocr_text),
-                    verbatim_text=result.verbatim_text,
+                    verbatim_text=redact_for_prompt(result.verbatim_text),
                     text_confidence=result.text_confidence,
                     has_interpretation=result.has_interpretation,
                     carries_a_reading=result.carries_a_reading,

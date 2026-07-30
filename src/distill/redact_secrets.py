@@ -117,6 +117,19 @@ URL_USERINFO_RE = re.compile(
     r"(?P<prefix>(?<![a-zA-Z0-9+.-])(?i:[a-z][a-z0-9+.-]{0,31})://[^/@\s:]{1,256}:)"
     r"(?P<value>[^@/\s]{1,512})(?=@)"
 )
+# The escape hatches the bounded rule above leaves open, each replaced
+# whole. User-only opaque tokens (`https://tok_abc123@host`): the 16-char
+# floor keeps `ssh://git@github.com` and friends intact - a short service
+# username is not a credential shape. And passwords past the primary rule's
+# 512 cap: still bounded, still linear.
+URL_USERINFO_TOKEN_RE = re.compile(
+    r"(?P<prefix>(?<![a-zA-Z0-9+.-])(?i:[a-z][a-z0-9+.-]{0,31})://)"
+    r"(?P<value>[^@/:\s]{16,2048})(?=@)"
+)
+URL_USERINFO_OVERLONG_RE = re.compile(
+    r"(?P<prefix>(?<![a-zA-Z0-9+.-])(?i:[a-z][a-z0-9+.-]{0,31})://)"
+    r"(?P<value>[^/@\s:]{1,256}:[^@/\s]{513,2048})(?=@)"
+)
 TUTORIAL_PLACEHOLDERS = {
     "your_key_here",
     "your_api_key",
@@ -180,6 +193,8 @@ def redact_text(text: str) -> RedactionResult:
         return f"{match.group('prefix')}[REDACTED]"
 
     redacted = URL_USERINFO_RE.sub(replace_userinfo, redacted)
+    redacted = URL_USERINFO_TOKEN_RE.sub(replace_userinfo, redacted)
+    redacted = URL_USERINFO_OVERLONG_RE.sub(replace_userinfo, redacted)
 
     for pattern in SECRET_PATTERNS:
         matches = pattern.findall(redacted)

@@ -71,7 +71,10 @@ _READ_CHUNK_BYTES = 64 * 1024
 # remote endpoint, because a slow local model is not the threat and must not
 # be half-degraded by a run-wide clock. The probe runs before the budget is
 # created, so its two requests are bounded by timeout_sec alone.
-DEFAULT_VISION_STAGE_BUDGET_SEC = 600.0
+# 3600s clears the run's own worst case (default 80 keyframes x 30s
+# timeout = 2400s) with margin; the bound exists for runaway remote cost,
+# not to race a working endpoint.
+DEFAULT_VISION_STAGE_BUDGET_SEC = 3600.0
 DEFAULT_VISION_STAGE_BUDGET_BYTES = 256 * 1024 * 1024
 
 
@@ -242,10 +245,12 @@ def _reject_endpoint(reason: str, message: str, **detail: Any) -> NoReturn:
     in either case - which is why the fix there was the message an operator
     gets, not a handler override to route the refusal back through here.
     """
-    if "url" in detail:
+    for url_key in ("url", "location"):
         # Centrally, so no rejection site can forget: an echoed URL never
-        # carries userinfo, query, fragment, or path (D-007).
-        detail["url"] = _safe_url_for_message(str(detail["url"]))
+        # carries userinfo, query, fragment, or path (D-007). `location` is a
+        # server-chosen value and gets the same treatment.
+        if url_key in detail:
+            detail[url_key] = _safe_url_for_message(str(detail[url_key]))
     _boundary_log("endpoint_rejected", {"reason": reason, **detail})
     raise EndpointRejected(reason, message, detail)
 
@@ -275,6 +280,32 @@ def _resolve_addresses(host: str, port: int) -> list[str]:
             {"host": host, "error": str(exc)},
         ) from exc
     return [str(info[4][0]) for info in infos]
+
+
+def _parse_retry_after(header: str) -> float | None:
+    """RFC 9110 Retry-After: delay-seconds or an HTTP-date, else None.
+
+    Non-finite and unparsable values are None - the caller's default backoff
+    covers them, and an endpoint's arithmetic is never this process's crash.
+    """
+    if not header:
+        return None
+    try:
+        seconds = float(header)
+        return seconds if math.isfinite(seconds) else None
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        target = parsedate_to_datetime(header)
+    except (TypeError, ValueError):
+        return None
+    if target.tzinfo is None:
+        return None
+    import datetime as _dt
+
+    return (target - _dt.datetime.now(_dt.UTC)).total_seconds()
 
 
 def _safe_url_for_message(url: str) -> str:
@@ -378,7 +409,11 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
             scheme=scheme,
         )
     if not host:
-        _reject_endpoint("host_missing", f"Local vision endpoint '{url}' names no host.", url=url)
+        _reject_endpoint(
+            "host_missing",
+            f"Local vision endpoint '{_safe_url_for_message(url)}' names no host.",
+            url=url,
+        )
     port = configured_port or DEFAULT_SCHEME_PORTS[scheme]
     try:
         address = ipaddress.ip_address(host)
@@ -635,6 +670,12 @@ def _urlopen_json(
     Distill would have to open itself. The bound here is per request, which is
     what D-029 asks for; it is not per packet.
     """
+    # The deadline is absolute from entry: policy resolution (which may hit
+    # DNS), connect, send, and every chunk of the answer all charge it. One
+    # caveat stated rather than hidden: a single blocked socket operation is
+    # bounded by the per-op timeout, so the true worst case is deadline plus
+    # one socket operation (D-008).
+    deadline = _monotonic() + timeout_sec
     scheme, host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
     _check_resolved_address(
         host,
@@ -706,14 +747,7 @@ def _urlopen_json(
             retry_after_header = ""
             if getattr(exc, "headers", None) is not None:
                 retry_after_header = str(exc.headers.get("Retry-After") or "")
-            try:
-                retry_after: float | None = float(retry_after_header)
-            except ValueError:
-                # The http-date form (or junk) is not worth parsing; the
-                # caller's default backoff covers it.
-                retry_after = None
-            if retry_after is not None and not math.isfinite(retry_after):
-                retry_after = None
+            retry_after = _parse_retry_after(retry_after_header)
             raise LocalVisionFailure(
                 "local_vision_retryable",
                 f"Local vision endpoint answered HTTP {exc.code}; retrying is "
@@ -723,14 +757,15 @@ def _urlopen_json(
         # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so
         # the probe/interpret paths can map them onto warning codes. Bounded
         # like any other body (R-44), and tighter: only a preview of it is ever
-        # used, so reading a gigabyte to quote 200 characters of it is a cost
-        # with no reader. Read only after the auth branch: a 401/403 body is
-        # never used, so a hostile one is never decoded at all.
-        detail = (
-            exc.read(ERROR_BODY_PREVIEW_BYTES).decode("utf-8", errors="replace")
-            if hasattr(exc, "read")
-            else ""
-        )
+        # used. Read only after the auth branch, and NEVER on an authenticated
+        # request: a server that echoes the Authorization header into its
+        # error body would otherwise reflect the credential into diagnostics.
+        if credential is not None:
+            detail = "<error body withheld: authenticated request>"
+        elif hasattr(exc, "read"):
+            detail = exc.read(ERROR_BODY_PREVIEW_BYTES).decode("utf-8", errors="replace")
+        else:
+            detail = ""
         if 300 <= exc.code < 400:
             # A redirect this module never got to refuse: urllib turns a 3xx it
             # cannot act on - no `Location`, or one naming a scheme it will not
@@ -756,8 +791,9 @@ def _urlopen_json(
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
+        preview = "<body withheld: authenticated request>" if credential is not None else raw[:200]
         raise ValueError(
-            f"non-JSON response from {_safe_url_for_message(url)}: {raw[:200]!r}"
+            f"non-JSON response from {_safe_url_for_message(url)}: {preview!r}"
         ) from exc
 
 

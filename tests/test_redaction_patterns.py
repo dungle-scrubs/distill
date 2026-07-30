@@ -426,3 +426,14 @@ def test_url_userinfo_matches_uppercase_schemes() -> None:
     result = redact_text("HTTPS://USER:SECRET-VALUE-123456@HOST.EXAMPLE.COM")
 
     assert "SECRET-VALUE-123456" not in result.text
+
+
+def test_url_userinfo_escape_hatches_are_covered() -> None:
+    opaque = redact_text("https://tok_abcdefghijklmnop@api.example.com/v1")
+    assert "tok_abcdefghijklmnop" not in opaque.text
+
+    overlong = redact_text(f"https://user:{'p' * 540}@host.example.com")
+    assert "p" * 540 not in overlong.text
+
+    # Short service usernames stay: a username is not a credential shape.
+    assert_intact("git clone ssh://git@github.com/org/repo.git")

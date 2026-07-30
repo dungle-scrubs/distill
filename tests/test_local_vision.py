@@ -241,13 +241,28 @@ def test_probe_reports_model_unavailable_when_model_not_served(
 def test_probe_reports_malformed_models_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def requestor(*, method: str, url: str, body: Any = None, timeout: float = 30.0) -> Any:
-        raise RuntimeError("HTTP 500 from server: internal error")
-
-    probe = probe_rapid_mlx_availability(LocalVisionConfig(), requestor=requestor)
+    """Since the Phase 2 landing review, a bad /models answer no longer vetoes
+    the endpoint (many providers serve no catalog): the catalog becomes
+    advisory-absent and the attempted completion decides. Both failing is
+    what reports unavailable."""
+    probe = probe_rapid_mlx_availability(
+        LocalVisionConfig(),
+        requestor=FakeRapidMlx(
+            models_error=ValueError("non-JSON response"),
+            chat_error=RuntimeError("HTTP 404: no completions either"),
+        ),
+    )
 
     assert probe.available is False
-    assert probe.code == "local_vision_rapid_mlx_malformed_response"
+    assert probe.code == "local_vision_model_unavailable"
+
+    working = probe_rapid_mlx_availability(
+        LocalVisionConfig(),
+        requestor=FakeRapidMlx(models_error=ValueError("non-JSON response"), chat_content="pong"),
+    )
+
+    assert working.available is True
+    assert working.detail["model_not_listed"] is True
 
 
 def test_probe_reports_timeout() -> None:
@@ -1876,6 +1891,11 @@ class TestBoundedRemoteBehavior:
         assert opened["n"] <= 2  # the third frame was never attempted
         codes = {w["code"] for w in warnings}
         assert "local_vision_budget_exhausted" in codes
+        summary = next(w for w in warnings if w["code"] == BREAKER_WARNING_CODE)
+        # The R-40 sentence is the operator's whole account: a spent budget
+        # must never read as "0 consecutive transport failures".
+        assert "budget was spent" in summary["message"]
+        assert "consecutive transport failures" not in summary["message"]
 
     def test_the_wall_clock_budget_degrades_the_remainder(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2087,6 +2107,9 @@ class TestBoundedRemoteBehavior:
         assert opened["n"] == 3
         assert all(frame.reading is None for frame in frames)
         assert interpreter.debug_info()["breaker"]["transport_failures"] == 0
+        summary = next(w for w in warnings if w["code"] == BREAKER_WARNING_CODE)
+        assert "rate-limiting" in summary["message"]
+        assert "consecutive transport failures" not in summary["message"]
 
 
 class TestPromptSideRedaction:
@@ -2237,7 +2260,8 @@ class TestNonLocalProvenance:
             "local_vision",
             "non_local_only_processing",
             "this run was configured to send keyframes to a non-loopback "
-            "vision endpoint; the generation is not local-only processing.",
+            "vision endpoint; the generation may not be local-only "
+            "processing.",
         )
 
         frame = _frame(1, Path("frames/frame1.png"), extracted_text="on-screen text")
@@ -2307,3 +2331,93 @@ class TestNonLocalProvenance:
         codes = {w["code"] for w in warnings}
         assert "non_local_only_processing" in codes
         assert "local_vision_rapid_mlx_unavailable" in codes
+
+
+def test_end_to_end_credential_budget_and_provenance_compose(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The composed remote path, config file to wire: api_key_env resolves
+    into a bearer on BOTH the probe and the frame request, the run-wide
+    budget rides both, the non-local disclosure lands in the warnings, the
+    fold lands in identity, and neither credential nor address reaches the
+    bundle surfaces."""
+
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "api_key_env": "DISTILL_E2E_VISION_KEY",
+                "base_url": "https://10.0.0.5:8000/v1",
+                "allow_remote_endpoint": True,
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_E2E_VISION_KEY", "sk-e2e-secret")
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path / "config"))
+    (tmp_path / "frame0.png").write_bytes(b"png")
+
+    options = DistillOptions.from_args({})
+    config = options.local_vision_config()
+
+    auth_headers: list[str | None] = []
+    budgets_seen: list[object] = []
+
+    class _RecordingOpener:
+        def open(self, request: Any, timeout: float | None = None) -> Any:
+            auth_headers.append(request.get_header("Authorization"))
+            body = (
+                json.dumps(_models_body(DEFAULT_MODEL))
+                if request.full_url.rstrip("/").endswith("/models")
+                else json.dumps(_chat_envelope(_frame_json()))
+            ).encode()
+
+            class _Resp:
+                def __enter__(self) -> Any:
+                    return self
+
+                def __exit__(self, *exc: object) -> None:
+                    return None
+
+                def __init__(self) -> None:
+                    self._offset = 0
+
+                def read1(self, size: int = -1) -> bytes:
+                    chunk = body[self._offset : self._offset + (size if size > 0 else len(body))]
+                    self._offset += len(chunk)
+                    return chunk
+
+                read = read1
+
+            return _Resp()
+
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _RecordingOpener())
+
+    original_post = __import__("distill.rapid_mlx", fromlist=["_http_post_json"])._http_post_json
+
+    def spying_post(*args: Any, **kwargs: Any) -> Any:
+        budgets_seen.append(kwargs.get("budget"))
+        return original_post(*args, **kwargs)
+
+    monkeypatch.setattr("distill.local_vision._http_post_json", spying_post)
+
+    interpreter = FrameInterpreter(config)
+    frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+    # Both requests authenticated with the resolved credential.
+    assert auth_headers and all(h == "Bearer sk-e2e-secret" for h in auth_headers)
+    # The frame request carried the run's budget (remote-opted config).
+    assert budgets_seen and budgets_seen[-1] is not None
+    assert frames[0].reading is not None
+    assert "non_local_only_processing" in {w["code"] for w in warnings}
+    # Identity folds; the credential reaches NO surface, and the address
+    # stays out of the bundle surfaces (it remains a machine-local claim in
+    # the local diagnostics view, per ADR-0004).
+    assert options.cache_payload("local")["local_vision_non_local"] is True
+    bundle_surfaces = (
+        json.dumps(options.cache_payload("local")),
+        json.dumps(options.public_dict("local")),
+    )
+    for surface in bundle_surfaces:
+        assert "sk-e2e-secret" not in surface
+        assert "10.0.0.5" not in surface
+    assert "sk-e2e-secret" not in json.dumps(config.public_dict(), default=str)

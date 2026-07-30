@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -541,7 +542,10 @@ def test_an_operator_typo_still_gets_argparses_usage_message(
     assert exit_info.value.code == 2
     output = capsys.readouterr()
     assert "Traceback" not in output.err
-    assert "usage: distill" in output.err
+    # Python 3.14's argparse colorizes usage when the environment says the
+    # terminal can; strip ANSI escapes so the assertion is about the words.
+    plain_err = re.sub(r"\x1b\[[0-9;]*m", "", output.err)
+    assert "usage: distill" in plain_err
     # And *only* the usage message. A boundary that had swallowed the parser's
     # own `SystemExit` would answer a typo with an error object naming
     # `SystemExit`, which says nothing about how to spell the command.
@@ -658,6 +662,7 @@ def test_the_debug_escape_hatch_re_raises_the_original_exception(
     opt-in env var is the whole of the escape: off, nothing changes; on, the
     original exception propagates with its stack intact.
     """
+
     def fault(*_args: object, **_kwargs: object) -> Any:
         raise RuntimeError("a fault three modules down")
 
@@ -815,7 +820,7 @@ def test_a_diagnostics_timeout_outside_the_domain_is_refused_like_a_run_path(
 
 
 def test_a_diagnostics_timeout_inside_the_domain_is_still_honoured(
-    capsys: pytest.CaptureFixture[str]
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The refusal is the domain's edge, not the flag's."""
     main(["local-vision-diagnostics", "--local-vision-timeout-sec", "12.5"])
@@ -867,7 +872,7 @@ def test_the_error_object_names_the_exception_without_printing_its_stack(
     assert payload["stage"] == "internal"
     assert payload["details"]["exception"] == "ZeroDivisionError"
     assert "division by zero" in payload["details"]["message"]
-    assert "File \"" not in json.dumps(payload)
+    assert 'File "' not in json.dumps(payload)
 
 
 def test_a_failing_run_leaves_the_error_record_as_the_last_line_of_stderr(

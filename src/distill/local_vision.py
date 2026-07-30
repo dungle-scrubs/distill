@@ -489,6 +489,8 @@ class _TransportBreaker:
         immediate_phrases = {
             "local_vision_auth_rejected": "the endpoint rejected the credential",
             ENDPOINT_REJECTED_CODE: "the endpoint was rejected",
+            VisionStageBudget.CODE: "the vision stage's run-wide budget was spent",
+            "local_vision_retry_exhausted": "the endpoint kept rate-limiting",
         }
         phrase = immediate_phrases.get(opened["code"])
         if phrase is not None:
@@ -551,7 +553,12 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
             # (D-007). Re-adding the raw base_url here defeated exactly that.
             dict(exc.detail),
         ) from exc
-    if config.credential_configured and config.credential is None and config_is_non_local(config):
+    if (
+        config.caption_frames
+        and config.credential_configured
+        and config.credential is None
+        and config_is_non_local(config)
+    ):
         # D-016's typo guard: a credential the operator *configured* resolved
         # to nothing, on a config that says remote is intended and whose host
         # is not literally loopback. Without allow_remote_endpoint the
@@ -775,6 +782,7 @@ def probe_rapid_mlx_availability(
             config.timeout_sec,
             allow_remote_endpoint=config.allow_remote_endpoint,
             credential=config.credential,
+            budget=config.budget,
         )
     except EndpointRejected as exc:
         return LocalVisionProbe(
@@ -784,7 +792,10 @@ def probe_rapid_mlx_availability(
             base_url=config.base_url,
             code=exc.code,
             message=f"{exc.message} Continuing with OCR-only output.",
-            detail={**exc.detail, "url": models_url},
+            # The rejection's own detail already carries a SANITIZED url when
+            # one is safe to echo; overriding it with the raw models_url
+            # defeated exactly that.
+            detail=dict(exc.detail),
         )
     except LocalVisionFailure as exc:
         # Raised typed from the transport (e.g. auth_rejected). Its message
@@ -839,15 +850,13 @@ def probe_rapid_mlx_availability(
             detail={"error": str(exc), "url": models_url},
         )
     except (ValueError, RuntimeError) as exc:
-        return LocalVisionProbe(
-            available=False,
-            backend=config.backend,
-            model=config.model,
-            base_url=config.base_url,
-            code="local_vision_rapid_mlx_malformed_response",
-            message="Rapid-MLX returned a malformed models response; continuing with OCR-only output.",
-            detail={"error": str(exc), "url": models_url},
-        )
+        # An HTTP error or a non-envelope answer from /models says nothing
+        # about completions (D-008: many providers and proxies serve no
+        # catalog at all). The catalog becomes advisory-absent and the
+        # attempted completion decides; only a transport-level failure above
+        # stops the probe, because both endpoints share a server.
+        _boundary_log("models_catalog_unavailable", {"error": str(exc)[:200], "url": models_url})
+        payload = {"data": []}
 
     served = _served_model_ids(payload)
     if config.model not in served:
@@ -946,6 +955,7 @@ def _attempt_minimal_completion(
             config.timeout_sec,
             allow_remote_endpoint=config.allow_remote_endpoint,
             credential=config.credential,
+            budget=config.budget,
         )
         if not envelope.get("choices"):
             # A 200 without a completion envelope (several proxies answer
@@ -1092,18 +1102,12 @@ class FrameInterpreter:
     ) -> tuple[list[FrameArtifact], list[WarningRecord]]:
         self._reset_run(frames)
         self._log("interpret.start", {"frames": len(frames), "backend": self.config.backend})
-        probe = self.probe(self.config)
-        self._last_probe = probe
-        # Cap the worker pool at the configured admission limit; never unbounded.
-        # max_parallel<=1 keeps interpretation serial — the config fallback if
-        # parallel-vs-serial is not a measured win (A-004).
-        self._max_parallel = max(int(self.max_parallel), 1)
         provenance_warnings: list[WarningRecord] = []
         if config_is_non_local(self.config):
             # D-012: both provenance surfaces - this warning and the identity
             # fold in options.cache_payload - read the SAME predicate on the
-            # same input, before any I/O, so a bundle keyed non-local always
-            # carries the disclosure even when the endpoint never answers.
+            # same input, before any I/O (including the probe's), so a bundle
+            # keyed non-local always carries the disclosure.
             non_local = warning(
                 "local_vision",
                 "non_local_only_processing",
@@ -1113,6 +1117,13 @@ class FrameInterpreter:
             )
             self._record_warning(non_local)
             provenance_warnings.append(non_local)
+        probing_config = self._probing_config()
+        probe = self.probe(probing_config)
+        self._last_probe = probe
+        # Cap the worker pool at the configured admission limit; never unbounded.
+        # max_parallel<=1 keeps interpretation serial — the config fallback if
+        # parallel-vs-serial is not a measured win (A-004).
+        self._max_parallel = max(int(self.max_parallel), 1)
         if not probe.available:
             if self.progress:
                 self.progress.skip_cached("local_vision", detail={"reason": probe.code})
@@ -1144,7 +1155,7 @@ class FrameInterpreter:
             # Resolve the target once via the probe, then interpret each frame
             # against that endpoint without re-probing. Use the resolved
             # model/base_url when the probe reported them.
-            resolved = self._resolved_config(probe)
+            resolved = self._resolved_config(probe, probing_config)
             self._log(
                 "interpret.pool",
                 {"frames": len(frames), "max_parallel": self._max_parallel},
@@ -1173,27 +1184,33 @@ class FrameInterpreter:
             # the prior leasing path without leaking a no-op callback.
             pass
 
-    def _resolved_config(self, probe: LocalVisionProbe) -> LocalVisionConfig:
-        # The budget starts when the stage does and rides the per-run resolved
-        # config, so the transport can charge each chunk as it arrives. It is
-        # attached only when the config opts into a remote endpoint: remote
-        # cost is the threat D-008 bounds, and a slow-but-working local model
-        # must not be half-degraded by a run-wide clock.
-        budget = (
-            VisionStageBudget(
+    def _probing_config(self) -> LocalVisionConfig:
+        # The budget starts when the STAGE does - before the probe - and one
+        # instance rides every request the stage makes, so the probe's GET
+        # and attempted completion charge the same bounds as the frames
+        # (D-008: run-wide means the run, not the run minus its first two
+        # requests). Attached only when the config opts into a remote
+        # endpoint: remote cost is the threat, and a slow-but-working local
+        # model must not be half-degraded by a run-wide clock.
+        if self.config.budget is None and self.config.allow_remote_endpoint:
+            budget = VisionStageBudget(
                 wall_clock_sec=float(self.budget_sec), max_bytes=int(self.budget_bytes)
             )
-            if self.config.allow_remote_endpoint
-            else None
-        )
-        if probe.backend != DEFAULT_LOCAL_VISION_BACKEND or not (probe.base_url and probe.model):
             return replace(self.config, budget=budget)
+        return self.config
+
+    def _resolved_config(
+        self, probe: LocalVisionProbe, probing: LocalVisionConfig
+    ) -> LocalVisionConfig:
+        # `probing` is the config the probe actually used - the SAME budget
+        # instance keeps charging through the frames (one run, one budget).
+        if probe.backend != DEFAULT_LOCAL_VISION_BACKEND or not (probe.base_url and probe.model):
+            return probing
         return replace(
-            self.config,
+            probing,
             backend=DEFAULT_LOCAL_VISION_BACKEND,
             model=probe.model,
             base_url=probe.base_url,
-            budget=budget,
         )
 
     def _interpret_frames(
@@ -1461,7 +1478,7 @@ class FrameInterpreter:
 
         assessment = assess_grounding(
             ocr_text=redact_for_prompt(frame.extracted_text),
-            verbatim_text=reading.verbatim_text,
+            verbatim_text=redact_for_prompt(reading.verbatim_text),
             text_confidence=reading.text_confidence,
             has_interpretation=reading.has_interpretation,
             carries_a_reading=reading.carries_a_reading,

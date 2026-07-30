@@ -304,7 +304,9 @@ def test_redirects_are_disabled_rather_than_re_validated(
         _urlopen_json("GET", MODELS_URL, None, 5.0)
 
     assert caught.value.detail["reason"] == "redirect"
-    assert caught.value.detail["location"] == other_loopback
+    # Sanitized to authority-only: a Location is a server-chosen value and a
+    # path can carry a token, so only scheme://host:port is echoed.
+    assert caught.value.detail["location"] == "http://127.0.0.1:9999"
     assert transport.requested == [MODELS_URL]
 
 
@@ -495,7 +497,7 @@ def test_every_rejected_endpoint_is_logged_with_its_reason(
         "non_loopback_address",
     ]
     assert rejected[0]["detail"]["host"] == "10.0.0.5"
-    assert rejected[1]["detail"]["location"] == LINK_LOCAL_URL
+    assert rejected[1]["detail"]["location"] == "http://169.254.169.254"
     assert rejected[2]["detail"]["address"] == "169.254.169.254"
     assert all(event["type"] == "distill.local_vision" for event in rejected)
 
