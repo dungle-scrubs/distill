@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -81,6 +81,35 @@ class FasterWhisperAdapter:
             word_timestamps=True,
         )
 
+
+
+# The transcript context a keyframe is judged against (D-003): segments
+# overlapping [timestamp - radius, timestamp + radius], in transcript order.
+# 30s of speech either side is enough to say whether the frame adds anything
+# beyond what is being said, without dragging in a different topic.
+SALIENCE_WINDOW_RADIUS_SEC = 30.0
+
+
+def select_transcript_window(
+    segments: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]],
+    timestamp_sec: float,
+    *,
+    radius_sec: float = SALIENCE_WINDOW_RADIUS_SEC,
+) -> str:
+    """The speech surrounding a frame timestamp, or "" when there is none.
+
+    "" is the emptiness predicate's answer, not a value to judge against: a
+    zero-segment or whitespace-only transcript means the frame has no context
+    to be salient *relative to*, so salience stays absent rather than being
+    scored against nothing (D-003).
+    """
+    low, high = timestamp_sec - radius_sec, timestamp_sec + radius_sec
+    parts = [
+        str(segment.get("text", "")).strip()
+        for segment in segments
+        if float(segment.get("end", 0.0)) >= low and float(segment.get("start", 0.0)) <= high
+    ]
+    return " ".join(part for part in parts if part)
 
 def parse_ffmpeg_progress_time(line: str) -> float | None:
     if line.startswith("out_time_ms="):

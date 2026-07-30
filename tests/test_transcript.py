@@ -507,3 +507,31 @@ def test_a_wedged_but_installed_ffmpeg_still_only_costs_the_transcript(
     assert extracted is False
     assert [item["code"] for item in warnings] == [transcript.AUDIO_EXTRACT_FAILED_CODE]
     assert "exceeded its total deadline" in warnings[0]["message"]
+
+
+class TestTranscriptWindow:
+    """M4.1: the transcript window around a frame timestamp, and the
+    emptiness predicate that keeps salience absent rather than judged
+    against nothing."""
+
+    def test_window_selects_overlapping_segments_in_order(self) -> None:
+        from distill.transcript import select_transcript_window
+
+        segments = (
+            {"start": 0.0, "end": 5.0, "text": "far before"},
+            {"start": 55.0, "end": 65.0, "text": "just before"},
+            {"start": 70.0, "end": 80.0, "text": "during"},
+            {"start": 85.0, "end": 95.0, "text": "just after"},
+            {"start": 200.0, "end": 210.0, "text": "far after"},
+        )
+
+        window = select_transcript_window(segments, 75.0, radius_sec=30.0)
+
+        assert window == "just before during just after"
+
+    def test_whitespace_or_empty_transcript_counts_as_no_transcript(self) -> None:
+        from distill.transcript import select_transcript_window
+
+        assert select_transcript_window((), 10.0, radius_sec=30.0) == ""
+        whitespace = ({"start": 5.0, "end": 15.0, "text": "   \n\t"},)
+        assert select_transcript_window(whitespace, 10.0, radius_sec=30.0) == ""
