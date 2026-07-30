@@ -1424,3 +1424,92 @@ class TestCredentialResolution:
         assert all(frame.reading is None for frame in frames)
         codes = {w["code"] for w in warnings}
         assert "local_vision_auth_rejected" in codes
+
+    def test_auth_rejected_frame_carries_the_ungrounded_assessment(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(*_args: Any, **_kwargs: Any) -> Any:
+            raise LocalVisionFailure(
+                "local_vision_auth_rejected",
+                "Local vision endpoint rejected the credential (HTTP 401); "
+                "continuing with OCR-only output.",
+                {"status": 401},
+            )
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        # FRAME_READ_FAILURE_CODES membership is what attaches the explicit
+        # "vision produced no usable output" grounding to the failed frame.
+        assert frames[0].reading is None
+        assert frames[0].grounding is not None
+        assert frames[0].grounding.get("level") == UNGROUNDED
+
+    def test_probe_request_carries_the_bearer_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from dataclasses import replace
+
+        from distill.local_vision import SecretCredential
+
+        captured: dict[str, Any] = {}
+
+        def fake_get(requestor, url, timeout_sec, **kwargs):  # noqa: ANN001
+            captured.update(kwargs)
+            return _models_body(DEFAULT_MODEL)
+
+        monkeypatch.setattr("distill.local_vision._http_get_json", fake_get)
+        config = replace(LocalVisionConfig(), credential=SecretCredential("sk-probe-secret"))
+
+        probe = probe_rapid_mlx_availability(config)
+
+        assert probe.available is True
+        assert captured["credential"] is config.credential
+
+    def test_probe_auth_rejection_yields_unavailable_probe_with_auth_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from email.message import Message
+
+        class _AuthRejectingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                raise urllib.error.HTTPError(
+                    request.full_url, 401, "denied", Message(), io.BytesIO(b"{}")
+                )
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _AuthRejectingOpener())
+
+        probe = probe_rapid_mlx_availability(LocalVisionConfig())
+
+        assert probe.available is False
+        assert probe.code == "local_vision_auth_rejected"
+
+    def test_empty_inline_api_key_is_the_same_typo_guard(self, tmp_path: Path) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps(
+                {
+                    "api_key": "",
+                    "base_url": "https://vision.example.com/v1",
+                    "allow_remote_endpoint": True,
+                }
+            )
+        )
+
+        with pytest.raises(DistillError):
+            load_local_vision_config(tmp_path)
+
+    def test_configured_but_empty_credential_on_loopback_is_not_fatal(self, tmp_path: Path) -> None:
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"api_key": "", "base_url": "http://localhost:8000/v1"})
+        )
+
+        config = load_local_vision_config(tmp_path)
+
+        # allow_remote_endpoint is False, so the per-request resolved-address
+        # check owns locality; the typo guard must not punish the local default.
+        assert config.credential is None
+        assert config.credential_configured is True

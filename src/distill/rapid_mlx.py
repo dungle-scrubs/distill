@@ -106,8 +106,10 @@ class SecretCredential:
         raise TypeError("SecretCredential cannot be serialized or copied")
 
     def __eq__(self, other: object) -> bool:
-        # Value equality, constant-time, so a config-keyed cache can never
-        # serve a response fetched under a different credential.
+        # Value equality (constant-time out of caution): two configs differing
+        # only by credential must never compare interchangeable. Cache keys
+        # deliberately exclude the credential; this is about equality, not
+        # about putting secrets in a key.
         if not isinstance(other, SecretCredential):
             return NotImplemented
         return hmac.compare_digest(self._value.encode(), other._value.encode())
@@ -119,6 +121,10 @@ class SecretCredential:
 AddressResolver = Callable[[str, int], list[str]]
 
 
+# The injectable request seam is credential-blind by design: a fake server
+# fed through `requestor` never sees headers, so credential behavior MUST be
+# tested at the opener level (patch `_OPENER`), never through this seam - a
+# credential test written against it passes vacuously.
 HttpRequestor = Callable[..., "dict[str, Any]"]
 
 
@@ -198,6 +204,22 @@ def _safe_url_for_message(url: str) -> str:
     if "@" in rest:
         rest = rest.rsplit("@", 1)[1]
     return f"{scheme}{sep}{rest}"
+
+
+def _static_host_is_loopback(url: str) -> bool:
+    """True only when the host is a *literal* loopback address. A hostname
+    cannot be settled without a lookup, so callers deciding statically must
+    treat a name as potentially remote."""
+    try:
+        host = urllib.parse.urlsplit(url).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str, int]:
@@ -520,16 +542,6 @@ def _urlopen_json(
             raise RuntimeError(f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap")
         raw = payload.decode("utf-8")
     except urllib.error.HTTPError as exc:
-        # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so
-        # the probe/interpret paths can map them onto warning codes. Bounded
-        # like any other body (R-44), and tighter: only a preview of it is ever
-        # used, so reading a gigabyte to quote 200 characters of it is a cost
-        # with no reader.
-        detail = (
-            exc.read(ERROR_BODY_PREVIEW_BYTES).decode("utf-8", errors="replace")
-            if hasattr(exc, "read")
-            else ""
-        )
         if exc.code in (401, 403):
             # D-007: an auth failure's error surface carries neither the
             # credential nor the endpoint's error body - a reflected body is
@@ -542,6 +554,17 @@ def _urlopen_json(
                 "continuing with OCR-only output.",
                 {"status": exc.code, "url": _safe_url_for_message(url)},
             ) from exc
+        # Surface HTTP error bodies (e.g. model-not-loaded) as a RuntimeError so
+        # the probe/interpret paths can map them onto warning codes. Bounded
+        # like any other body (R-44), and tighter: only a preview of it is ever
+        # used, so reading a gigabyte to quote 200 characters of it is a cost
+        # with no reader. Read only after the auth branch: a 401/403 body is
+        # never used, so a hostile one is never decoded at all.
+        detail = (
+            exc.read(ERROR_BODY_PREVIEW_BYTES).decode("utf-8", errors="replace")
+            if hasattr(exc, "read")
+            else ""
+        )
         if 300 <= exc.code < 400:
             # A redirect this module never got to refuse: urllib turns a 3xx it
             # cannot act on - no `Location`, or one naming a scheme it will not

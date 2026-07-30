@@ -135,6 +135,9 @@ from .rapid_mlx import (
     _served_model_ids as _served_model_ids,
 )
 from .rapid_mlx import (
+    _static_host_is_loopback as _static_host_is_loopback,
+)
+from .rapid_mlx import (
     _urlopen_json as _urlopen_json,
 )
 from .rapid_mlx import (
@@ -211,12 +214,6 @@ class LocalVisionConfig:
     client will do with an answer rather than about whose answer it is.
     """
     credential: SecretCredential | None = field(default=None, repr=False, metadata={"secret": True})
-    # Whether api_key/api_key_env was present in any config layer, and the env
-    # var it named. Neither is secret (a *name* is diagnostics, not a value);
-    # together they let validation tell "intentionally no auth" apart from
-    # "meant to authenticate and the value went missing" (D-016).
-    credential_configured: bool = False
-    credential_env: str = ""
     """The endpoint credential, in its non-serializable carrier (D-007).
 
     The carrier itself redacts every text form and refuses serialization;
@@ -224,6 +221,12 @@ class LocalVisionConfig:
     It participates in equality (the carrier compares by value) so configs
     differing only by credential are never interchangeable.
     """
+    # Whether api_key/api_key_env was present in any config layer, and the env
+    # var it named. Neither is secret (a *name* is diagnostics, not a value);
+    # together they let validation tell "intentionally no auth" apart from
+    # "meant to authenticate and the value went missing" (D-016).
+    credential_configured: bool = False
+    credential_env: str = ""
 
     def public_dict(self) -> dict[str, Any]:
         # Excluded by the `secret` metadata flag and by carrier type - a rule
@@ -358,9 +361,9 @@ class _TransportBreaker:
                     self._transport_failures += 1
                 return None
             if code in IMMEDIATE_FAILURE_CODES:
-                # One rejection condemns the rest; no count to accumulate.
-                self._consecutive += 1
-                self._transport_failures += 1
+                # One rejection condemns the rest. It arrived AS a response,
+                # so it is not a transport failure and is not counted as one;
+                # the taxonomy at DELIVERED_RESPONSE_CODES stays true.
                 self._opened = {
                     "state": "open",
                     "consecutive_failures": self._consecutive,
@@ -419,11 +422,17 @@ class _TransportBreaker:
             skipped = self._skipped
         if opened is None or not skipped:
             return None
+        if opened["code"] in IMMEDIATE_FAILURE_CODES:
+            reason = f"the endpoint rejected the credential ({opened['code']})"
+        else:
+            reason = (
+                f"{opened['consecutive_failures']} consecutive transport failures "
+                f"({opened['code']})"
+            )
         return warning(
             "local_vision",
             BREAKER_WARNING_CODE,
-            f"local vision stopped after {opened['consecutive_failures']} consecutive "
-            f"transport failures ({opened['code']}) at keyframe {opened['frame']}; "
+            f"local vision stopped after {reason} at keyframe {opened['frame']}; "
             f"{skipped} of {frame_count} keyframes were not attempted and continue "
             "with OCR-only output.",
         )
@@ -476,12 +485,15 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     if (
         config.credential_configured
         and config.credential is None
+        and config.allow_remote_endpoint
         and not _static_host_is_loopback(config.base_url)
     ):
         # D-016's typo guard: a credential the operator *configured* resolved
-        # to nothing, and the endpoint is not loopback. Sending keyframes
-        # anyway would quietly run unauthenticated against the wrong bar;
-        # having configured no credential at all remains intentional no-auth.
+        # to nothing, on a config that says remote is intended and whose host
+        # is not literally loopback. Without allow_remote_endpoint the
+        # per-request resolved-address check already proves the endpoint
+        # local (D-029), so a hostname like `localhost` is not punished.
+        # Configuring no credential at all remains intentional no-auth.
         named = (
             f" (env var '{config.credential_env}' is unset or empty)"
             if config.credential_env
@@ -495,24 +507,6 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
             {"reason": "credential_configured_but_empty", "api_key_env": config.credential_env},
         )
     return config
-
-
-def _static_host_is_loopback(url: str) -> bool:
-    """True only when the host is a *literal* loopback address. A hostname
-    cannot be settled without a lookup, so for the fail-closed credential
-    check it counts as non-loopback."""
-    try:
-        host = urllib.parse.urlsplit(url).hostname
-    except ValueError:
-        return False
-    if not host:
-        return False
-    try:
-        import ipaddress
-
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
 
 
 config_dir = general_config_dir

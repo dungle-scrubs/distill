@@ -371,6 +371,11 @@ class DistillOptions:
     local_vision_credential: SecretCredential | None = field(
         default=None, repr=False, metadata={"secret": True}
     )
+    # The fail-closed metadata rides with the credential so a reconstructed
+    # config still knows "meant to authenticate" from "intentionally no auth"
+    # (D-016); neither is secret, neither enters the cache allowlists.
+    local_vision_credential_configured: bool = False
+    local_vision_credential_env: str = ""
     job_id: str = ""
     resume_partial: bool = True
 
@@ -429,6 +434,8 @@ class DistillOptions:
             ),
             local_vision_allow_remote_endpoint=local_vision.allow_remote_endpoint,
             local_vision_credential=local_vision.credential,
+            local_vision_credential_configured=local_vision.credential_configured,
+            local_vision_credential_env=local_vision.credential_env,
             job_id=str(values["job_id"] or f"distill-{uuid4().hex}"),
             resume_partial=values["resume_partial"],
         )
@@ -486,6 +493,8 @@ class DistillOptions:
             caption_frames=self.caption_frames,
             allow_remote_endpoint=self.local_vision_allow_remote_endpoint,
             credential=self.local_vision_credential,
+            credential_configured=self.local_vision_credential_configured,
+            credential_env=self.local_vision_credential_env,
         )
 
     def transcription_config(self) -> TranscriptionConfig:
