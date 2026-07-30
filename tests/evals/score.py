@@ -96,7 +96,7 @@ class CaseResult:
     vision_f1: float | None
     flagged: bool | None  # grounding marked it low-confidence
     should_flag: bool  # human says it is not cleanly legible
-    claimed_text: bool | None = None
+    claimed_text: bool | None = None  # textless frame: reader claimed text? None when unscored
 
 
 @dataclass(frozen=True)
@@ -110,6 +110,8 @@ class LabelledCase:
 
 @dataclass(frozen=True)
 class AcceptanceVerdict:
+    """Per-condition outcome of an `AcceptanceRule`; `passed` is the single pass/fail."""
+
     passed: bool
     accuracy_ok: bool
     hallucination_ok: bool
@@ -117,12 +119,20 @@ class AcceptanceVerdict:
 
 @dataclass(frozen=True)
 class AcceptanceRule:
+    """The eval's pass/fail bar: an accuracy floor AND a hallucination ceiling."""
+
     accuracy_floor: float
     hallucination_ceiling: float
 
     def evaluate(
         self, accuracy: float | None, hallucination_rate: float | None
     ) -> AcceptanceVerdict:
+        """Pass only when both metrics were measured and both stay inside their bounds.
+
+        A missing metric (``None`` - a run without ``--with-vision``, or a corpus
+        with no textless cases) fails its condition: an unmeasured gate is not a
+        passed gate. Both bounds are inclusive.
+        """
         accuracy_ok = accuracy is not None and accuracy >= self.accuracy_floor
         hallucination_ok = (
             hallucination_rate is not None and hallucination_rate <= self.hallucination_ceiling
@@ -284,8 +294,10 @@ def text_recovery_accuracy(results: list[CaseResult]) -> float | None:
 
 
 def hallucination_rate(results: list[CaseResult]) -> float | None:
-    textless = [r for r in results if not r.has_text and r.claimed_text is not None]
-    return _mean([float(r.claimed_text) for r in textless])
+    claims = [
+        float(r.claimed_text) for r in results if not r.has_text and r.claimed_text is not None
+    ]
+    return _mean(claims)
 
 
 def summarize(results: list[CaseResult]) -> dict:
@@ -301,6 +313,8 @@ def summarize(results: list[CaseResult]) -> dict:
         "cases_scored": len(results),
         "ocr_wer_mean": _mean(ocr_wers),
         "vision_wer_mean": _mean(vision_wers),
+        # Same value as text_recovery_accuracy; kept for continuity with recorded
+        # runs (the README Findings tables are keyed on token recall).
         "vision_token_recall_mean": accuracy,
         "text_recovery_accuracy": accuracy,
         "hallucination_rate": hallucination_rate(results),

@@ -133,8 +133,12 @@ uv run python tests/evals/score.py --with-vision --json
 - **`grounding_precision`/`recall`**: whether `grounding.assess_grounding` flags the
   hard/unreadable frames (recall) without crying wolf on clean ones (precision).
 
-Gate 2 -> 3 consumes `AcceptanceRule`, which passes only when text-recovery
-accuracy meets its floor and hallucination rate stays at or below its ceiling.
+The Gate 2 -> 3 check (plan 02) will apply `AcceptanceRule`, which passes only
+when text-recovery accuracy meets its floor and hallucination rate stays at or
+below its ceiling. The floor and ceiling are supplied by the caller and are
+pinned when the local baseline is recorded. Both metrics require
+`--with-vision`; an OCR-only run reports them as unmeasured (`None`), which
+the rule fails closed.
 
 Use the scores to decide whether a prompt tweak, an OCR setting, or a different vision
 model is actually worth it — measured, not guessed.

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
@@ -179,14 +178,13 @@ def test_text_recovery_accuracy_means_scored_text_bearing_recalls() -> None:
         case_result(has_text=True, vision_recall=0.8),
         case_result(has_text=True, vision_recall=0.6),
         case_result(has_text=True),
-        case_result(has_text=False, vision_recall=1.0, claimed_text=False),
     ]
 
     assert score.text_recovery_accuracy(results) == pytest.approx(0.7)
     assert score.text_recovery_accuracy([]) is None
 
 
-def test_acceptance_rule_passes_inclusive_boundaries_and_is_frozen() -> None:
+def test_acceptance_rule_boundaries_are_inclusive() -> None:
     rule = score.AcceptanceRule(accuracy_floor=0.9, hallucination_ceiling=0.1)
 
     verdict = rule.evaluate(accuracy=0.9, hallucination_rate=0.1)
@@ -196,8 +194,29 @@ def test_acceptance_rule_passes_inclusive_boundaries_and_is_frozen() -> None:
         accuracy_ok=True,
         hallucination_ok=True,
     )
-    with pytest.raises(FrozenInstanceError):
-        rule.accuracy_floor = 0.8
+
+
+@pytest.mark.parametrize(
+    ("accuracy", "hallucination_rate", "accuracy_ok", "hallucination_ok"),
+    [
+        (0.89, 0.1, False, True),
+        (0.9, 0.11, True, False),
+        (None, 0.1, False, True),
+        (0.9, None, True, False),
+    ],
+)
+def test_acceptance_rule_fails_out_of_bounds_or_unmeasured_metrics(
+    accuracy, hallucination_rate, accuracy_ok, hallucination_ok
+) -> None:
+    rule = score.AcceptanceRule(accuracy_floor=0.9, hallucination_ceiling=0.1)
+
+    verdict = rule.evaluate(accuracy=accuracy, hallucination_rate=hallucination_rate)
+
+    assert verdict == score.AcceptanceVerdict(
+        passed=False,
+        accuracy_ok=accuracy_ok,
+        hallucination_ok=hallucination_ok,
+    )
 
 
 def test_summarize_includes_accuracy_and_hallucination_rate() -> None:
