@@ -2421,3 +2421,379 @@ def test_end_to_end_credential_budget_and_provenance_compose(
         assert "sk-e2e-secret" not in surface
         assert "10.0.0.5" not in surface
     assert "sk-e2e-secret" not in json.dumps(config.public_dict(), default=str)
+
+
+class TestSalienceSchema:
+    """M4.3 (D-003/D-018): adds_information is a strict boolean; anything
+    else yields absent salience, never a guessed value."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"adds_information": True, "reason": "shows a diagram"},
+            {"adds_information": False, "reason": "restates the speech"},
+        ],
+    )
+    def test_a_strict_boolean_parses(self, payload: dict) -> None:
+        from distill.rapid_mlx import parse_frame_salience
+
+        salience = parse_frame_salience(payload)
+
+        assert salience is not None
+        assert salience.adds_information is payload["adds_information"]
+        assert salience.reason == payload["reason"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"adds_information": "false", "reason": "stringly"},
+            {"adds_information": "true", "reason": "stringly"},
+            {"adds_information": 1, "reason": "inty"},
+            {"adds_information": None, "reason": "nully"},
+            {"reason": "missing the field"},
+            {},
+            "not a mapping",
+            None,
+        ],
+    )
+    def test_anything_else_is_absent_not_guessed(self, payload: object) -> None:
+        from distill.rapid_mlx import parse_frame_salience
+
+        assert parse_frame_salience(payload) is None
+
+    def test_an_oversize_reason_is_truncated_with_a_notice(self) -> None:
+        from distill.rapid_mlx import SALIENCE_REASON_MAX_CHARS, parse_frame_salience
+
+        salience = parse_frame_salience(
+            {
+                "adds_information": True,
+                "reason": ("reason words " * 40)[: SALIENCE_REASON_MAX_CHARS + 50],
+            }
+        )
+
+        assert salience is not None
+        assert len(salience.reason) == SALIENCE_REASON_MAX_CHARS
+        assert salience.reason_truncated is True
+
+    def test_a_reason_exactly_at_the_cap_is_not_flagged_truncated(self) -> None:
+        from distill.rapid_mlx import SALIENCE_REASON_MAX_CHARS, parse_frame_salience
+
+        salience = parse_frame_salience(
+            {"adds_information": True, "reason": "r" * SALIENCE_REASON_MAX_CHARS}
+        )
+
+        assert salience is not None
+        assert salience.reason_truncated is False
+
+    def test_a_non_string_reason_is_refused_not_stringified(self) -> None:
+        from distill.rapid_mlx import parse_frame_salience
+
+        salience = parse_frame_salience(
+            {"adds_information": True, "reason": {"why": "a structure"}}
+        )
+
+        assert salience is not None
+        assert salience.reason == ""
+
+
+class TestSalienceRecording:
+    """M4.4 (D-003/D-018): validated salience lands on the frame artifact;
+    processing never drops a frame because of it."""
+
+    def test_validated_salience_is_recorded_on_every_frame_kept(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        for index in range(2):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            content = _frame_json(adds_information=False, reason="restates the speech")
+            return _chat_envelope(content)
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        segments = ({"start": 0.0, "end": 20.0, "text": "the speaker explains"},)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(2)],
+            transcript_segments=segments,
+        )
+
+        # Never dropped, and every kept frame carries the judgment.
+        assert len(frames) == 2
+        for frame in frames:
+            assert frame.salience is not None
+            assert frame.salience["adds_information"] is False
+            assert frame.salience["reason"] == "restates the speech"
+
+    def test_invalid_salience_stays_absent_on_the_frame(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            return _chat_envelope(_frame_json(adds_information="false", reason="stringly"))
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        segments = ({"start": 0.0, "end": 20.0, "text": "context"},)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret(
+            [_frame(1, tmp_path / "frame0.png")], transcript_segments=segments
+        )
+
+        assert frames[0].reading is not None  # the reading itself is fine
+        assert frames[0].salience is None  # absent, never guessed
+
+
+class TestFrameSalienceToggle:
+    """M4.5 (D-017): top-level frame_salience, default on, user-disableable,
+    cache_key=True - on and off yield different bundle keys."""
+
+    def test_defaults_on_and_is_disableable_and_keys_the_cache(self) -> None:
+        default = DistillOptions.from_args({})
+        disabled = DistillOptions.from_args({"frame_salience": False})
+
+        assert default.frame_salience is True
+        assert disabled.frame_salience is False
+        assert default.opts_hash("local") != disabled.opts_hash("local")
+        assert default.cache_payload("local")["frame_salience"] is True
+
+    def test_disabled_salience_builds_no_window_and_records_none(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        prompts: list[str] = []
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            [message] = body["messages"]
+            prompts.append(next(p["text"] for p in message["content"] if p["type"] == "text"))
+            return _chat_envelope(_frame_json(adds_information=True, reason="claims to add"))
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        segments = ({"start": 0.0, "end": 20.0, "text": "context"},)
+
+        interpreter = FrameInterpreter(
+            LocalVisionConfig(), probe=_available_probe, frame_salience=False
+        )
+        frames, _warnings = interpreter.interpret(
+            [_frame(1, tmp_path / "frame0.png")], transcript_segments=segments
+        )
+
+        assert "adds_information" not in prompts[0]
+        assert frames[0].salience is None
+
+
+class TestFilteredRenderView:
+    """M4.6 (D-006): the stored render always carries every frame plus its
+    salience annotation; the filtered view is read-time, marked
+    non-authoritative, and never written back."""
+
+    def _frames(self, tmp_path: Path) -> list[FrameArtifact]:
+        import dataclasses as dc
+
+        base = _frame(1, tmp_path / "a.png", extracted_text="adds a diagram")
+        adds = dc.replace(
+            base,
+            salience={
+                "adds_information": True,
+                "reason": "shows a diagram",
+                "reason_truncated": False,
+            },
+        )
+        redundant = dc.replace(
+            _frame(2, tmp_path / "b.png", extracted_text="the same words"),
+            salience={
+                "adds_information": False,
+                "reason": "restates the speech",
+                "reason_truncated": False,
+            },
+        )
+        unjudged = _frame(3, tmp_path / "c.png", extracted_text="no judgment")
+        return [adds, redundant, unjudged]
+
+    def test_the_stored_render_keeps_all_frames_with_annotations(self, tmp_path: Path) -> None:
+        from distill.render import render_markdown
+
+        rendered = render_markdown("example.mp4", 30.0, None, self._frames(tmp_path), [])
+
+        assert "adds a diagram" in rendered
+        assert "the same words" in rendered
+        assert "no judgment" in rendered
+        assert "restates the speech" in rendered  # the annotation, not a drop
+
+    def test_the_filtered_view_drops_only_judged_redundant_frames(self, tmp_path: Path) -> None:
+        from distill.render import render_filtered_markdown
+
+        rendered = render_filtered_markdown("example.mp4", 30.0, None, self._frames(tmp_path), [])
+
+        assert "adds a diagram" in rendered
+        assert "the same words" not in rendered  # judged redundant: dropped
+        assert "no judgment" in rendered  # absent salience is not redundancy
+        assert "Non-authoritative" in rendered
+        assert "every frame" in rendered  # points the reader at the stored render
+
+    def test_salience_survives_the_serialize_round_trip(self, tmp_path: Path) -> None:
+        """The judgment must be durable: a resumed run re-renders from
+        deserialized frames, and losing salience there silently strips every
+        annotation while the bundle key still claims salience was on."""
+        import dataclasses as dc
+
+        from distill.artifacts import FrameArtifact, RedactionState, serialize
+
+        frame = dc.replace(
+            _frame(1, tmp_path / "a.png", extracted_text="text"),
+            salience={
+                "adds_information": True,
+                "reason": "shows a diagram",
+                "reason_truncated": False,
+            },
+        )
+
+        document = serialize(frame)
+        rebuilt = FrameArtifact.from_document(document, redaction=RedactionState.APPLIED)
+
+        assert frame.salience is not None
+        assert rebuilt.salience is not None
+        assert dict(rebuilt.salience) == dict(frame.salience)
+
+    def test_volunteered_salience_without_a_window_is_not_recorded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A judgment against speech the model was never shown is not a
+        judgment: no transcript window for this frame means absent salience,
+        whatever the model volunteers (D-003)."""
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            return _chat_envelope(_frame_json(adds_information=False, reason="volunteered"))
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        # Transcript ends at 5s; the frame sits far outside any window.
+        segments = ({"start": 0.0, "end": 5.0, "text": "early speech"},)
+        far_frame = FrameArtifact(
+            index=1,
+            timestamp_sec=900.0,
+            path=str(tmp_path / "frame0.png"),
+            relative_path="frames/frame0.png",
+            extracted_text="",
+        )
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret([far_frame], transcript_segments=segments)
+
+        assert frames[0].reading is not None
+        assert frames[0].salience is None
+
+    def test_a_credential_straddling_the_reason_cap_does_not_survive(self) -> None:
+        """Redact-then-cap (D-010): cutting first can split a credential
+        mid-syntax so the redactor no longer matches it, storing the secret
+        whole - the live-repro'd landing-review finding."""
+        from distill.rapid_mlx import SALIENCE_REASON_MAX_CHARS, parse_frame_salience
+
+        filler = ("visible words " * 40)[: SALIENCE_REASON_MAX_CHARS - 20]
+        secret_url = "https://user:correct-horse-battery-staple@example.com"
+
+        salience = parse_frame_salience({"adds_information": True, "reason": filler + secret_url})
+
+        assert salience is not None
+        assert "correct-horse-battery-staple" not in salience.reason
+
+    def test_the_composed_request_body_asks_for_salience_exactly_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The prompt builder owns the response schema. The transport used to
+        append a second, closed field list - the LAST thing the model read -
+        which omitted the salience fields, so no run ever recorded one."""
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        request_texts: list[str] = []
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            [message] = body["messages"]
+            request_texts.append(next(p["text"] for p in message["content"] if p["type"] == "text"))
+            return _chat_envelope(_frame_json(adds_information=True, reason="adds"))
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        segments = ({"start": 0.0, "end": 20.0, "text": "spoken context"},)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+        frames, _warnings = interpreter.interpret(
+            [_frame(1, tmp_path / "frame0.png")], transcript_segments=segments
+        )
+
+        [request_text] = request_texts
+        assert "adds_information" in request_text
+        assert request_text.count("Return compact JSON") == 1
+        assert frames[0].salience is not None
+
+    def test_an_all_redundant_filtered_view_returns_prose_not_an_error(
+        self, tmp_path: Path
+    ) -> None:
+        import dataclasses as dc
+
+        from distill.render import render_filtered_markdown
+
+        redundant = dc.replace(
+            _frame(1, tmp_path / "a.png", extracted_text="words"),
+            salience={
+                "adds_information": False,
+                "reason": "restates",
+                "reason_truncated": False,
+            },
+        )
+
+        rendered = render_filtered_markdown("example.mp4", 10.0, None, [redundant], [])
+
+        assert "Non-authoritative" in rendered
+        assert "judged redundant" in rendered
+
+    def test_the_pipeline_seam_passes_the_transcript_to_the_interpreter(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from distill.artifacts import RedactionState, Transcript
+        from distill.pipeline import interpret_frames_with_local_vision
+
+        (tmp_path / "frame0.png").write_bytes(b"png")
+
+        def fake_urlopen(
+            method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+        ) -> Any:
+            if url.rstrip("/").endswith("/models"):
+                return _models_body(DEFAULT_MODEL)
+            return _chat_envelope(_frame_json(adds_information=True, reason="adds"))
+
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+        transcript = Transcript(
+            language="en",
+            segments=({"start": 0.0, "end": 20.0, "text": "spoken"},),
+            redaction=RedactionState.APPLIED,
+        )
+
+        frames, _warnings = interpret_frames_with_local_vision(
+            [_frame(1, tmp_path / "frame0.png")],
+            DistillOptions.from_args({}),
+            None,
+            transcript=transcript,
+        )
+
+        assert frames[0].salience is not None

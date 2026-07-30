@@ -54,9 +54,7 @@ EXTRACTED_TEXT_LIMIT_BYTES = 256 * 1024
 WARNING_STAGE = "artifacts"
 TRUNCATION_WARNING_CODE = "extracted_text_truncated"
 REDACTION_POLICY_NOT_APPLIED_CODE = "E_REDACTION_POLICY_NOT_APPLIED"
-_RFC3339_UTC_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
-)
+_RFC3339_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z")
 
 
 class RedactionState(StrEnum):
@@ -138,7 +136,9 @@ class _PolicyText:
         return cls(text)
 
 
-def _cap_extracted_text(text: _PolicyText, *, path: str, warnings: list[FrozenWarningRecord]) -> str:
+def _cap_extracted_text(
+    text: _PolicyText, *, path: str, warnings: list[FrozenWarningRecord]
+) -> str:
     """Return `text` within the per-field cap, recording a **warning** if it was cut.
 
     The budget is bytes, because KiB is a byte unit and a character is not a
@@ -243,9 +243,7 @@ def _freeze(
         return value
     if isinstance(value, str):
         text = (
-            _redact(value, warnings=warnings)
-            if redact
-            else _PolicyText.policy_did_not_run(value)
+            _redact(value, warnings=warnings) if redact else _PolicyText.policy_did_not_run(value)
         )
         return _cap_extracted_text(text, path=path, warnings=warnings) if cap else text.text
     if isinstance(value, Mapping):
@@ -524,6 +522,70 @@ class Provenance(Carrier):
         return MappingProxyType({key: value for key, value in fields.items() if value is not None})
 
 
+# The reason a reader sees for a salience judgment; past this it is filler.
+SALIENCE_REASON_MAX_CHARS = 400
+
+
+@dataclass(frozen=True)
+class FrameSalience:
+    """D-003: whether a keyframe adds information beyond the transcript.
+
+    Informational only (D-018) - recorded on the frame artifact, surfaced to
+    readers, never consulted by processing to drop a frame. `reason` is
+    size-capped at parse; `reason_truncated` says when the cap cut it.
+
+    `reason` is MODEL OUTPUT - the same trust class as `visual_summary`, and
+    it can echo text read straight off the pixels that no prompt-side sink
+    ever saw. It therefore serializes via `document()` (the model-authored
+    convention) and MUST land inside a `FrameArtifact` region named in
+    `EXTRACTED_TEXT_FIELDS`, never in a Distill-authored region like
+    `grounding`. Carriers cannot hold the dataclass itself: always the
+    mapping.
+    """
+
+    adds_information: bool
+    reason: str = ""
+    reason_truncated: bool = False
+
+    def __post_init__(self) -> None:
+        _refuse_undeclared_values(self)
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "adds_information": self.adds_information,
+            "reason": self.reason,
+            "reason_truncated": self.reason_truncated,
+        }
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> FrameSalience | None:
+        """Rebuild from a stored mapping, re-applying parse-time strictness.
+
+        The resume path reads mappings off disk; a document whose
+        `adds_information` is not a boolean yields None on the way back in,
+        exactly as it would have at parse (D-003).
+        """
+        if not isinstance(document, Mapping):
+            return None
+        adds_information = document.get("adds_information")
+        if not isinstance(adds_information, bool):
+            return None
+        raw_reason = document.get("reason")
+        reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
+        # The same invariants as the live parse, re-applied: a forged or
+        # drifted document does not get to resume an oversized reason or a
+        # stringly truncation flag.
+        recapped = len(reason) > SALIENCE_REASON_MAX_CHARS
+        if recapped:
+            reason = reason[:SALIENCE_REASON_MAX_CHARS]
+        stored_flag = document.get("reason_truncated")
+        return cls(
+            adds_information=adds_information,
+            reason=reason,
+            reason_truncated=(stored_flag is True) or recapped,
+        )
+
+
 @dataclass(frozen=True)
 class Interpretation:
     """The vision model's structured reading of one **keyframe**.
@@ -581,6 +643,10 @@ class Interpretation:
     frame_kind: str = ""
     verbatim_text: str = ""
     text_confidence: str = "none"
+    # Transport-only (D-003): the parsed salience rides the reading from the
+    # parser to the frame artifact, which records it as its own top-level
+    # field; document() excludes it so the judgment is stored once.
+    salience: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         # On the same terms as a carrier, and for the same reason: a reading is
@@ -610,10 +676,13 @@ class Interpretation:
 
     def document(self) -> dict[str, Any]:
         """This reading as the plain mapping a **frame artifact** carries."""
-        return {
+        document = {
             **dataclasses.asdict(self),
             "detected_elements": list(self.detected_elements),
         }
+        # Stored once, on the frame artifact's own `salience` field.
+        document.pop("salience", None)
+        return document
 
     @classmethod
     def from_document(cls, document: Mapping[str, Any] | None) -> Interpretation | None:
@@ -629,6 +698,11 @@ class Interpretation:
             return None
         fields = {field.name for field in dataclasses.fields(cls)}
         values = {key: value for key, value in document.items() if key in fields}
+        # Transport-only: `salience` never appears in a stored document
+        # (document() pops it; the artifact records it top-level), so a
+        # drifted document carrying one is dropped rather than rebuilt into
+        # a frozen mapping that asdict cannot deep-copy.
+        values.pop("salience", None)
         values["detected_elements"] = _declared_elements(values.get("detected_elements"))
         return cls(**values)
 
@@ -711,7 +785,11 @@ class FrameArtifact(Carrier):
     stage without each stage being told about it separately.
     """
 
-    EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = ("extracted_text", "interpretation")
+    EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = (
+        "extracted_text",
+        "interpretation",
+        "salience",
+    )
 
     index: int
     timestamp_sec: float
@@ -722,6 +800,11 @@ class FrameArtifact(Carrier):
     extracted_text: str = ""
     interpretation: Mapping[str, Any] | None = None
     grounding: Mapping[str, Any] | None = None
+    # D-003/D-018: the model's judgment of what this frame adds beyond the
+    # surrounding speech. Model output (its `reason` can echo the pixels), so
+    # it lives in the extracted-text region; informational only - nothing in
+    # processing consults it to drop a frame.
+    salience: Mapping[str, Any] | None = None
 
     @property
     def reading(self) -> Interpretation | None:
@@ -765,6 +848,7 @@ class FrameArtifact(Carrier):
             self,
             interpretation=None if reading is None else reading.document(),
             grounding=grounding,
+            salience=None if reading is None else reading.salience,
         )
         return added, added._raised_since(self)
 
@@ -818,6 +902,11 @@ class FrameArtifact(Carrier):
         values = {key: value for key, value in document.items() if key in fields}
         values["redaction"] = redaction
         values["warnings"] = tuple(values.get("warnings", ()))
+        if values.get("salience") is not None:
+            # One invariant owner: a stored judgment re-enters through the
+            # same strictness as the live parse, or not at all.
+            rebuilt = FrameSalience.from_document(values["salience"])
+            values["salience"] = None if rebuilt is None else rebuilt.document()
         artifact = cls(**values)
         if artifact.interpretation is not None:
             Interpretation.from_document(artifact.interpretation)
@@ -835,6 +924,7 @@ class FrameArtifact(Carrier):
                 "extracted_text": self.extracted_text,
                 "interpretation": self.interpretation,
                 "grounding": self.grounding,
+                "salience": self.salience,
                 "redaction": self.redaction,
                 "warnings": self.warnings,
             }

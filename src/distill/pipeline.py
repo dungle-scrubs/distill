@@ -548,11 +548,14 @@ class ProcessingRun:
         )
         return carrier, [dict(item) for item in carrier.warnings]
 
-    def _produce_local_vision(self, frames: list[FrameArtifact]) -> dict[str, Any]:
+    def _produce_local_vision(
+        self, frames: list[FrameArtifact], transcript: Transcript | None
+    ) -> dict[str, Any]:
         vision_frames, vision_warnings = interpret_frames_with_local_vision(
             frames,
             self.options,
             self.progress,
+            transcript=transcript,
         )
         return {"frames": vision_frames, "warnings": vision_warnings}
 
@@ -634,7 +637,7 @@ class ProcessingRun:
                 warnings,
                 "local_vision",
                 ("local_vision",),
-                lambda: self._produce_local_vision(frames),
+                lambda: self._produce_local_vision(frames, transcript),
                 self._recovered_frames,
             )
         else:
@@ -1129,6 +1132,8 @@ def interpret_frames_with_local_vision(
     frames: list[FrameArtifact],
     options: DistillOptions,
     progress: ProgressReporter | None = None,
+    *,
+    transcript: Transcript | None = None,
 ) -> tuple[list[FrameArtifact], list[WarningRecord]]:
     """Interpret every frame, under the **redaction** policy the frames carry.
 
@@ -1136,14 +1141,23 @@ def interpret_frames_with_local_vision(
     recorded on each **frame artifact** by `select_keyframes` and travels with
     it, so the model's words are redacted where they enter the carrier (R-19)
     rather than by a helper the vision pass had to remember to call.
+
+    The transcript is the salience context (D-003): each frame is judged
+    against the speech around its timestamp when `frame_salience` is on. A
+    missing transcript means absent salience, never a judgment against
+    nothing.
     """
     interpreter = FrameInterpreter(
         config=options.local_vision_config(),
         progress=progress,
         probe=probe_local_vision,
         try_interpret=try_interpret_image_after_probe,
+        frame_salience=options.frame_salience,
     )
-    return interpreter.interpret(frames)
+    return interpreter.interpret(
+        frames,
+        transcript_segments=None if transcript is None else transcript.segments,
+    )
 
 
 def tool_registry() -> dict[str, ToolSpec]:

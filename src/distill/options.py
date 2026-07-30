@@ -61,6 +61,10 @@ OPTION_SPECS: tuple[OptionSpec, ...] = (
     OptionSpec("ocr_language", "eng", str),
     OptionSpec("ocr_preprocess", True, bool, boolean=True),
     OptionSpec("redact_secrets", True, bool, boolean=True),
+    # D-017/D-003: whether keyframes are judged against the surrounding
+    # speech. cache_key by default: on and off produce different renders,
+    # so they are different bundles.
+    OptionSpec("frame_salience", True, bool, boolean=True),
     OptionSpec("max_keyframes", 80, int),
     OptionSpec("min_interval_sec", 4.0, float),
     OptionSpec("max_duration_sec", DEFAULT_MAX_DURATION_SEC, float),
@@ -351,6 +355,7 @@ class DistillOptions:
     ocr_language: str = "eng"
     ocr_preprocess: bool = True
     redact_secrets: bool = True
+    frame_salience: bool = True
     max_keyframes: int = 80
     min_interval_sec: float = 4.0
     max_duration_sec: float = DEFAULT_MAX_DURATION_SEC
@@ -413,6 +418,7 @@ class DistillOptions:
             ocr_language=values["ocr_language"],
             ocr_preprocess=values["ocr_preprocess"],
             redact_secrets=values["redact_secrets"],
+            frame_salience=values["frame_salience"],
             max_keyframes=values["max_keyframes"],
             min_interval_sec=values["min_interval_sec"],
             max_duration_sec=values["max_duration_sec"],

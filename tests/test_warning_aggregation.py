@@ -236,6 +236,8 @@ def test_a_published_manifest_carries_one_record_per_stage_and_code(
         frames: list[FrameArtifact],
         _options: DistillOptions,
         _progress: ProgressReporter,
+        *,
+        transcript: Any = None,
     ) -> tuple[list[FrameArtifact], list[dict[str, Any]]]:
         return frames, [
             *[warning("local_vision", "local_vision_timeout", "frame timed out")] * 5,
@@ -458,6 +460,8 @@ def test_the_runs_own_fold_reaches_the_manifest_without_a_video(
         frames: list[FrameArtifact],
         _options: DistillOptions,
         _progress: ProgressReporter,
+        *,
+        transcript: Any = None,
     ) -> tuple[list[FrameArtifact], list[dict[str, Any]]]:
         interpreted = [
             frame.with_interpretation(Interpretation(visual_summary="A readable frame"))[0]

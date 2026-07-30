@@ -167,6 +167,10 @@ def response_frames(frames: list[FrameArtifact]) -> list[dict[str, Any]]:
         }
         if document["interpretation"] is not None:
             item["visual_interpretation"] = document["interpretation"]
+        if document.get("salience") is not None:
+            # The judgment must survive publish: a filtered view produced from
+            # a manifest has nothing machine-readable without it (D-006).
+            item["salience"] = document["salience"]
         response.append(item)
     return response
 

@@ -43,7 +43,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
@@ -151,8 +151,12 @@ from .rapid_mlx import (
     _urlopen_json as _urlopen_json,
 )
 from .rapid_mlx import (
+    parse_frame_salience as parse_frame_salience,
+)
+from .rapid_mlx import (
     parse_interpretation_json as parse_interpretation_json,
 )
+from .transcript import select_transcript_window
 
 DEFAULT_LOCAL_VISION_BACKEND = "rapid-mlx"
 DEFAULT_LOCAL_VISION_MODEL = "mlx-community/Qwen3-VL-8B-Instruct-8bit"
@@ -1089,17 +1093,27 @@ class FrameInterpreter:
     debug: bool | None = None
     budget_sec: float = DEFAULT_VISION_STAGE_BUDGET_SEC
     budget_bytes: int = DEFAULT_VISION_STAGE_BUDGET_BYTES
+    # D-017: the toggle gates window construction, so a disabled run never
+    # asks the model for a judgment and records no salience at all.
+    frame_salience: bool = True
     _last_probe: LocalVisionProbe | None = None
     _frame_count: int = 0
     _interpreted_count: int = 0
     _max_parallel: int = 1
+    _transcript_segments: tuple[Any, ...] = ()
+    _salience_requested: int = 0
+    _salience_recorded: int = 0
     _warning_counts: dict[str, int] = field(default_factory=dict)
     _trace_events: list[dict[str, Any]] = field(default_factory=list)
     _breaker: _TransportBreaker = field(default_factory=_TransportBreaker)
 
     def interpret(
-        self, frames: list[FrameArtifact]
+        self,
+        frames: list[FrameArtifact],
+        *,
+        transcript_segments: Iterable[Any] | None = None,
     ) -> tuple[list[FrameArtifact], list[WarningRecord]]:
+        self._transcript_segments = tuple(transcript_segments or ()) if self.frame_salience else ()
         self._reset_run(frames)
         self._log("interpret.start", {"frames": len(frames), "backend": self.config.backend})
         provenance_warnings: list[WarningRecord] = []
@@ -1111,9 +1125,9 @@ class FrameInterpreter:
             non_local = warning(
                 "local_vision",
                 "non_local_only_processing",
-                "this run was configured to send keyframes to a non-loopback "
-                "vision endpoint; the generation may not be local-only "
-                "processing.",
+                "this run was configured to send keyframes and surrounding "
+                "transcript text to a non-loopback vision endpoint; the "
+                "generation may not be local-only processing.",
             )
             self._record_warning(non_local)
             provenance_warnings.append(non_local)
@@ -1347,6 +1361,8 @@ class FrameInterpreter:
                 "model": self._last_probe.model,
             },
             "frame_count": self._frame_count,
+            "salience_requested": self._salience_requested,
+            "salience_recorded": self._salience_recorded,
             "interpreted_count": self._interpreted_count,
             "max_parallel": self._max_parallel,
             "warning_counts": dict(sorted(self._warning_counts.items())),
@@ -1384,13 +1400,31 @@ class FrameInterpreter:
         from .vision_prompts import build_technical_frame_prompt
 
         self._ensure_frame_invariants(index, frame, frame_count)
-        prompt = build_technical_frame_prompt(ocr_text=frame.extracted_text or None)
+        window = (
+            select_transcript_window(self._transcript_segments, frame.timestamp_sec)
+            if self._transcript_segments
+            else ""
+        )
+        prompt = build_technical_frame_prompt(
+            ocr_text=frame.extracted_text or None,
+            transcript_window=window or None,
+        )
         result, frame_warning = self._try_interpret_frame(
             config,
             Path(frame.path),
             prompt.prompt,
             prompt_profile=prompt.profile,
         )
+        if window:
+            self._salience_requested += 1
+        if result is not None and result.salience is not None and self.frame_salience and window:
+            self._salience_recorded += 1
+        if result is not None and (not self.frame_salience or not window):
+            # Not asked means not recorded: whether the toggle is off or this
+            # frame simply had no transcript window, a model that volunteers
+            # the fields anyway does not get to write a judgment against
+            # speech it was never shown (D-017, D-003).
+            result = replace(result, salience=None)
         if frame_warning:
             warnings.append(frame_warning)
         read_code = frame_warning.get("code") if frame_warning else None
@@ -1614,12 +1648,11 @@ def _interpret_with_rapid_mlx(
             "Local vision could not read the frame image; continuing with OCR-only output.",
             {"path": str(image_path), "error": str(exc)},
         ) from exc
-    request_prompt = (
-        f"{prompt}\n\n"
-        "Return compact JSON with string fields frame_kind, verbatim_text, text_confidence, "
-        "visual_summary, interpretation, uncertainty, and detected_elements as an array of strings. "
-        'Leave verbatim_text empty and set text_confidence to "none" if you cannot read the text.'
-    )
+    # The prompt builder owns the response schema (it already names every
+    # field, salience included when a window exists); a second field list
+    # appended here was the LAST thing the model read, and it omitted the
+    # salience fields - so no run ever recorded one.
+    request_prompt = prompt
     data_uri = f"data:image/png;base64,{base64.b64encode(image_bytes).decode('ascii')}"
     body = {
         "model": config.model,
@@ -1697,6 +1730,7 @@ def _result_from_payload(
     for one that is not (R-39): what is missing from a validated payload is a
     field the model left out, not an answer that said nothing.
     """
+    salience = parse_frame_salience(interpreted)
     elements = interpreted.get("detected_elements", [])
     if not isinstance(elements, list):
         elements = []
@@ -1711,4 +1745,5 @@ def _result_from_payload(
         frame_kind=_normalize_frame_kind(interpreted.get("frame_kind")),
         verbatim_text=str(interpreted.get("verbatim_text", "")).strip(),
         text_confidence=_normalize_text_confidence(interpreted.get("text_confidence")),
+        salience=None if salience is None else salience.document(),
     )
