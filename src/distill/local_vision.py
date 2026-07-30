@@ -64,6 +64,12 @@ from .rapid_mlx import (
     DEFAULT_SCHEME_PORTS as DEFAULT_SCHEME_PORTS,
 )
 from .rapid_mlx import (
+    DEFAULT_VISION_STAGE_BUDGET_BYTES as DEFAULT_VISION_STAGE_BUDGET_BYTES,
+)
+from .rapid_mlx import (
+    DEFAULT_VISION_STAGE_BUDGET_SEC as DEFAULT_VISION_STAGE_BUDGET_SEC,
+)
+from .rapid_mlx import (
     ENDPOINT_REJECTED_CODE as ENDPOINT_REJECTED_CODE,
 )
 from .rapid_mlx import (
@@ -196,17 +202,15 @@ _sleep = time.sleep
 IMMEDIATE_FAILURE_CODES = frozenset(
     {
         "local_vision_auth_rejected",
+        # An endpoint that kept answering 429/5xx through the bounded retries
+        # will do it again for the next keyframe; retrying the run into a
+        # rate limiter is the amplification D-008 exists to prevent.
+        "local_vision_retry_exhausted",
         ENDPOINT_REJECTED_CODE,
         VisionStageBudget.CODE,
     }
 )
 BREAKER_WARNING_CODE = "local_vision_transport_breaker_open"
-# Run-wide vision-stage budget defaults (D-008): generous enough that a local
-# run never notices them, small enough that a remote endpoint cannot drip a
-# run into unbounded cost. Wall clock covers the whole stage; bytes are the
-# received response bodies.
-DEFAULT_VISION_STAGE_BUDGET_SEC = 600.0
-DEFAULT_VISION_STAGE_BUDGET_BYTES = 256 * 1024 * 1024
 FRAME_READ_FAILURE_CODES = frozenset(
     {
         "local_vision_malformed_response",
@@ -772,13 +776,23 @@ def probe_rapid_mlx_availability(
     except LocalVisionFailure as exc:
         # Raised typed from the transport (e.g. auth_rejected). Its message
         # and detail are already credential- and body-free by construction.
+        # A retryable (429/5xx) has no retry loop on the probe path: the
+        # server erroring IS the probe's answer, reported as unavailable
+        # with the status - "try again shortly" is the operator action.
+        code, message = exc.code, exc.message
+        if exc.code == "local_vision_retryable":
+            code = "local_vision_rapid_mlx_unavailable"
+            message = (
+                f"Rapid-MLX answered HTTP {exc.detail.get('status')} to the "
+                "probe; continuing with OCR-only output."
+            )
         return LocalVisionProbe(
             available=False,
             backend=config.backend,
             model=config.model,
             base_url=config.base_url,
-            code=exc.code,
-            message=exc.message,
+            code=code,
+            message=message,
             detail=dict(exc.detail),
         )
     except TimeoutError as exc:
@@ -930,7 +944,14 @@ def _attempt_minimal_completion(
             )
     except LocalVisionFailure as exc:
         # Typed already (auth_rejected, endpoint rejection, transport code):
-        # pass it through untouched so the cause survives to the surface.
+        # pass it through untouched so the cause survives to the surface. A
+        # retryable becomes unavailability: the attempt has no retry loop.
+        if exc.code == "local_vision_retryable":
+            return LocalVisionFailure(
+                "local_vision_rapid_mlx_unavailable",
+                f"completion attempt answered HTTP {exc.detail.get('status')}",
+                dict(exc.detail),
+            )
         return exc
     except TimeoutError as exc:
         return LocalVisionFailure(
@@ -1126,9 +1147,16 @@ class FrameInterpreter:
 
     def _resolved_config(self, probe: LocalVisionProbe) -> LocalVisionConfig:
         # The budget starts when the stage does and rides the per-run resolved
-        # config, so the transport can charge each chunk as it arrives (D-008).
-        budget = VisionStageBudget(
-            wall_clock_sec=float(self.budget_sec), max_bytes=int(self.budget_bytes)
+        # config, so the transport can charge each chunk as it arrives. It is
+        # attached only when the config opts into a remote endpoint: remote
+        # cost is the threat D-008 bounds, and a slow-but-working local model
+        # must not be half-degraded by a run-wide clock.
+        budget = (
+            VisionStageBudget(
+                wall_clock_sec=float(self.budget_sec), max_bytes=int(self.budget_bytes)
+            )
+            if self.config.allow_remote_endpoint
+            else None
         )
         if probe.backend != DEFAULT_LOCAL_VISION_BACKEND or not (probe.base_url and probe.model):
             return replace(self.config, budget=budget)
@@ -1502,8 +1530,8 @@ def _post_completion_with_retries(
         except LocalVisionFailure as exc:
             if exc.code != "local_vision_retryable":
                 raise
-            status = exc.detail.get("status")
             if retries_left <= 0:
+                status = exc.detail.get("status")
                 raise LocalVisionFailure(
                     "local_vision_retry_exhausted",
                     f"Local vision endpoint kept answering HTTP {status} after "
@@ -1513,11 +1541,11 @@ def _post_completion_with_retries(
                 ) from exc
             retries_left -= 1
             retry_after = exc.detail.get("retry_after")
-            pause = min(
-                float(retry_after) if retry_after else DEFAULT_RETRY_BACKOFF_SEC,
-                RETRY_AFTER_CAP_SEC,
-            )
-            _sleep(pause)
+            requested = float(retry_after) if retry_after is not None else DEFAULT_RETRY_BACKOFF_SEC
+            # Clamped on both ends: a negative or NaN Retry-After is the
+            # endpoint's bug, not a crash in this process, and zero means
+            # "retry now", not "use the default".
+            _sleep(max(0.0, min(requested, RETRY_AFTER_CAP_SEC)))
 
 
 def _interpret_with_rapid_mlx(

@@ -20,6 +20,7 @@ import http.client
 import ipaddress
 import json
 import logging
+import math
 import socket
 import threading
 import time
@@ -65,6 +66,15 @@ _monotonic = time.monotonic
 _READ_CHUNK_BYTES = 64 * 1024
 
 
+# Run-wide vision-stage budget defaults (D-008). They exist to bound REMOTE
+# cost - the interpreter only attaches a budget when the config opts into a
+# remote endpoint, because a slow local model is not the threat and must not
+# be half-degraded by a run-wide clock. The probe runs before the budget is
+# created, so its two requests are bounded by timeout_sec alone.
+DEFAULT_VISION_STAGE_BUDGET_SEC = 600.0
+DEFAULT_VISION_STAGE_BUDGET_BYTES = 256 * 1024 * 1024
+
+
 class VisionStageBudget:
     """Run-wide bounds for the vision stage: wall clock and received bytes.
 
@@ -77,17 +87,24 @@ class VisionStageBudget:
     CODE = "local_vision_budget_exhausted"
 
     def __init__(self, *, wall_clock_sec: float, max_bytes: int) -> None:
+        if wall_clock_sec <= 0 or max_bytes <= 0:
+            raise ValueError("vision stage budget bounds must be positive")
         self._deadline = _monotonic() + wall_clock_sec
         self._wall_clock_sec = wall_clock_sec
         self._max_bytes = max_bytes
         self._remaining = max_bytes
         self._lock = threading.Lock()
+        self._exhausted = False
 
     def _exhaust(self, why: str) -> NoReturn:
-        _boundary_log(
-            "budget_exhausted",
-            {"why": why, "wall_clock_sec": self._wall_clock_sec, "max_bytes": self._max_bytes},
-        )
+        if not self._exhausted:
+            # Latched: one run, one budget_exhausted event, however many
+            # threads cross the line together.
+            self._exhausted = True
+            _boundary_log(
+                "budget_exhausted",
+                {"why": why, "wall_clock_sec": self._wall_clock_sec, "max_bytes": self._max_bytes},
+            )
         raise LocalVisionFailure(
             self.CODE,
             f"the vision stage's run-wide budget is spent ({why}); remaining "
@@ -651,7 +668,11 @@ def _urlopen_json(
             while received <= MAX_RESPONSE_BYTES:
                 if _monotonic() > deadline:
                     raise TimeoutError(f"response did not complete within {timeout_sec} seconds")
-                chunk = response.read(min(_READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - received))
+                # read1, not read: BufferedIOBase.read(n) blocks until n bytes
+                # accumulate, so a dripping body would never return to the
+                # deadline check. read1 yields whatever one raw read produces,
+                # keeping the clock honest per drip.
+                chunk = response.read1(min(_READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - received))
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -690,6 +711,8 @@ def _urlopen_json(
             except ValueError:
                 # The http-date form (or junk) is not worth parsing; the
                 # caller's default backoff covers it.
+                retry_after = None
+            if retry_after is not None and not math.isfinite(retry_after):
                 retry_after = None
             raise LocalVisionFailure(
                 "local_vision_retryable",

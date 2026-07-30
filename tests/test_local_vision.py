@@ -829,6 +829,8 @@ class _FakeHttpResponse:
         self._offset += len(chunk)
         return chunk
 
+    read1 = read
+
 
 class _FakeOpener:
     """Stands in for the vision client's opener, serving one canned response.
@@ -1824,6 +1826,8 @@ class TestBoundedRemoteBehavior:
                 clock["now"] += 10.0
                 return b"x" * min(size if size > 0 else 65536, 65536)
 
+            read1 = read
+
         class _DrippingOpener:
             def open(self, request: Any, timeout: float | None = None) -> Any:
                 return _DrippingResponse()
@@ -1854,7 +1858,9 @@ class TestBoundedRemoteBehavior:
         monkeypatch.setattr("distill.rapid_mlx._OPENER", _CountingOpener(payload))
 
         interpreter = FrameInterpreter(
-            LocalVisionConfig(),
+            # The budget bounds remote cost, so it attaches only to a config
+            # that opted into a remote endpoint (loopback + opt-in is legal).
+            LocalVisionConfig(allow_remote_endpoint=True),
             probe=_available_probe,
             # Enough for one response, not two: the second request must find
             # the budget spent and the third must never be attempted.
@@ -1888,7 +1894,7 @@ class TestBoundedRemoteBehavior:
         monkeypatch.setattr("distill.rapid_mlx._OPENER", _SlowFrameOpener(payload))
 
         interpreter = FrameInterpreter(
-            LocalVisionConfig(timeout_sec=1000.0),
+            LocalVisionConfig(timeout_sec=1000.0, allow_remote_endpoint=True),
             probe=_available_probe,
             budget_sec=150.0,
         )
@@ -1934,3 +1940,150 @@ class TestBoundedRemoteBehavior:
         # server's requested pause.
         assert opened["n"] == 3
         assert sleeps == [3.0, 3.0]
+
+    def test_a_local_run_carries_no_budget(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The budget bounds remote cost (D-008); a slow-but-working local
+        model must never be half-degraded by a run-wide clock."""
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _FakeOpener(payload))
+
+        interpreter = FrameInterpreter(
+            LocalVisionConfig(),  # no remote opt-in
+            probe=_available_probe,
+            budget_bytes=1,  # would exhaust instantly if it applied
+            budget_sec=0.000001,
+        )
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        assert all(frame.reading is not None for frame in frames)
+        assert "local_vision_budget_exhausted" not in {w["code"] for w in warnings}
+
+    def test_an_exhausted_budget_blocks_the_request_before_it_is_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """check() runs before open: a spent budget never sends the request,
+        which is the only thing that stops traffic once the run is over
+        budget (the breaker covers the interpreter path; this covers every
+        path that carries a budget)."""
+        from distill.rapid_mlx import VisionStageBudget, _urlopen_json
+
+        clock = {"now": 0.0}
+        monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: clock["now"])
+        opened = {"n": 0}
+
+        class _NeverOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                opened["n"] += 1
+                raise AssertionError("a spent budget must not send a request")
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _NeverOpener())
+        budget = VisionStageBudget(wall_clock_sec=5.0, max_bytes=1024)
+        clock["now"] = 100.0
+
+        with pytest.raises(LocalVisionFailure) as excinfo:
+            _urlopen_json(
+                "POST",
+                "http://127.0.0.1:8000/v1/chat/completions",
+                {"model": "m"},
+                timeout_sec=30.0,
+                budget=budget,
+            )
+
+        assert excinfo.value.code == "local_vision_budget_exhausted"
+        assert opened["n"] == 0
+
+    def test_a_429_without_retry_after_uses_the_default_backoff(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from email.message import Message
+
+        sleeps: list[float] = []
+
+        class _RateLimitingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                raise urllib.error.HTTPError(
+                    request.full_url, 503, "busy", Message(), io.BytesIO(b"{}")
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _RateLimitingOpener())
+        monkeypatch.setattr("distill.local_vision._sleep", sleeps.append)
+
+        result, failure_warning = try_interpret_image(
+            LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+        )
+
+        assert result is None
+        assert failure_warning is not None
+        assert failure_warning["code"] == "local_vision_retry_exhausted"
+        assert sleeps == [1.0, 1.0]
+
+    @pytest.mark.parametrize("retry_after", ["-1", "nan", "0"])
+    def test_hostile_retry_after_values_never_crash_the_pause(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, retry_after: str
+    ) -> None:
+        from email.message import Message
+
+        sleeps: list[float] = []
+
+        class _HostileOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                headers = Message()
+                headers["Retry-After"] = retry_after
+                raise urllib.error.HTTPError(
+                    request.full_url, 429, "limited", headers, io.BytesIO(b"{}")
+                )
+
+        image = tmp_path / "frame.png"
+        image.write_bytes(b"png")
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _HostileOpener())
+        monkeypatch.setattr("distill.local_vision._sleep", sleeps.append)
+
+        result, failure_warning = try_interpret_image(
+            LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+        )
+
+        assert result is None
+        assert failure_warning is not None
+        # The endpoint's bug stays the endpoint's: still a rate-limit story,
+        # never a crash misreported as malformed JSON.
+        assert failure_warning["code"] == "local_vision_retry_exhausted"
+        assert all(0.0 <= pause <= 10.0 for pause in sleeps)
+
+    def test_one_rate_limited_frame_degrades_the_remaining_frames(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from email.message import Message
+
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        opened = {"n": 0}
+
+        class _RateLimitingOpener:
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                opened["n"] += 1
+                raise urllib.error.HTTPError(
+                    request.full_url, 429, "limited", Message(), io.BytesIO(b"{}")
+                )
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _RateLimitingOpener())
+        monkeypatch.setattr("distill.local_vision._sleep", lambda _pause: None)
+
+        interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe, debug=True)
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        # Frame 1 spends its bounded retries (3 requests); frames 2-3 are
+        # never attempted - retrying a run into a rate limiter is the
+        # amplification the immediate trip prevents.
+        assert opened["n"] == 3
+        assert all(frame.reading is None for frame in frames)
+        assert interpreter.debug_info()["breaker"]["transport_failures"] == 0

@@ -86,6 +86,8 @@ class _CannedResponse:
         self._offset += len(chunk)
         return chunk
 
+    read1 = read
+
     def close(self) -> None:
         return None
 
