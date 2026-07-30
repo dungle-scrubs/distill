@@ -5,9 +5,11 @@ Reads ``cases.toml`` and each frame's ``<id>.gt.txt`` and reports two things:
 1. Word-error-rate (WER) of recovered text vs. truth, for text-bearing frames.
    Preprocessed OCR is always scored; the vision model's ``verbatim_text`` is
    scored too when ``--with-vision`` is set and Rapid-MLX is running.
-2. Grounding-flag accuracy: whether ``grounding.assess_grounding`` flags the
-   frames a human marked hard/unreadable (``legibility != "clean"``) and stays
-   quiet on clean ones — precision/recall over that label.
+2. Grounding-flag accuracy: whether ``grounding.assess_grounding`` leaves the
+   frames a human marked hard/unreadable (``legibility != "clean"``)
+   uncorroborated and corroborates the clean ones — precision/recall over that
+   label. Since M3.1 the assessment states agreement rather than confidence,
+   so "flagged" here means "not corroborated".
 
 Unverified or empty cases are skipped, so the score reflects only frames a human
 has actually confirmed. Labels and fixtures are validated up front, and a
@@ -37,6 +39,9 @@ VALID_CATEGORIES = frozenset(
     {
         "clean_text",
         "textless",
+        # Content is empty, but legible chrome such as browser UI, logos, or
+        # banners is present, so a transcription is not invention.
+        "chrome_only",
         "injection",
         "safety_blocked",
         "ocr_vision_disagreement",
@@ -109,7 +114,7 @@ class CaseResult:
     vision_f1: float | None
     flagged: bool | None  # grounding marked it low-confidence
     should_flag: bool  # human says it is not cleanly legible
-    claimed_text: bool | None = None  # textless frame: reader claimed text? None when unscored
+    claimed_text: bool | None = None  # has_text=false frame: claimed text? None when unscored
     unusable: bool = False  # vision returned no usable interpretation
 
 
@@ -129,17 +134,32 @@ class AcceptanceVerdict:
     passed: bool
     accuracy_ok: bool
     hallucination_ok: bool
+    f1_ok: bool
 
 
 @dataclass(frozen=True)
 class AcceptanceRule:
-    """The eval's pass/fail bar: an accuracy floor AND a hallucination ceiling."""
+    """The eval's pass/fail bar: an accuracy floor, an invention ceiling, and
+    a token-F1 floor.
+
+    F1 is the third bound because the other two cannot see stray text.
+    `text_recovery_accuracy` is recall-only - deliberately, so that chrome the
+    reader adds does not punish it - and the invention ceiling only looks at
+    frames with no text at all. Without F1, a reader could transcribe every
+    banner, logo and browser bar on real slides and still pass. Precision, and
+    therefore F1, falls when the reader adds tokens the truth omits, so that is
+    where the content boundary belongs.
+    """
 
     accuracy_floor: float
     hallucination_ceiling: float
+    f1_floor: float = 0.0
 
     def evaluate(
-        self, accuracy: float | None, hallucination_rate: float | None
+        self,
+        accuracy: float | None,
+        hallucination_rate: float | None,
+        f1: float | None = None,
     ) -> AcceptanceVerdict:
         """Pass only when both metrics were measured and both stay inside their bounds.
 
@@ -151,10 +171,12 @@ class AcceptanceRule:
         hallucination_ok = (
             hallucination_rate is not None and hallucination_rate <= self.hallucination_ceiling
         )
+        f1_ok = f1 is not None and f1 >= self.f1_floor
         return AcceptanceVerdict(
-            passed=accuracy_ok and hallucination_ok,
+            passed=accuracy_ok and hallucination_ok and f1_ok,
             accuracy_ok=accuracy_ok,
             hallucination_ok=hallucination_ok,
+            f1_ok=f1_ok,
         )
 
 
@@ -182,9 +204,10 @@ def load_labelled_cases() -> list[LabelledCase]:
         verified = raw_case.get("verified", False)
         if not isinstance(verified, bool):
             raise ValueError(f"case {case_id} has non-boolean verified: {verified!r}")
-        if (category == "textless") != (has_text is False):
+        if (category in {"textless", "chrome_only"}) != (has_text is False):
             raise ValueError(
-                f"case {case_id} category must be textless exactly when has_text is false"
+                f"case {case_id} category must be textless or chrome_only exactly "
+                "when has_text is false"
             )
         for suffix in (".png", ".gt.txt"):
             path = FRAMES_DIR / f"{case_id}{suffix}"
@@ -194,7 +217,7 @@ def load_labelled_cases() -> list[LabelledCase]:
             truth = truth_text(case_id)
             if truth is not None:
                 if not has_text and truth:
-                    raise ValueError(f"case {case_id} is textless but has non-empty truth")
+                    raise ValueError(f"case {case_id} has_text is false but truth is non-empty")
                 if has_text and not truth:
                     raise ValueError(f"case {case_id} is text-bearing but has empty truth")
         cases.append(
@@ -289,7 +312,7 @@ def evaluate(
                     has_interpretation=result.has_interpretation,
                     carries_a_reading=result.carries_a_reading,
                 )
-                flagged = assessment.is_low_confidence
+                flagged = not assessment.is_corroborated
             else:
                 # The model produced nothing usable: the pipeline now treats this
                 # as a low-confidence (ungrounded) frame, so the eval does too.
@@ -322,8 +345,18 @@ def evaluate(
 def _vision_config(
     model: str | None = None, backend: str | None = None, base_url: str | None = None
 ):
-    from distill.local_vision import LocalVisionConfig
+    """The config the eval scores against, resolved the way a run resolves it.
 
+    Loaded through `load_local_vision_config` rather than constructed bare, so
+    a credential (`api_key_env`) and the remote opt-in come from the same
+    config layers production reads - the Gate 2->3 comparison is only evidence
+    about the endpoint path if it goes through that path. Scope it with
+    DISTILL_CONFIG_DIR to score a cloud reader without touching the machine's
+    own settings. CLI overrides still win over the file.
+    """
+    from distill.local_vision import load_local_vision_config
+
+    base = load_local_vision_config()
     overrides: dict[str, str] = {}
     if model:
         overrides["model"] = model
@@ -331,7 +364,7 @@ def _vision_config(
         overrides["backend"] = backend
     if base_url:
         overrides["base_url"] = base_url.rstrip("/")
-    return replace(LocalVisionConfig(), **overrides) if overrides else LocalVisionConfig()
+    return replace(base, **overrides) if overrides else base
 
 
 def _vision_interpreter(
@@ -363,8 +396,36 @@ def text_recovery_accuracy(results: list[CaseResult]) -> float | None:
 
 
 def hallucination_rate(results: list[CaseResult]) -> float | None:
+    """Return the invention rate over true negatives with no text pixels at all.
+
+    Only ``textless`` cases belong in the denominator. Text read off a
+    ``chrome_only`` frame was really there, so it is not invention and does not
+    belong in this metric - but it is not a harmless convention disagreement
+    either: the prompt explicitly instructs the reader to ignore chrome, naming
+    logos, banners, watermarks, speaker insets and page numbers. Transcribing
+    it is an instruction-following failure, reported separately by
+    ``chrome_transcription_rate``.
+    """
     claims = [
-        float(r.claimed_text) for r in results if not r.has_text and r.claimed_text is not None
+        float(result.claimed_text)
+        for result in results
+        if result.category == "textless" and result.claimed_text is not None
+    ]
+    return _mean(claims)
+
+
+def chrome_transcription_rate(results: list[CaseResult]) -> float | None:
+    """Return the fraction of scored chrome-only cases where the reader claimed text.
+
+    Not invention (the text is genuinely on screen) and not part of the
+    acceptance bar, but not nothing either: the prompt tells the reader to
+    ignore chrome, so a non-zero rate is a measured instruction-following
+    weakness. Reported beside the verdict so it cannot be overlooked.
+    """
+    claims = [
+        float(result.claimed_text)
+        for result in results
+        if result.category == "chrome_only" and result.claimed_text is not None
     ]
     return _mean(claims)
 
@@ -387,6 +448,7 @@ def summarize(results: list[CaseResult]) -> dict:
         "vision_token_recall_mean": accuracy,
         "text_recovery_accuracy": accuracy,
         "hallucination_rate": hallucination_rate(results),
+        "chrome_transcription_rate": chrome_transcription_rate(results),
         "unusable_readings": sum(1 for result in results if result.unusable),
         "vision_token_f1_mean": _mean(vision_f1s),
         "grounding_precision": (true_pos / flagged_total) if flagged_total else None,
@@ -435,11 +497,18 @@ def main() -> None:
         verdict = rule.evaluate(
             accuracy=summary["text_recovery_accuracy"],
             hallucination_rate=summary["hallucination_rate"],
+            f1=summary["vision_token_f1_mean"],
         )
         gate = {
             "passed": verdict.passed,
             "accuracy_ok": verdict.accuracy_ok,
             "hallucination_ok": verdict.hallucination_ok,
+            "f1_ok": verdict.f1_ok,
+            # Reported beside the verdict, deliberately not part of it: a
+            # reader that transcribes chrome disobeyed the prompt's explicit
+            # instruction to ignore it, which is worth seeing wherever the
+            # verdict is seen even though it is not invention.
+            "chrome_transcription_rate": summary["chrome_transcription_rate"],
             "unusable_readings": summary["unusable_readings"],
         }
     if args.json:

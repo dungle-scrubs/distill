@@ -48,27 +48,10 @@ from .artifacts import (
 )
 from .emit import EMITTER
 from .errors import DistillError, WarningRecord
-from .grounding import CORROBORATED, SELF_REPORT, UNGROUNDED, WEAK, GroundingAssessment
+from .grounding import GroundingAssessment
 from .links import RelatedLink
 
 MIN_TRANSCRIPT_CHARS = 3
-
-GROUNDING_LEVELS = frozenset({CORROBORATED, SELF_REPORT, WEAK, UNGROUNDED})
-"""The levels this document is willing to print as a level.
-
-`GroundingAssessment.from_document` passes an unrecognized level through on
-purpose - anything outside `grounding.NOT_LOW_CONFIDENCE` reads as low
-confidence, which is the answer that does not vouch for text nobody checked - so
-what arrives here is not guaranteed to be one of `grounding.py`'s words. The
-banner still says low confidence for it; it just does not repeat the string as
-though it named a level.
-
-Every level `grounding.py` defines is listed, `CORROBORATED` included, so this
-set is "the words that name a level" and not "the words that mark a frame".
-Whether a level is marked at all is one question and it is asked once, of the
-assessment, in `_low_confidence_lines` - a second copy of that judgement here
-would be a level that could stop being marked by being left off a list.
-"""
 
 UNTRUSTED_DATA_PREAMBLE = (
     "> **Untrusted data.** Most of what follows was chosen by whoever produced",
@@ -103,10 +86,27 @@ warning that grows a field (an occurrence count, a path) must not grow a way of
 reaching the document undelimited.
 """
 
-UNVERIFIED_CAVEAT = (
-    "On-screen text may be unreadable; treat the interpretation below as unverified."
-)
-NO_OUTPUT_CAVEAT = "The vision model returned no usable output for this frame."
+CORROBORATED_NOTE = "Corroborated: matches the on-screen-text reader."
+"""D-015's wording: factual agreement, and no claim of independence.
+
+The two readers are not independent today - the vision model is shown the
+image-text reader's output in its prompt, so it can echo what that reader
+recovered. The note therefore says the readings *match*, which is what was
+established, rather than that two readers *independently* agree, which was
+not.
+"""
+
+UNCORROBORATED_NOTE = "The on-screen-text reader did not confirm this reading."
+"""The one neutral note every non-corroborated level collapses to (D-002).
+
+`self_report`, `weak` and `ungrounded` are kept as internal levels because
+they say different things about *why* corroboration is absent, and they stay
+in the recorded grounding. A reader is told the fact that matters - nobody
+confirmed it - without three gradations of doubt about a reading the vision
+model is now authoritative for.
+"""
+
+NO_OUTPUT_NOTE = "The vision model returned no usable output for this frame."
 
 
 def transcript_is_empty(transcript: Transcript | None) -> bool:
@@ -378,15 +378,14 @@ def _frame_lines(frame: FrameArtifact, *, include_image_link: bool) -> list[str]
     assessment = GroundingAssessment.from_document(frame.grounding)
     if reading is not None:
         lines.extend(["Visual interpretation:", ""])
-        lines.extend(_low_confidence_lines(assessment, UNVERIFIED_CAVEAT))
+        lines.extend(_corroboration_lines(assessment))
         lines.extend(_reading_lines(reading))
         if reading.verbatim_text.strip():
             lines.extend(
                 ["Verbatim slide text:", "", *_untrusted_lines(reading.verbatim_text.strip())]
             )
-    elif assessment is not None and assessment.is_low_confidence:
-        lines.extend(["Visual interpretation:", ""])
-        lines.extend(_low_confidence_lines(assessment, NO_OUTPUT_CAVEAT))
+    elif assessment is not None:
+        lines.extend(["Visual interpretation:", "", f"> {NO_OUTPUT_NOTE}", ""])
     if frame.extracted_text.strip():
         lines.extend(["OCR:", "", *_untrusted_lines(frame.extracted_text.strip())])
     salience = FrameSalience.from_document(frame.salience) if frame.salience else None
@@ -461,55 +460,32 @@ def render_filtered_markdown(
     return f"{FILTERED_VIEW_BANNER}\n\n{rendered}"
 
 
-def _low_confidence_lines(assessment: GroundingAssessment | None, caveat: str) -> list[str]:
-    """The banner a low-confidence **grounding** puts above a reading.
+def _corroboration_lines(assessment: GroundingAssessment | None) -> list[str]:
+    """The neutral **grounding** note that sits above a reading (D-002/D-015).
 
-    Absent for a **corroborated** frame, and absent for a frame nobody
-    assessed: a banner that appeared whenever the assessment was missing would
-    report low confidence for every frame produced before the vision pass ran.
+    Two notes, not four: `CORROBORATED` says the readings match, and every
+    other level collapses to "the on-screen-text reader did not confirm this
+    reading". The internal levels stay in the recorded grounding because they
+    say different things about why corroboration is absent; a reader is told
+    the fact rather than a grade, because since the vision model became the
+    authoritative reader an uncorroborated frame is not a doubted one.
 
-    Which levels earn it is not restated here. The assessment is asked, so
-    `SELF_REPORT` was marked the moment `grounding.py` declared it a level
-    outside `NOT_LOW_CONFIDENCE` - a list of marked levels kept here would have
-    let the new level arrive unmarked by being an entry nobody added (R-42).
+    Absent for a frame nobody assessed: a note printed whenever the assessment
+    was missing would speak about corroboration for every frame produced
+    before the vision pass ran.
 
-    Distill's own voice, so it is not delimited: a **grounding** is Distill's
-    assessment of a reading, and its level and reason are literals in
-    `grounding.py`. What holds that is a claim about another module rather than
-    a property of this text, and an assessment rebuilt from a document takes
-    whatever the document held - `FrameArtifact.from_document` declares that
-    document to be input under R-23 and leaves the hardening here. So each part
-    of the banner is made safe rather than trusted to be: the level is printed
-    only when it is a level this codebase defines, and the reason is escaped
-    the way a link label is, which is what stops a line ending in it continuing
-    as document structure and stops an inline construct in it acting at all.
-
-    Escaping and not a fence, because the sentence is Distill's: a block would
-    label Distill's own assessment as **extracted text**. The escape is
-    lossless in the reader's terms (see `emit.link_label`), so the reason still
-    reads as what it said.
-
-    `_one_line` runs first and is the half that is *not* lossless. It is
-    deliberate: a line ending survives the escape, so without the collapse the
-    banner would occupy one line of the render while reading as several.
+    Distill's own voice, so it is not delimited: the note is a literal here and
+    the level names are literals in `grounding.py`. The reason carried by an
+    assessment is *not* printed - it was the justification for a confidence
+    verdict that no longer exists, and it is the one part of an assessment that
+    can arrive from a document `FrameArtifact.from_document` declares to be
+    input under R-23. Dropping it removes the hardening burden rather than
+    restating it.
     """
-    if assessment is None or not assessment.is_low_confidence:
+    if assessment is None:
         return []
-    level = assessment.level if assessment.level in GROUNDING_LEVELS else "low"
-    reason = EMITTER.link_label(_one_line(assessment.reason))
-    return [f"> ⚠ Low-confidence frame ({level}): {reason}. {caveat}", ""]
-
-
-def _one_line(text: str) -> str:
-    """`text` with every run of whitespace, line endings included, made a space.
-
-    Legibility rather than safety, now that the banner's reason is escaped: the
-    escape is what stops a line ending from ending the *document* line, and this
-    is what keeps the result a sentence. The escape preserves the line ending
-    rather than removing it, so a reader given the reason uncollapsed would read
-    a banner broken across lines it does not occupy.
-    """
-    return " ".join(text.split())
+    note = CORROBORATED_NOTE if assessment.is_corroborated else UNCORROBORATED_NOTE
+    return [f"> {note}", ""]
 
 
 def _reading_lines(reading: Interpretation) -> list[str]:
@@ -552,10 +528,11 @@ def format_timestamp(seconds: float) -> str:
 
 
 __all__ = [
+    "CORROBORATED_NOTE",
     "MIN_TRANSCRIPT_CHARS",
-    "NO_OUTPUT_CAVEAT",
+    "NO_OUTPUT_NOTE",
+    "UNCORROBORATED_NOTE",
     "UNTRUSTED_DATA_PREAMBLE",
-    "UNVERIFIED_CAVEAT",
     "ensure_content",
     "format_timestamp",
     "frames_are_useless",

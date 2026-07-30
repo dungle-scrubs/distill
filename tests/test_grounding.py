@@ -46,7 +46,7 @@ def test_confident_interpretation_with_no_readable_text_is_ungrounded() -> None:
     )
 
     assert assessment.level == UNGROUNDED
-    assert assessment.is_low_confidence is True
+    assert assessment.is_corroborated is False
 
 
 def test_a_textless_frame_without_an_interpretation_is_not_marked() -> None:
@@ -63,7 +63,7 @@ def test_a_textless_frame_without_an_interpretation_is_not_marked() -> None:
     )
 
     assert assessment.level == CORROBORATED
-    assert assessment.is_low_confidence is False
+    assert assessment.is_corroborated is True
     assert assessment.reason == "no on-screen text present"
 
 
@@ -121,10 +121,10 @@ def test_a_confident_lone_reader_is_not_given_the_level_two_agreeing_readers_get
     )
 
     assert corroborated.level == CORROBORATED
-    assert corroborated.is_low_confidence is False
+    assert corroborated.is_corroborated is True
     assert lone_reader.level != corroborated.level
     assert lone_reader.level == SELF_REPORT
-    assert lone_reader.is_low_confidence is True
+    assert lone_reader.is_corroborated is False
 
 
 def test_a_lone_readers_description_of_an_unreadable_frame_is_marked() -> None:
@@ -146,7 +146,7 @@ def test_a_lone_readers_description_of_an_unreadable_frame_is_marked() -> None:
     assessment = _graded(ocr_text="", reading=reading)
 
     assert reading.carries_a_reading is True
-    assert assessment.is_low_confidence is True
+    assert assessment.is_corroborated is False
     assert assessment.level != CORROBORATED
     assert "no on-screen text present" not in assessment.reason
 
@@ -170,7 +170,7 @@ def test_a_reading_admitting_it_cannot_read_the_frame_is_not_called_textless() -
 
     assessment = _graded(ocr_text="", reading=reading)
 
-    assert assessment.is_low_confidence is True
+    assert assessment.is_corroborated is False
     assert "no on-screen text present" not in assessment.reason
 
 
@@ -214,7 +214,7 @@ def test_a_transcription_that_tokenizes_to_nothing_is_still_something_the_model_
     assert reading.carries_a_reading is True
     assert reading.has_interpretation is False
     assert assessment.level == SELF_REPORT
-    assert assessment.is_low_confidence is True
+    assert assessment.is_corroborated is False
 
 
 def test_a_reading_that_said_nothing_at_all_still_reaches_the_unmarked_answer() -> None:
@@ -255,3 +255,78 @@ def test_a_reading_rebuilt_from_a_drifted_document_shows_no_elements_it_invented
     mixed = Interpretation.from_document({"detected_elements": ["axis", 7, {"a": 1}, "legend"]})
     assert mixed is not None
     assert mixed.detected_elements == ("axis", "legend")
+
+
+def test_grounding_no_longer_carries_a_confidence_verdict() -> None:
+    """M3.1 (D-002): the vision reading is the authoritative reader, so
+    grounding records whether a second reader agreed - it does not grade
+    confidence. The `is_low_confidence` verdict is gone; `is_corroborated`
+    states the fact instead, and `corroborated` keeps its strict two-readers
+    meaning."""
+    corroborated = assess_grounding(
+        ocr_text="Deploy pipeline overview",
+        verbatim_text="Deploy pipeline overview",
+        text_confidence="high",
+        has_interpretation=True,
+        carries_a_reading=True,
+    )
+    lone_reader = assess_grounding(
+        ocr_text="",
+        verbatim_text="Deploy pipeline overview",
+        text_confidence="high",
+        has_interpretation=True,
+        carries_a_reading=True,
+    )
+
+    assert corroborated.level == CORROBORATED
+    assert corroborated.is_corroborated is True
+    assert lone_reader.is_corroborated is False
+    # The vocabulary that graded a reading is gone, not merely unused.
+    assert not hasattr(corroborated, "is_low_confidence")
+
+
+def test_the_render_note_is_neutral_and_collapses_the_uncorroborated_levels() -> None:
+    """M3.2 (D-002/D-015): the three non-corroborated levels collapse to one
+    neutral note. No warning framing, no low-confidence verdict, and the
+    corroborated note claims agreement - not independence, since the vision
+    reader is shown the image-text reader's output."""
+    from pathlib import Path
+
+    from distill.artifacts import FrameArtifact, RedactionState
+    from distill.render import render_markdown
+
+    def render_at(level: str) -> str:
+        frame = FrameArtifact(
+            index=1,
+            timestamp_sec=1.0,
+            path=str(Path("frames/frame1.png")),
+            relative_path="frames/frame1.png",
+            extracted_text="Deploy pipeline overview",
+            redaction=RedactionState.APPLIED,
+        )
+        carried, _w = frame.with_interpretation(
+            Interpretation(
+                visual_summary="A deployment diagram",
+                verbatim_text="Deploy pipeline overview",
+                text_confidence="high",
+            ),
+            grounding={"level": level, "reason": "reason text"},
+        )
+        return render_markdown("demo.mp4", 10.0, None, [carried], [])
+
+    corroborated = render_at(CORROBORATED)
+    assert "matches the on-screen-text reader" in corroborated
+    assert "Low-confidence" not in corroborated
+    assert "⚠" not in corroborated
+
+    notes = set()
+    for level in (SELF_REPORT, WEAK, UNGROUNDED):
+        rendered = render_at(level)
+        assert "Low-confidence" not in rendered
+        assert "⚠" not in rendered
+        assert "unverified" not in rendered.lower()
+        notes.add(next(line for line in rendered.split("\n") if "on-screen-text reader" in line))
+
+    # One note for all three, not three differently-worded ones.
+    assert len(notes) == 1
+    assert "did not" in notes.pop()

@@ -16,7 +16,12 @@ from distill.errors import DistillError
 from distill.grounding import assess_grounding
 from distill.progress import ProgressReporter
 from distill.redact_secrets import redact_text
-from distill.render import frames_are_useless, render_markdown, transcript_is_empty
+from distill.render import (
+    UNCORROBORATED_NOTE,
+    frames_are_useless,
+    render_markdown,
+    transcript_is_empty,
+)
 
 
 def keyframe(**overrides: Any) -> FrameArtifact:
@@ -183,9 +188,7 @@ def test_four_confusable_secrets_are_one_warning_that_says_four() -> None:
         {
             "stage": "redaction",
             "code": "possible_confusable_secret",
-            "message": (
-                "OCR text contained a secret-like value after confusable normalization"
-            ),
+            "message": ("OCR text contained a secret-like value after confusable normalization"),
             "occurrences": 4,
         }
     ]
@@ -408,7 +411,7 @@ def test_no_content_escalates() -> None:
     assert exc.value.code == "E_NO_CONTENT"
 
 
-def test_low_confidence_frame_renders_warning_marker_and_verbatim_block() -> None:
+def test_an_uncorroborated_frame_renders_the_neutral_note_and_verbatim_block() -> None:
     frame, _warnings = keyframe().with_interpretation(
         Interpretation(
             visual_summary="A dark slide",
@@ -424,8 +427,11 @@ def test_low_confidence_frame_renders_warning_marker_and_verbatim_block() -> Non
     )
     markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
 
-    assert "⚠ Low-confidence frame (ungrounded)" in markdown
-    assert "treat the interpretation below as unverified" in markdown
+    # M3.1/D-002: grounding is a note, not a verdict - the reading stands and
+    # the render says only that the other reader did not confirm it.
+    assert UNCORROBORATED_NOTE in markdown
+    assert "Low-confidence" not in markdown
+    assert "unverified" not in markdown
     # The model's word about its own reading is the model's word: R-26 moved it
     # out of the inline bullet this used to pin and into a delimited block. The
     # marker above it is Distill's own assessment and stays document structure.
@@ -455,7 +461,7 @@ def graded(*, ocr_text: str, reading: Interpretation) -> FrameArtifact:
     return frame
 
 
-def test_a_lone_confident_reader_still_gets_the_low_confidence_marker() -> None:
+def test_a_lone_confident_reader_is_still_reported_uncorroborated() -> None:
     """R-42: the render does not suppress the marker on a reader's own say-so.
 
     OCR recovered nothing, so the only evidence for this slide's text is the
@@ -477,15 +483,15 @@ def test_a_lone_confident_reader_still_gets_the_low_confidence_marker() -> None:
 
     markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
 
-    assert "⚠ Low-confidence frame (self_report)" in markdown
-    assert "treat the interpretation below as unverified" in markdown
+    assert UNCORROBORATED_NOTE in markdown
+    assert "Low-confidence" not in markdown
     # The reading is marked, not withheld.
     assert "```untrusted-text\nWhat a software factory needs Agent Runtimes Orchestration\n```" in (
         markdown
     )
 
 
-def test_a_description_of_an_unreadable_frame_reaches_the_reader_marked() -> None:
+def test_a_description_of_an_unreadable_frame_reaches_the_reader_with_its_note() -> None:
     """The render seam of the same finding: a summary-only reading is banner-ed.
 
     The model was told to leave `verbatim_text` empty when it cannot read the
@@ -503,8 +509,8 @@ def test_a_description_of_an_unreadable_frame_reaches_the_reader_marked() -> Non
 
     markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
 
-    assert "⚠ Low-confidence frame" in markdown
-    assert "treat the interpretation below as unverified" in markdown
+    assert UNCORROBORATED_NOTE in markdown
+    assert "Low-confidence" not in markdown
     # The reading is marked, not withheld.
     assert "Q3 revenue" in markdown
 
@@ -520,7 +526,7 @@ def test_a_frame_nobody_said_anything_about_is_rendered_without_a_banner() -> No
 
     markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
 
-    assert "Low-confidence frame" not in markdown
+    assert "Low-confidence" not in markdown
 
 
 def test_a_corroborated_frame_omits_the_marker_and_shows_verbatim() -> None:
@@ -544,7 +550,7 @@ def test_a_corroborated_frame_omits_the_marker_and_shows_verbatim() -> None:
     )
     markdown = render_markdown("demo.mp4", 10.0, None, [frame], [])
 
-    assert "Low-confidence frame" not in markdown
+    assert "Low-confidence" not in markdown
     assert "Verbatim slide text:" in markdown
     # Still fenced, and now tagged with the trust class the text has: verbatim
     # text is the model's report of what a **keyframe** showed (R-26).

@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 WIDTH = 1280
 HEIGHT = 720
@@ -180,6 +180,133 @@ def _striped_disagreement(text: str) -> Image.Image:
     return image
 
 
+def _dark_bokeh(_text: str) -> Image.Image:
+    image = Image.new("RGB", FRAME_SIZE, "#080a0d")
+    circles = Image.new("RGBA", FRAME_SIZE, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(circles)
+    for bounds, fill in (
+        ((-170, 80, 310, 560), (28, 40, 50, 150)),
+        ((180, -190, 710, 340), (39, 31, 48, 125)),
+        ((510, 150, 950, 590), (24, 43, 45, 145)),
+        ((850, -80, 1390, 460), (43, 36, 29, 115)),
+        ((920, 360, 1320, 760), (27, 32, 45, 135)),
+        ((310, 430, 650, 770), (34, 29, 39, 105)),
+    ):
+        draw.ellipse(bounds, fill=fill)
+    softened = circles.filter(ImageFilter.GaussianBlur(radius=72))
+    return Image.alpha_composite(image.convert("RGBA"), softened).convert("RGB")
+
+
+def _abstract_geometry(_text: str) -> Image.Image:
+    image = Image.new("RGB", FRAME_SIZE, "#6f7476")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((90, 105, 610, 535), fill="#8c8377")
+    draw.rectangle((475, 55, 1115, 345), fill="#65777a")
+    draw.polygon(((110, 620), (475, 235), (790, 650)), fill="#7d6d70")
+    draw.polygon(((690, 95), (1215, 235), (1010, 680)), fill="#7b816d")
+    draw.rectangle((575, 300, 970, 625), fill="#727083")
+    return image
+
+
+def _blurred_room(_text: str) -> Image.Image:
+    buffer = bytearray(WIDTH * HEIGHT * 3)
+    index = 0
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            horizontal = x / WIDTH
+            vertical = y / HEIGHT
+            noise = ((x * 17 + y * 29 + (x * y) % 31) % 17) - 8
+            red = int(72 + 55 * horizontal + 26 * vertical) + noise
+            green = int(80 + 38 * horizontal + 18 * vertical) + noise
+            blue = int(86 + 22 * horizontal + 34 * (1 - vertical)) + noise
+            buffer[index : index + 3] = (
+                max(0, min(255, red)),
+                max(0, min(255, green)),
+                max(0, min(255, blue)),
+            )
+            index += 3
+    image = Image.frombytes("RGB", FRAME_SIZE, bytes(buffer))
+    draw = ImageDraw.Draw(image, "RGBA")
+    draw.rectangle((0, 0, 410, HEIGHT), fill=(38, 47, 53, 105))
+    draw.ellipse((720, -180, 1380, 480), fill=(196, 166, 128, 90))
+    return image.filter(ImageFilter.GaussianBlur(radius=28))
+
+
+def _gray_wall(_text: str) -> Image.Image:
+    buffer = bytearray(WIDTH * HEIGHT * 3)
+    index = 0
+    highlight_x = 790
+    highlight_y = 285
+    maximum_distance = 520**2
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            distance = (x - highlight_x) ** 2 + (y - highlight_y) ** 2
+            highlight = max(0, 24 * (maximum_distance - distance) // maximum_distance)
+            value = 126 + highlight
+            buffer[index : index + 3] = (value, value, value)
+            index += 3
+    return Image.frombytes("RGB", FRAME_SIZE, bytes(buffer))
+
+
+def _soft_gradient(_text: str) -> Image.Image:
+    """A calm horizontal gradient with deterministic grain. The easy end of the
+    true-negative range: nothing here suggests text at all."""
+    buffer = bytearray(WIDTH * HEIGHT * 3)
+    index = 0
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            across = x / WIDTH
+            grain = ((x * 13 + y * 7) % 11) - 5
+            red = int(58 + 96 * across) + grain
+            green = int(66 + 74 * across) + grain
+            blue = int(88 + 52 * across) + grain
+            buffer[index : index + 3] = (
+                max(0, min(255, red)),
+                max(0, min(255, green)),
+                max(0, min(255, blue)),
+            )
+            index += 3
+    return Image.frombytes("RGB", FRAME_SIZE, bytes(buffer))
+
+
+def _blurred_slide_shape(_text: str) -> Image.Image:
+    """A slide's SHAPE with no glyphs: a title bar, bullet rows and a footer,
+    blurred past legibility.
+
+    The hard end of the true-negative range, and the reason it exists: a frame
+    that looks like it should carry text is what actually induces a reader to
+    invent some. A flat gray wall tests almost nothing.
+    """
+    image = Image.new("RGB", FRAME_SIZE, "#f2efe9")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((110, 92, 880, 152), fill="#8f9aa6")
+    for row in range(4):
+        top = 250 + row * 88
+        width = (760, 640, 700, 520)[row]
+        draw.ellipse((116, top + 14, 140, top + 38), fill="#9aa4ae")
+        draw.rectangle((170, top, 170 + width, top + 46), fill="#a7b0b9")
+    draw.rectangle((110, 640, 430, 676), fill="#c3c8cd")
+    return image.filter(ImageFilter.GaussianBlur(radius=17))
+
+
+def _terminal_shape(_text: str) -> Image.Image:
+    """A terminal window's shape - dark panel, title strip, rows of short bars
+    at code-line rhythm - with no glyphs. The 'screenshot too low-resolution to
+    read' case, and the second frame built to tempt invention."""
+    image = Image.new("RGB", FRAME_SIZE, "#0d1117")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((150, 70, 1130, 660), fill="#161b22")
+    draw.rectangle((150, 70, 1130, 118), fill="#21262d")
+    for dot_x, fill in ((178, "#e06c5a"), (206, "#d9b45c"), (234, "#63b862")):
+        draw.ellipse((dot_x, 84, dot_x + 18, 102), fill=fill)
+    rhythm = (320, 180, 470, 250, 390, 150, 430, 300, 210, 360)
+    for row, width in enumerate(rhythm):
+        top = 156 + row * 46
+        indent = 190 + (40 if row % 3 == 1 else 0)
+        draw.rectangle((indent, top, indent + width, top + 16), fill="#3f4a57")
+    return image.filter(ImageFilter.GaussianBlur(radius=9))
+
+
 @dataclass(frozen=True)
 class SyntheticCase:
     text: str
@@ -223,6 +350,13 @@ Independent readers reveal the evidence""",
 Vision should recover this sentence""",
         render=_striped_disagreement,
     ),
+    "23_synth_textless_f01": SyntheticCase(text="", render=_dark_bokeh),
+    "24_synth_textless_f02": SyntheticCase(text="", render=_abstract_geometry),
+    "25_synth_textless_f03": SyntheticCase(text="", render=_blurred_room),
+    "26_synth_textless_f04": SyntheticCase(text="", render=_gray_wall),
+    "27_synth_textless_f05": SyntheticCase(text="", render=_soft_gradient),
+    "28_synth_textless_f06": SyntheticCase(text="", render=_blurred_slide_shape),
+    "29_synth_textless_f07": SyntheticCase(text="", render=_terminal_shape),
 }
 
 SYNTHETIC_CASE_TEXT = {

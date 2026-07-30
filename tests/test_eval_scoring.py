@@ -17,6 +17,7 @@ def case_result(
     *,
     case_id: str = "case",
     has_text: bool,
+    category: str | None = None,
     vision_wer: float | None = None,
     vision_recall: float | None = None,
     vision_f1: float | None = None,
@@ -25,7 +26,7 @@ def case_result(
 ) -> score.CaseResult:
     return score.CaseResult(
         id=case_id,
-        category="clean_text" if has_text else "textless",
+        category=category or ("clean_text" if has_text else "textless"),
         legibility="clean" if has_text else "unreadable",
         has_text=has_text,
         ocr_wer=None,
@@ -118,7 +119,14 @@ def test_labelled_corpus_represents_every_category() -> None:
     categories = {case.category for case in cases}
 
     assert cases
+    assert "chrome_only" in categories
     assert categories == score.VALID_CATEGORIES
+
+
+def test_labelled_corpus_has_at_least_six_true_negative_cases() -> None:
+    cases = score.load_labelled_cases()
+
+    assert sum(case.category == "textless" for case in cases) >= 6
 
 
 def test_synthetic_truth_matches_the_generator_text() -> None:
@@ -235,6 +243,24 @@ def test_labelled_corpus_rejects_category_has_text_mismatch(
         score.load_labelled_cases()
 
 
+def test_labelled_corpus_accepts_chrome_only_without_content_text(tmp_path, monkeypatch) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "chrome.png").write_bytes(b"png")
+    (frames_dir / "chrome.gt.txt").write_text("")
+    (tmp_path / "cases.toml").write_text(
+        '[[case]]\nid = "chrome"\ncategory = "chrome_only"\n'
+        'legibility = "unreadable"\nhas_text = false\n'
+    )
+    monkeypatch.setattr(score, "EVAL_ROOT", tmp_path)
+    monkeypatch.setattr(score, "FRAMES_DIR", frames_dir)
+
+    [case] = score.load_labelled_cases()
+
+    assert case.category == "chrome_only"
+    assert case.has_text is False
+
+
 @pytest.mark.parametrize(
     ("category", "has_text", "truth"),
     [
@@ -267,6 +293,41 @@ def test_hallucination_rate_is_fraction_of_textless_cases_claiming_text() -> Non
     ]
 
     assert score.hallucination_rate(results) == 0.5
+
+
+def test_hallucination_rate_ignores_chrome_only_claims() -> None:
+    results = [
+        case_result(
+            case_id="chrome-claim",
+            category="chrome_only",
+            has_text=False,
+            claimed_text=True,
+        ),
+        case_result(case_id="true-negative", has_text=False, claimed_text=False),
+    ]
+
+    assert score.hallucination_rate(results) == 0.0
+
+
+def test_chrome_transcription_rate_counts_only_chrome_only_claims() -> None:
+    results = [
+        case_result(
+            case_id="chrome-claim",
+            category="chrome_only",
+            has_text=False,
+            claimed_text=True,
+        ),
+        case_result(
+            case_id="chrome-no-claim",
+            category="chrome_only",
+            has_text=False,
+            claimed_text=False,
+        ),
+        case_result(case_id="true-negative-claim", has_text=False, claimed_text=True),
+    ]
+
+    assert score.chrome_transcription_rate(results) == 0.5
+    assert score.chrome_transcription_rate(results[2:]) is None
 
 
 def test_evaluate_does_not_count_punctuation_only_text_as_a_claim(monkeypatch) -> None:
@@ -315,14 +376,15 @@ def test_text_recovery_accuracy_includes_total_misses_in_denominator() -> None:
 
 
 def test_acceptance_rule_boundaries_are_inclusive() -> None:
-    rule = score.AcceptanceRule(accuracy_floor=0.9, hallucination_ceiling=0.1)
+    rule = score.AcceptanceRule(accuracy_floor=0.9, hallucination_ceiling=0.1, f1_floor=0.9)
 
-    verdict = rule.evaluate(accuracy=0.9, hallucination_rate=0.1)
+    verdict = rule.evaluate(accuracy=0.9, hallucination_rate=0.1, f1=0.9)
 
     assert verdict == score.AcceptanceVerdict(
         passed=True,
         accuracy_ok=True,
         hallucination_ok=True,
+        f1_ok=True,
     )
 
 
@@ -338,14 +400,15 @@ def test_acceptance_rule_boundaries_are_inclusive() -> None:
 def test_acceptance_rule_fails_out_of_bounds_or_unmeasured_metrics(
     accuracy, hallucination_rate, accuracy_ok, hallucination_ok
 ) -> None:
-    rule = score.AcceptanceRule(accuracy_floor=0.9, hallucination_ceiling=0.1)
+    rule = score.AcceptanceRule(accuracy_floor=0.9, hallucination_ceiling=0.1, f1_floor=0.9)
 
-    verdict = rule.evaluate(accuracy=accuracy, hallucination_rate=hallucination_rate)
+    verdict = rule.evaluate(accuracy=accuracy, hallucination_rate=hallucination_rate, f1=0.9)
 
     assert verdict == score.AcceptanceVerdict(
         passed=False,
         accuracy_ok=accuracy_ok,
         hallucination_ok=hallucination_ok,
+        f1_ok=True,
     )
 
 
@@ -385,17 +448,19 @@ def test_local_baseline_pins_thresholds_from_its_own_measured_run() -> None:
     verdict = rule.evaluate(
         accuracy=summary["text_recovery_accuracy"],
         hallucination_rate=summary["hallucination_rate"],
+        f1=summary["vision_token_f1_mean"],
     )
 
     assert verdict.passed
 
 
-def test_summarize_includes_accuracy_and_hallucination_rate() -> None:
+def test_summarize_includes_accuracy_and_claim_rates() -> None:
     results = [
         case_result(has_text=True, vision_recall=0.8),
         case_result(has_text=True, vision_recall=0.6),
         case_result(has_text=False, claimed_text=True),
         case_result(has_text=False, claimed_text=False),
+        case_result(category="chrome_only", has_text=False, claimed_text=True),
     ]
 
     summary = score.summarize(results)
@@ -403,6 +468,7 @@ def test_summarize_includes_accuracy_and_hallucination_rate() -> None:
     assert summary["text_recovery_accuracy"] == pytest.approx(0.7)
     assert summary["vision_token_recall_mean"] == summary["text_recovery_accuracy"]
     assert summary["hallucination_rate"] == 0.5
+    assert summary["chrome_transcription_rate"] == 1.0
     assert summary["unusable_readings"] == 0
 
 
@@ -426,3 +492,63 @@ def test_summarize_counts_only_readings_marked_unusable() -> None:
     ]
 
     assert score.summarize(results)["unusable_readings"] == 1
+
+
+def test_the_f1_floor_catches_stray_text_the_other_bounds_cannot() -> None:
+    """Accuracy is recall-only and invention looks only at textless frames, so
+    without an F1 floor a reader could transcribe every banner and logo on real
+    slides and still pass."""
+    rule = score.AcceptanceRule(accuracy_floor=0.8, hallucination_ceiling=0.0, f1_floor=0.85)
+
+    polluted = rule.evaluate(accuracy=0.99, hallucination_rate=0.0, f1=0.60)
+    assert polluted.passed is False
+    assert polluted.accuracy_ok is True and polluted.hallucination_ok is True
+    assert polluted.f1_ok is False
+
+    at_floor = rule.evaluate(accuracy=0.99, hallucination_rate=0.0, f1=0.85)
+    assert at_floor.passed is True
+
+    unmeasured = rule.evaluate(accuracy=0.99, hallucination_rate=0.0, f1=None)
+    assert unmeasured.passed is False
+
+
+def test_chrome_only_frames_stay_out_of_the_invention_metric() -> None:
+    """Text read off a chrome frame was really there, so it is not invention -
+    but it is still reported, because the prompt told the reader to ignore it."""
+    results = [
+        case_result(case_id="chrome", has_text=False, claimed_text=True, category="chrome_only"),
+        case_result(case_id="true-neg", has_text=False, claimed_text=False, category="textless"),
+    ]
+
+    assert score.hallucination_rate(results) == 0.0
+    assert score.chrome_transcription_rate(results) == 1.0
+
+
+def test_the_corpus_keeps_a_wide_true_negative_denominator() -> None:
+    """A zero invention ceiling only means something over enough true
+    negatives, and only if they are frames with no text at all."""
+    cases = score.load_labelled_cases()
+    textless = [c for c in cases if c.category == "textless"]
+
+    assert len(textless) >= 6
+    for case in textless:
+        assert case.has_text is False
+
+
+def test_the_gate_evidence_file_is_internally_consistent() -> None:
+    """The evidence must not be silently rewritten: its verdict has to follow
+    from its own summary under the pinned rule, and the superseded run has to
+    still record its failure."""
+    evidence = json.loads((score.EVAL_ROOT / "gate_2_to_3_cloud.json").read_text())
+    baseline = json.loads((score.EVAL_ROOT / "baseline_local.json").read_text())
+    rule = score.AcceptanceRule(
+        **{k: v for k, v in baseline["acceptance_rule"].items() if k != "noise_band"}
+    )
+
+    recomputed = rule.evaluate(
+        accuracy=evidence["summary"]["text_recovery_accuracy"],
+        hallucination_rate=evidence["summary"]["hallucination_rate"],
+        f1=evidence["summary"]["vision_token_f1_mean"],
+    )
+    assert recomputed.passed is evidence["verdict"]["passed"]
+    assert evidence["superseded_run"]["verdict"]["passed"] is False

@@ -3,7 +3,7 @@
 This module owns the cross-check between OCR text and a vision model's
 transcription, so a confident interpretation that no readable text supports can
 be flagged instead of silently trusted. It owns the **grounding** levels and
-which of them is not low confidence. It does not call a model, read images, or
+which of them means the two readings agree. It does not call a model, read images, or
 render markdown, and it does not decide what a marked frame looks like to a
 reader - that is `render.py`'s.
 """
@@ -16,9 +16,16 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 CORROBORATED = "corroborated"
-"""Two readers independently recovered the same text from the **keyframe**.
+"""Both readers recovered the same text from the **keyframe**.
 
-The only level that is not low confidence, because it is the only one holding
+The word keeps its strict two-readers meaning: a lone confident reader is never
+corroborated, however sure it is. It does NOT claim independence - the vision
+model is shown the image-text reader's output in its prompt, so it can echo
+what that reader recovered. Genuine independence would need a blind second
+reading (a possible future change), which is why the reader-facing note says
+the readings match rather than that two readers independently agree.
+
+The only level that means agreement, because it is the only one holding
 evidence a second reader produced. It replaces `grounded`, which named this and
 a lone reader's own say-so with one word (R-42) - and a level a reader cannot
 distinguish is a level that vouches for the wrong thing.
@@ -31,7 +38,7 @@ Distinct from `WEAK` rather than folded into it: the reading is substantive and
 the model was confident, so the frame is worth reporting - it is the
 *corroboration* that is missing, not the reading. Distinct from `CORROBORATED`
 because a model grading its own homework is not a second opinion, however
-confident the grade (D-007). Low confidence, so the render marks it.
+confident the grade (D-007). Not corroborated, so the render says so plainly.
 """
 
 WEAK = "weak"
@@ -44,13 +51,13 @@ as one, or an interpretation over text neither reader recovered.
 UNGROUNDED = "ungrounded"
 """An interpretation exists and no reader recovered text that could support it."""
 
-NOT_LOW_CONFIDENCE = frozenset({CORROBORATED})
-"""The levels a reader may take at face value.
+CORROBORATED_LEVELS = frozenset({CORROBORATED})
+"""The levels that mean a second reader recovered the same text.
 
-A set of one, and stated as a set anyway: `is_low_confidence` is a question
+A set of one, and stated as a set anyway: `is_corroborated` is a question
 about the level rather than an inequality against a particular string, so a
 level added later is a decision made here instead of an operator quietly
-inverted somewhere else.
+inverting it somewhere else.
 """
 
 # Overlap of vision-transcribed tokens that also appear in OCR. Above STRONG the
@@ -82,8 +89,15 @@ class GroundingAssessment:
     reason: str
 
     @property
-    def is_low_confidence(self) -> bool:
-        return self.level not in NOT_LOW_CONFIDENCE
+    def is_corroborated(self) -> bool:
+        """Whether a second reader recovered the same text (D-002).
+
+        A fact about agreement, not a verdict on the reading. Since the vision
+        model became the authoritative reader, an uncorroborated frame is not
+        a doubted one - it is a frame the image-text reader did not confirm,
+        which is what the render says in plain words.
+        """
+        return self.level in CORROBORATED_LEVELS
 
     def public_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -100,9 +114,9 @@ class GroundingAssessment:
         neither was asked.
 
         A `level` this module does not define is passed through rather than
-        refused. `is_low_confidence` is stated against `NOT_LOW_CONFIDENCE`, so
-        an unrecognized level reads as low confidence, which is the answer that
-        does not vouch for text nobody checked.
+        refused. `is_corroborated` is stated against `CORROBORATED_LEVELS`, so
+        an unrecognized level reads as uncorroborated, which is the answer that
+        does not claim agreement nobody established.
         """
         if document is None:
             return None
@@ -203,7 +217,7 @@ def assess_grounding(
     # Both readers were asked, both recovered nothing, and nothing claims
     # otherwise: a photo, a face, a blank slide. That is the two readers
     # agreeing on what the frame holds, and there is no interpretation over it
-    # for a marker to warn about - so it is not low confidence.
+    # for a second reader to disagree with - so it counts as agreement.
     #
     # Reserved for that case alone. A model that described the frame while
     # reading no text off it has claimed something, and this sentence would be

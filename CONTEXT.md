@@ -106,6 +106,23 @@ _Avoid_: caption, description
 On-screen text the vision model reports it could actually read, as opposed to
 what it inferred.
 
+**Vision endpoint**:
+The OpenAI-compatible service a run sends **keyframes** to for
+**interpretation**, named by its address, the model it serves, and a
+credential. Whether it runs on the machine producing the **bundle** or in the
+cloud, and who provides it, is a configuration choice Distill does not otherwise
+track. The model it serves is identity-affecting and enters the **options
+hash**; the address and credential are **machine-local claims** and never enter
+a **bundle**.
+_Avoid_: provider, backend (Distill knows the endpoint, not who runs it)
+
+**Frame salience**:
+Whether a **keyframe** adds information the **transcript** does not already
+convey, judged against the surrounding transcript and recorded on the **frame
+artifact**. It lets a reader decide what to skip; Distill never uses it to drop
+a **keyframe**. A **source** with no **transcript** has none.
+_Avoid_: relevance (it is relative to the transcript, not absolute), importance
+
 **Render**:
 The markdown account of a **generation**, written to be read by a person or an
 LLM agent.
@@ -151,17 +168,34 @@ durable.
 Any point at which **extracted text** becomes durable — written to disk, or
 placed into a **render**. Redaction is complete only when every sink is covered.
 
+**Local-only processing**:
+The property that a run sends no **source** content off the machine that
+produces the **bundle**. When the **vision endpoint** is remote, **keyframes**
+and their **extracted text** leave the machine and the run is not local-only.
+Distinct from a **machine-local claim**, which is about a recorded value being
+true only where produced, not about where processing happens.
+_Avoid_: private, on-device (private is a consequence; on-device names the place, not the property)
+
 **Grounding**:
-The assessment of whether an **interpretation** is supported by text that was
-genuinely read rather than inferred.
+Whether the vision model's reading of a **keyframe** was **corroborated** by a
+second reader. The vision model is the primary reader and its **interpretation**
+is recorded as authoritative; grounding is an informational note carried beside
+it, not a gate that lowers confidence in an uncorroborated reading.
 
 **Corroborated**:
-Two readers — the image-text reader and the vision model — independently
-recovered the same text from a **keyframe**.
+Two readers, the image-text reader and the vision model, independently recovered
+the same text from a **keyframe**. The word keeps this strict meaning: a lone
+confident reader is never corroborated, however sure it is.
+_Caveat_: today the vision model is shown the image-text reader's output in its
+prompt, so the two are not truly independent - the vision reader can echo what
+the image-text reader recovered. The reader-facing note therefore says "matches
+the on-screen-text reader" and claims no independence; genuine independence would
+need a blind second reading (a possible future change).
 
 **Ungrounded**:
-An **interpretation** exists although no reader recovered readable text that
-could support it.
+The vision model produced an **interpretation** that no second reader
+corroborated. It is recorded as such and still trusted as the primary reader's
+reading; the note says corroboration is absent, not that the reading is wrong.
 
 ### Reproducibility
 
@@ -215,8 +249,16 @@ came from an eval may only be changed by another eval.
 - A **staging directory** holds **stage results**; a **generation** does not
 - A **generation** holds one **transcript**, many **frame artifacts**, and one
   **render**
-- A **frame artifact** has one **keyframe**, at most one **interpretation**, and
-  one **grounding**
+- A **frame artifact** has one **keyframe**, at most one **interpretation**, one
+  **grounding**, and at most one **frame salience**
+- An **interpretation** comes from a **vision endpoint**; the model it serves
+  enters the **options hash**, while the endpoint's address and credential are
+  **machine-local claims** and stay out of every **bundle**
+- **Frame salience** is judged against the **transcript**, so a **source** with
+  no transcript has none
+- **Local-only processing** holds only while the **vision endpoint** runs on the
+  producing machine; a remote endpoint sends **keyframes** and their **extracted
+  text** across the machine boundary
 - **Extracted text** flows from a **source** into **frame artifacts** and the
   **transcript**, and reaches a reader only through a **redaction sink**
 - A **generation** records the **provenance** of the **source** it came from;
@@ -283,6 +325,25 @@ Staging directory ─────────> Generation   (indivisible: the ge
 > **machine-local claim**: it can never tell a reader something they don't
 > already have, and it becomes false the moment somebody copies the bundle. What
 > a manifest describes is what the **generation** contains."
+>
+> **Dev:** "This frame is just someone dragging a window around while they talk.
+> Low salience, so we drop it from the render?"
+> **Domain expert:** "No. **Frame salience** is recorded, never a reason for
+> Distill to drop a **keyframe**. It says the frame adds little the
+> **transcript** doesn't already carry, so a reader can skip it, but relevance
+> is the reader's call, not ours - a later question about the UI flow makes that
+> exact frame the point. And salience is judged against the transcript, so a
+> silent **source** has none to record."
+>
+> **Dev:** "I pointed the vision step at a hosted model to get better slide
+> reads. Same bundle either way, right?"
+> **Domain expert:** "The reads may be better, but that run is no longer doing
+> **local-only processing**: the **keyframes** and their **extracted text** left
+> the machine to reach a remote **vision endpoint**. The model it serves is part
+> of the **options hash** because it changes what's produced; the endpoint's
+> address and key are **machine-local claims** and stay out of the bundle. What
+> changed isn't identity, it's that source content crossed the machine
+> boundary."
 
 ## Flagged ambiguities
 
@@ -327,3 +388,20 @@ Staging directory ─────────> Generation   (indivisible: the ge
   later kept or which machine keeps it. What Distill owes such a reader is a
   **self-contained render**; the collection and the topology are the caller's
   vocabulary, not the domain's.
+- **"machine-local claim"** was conflated with the privacy property when
+  "reverse the machine-local claim" was said for a change that lets frames leave
+  the machine - resolved: a **machine-local claim** is a recorded value's
+  locality (a path or address true only where produced), while **local-only
+  processing** is the property that source content never leaves the producing
+  machine. Superseding ADR-0001 changes the latter and leaves the former
+  untouched.
+- **"provider"** and **"backend"** were proposed for where the vision model runs
+  - rejected: Distill speaks one OpenAI-compatible API to a configured **vision
+  endpoint** and does not track who runs it, exactly as it does not track where
+  a **render** is later kept. Local versus cloud is a property of the endpoint's
+  address, not a second concept.
+- **"grounding"** gated confidence: an uncorroborated vision reading was treated
+  as low-confidence - resolved: the vision model is the primary reader and its
+  **interpretation** is authoritative, so **grounding** is an informational note
+  rather than a gate. **Corroborated** keeps its strict two-readers meaning, so
+  a lone reader still cannot borrow the authority of agreement.

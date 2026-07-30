@@ -1,5 +1,11 @@
 # Rapid-MLX is the only vision backend
 
+> **Superseded by [ADR-0005](0005-any-profile-compliant-vision-endpoint.md).**
+> The eval this ADR required was run and its central claim held: only a frontier
+> cloud reader meaningfully beats the local 8-bit model. Distill now speaks to any
+> profile-compliant OpenAI-compatible endpoint, with Rapid-MLX still the default and
+> a remote one gated on explicit opt-in. What follows is kept as written.
+
 Distill needs a local vision-language model to interpret keyframes, and several
 local runtimes could serve one. We talk to a Rapid-MLX server directly over its
 OpenAI-compatible HTTP API and support no other backend: a human-verified

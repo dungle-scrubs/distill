@@ -23,8 +23,9 @@ runtime shim.
 
 The transport, the OpenAI-style envelope parsing, and the endpoint policy
 (R-43, R-44: the scheme, the loopback rule and its opt-out, the refusal to
-follow a redirect, the 32 MiB bound) are ``rapid_mlx``'s - the client for the
-one backend Distill supports (ADR-0001). This module drives that client: it
+follow a redirect, the 32 MiB bound) are ``rapid_mlx``'s - the one
+OpenAI-compatible client, whose default endpoint is a local Rapid-MLX server
+(ADR-0005, superseding ADR-0001). This module drives that client: it
 owns the configuration, decides whether a pass can run, and runs the
 interpretation. The endpoint policy still lives next to the requests it governs,
 because both moved together; splitting them so a caller could reach around the
@@ -1454,7 +1455,7 @@ class FrameInterpreter:
                 )
             )
         if result:
-            return self._interpreted(frame, result, index, warnings), True, read_code
+            return self._interpreted(frame, result, warnings), True, read_code
         if read_code in FRAME_READ_FAILURE_CODES:
             unusable = GroundingAssessment(
                 UNGROUNDED,
@@ -1493,7 +1494,6 @@ class FrameInterpreter:
         self,
         frame: FrameArtifact,
         reading: Interpretation,
-        index: int,
         warnings: list[WarningRecord],
     ) -> FrameArtifact:
         """The frame carrying the model's reading and Distill's grounding of it.
@@ -1521,15 +1521,14 @@ class FrameInterpreter:
             reading, grounding=assessment.public_dict()
         )
         warnings.extend(carrier_warnings)
-        if assessment.level == UNGROUNDED:
-            warnings.append(
-                warning(
-                    "local_vision",
-                    "frame_text_ungrounded",
-                    f"frame {frame.index or index + 1} interpretation is not grounded in "
-                    f"readable text: {assessment.reason}",
-                )
-            )
+        # No ungrounded warning: since M3.1 (D-002) the vision reading is the
+        # authoritative one, so "not grounded in readable text" is not a defect
+        # to report - it is the ordinary case for a frame the image-text reader
+        # could not read. The level is still recorded on the artifact and the
+        # render carries its neutral note; a warning would re-deliver the
+        # retired confidence verdict through a channel consumers read as a
+        # credibility signal, and would reintroduce the document-sourced reason
+        # text the render just stopped printing.
         return carried
 
     def _reset_run(self, frames: list[FrameArtifact]) -> None:
