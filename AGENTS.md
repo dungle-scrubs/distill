@@ -60,8 +60,9 @@ backend.
   server elsewhere is deliberate: `--local-vision-allow-remote-endpoint` on
   `process-local-video`, `process-youtube-video`, `process-youtube-playlist` and
   `local-vision-diagnostics`, or `"allow_remote_endpoint": true` in the
-  local-vision config. The opt-out widens the host and nothing else - redirects
-  stay disabled and the 32 MiB response cap stays, wherever the endpoint is.
+  local-vision config. The opt-out widens the host and nothing else -
+  redirects stay disabled, the 32 MiB response cap stays, and a non-loopback
+  endpoint must speak `https` (plain `http` is loopback-only, opt-out or not).
 - **Start the server yourself** - Distill assumes it is already running:
   ```bash
   rapid-mlx serve mlx-community/Qwen3-VL-8B-Instruct-8bit

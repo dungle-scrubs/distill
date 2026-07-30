@@ -213,7 +213,9 @@ class LocalVisionConfig:
 
     It does not widen the scheme, re-enable redirects, or lift the response
     cap. Those hold wherever the endpoint is, because they are about what the
-    client will do with an answer rather than about whose answer it is.
+    client will do with an answer rather than about whose answer it is. And
+    the widened host narrows the scheme: a non-loopback endpoint must speak
+    `https` (D-008) - plain `http` is loopback-only, opt-out or not.
     """
     credential: SecretCredential | None = field(default=None, repr=False, metadata={"secret": True})
     """The endpoint credential, in its non-serializable carrier (D-007).
@@ -424,10 +426,13 @@ class _TransportBreaker:
             skipped = self._skipped
         if opened is None or not skipped:
             return None
-        if opened["code"] == "local_vision_auth_rejected":
-            reason = f"the endpoint rejected the credential ({opened['code']})"
-        elif opened["code"] in IMMEDIATE_FAILURE_CODES:
-            reason = f"the endpoint was rejected ({opened['code']})"
+        immediate_phrases = {
+            "local_vision_auth_rejected": "the endpoint rejected the credential",
+            ENDPOINT_REJECTED_CODE: "the endpoint was rejected",
+        }
+        phrase = immediate_phrases.get(opened["code"])
+        if phrase is not None:
+            reason = f"{phrase} ({opened['code']})"
         else:
             reason = (
                 f"{opened['consecutive_failures']} consecutive transport failures "

@@ -165,6 +165,10 @@ def _reject_endpoint(reason: str, message: str, **detail: Any) -> NoReturn:
     in either case - which is why the fix there was the message an operator
     gets, not a handler override to route the refusal back through here.
     """
+    if "url" in detail:
+        # Centrally, so no rejection site can forget: an echoed URL never
+        # carries userinfo, query, fragment, or path (D-007).
+        detail["url"] = _safe_url_for_message(str(detail["url"]))
     _boundary_log("endpoint_rejected", {"reason": reason, **detail})
     raise EndpointRejected(reason, message, detail)
 
@@ -182,13 +186,17 @@ def _resolve_addresses(host: str, port: int) -> list[str]:
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
-        _reject_endpoint(
-            "unresolvable",
+        # Unavailability, not a policy verdict: nothing was rejected, the host
+        # could not be FOUND. The transport-failure code routes this to the
+        # 3-strike breaker like a refused TCP connect - a transient DNS flap
+        # must not condemn a whole run the way a real rejection does.
+        _boundary_log("endpoint_unresolvable", {"host": host, "error": str(exc)})
+        raise LocalVisionFailure(
+            "local_vision_rapid_mlx_unavailable",
             f"Local vision endpoint host '{host}' does not resolve; "
             "continuing with OCR-only output.",
-            host=host,
-            error=str(exc),
-        )
+            {"host": host, "error": str(exc)},
+        ) from exc
     return [str(info[4][0]) for info in infos]
 
 
@@ -203,6 +211,9 @@ def _safe_url_for_message(url: str) -> str:
         scheme, sep, rest = "", "", trimmed
     if "@" in rest:
         rest = rest.rsplit("@", 1)[1]
+    # Authority only: a path can carry a key too (`/v1/sk-...`), and the
+    # diagnostic value of an echoed URL is the scheme, host, and port.
+    rest = rest.split("/", 1)[0]
     return f"{scheme}{sep}{rest}"
 
 
@@ -222,7 +233,7 @@ def _static_host_is_loopback(url: str) -> bool:
         return False
 
 
-def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str, int]:
+def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str, str, int]:
     """R-43's static half: what can be decided about `url` without asking anyone.
 
     The scheme, the presence of a host, and - when the host is written as an
@@ -316,7 +327,7 @@ def _checked_endpoint_url(url: str, *, allow_remote_endpoint: bool) -> tuple[str
             url=url,
             host=host,
         )
-    return host, port
+    return scheme, host, port
 
 
 def _check_resolved_address(
@@ -324,7 +335,7 @@ def _check_resolved_address(
     port: int,
     *,
     allow_remote_endpoint: bool,
-    scheme: str = "http",
+    scheme: str,
     resolver: AddressResolver | None = None,
 ) -> list[str]:
     """R-43's authoritative half: every address `host` resolves to is loopback.
@@ -342,10 +353,12 @@ def _check_resolved_address(
         return []
     addresses = (resolver or _resolve_addresses)(host, port)
     if not addresses:
-        _reject_endpoint(
-            "unresolvable",
-            f"Local vision endpoint host '{host}' resolved to no address.",
-            host=host,
+        _boundary_log("endpoint_unresolvable", {"host": host})
+        raise LocalVisionFailure(
+            "local_vision_rapid_mlx_unavailable",
+            f"Local vision endpoint host '{host}' resolved to no address; "
+            "continuing with OCR-only output.",
+            {"host": host},
         )
     reject_reason, reject_hint = (
         ("http_off_loopback", "a remote endpoint requires https")
@@ -540,12 +553,12 @@ def _urlopen_json(
     Distill would have to open itself. The bound here is per request, which is
     what D-029 asks for; it is not per packet.
     """
-    host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
+    scheme, host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
     _check_resolved_address(
         host,
         port,
         allow_remote_endpoint=allow_remote_endpoint,
-        scheme=urllib.parse.urlsplit(url).scheme,
+        scheme=scheme,
         resolver=resolver,
     )
     data = None if body is None else json.dumps(body).encode("utf-8")

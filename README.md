@@ -336,7 +336,9 @@ where it points is a decision rather than a default:
   `"allow_remote_endpoint": true` in the local-vision config) to reach a server
   elsewhere deliberately.
 - **`http` or `https` only.** No other scheme is accepted, with or without the
-  opt-out.
+  opt-out - and `http` only ever speaks to loopback. A non-loopback endpoint
+  requires `https` even with the opt-out, so a keyframe or credential never
+  crosses the network in cleartext.
 - **Redirects are not followed**, and a response body beyond 32 MiB is refused.
   Both hold wherever the endpoint is: they are about what the client does with
   an answer, not about whose answer it is.

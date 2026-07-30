@@ -17,6 +17,7 @@ from distill.artifacts import FrameArtifact, Interpretation
 from distill.errors import DistillError
 from distill.grounding import UNGROUNDED
 from distill.local_vision import (
+    BREAKER_WARNING_CODE,
     DEFAULT_LOCAL_VISION_BASE_URL,
     DEFAULT_LOCAL_VISION_MODEL,
     DEFAULT_TIMEOUT_SEC,
@@ -1575,10 +1576,14 @@ class TestEndpointPolicyHttps:
             method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
         ) -> Any:
             attempts.append(url)
+            # A rebind is the rejection that actually reaches a frame: the
+            # config validated, the probe passed, and the name changed its
+            # answer mid-run (D-029).
             raise EndpointRejected(
-                "http_off_loopback",
-                "Local vision endpoint host resolves off loopback; a remote "
-                "endpoint requires https.",
+                "non_loopback_address",
+                "Local vision endpoint host resolves to 203.0.113.7, which is "
+                "not loopback; set local_vision_allow_remote_endpoint to reach "
+                "one deliberately.",
             )
 
         monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
@@ -1592,3 +1597,45 @@ class TestEndpointPolicyHttps:
         # enough to condemn the rest.
         assert len(attempts) == 1
         assert all(frame.reading is None for frame in frames)
+        summary = next(w for w in warnings if w["code"] == BREAKER_WARNING_CODE)
+        assert "the endpoint was rejected" in summary["message"]
+        assert "consecutive transport failures" not in summary["message"]
+
+    def test_a_transient_dns_failure_gets_transport_strikes_not_condemnation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unresolvable name is unavailability, not a policy verdict: it
+        must carry the transport-failure code (3-strike breaker), never the
+        rejection code that condemns the run on the first flap."""
+        import distill.rapid_mlx as rapid_mlx_module
+        from distill.rapid_mlx import EndpointRejected, _resolve_addresses
+
+        def failing_getaddrinfo(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("temporary failure in name resolution")
+
+        monkeypatch.setattr(rapid_mlx_module.socket, "getaddrinfo", failing_getaddrinfo)
+
+        with pytest.raises(LocalVisionFailure) as excinfo:
+            _resolve_addresses("vision.test", 8000)
+
+        assert excinfo.value.code == "local_vision_rapid_mlx_unavailable"
+        assert not isinstance(excinfo.value, EndpointRejected)
+
+    def test_the_production_opener_verifies_tls(self) -> None:
+        """M2.3's premise is TLS for anything remote; pin that the opener's
+        HTTPS handler actually verifies certificates and hostnames, so a
+        future _build_opener change cannot silently turn verification off."""
+        import ssl
+        import urllib.request as _ur
+
+        from distill.rapid_mlx import _build_opener
+
+        opener = _build_opener()
+        handlers = getattr(opener, "handlers", [])
+        https_handlers = [h for h in handlers if isinstance(h, _ur.HTTPSHandler)]
+
+        assert https_handlers, "the opener must have an HTTPS handler"
+        for handler in https_handlers:
+            context = handler._context  # noqa: SLF001 - the pin is the point
+            assert context.verify_mode is ssl.CERT_REQUIRED
+            assert context.check_hostname is True
