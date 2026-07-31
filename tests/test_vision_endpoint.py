@@ -17,6 +17,7 @@ import http.server
 import json
 import logging
 import socket
+import ssl
 import threading
 import urllib.request
 from collections.abc import Callable, Iterator
@@ -43,7 +44,12 @@ from distill.options import DistillOptions
 
 # Direct, not through `local_vision`'s re-exports: the pinning transport is an
 # internal of the client module, and the facade should not widen to name it.
-from distill.rapid_mlx import _connect_to_a_validated_address, _DialsOnlyTheValidatedAddress
+from distill.rapid_mlx import (
+    _connect_to_a_validated_address,
+    _connection_pinned_to,
+    _DialsOnlyTheValidatedAddress,
+    _EndpointRequest,
+)
 
 LOOPBACK_URL = "http://127.0.0.1:8000/v1"
 # https, not http: since M2.3 (D-008) a non-loopback endpoint requires TLS
@@ -227,6 +233,61 @@ class _RealEndpoint:
         self._httpd.server_close()
         self._thread.join(timeout=5)
         assert not self._thread.is_alive(), "loopback endpoint did not shut down"
+
+
+class _AcceptOnlyEndpoint:
+    """A loopback listener that records connections and speaks no protocol.
+
+    Enough to answer "which address was dialled" for a scheme whose handshake
+    cannot complete here: an `https` request against it fails, and failing is
+    fine - the question is which of two listeners the socket went to.
+    """
+
+    def __init__(self) -> None:
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(8)
+        self.port: int = self._listener.getsockname()[1]
+        self.connections = 0
+        self._closing = threading.Event()
+        self._thread = threading.Thread(target=self._accept_until_closed, daemon=True)
+        try:
+            self._thread.start()
+        except BaseException:
+            self._listener.close()
+            raise
+
+    def _accept_until_closed(self) -> None:
+        while not self._closing.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except OSError:
+                return
+            self.connections += 1
+            connection.close()
+
+    def close(self) -> None:
+        self._closing.set()
+        self._listener.close()
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture
+def accept_only_endpoint() -> Iterator[Callable[[], _AcceptOnlyEndpoint]]:
+    """Bare loopback listeners on demand, torn down whatever the test does."""
+    endpoints: list[_AcceptOnlyEndpoint] = []
+
+    def build() -> _AcceptOnlyEndpoint:
+        endpoint = _AcceptOnlyEndpoint()
+        endpoints.append(endpoint)
+        return endpoint
+
+    try:
+        yield build
+    finally:
+        for endpoint in endpoints:
+            endpoint.close()
 
 
 @pytest.fixture
@@ -605,6 +666,46 @@ def test_the_validated_addresses_share_one_deadline_rather_than_each_getting_it(
     # Each attempt given only what the deadline still had, the repeat collapsed,
     # and the last address never dialled because the deadline had run out.
     assert handed == [("127.0.0.1", 2.0), ("127.0.0.2", 1.5)]
+
+
+def test_https_is_pinned_too_and_still_names_the_host_for_tls(
+    monkeypatch: pytest.MonkeyPatch,
+    accept_only_endpoint: Callable[[], _AcceptOnlyEndpoint],
+) -> None:
+    """`https_open` is its own code path, so it gets its own proof.
+
+    An implementation that pinned `http` and left `https` to urllib's ordinary
+    resolution would pass every other test here, because every other live test
+    reaches for an `http` URL. Two things have to hold for `https`, and they
+    pull in opposite directions: the socket goes to the *address* the check
+    approved, and TLS is still verified against the *hostname* the operator
+    configured - `HTTPSConnection.connect()` wraps with
+    `server_hostname=self.host`, so a pin that replaced the host would quietly
+    verify the certificate against an IP instead.
+
+    The handshake itself cannot complete against a listener with no
+    certificate, and does not need to: what is asserted is which of the two
+    listeners was dialled, and that the connection kept the name.
+    """
+    validated, swapped = accept_only_endpoint(), accept_only_endpoint()
+    _answers_with_ports(monkeypatch, validated.port, swapped.port)
+
+    # No injected resolver: the check must take the *first* answer and the
+    # connect the *second*, or an unpinned `https_open` would land on the
+    # validated port by accident and the test would prove nothing.
+    with pytest.raises((LocalVisionFailure, OSError, ssl.SSLError, RuntimeError)):
+        _urlopen_json("GET", f"https://vision.test:{validated.port}/v1/models", None, 5.0)
+
+    assert validated.connections == 1
+    assert swapped.connections == 0
+
+    # And the connection TLS would have wrapped is still named by the host, so
+    # `server_hostname` is the hostname and not the pinned address.
+    request = _EndpointRequest(
+        "https://vision.test:443/v1/models", validated_addresses=("127.0.0.1",), deadline=None
+    )
+    connection = _connection_pinned_to(http.client.HTTPSConnection, request)("vision.test")
+    assert connection.host == "vision.test"
 
 
 def test_a_deadline_already_spent_dials_nothing_at_all(

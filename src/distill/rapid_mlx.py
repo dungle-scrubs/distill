@@ -861,8 +861,16 @@ def _urlopen_json(
     # do.
     if budget is not None:
         budget.check()
+    # What is *left* of the deadline, not the whole timeout again: urllib
+    # applies this per socket operation, so handing it the full `timeout_sec`
+    # after resolution has already spent part of the budget lets the connect,
+    # the handshake and the header read each run past the bound the caller
+    # asked for. What this still does not cover, stated rather than implied:
+    # `getaddrinfo` above blocks without a deadline of its own, so a resolver
+    # that never answers is bounded by the system resolver and not by this.
+    remaining = max(0.0, deadline - _monotonic())
     try:
-        with _OPENER.open(request, timeout=timeout_sec) as response:
+        with _OPENER.open(request, timeout=remaining) as response:
             # One byte past the cap, so a body that is exactly at it still
             # arrives and a body over it is recognisable without being read.
             # The header is not consulted: a Content-Length is the sender's
