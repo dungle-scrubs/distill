@@ -15,6 +15,10 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Any
 
+# The mark's shape, not the kind set: this module needs to know that a
+# substring is Distill's own words, never what category it stood for.
+from .redact_secrets import MARK_RE
+
 CORROBORATED = "corroborated"
 """Both readers recovered the same text from the **keyframe**.
 
@@ -77,7 +81,19 @@ _TOKEN = re.compile(r"[a-z0-9]{2,}")
 
 
 def _tokens(text: str) -> set[str]:
-    return set(_TOKEN.findall(text.lower()))
+    """The words a reader recovered - and only those.
+
+    A **redaction mark** is dropped first. Both sides reach this function after
+    redaction (deliberately: a frame must not be marked uncorroborated because
+    the model honestly echoed a mark), so a mark is text Distill wrote appearing
+    on both sides at once. `[REDACTED:api-key]` lowercases into `redacted`,
+    `api` and `key` - three tokens that agree with themselves and inflate the
+    overlap of any secret-bearing frame.
+
+    Corroboration is a claim about two readers. Distill's own words are not
+    evidence for it, whatever they are counted against.
+    """
+    return set(_TOKEN.findall(MARK_RE.sub(" ", text).lower()))
 
 
 @dataclass(frozen=True)
