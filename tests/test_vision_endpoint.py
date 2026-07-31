@@ -434,13 +434,26 @@ def test_the_opt_out_permits_a_non_loopback_host(
     )
 
     assert options.local_vision_base_url == PRIVATE_URL
-    assert options.local_vision_config() == LocalVisionConfig(
+    rebuilt = options.local_vision_config()
+    assert rebuilt == LocalVisionConfig(
         backend=options.local_vision_backend,
         model=options.local_vision_model,
         base_url=PRIVATE_URL,
         timeout_sec=options.local_vision_timeout_sec,
         caption_frames=options.caption_frames,
         allow_remote_endpoint=True,
+        # <!-- D-028 --> The chain rides through `DistillOptions` now, so the
+        # rebuilt config carries the one-entry chain a single-endpoint config
+        # derives rather than dropping it. Spelled out rather than excluded
+        # from the comparison: the whole point of threading it is that this
+        # value is no longer empty here.
+        endpoints=(
+            LocalVisionConfig(
+                model=options.local_vision_model,
+                base_url=PRIVATE_URL,
+                allow_remote_endpoint=True,
+            ),
+        ),
     )
     # Same loopback endpoint on both sides, so only the policy flag differs.
     permitted = DistillOptions.from_args({"local_vision_allow_remote_endpoint": True})

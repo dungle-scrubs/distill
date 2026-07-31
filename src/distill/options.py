@@ -419,6 +419,21 @@ class DistillOptions:
     # (D-016); neither is secret, neither enters the cache allowlists.
     local_vision_credential_configured: bool = False
     local_vision_credential_env: str = ""
+    local_vision_endpoints: tuple[LocalVisionConfig, ...] | None = field(
+        default=None, repr=False, compare=False, metadata={"runtime": True}
+    )
+    """The configured **endpoint chain**, carried through rather than flattened.
+
+    <!-- D-028 --> Every other local-vision field is flattened into a scalar
+    here, and `local_vision_config()` rebuilds a config from those scalars. A
+    chain cannot be flattened that way, so before this it was simply dropped -
+    a multi-entry chain parsed, validated, and was then ignored at runtime,
+    which is a configuration silently not taking effect.
+
+    Not part of identity: which endpoints were *offered* does not describe what
+    a run produced. The **selected endpoint**'s model does, and that reaches the
+    **options hash** through `local_vision_model` as it always has.
+    """
     job_id: str = ""
     resume_partial: bool = True
 
@@ -481,6 +496,7 @@ class DistillOptions:
             local_vision_credential=local_vision.credential,
             local_vision_credential_configured=local_vision.credential_configured,
             local_vision_credential_env=local_vision.credential_env,
+            local_vision_endpoints=local_vision.endpoints,
             job_id=str(values["job_id"] or f"distill-{uuid4().hex}"),
             resume_partial=values["resume_partial"],
         )
@@ -540,6 +556,7 @@ class DistillOptions:
             credential=self.local_vision_credential,
             credential_configured=self.local_vision_credential_configured,
             credential_env=self.local_vision_credential_env,
+            endpoints=self.local_vision_endpoints,
         )
 
     def transcription_config(self) -> TranscriptionConfig:

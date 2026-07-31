@@ -1264,3 +1264,35 @@ def test_a_dense_but_bounded_schedule_is_accepted() -> None:
     # 3600 / 0.01 = 360_000 candidates, under the 500_000 ceiling.
     options = DistillOptions.from_args({"max_duration_sec": 3600.0, "max_static_window_sec": 0.01})
     assert options.max_duration_sec / options.max_static_window_sec < MAX_CANDIDATE_SCHEDULE
+
+
+def test_a_configured_chain_survives_into_the_config_the_pipeline_uses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """<!-- D-028 --> The gap Phase 1 left open, closed.
+
+    `DistillOptions.local_vision_config()` rebuilds a `LocalVisionConfig` from
+    flattened scalars, and the interpret path uses that reconstruction. Until
+    the chain rides along, a multi-entry chain parses, validates, and is then
+    ignored at runtime - which is a configuration silently not taking effect,
+    the worst of the three possible behaviours.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+
+    options = DistillOptions.from_args({})
+    config = options.local_vision_config()
+
+    assert [entry.model for entry in config.endpoints or ()] == [
+        "qwen3-vl:8b",
+        "qwen3-vl:32b",
+    ]
