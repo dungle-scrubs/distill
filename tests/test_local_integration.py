@@ -852,3 +852,69 @@ def test_an_unwritable_artifact_directory_does_not_fail_the_run(
 
     assert response["artifact_path"] is None
     assert Path(response["self_contained_markdown_path"]).is_file()
+
+
+def test_the_artifact_name_does_not_move_when_the_options_do(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The name follows the *source fingerprint*, not the bundle key.
+
+    The bundle key folds in the processing options and the pipeline version, so
+    naming the artifact after it would give the same recording a new filename
+    on every option change and every upgrade - each one leaving the previous
+    file behind in somebody's project.
+    """
+    video = tmp_path / "keynote.mp4"
+    make_short_screencast(video)
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    args = {
+        "path": str(video),
+        "output_dir": str(tmp_path / "cache"),
+        "ocr": False,
+        "caption_frames": False,
+        "max_static_window_sec": 1,
+    }
+
+    one = distill_session.process_local_video({**args, "max_keyframes": 1})
+    two = distill_session.process_local_video({**args, "max_keyframes": 2})
+
+    assert two["cached"] is False, "different options must be a different bundle"
+    assert two["source_hash"] != one["source_hash"]
+    assert two["artifact_path"] == one["artifact_path"]
+
+
+def test_a_symlinked_source_leaks_neither_its_path_nor_its_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Gate 4->5 by the other route. A symlinked source warns that it resolved,
+    and that warning is rendered into the archive verbatim - so the path form
+    put the operator's directory layout, and a credential-shaped target name,
+    into the one document the gate exists to keep both out of.
+    """
+    secret_name = f"ghp_{'a' * 36}"
+    target = tmp_path / "targets" / f"{secret_name}.mp4"
+    target.parent.mkdir()
+    make_short_screencast(target)
+    link = tmp_path / "keynote.mp4"
+    link.symlink_to(target)
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+
+    response = distill_session.process_local_video(
+        {
+            "path": str(link),
+            "output_dir": str(tmp_path / "cache"),
+            "ocr": False,
+            "caption_frames": False,
+            "max_keyframes": 1,
+            "max_static_window_sec": 1,
+        }
+    )
+
+    archived = Path(response["self_contained_markdown_path"]).read_text()
+    assert "symlink" in archived.lower(), "the operator still learns it was a link"
+    assert secret_name not in archived
+    assert str(target) not in archived
+    assert str(tmp_path) not in archived
+    assert secret_name not in Path(response["artifact_path"]).read_text()

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .artifact import artifact_entry_name, resolve_artifact_dir, write_artifact
+from .artifact import artifact_entry_name, emit_artifact, resolve_artifact_dir
 from .artifacts import FrameArtifact, RedactionState, Transcript
 from .bundle_store import (
     BATCH_ITEM_LOCK_WAIT_SEC,
@@ -568,16 +568,22 @@ class ProcessingRun:
             artifact_dir = resolve_artifact_dir(
                 explicit=self.options.artifact_dir,
                 env=dict(os.environ),
-                configured=None,
                 cwd=Path.cwd(),
             )
             entry = artifact_entry_name(
                 self.source.youtube_video_id,
-                self.source.source_hash,
+                self.source.source_fingerprint,
                 Path(self.source.resolved_path).stem,
             )
-            return str(write_artifact(snapshot.self_contained_markdown, artifact_dir, entry))
-        except OSError as exc:
+            return str(
+                emit_artifact(
+                    snapshot.self_contained_markdown,
+                    artifact_dir,
+                    entry,
+                    output_root=self.output_root,
+                )
+            )
+        except (OSError, ValueError, DistillError) as exc:
             LOGGER.warning("artifact not written: %s", exc)
             return None
 

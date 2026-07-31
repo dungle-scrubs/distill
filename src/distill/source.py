@@ -116,6 +116,7 @@ from .media_inspect import (
 )
 from .options import DistillOptions
 from .progress import ProgressReporter
+from .redact_secrets import redact_text
 from .run_command import (
     CommandResult,
     run_json,
@@ -553,11 +554,18 @@ class LocalSourceProvider:
         resolved = original.resolve()
         warnings: list[WarningRecord] = []
         if resolved != original.absolute():
+            # The target's name, redacted, and not the absolute path it was
+            # found at. A warning is rendered into the archive verbatim, so the
+            # path form put the operator's home directory layout - and, when a
+            # link pointed at a credential-shaped filename, the credential
+            # itself - into a document gate 4->5 exists to keep both out of.
+            # Which link resolved where is a fact about this machine; that the
+            # source was a link, and what it named, is the diagnosis.
             warnings.append(
                 warning(
                     "source",
                     "symlink_resolved",
-                    f"source path resolved to {resolved}",
+                    f"source path resolved to {redact_text(resolved.name).text}",
                 )
             )
         fingerprint = local_fingerprint(resolved, options.cache_mode, progress)
