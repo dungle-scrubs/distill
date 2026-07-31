@@ -630,15 +630,16 @@ class LocalSourceProvider:
                 )
             )
         fingerprint = local_fingerprint(resolved, options.cache_mode, progress)
-        # <!-- D-037 --> NOT YET wired to `_resolved_for`. Substituting the
-        # resolution's options here is correct and is what M2.2 exists to do,
-        # and it changes the key of every run that cannot reach an endpoint:
-        # such a run resolves to `chain_exhausted` and publishes under that key
-        # rather than the `selected` one. That is the intended behaviour
-        # (P3-D-012) and it invalidates 36 tests that encode the old
-        # single-endpoint assumption. The migration is the milestone's real
-        # scope, not a line change.
-        bundle_key = source_hash(fingerprint, options.opts_hash("local"))
+        # <!-- P3-D-015 --> The key comes from the resolution, not from the
+        # options the run started with. Those still name whichever endpoint the
+        # chain happened to list first, so deriving from them publishes entry
+        # 0's key for a run that called entry 1.
+        # Named `resolution`, not `resolved`: `resolved` is already the source
+        # path in this scope, and shadowing it hands a ResolvedRun to
+        # `probe_duration`.
+        resolution = _resolved_for(options, fingerprint, "local", request.output_root)
+        options = resolution.options
+        bundle_key = source_hash(fingerprint, resolution.opts_hash)
         duration = self._served_duration(request, bundle_key)
         if duration is None:
             if progress:

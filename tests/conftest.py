@@ -37,9 +37,7 @@ def neutralize_distill_environment(
     production caller.
     """
     for name in list(os.environ):
-        if name.startswith(DISTILL_ENV_PREFIX) and not name.startswith(
-            TEST_SELECTION_ENV_PREFIX
-        ):
+        if name.startswith(DISTILL_ENV_PREFIX) and not name.startswith(TEST_SELECTION_ENV_PREFIX):
             environment.delenv(name, raising=False)
     environment.delenv("CONFIG_DIR", raising=False)
     # XDG_CONFIG_HOME is not in the DISTILL_ namespace and is now one of the
@@ -88,6 +86,27 @@ def fake_tool(
         return path
 
     return install
+
+
+@pytest.fixture(autouse=True)
+def a_reachable_vision_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test gets a reachable **vision endpoint** unless it says otherwise.
+
+    Before chain resolution existed, a run's **bundle key** was derived from the
+    options it started with, whose `vision_mode` is `selected` - so every test
+    that published a bundle published under a *selected* key, whether or not a
+    server was actually running.
+
+    Resolution makes that assumption explicit: with nothing reachable a run
+    resolves to `chain_exhausted` and publishes under a different key. Stubbing
+    the probe as available keeps every test that is not *about* availability on
+    the keys it always used, rather than having each one restate an assumption
+    it never knew it was making.
+
+    A test about the chain overrides this - `monkeypatch.setattr` again, or a
+    `probe` passed straight to `resolve_chain`.
+    """
+    monkeypatch.setattr("distill.source._probe_endpoint", lambda _endpoint: True)
 
 
 @pytest.fixture(autouse=True)
