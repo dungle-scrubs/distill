@@ -274,9 +274,17 @@ class LocalVisionConfig:
     """The run's vision-stage budget, attached by the interpreter to its
     per-run resolved config. Runtime state, not configuration: excluded from
     identity, `repr`, and `public_dict`."""
-    endpoints: tuple[LocalVisionConfig, ...] = ()
-    """The configured **endpoint chain**, in preference order; empty when the
-    operator configured a single endpoint the old way.
+    endpoints: tuple[LocalVisionConfig, ...] | None = None
+    """The configured **endpoint chain**, in preference order.
+
+    `None` and `()` are different facts and the distinction is load-bearing:
+    `None` is "no chain was configured", which the top-level fields answer for
+    and `_with_chain` turns into a one-entry chain; `()` is "a chain was
+    configured and it names no endpoints", which is a configuration mistake and
+    is refused. Collapsing them would read an empty array as the defaults and
+    run an endpoint the operator did not ask for.
+
+    After the config is settled this is always a tuple of at least one entry.
 
     Entries are `LocalVisionConfig` values rather than a type of their own, so
     this module keeps no knowledge of what a chain *means* - order, selection,
@@ -308,7 +316,7 @@ class LocalVisionConfig:
                 # tuple of dataclasses reaching a serializer would take those
                 # carriers with it. Recursing keeps the secret rule in one
                 # place rather than restating it per field spelling.
-                public[f.name] = [entry.public_dict() for entry in value]
+                public[f.name] = None if value is None else [e.public_dict() for e in value]
                 continue
             public[f.name] = value
         return public
@@ -567,6 +575,19 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     address allowed, and silently degrading to OCR-only would hide that the
     operator's configuration was ignored.
     """
+    if config.endpoints == ():
+        # Refused here rather than while merging layers, for the reason
+        # `_merged_local_vision_config` states: a per-call override is allowed
+        # to rescue a file that names something unusable, and naming both
+        # `--local-vision-model` and `--local-vision-base-url` replaces the
+        # chain outright. Only the settled config is checked.
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            "'endpoints' was configured but names no endpoint. Remove it to use "
+            "the default endpoint, or pass --no-caption-frames to run without vision.",
+            {"endpoints": 0},
+        )
     try:
         _checked_endpoint_url(config.base_url, allow_remote_endpoint=config.allow_remote_endpoint)
     except EndpointRejected as exc:
@@ -706,7 +727,7 @@ def _with_chain(config: LocalVisionConfig) -> LocalVisionConfig:
     Derived after validation, not before: the entry has to mirror the endpoint
     the run will actually use, and validation is what settles that.
     """
-    if config.endpoints:
+    if config.endpoints is not None:
         return config
     return replace(
         config,
@@ -776,8 +797,8 @@ def _resolved_credential(
 
 def _endpoints_from_payload(
     payload: dict[str, Any],
-    inherited: tuple[LocalVisionConfig, ...],
-) -> tuple[LocalVisionConfig, ...]:
+    inherited: tuple[LocalVisionConfig, ...] | None,
+) -> tuple[LocalVisionConfig, ...] | None:
     """The **endpoint chain** this layer configured, or the one it inherited.
 
     <!-- P3-D-010 --> Every entry is folded onto a fresh `LocalVisionConfig`,

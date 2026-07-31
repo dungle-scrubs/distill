@@ -257,6 +257,56 @@ def test_an_entry_omitting_a_field_takes_the_default_not_its_neighbours(
     ]
 
 
+def test_backend_timeout_and_caption_frames_are_chain_wide(tmp_path: Path) -> None:
+    """M1.1: some settings belong to the run, not to an endpoint.
+
+    `backend` names the wire protocol Distill speaks and is pinned to
+    `rapid-mlx` (ADR-0005: one client, no provider abstraction), and a timeout
+    and whether frames are captioned at all describe the run. An entry is free
+    to *say* `timeout_sec`, because JSON is; what it must not do is change the
+    run's. The fixture has entry 1 naming a different timeout for exactly that
+    reason.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "timeout_sec": 12,
+                "caption_frames": False,
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {
+                        "model": "qwen3-vl:32b",
+                        "base_url": "http://127.0.0.1:9000/v1",
+                        "timeout_sec": 999,
+                    },
+                ],
+            }
+        )
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert config.backend == "rapid-mlx"
+    assert config.timeout_sec == 12.0
+    assert config.caption_frames is False
+
+
+def test_an_empty_endpoints_array_is_refused(tmp_path: Path) -> None:
+    """M1.1: an empty chain is a configuration mistake, not a disabled run.
+
+    `--no-caption-frames` is how an operator says "no vision". An empty array
+    says "here are the endpoints I want you to try" and then names none, which
+    cannot be honored and must not be silently read as either the defaults or
+    as disabled - both would run something the operator did not ask for.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(json.dumps({"endpoints": []}))
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+
+
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
     (tmp_path / "distill.local-vision.json").write_text(
         json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})
