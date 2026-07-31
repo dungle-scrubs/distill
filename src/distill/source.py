@@ -71,7 +71,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from .artifacts import Provenance, RedactionState
+from .artifacts import Provenance, RedactionState, document_carries_a_reading
 from .bundle_store import (
     SINGLE_SOURCE_LOCK_WAIT_SEC,
     BundleStore,
@@ -434,12 +434,7 @@ def release_acquisition_lease(source: Any, *, during: BaseException | None = Non
 
 
 def _processed_at_utc() -> str:
-    return (
-        datetime.now(UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -477,20 +472,6 @@ class YouTubeDownloaderProtocol(Protocol):
     ) -> AcquiredSource: ...
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def servable_duration(output_root: Path, bundle_key: str) -> float | None:
     """The duration of the **bundle** `bundle_key` names, if it is servable.
 
@@ -511,6 +492,39 @@ def servable_duration(output_root: Path, bundle_key: str) -> float | None:
     if snapshot is None:
         return None
     return manifest_duration(snapshot.manifest)
+
+
+def servable_interpretation_count(output_root: Path, bundle_key: str) -> int | None:
+    """How many frames of the servable **generation** carry a reading.
+
+    <!-- D-036 --> The question chain resolution asks before treating a
+    candidate key as a hit: a `selected` key promises a reader's work is in
+    there, so a generation holding none is not the bundle that key describes
+    (P3-D-019).
+
+    `None` and zero are different answers. `None` is "no generation" - nothing
+    to serve. Zero is "a generation, holding no readings", which is a miss under
+    a `selected` key and exactly what a disabled or exhausted bundle is expected
+    to hold.
+
+    Answered from the **manifest** alone, which already embeds the frame
+    documents. Opening every frame of every candidate would make Phase 1's scan
+    cost what it exists to avoid - the same reason `servable_duration` reads a
+    recorded duration rather than re-probing the media.
+    """
+    snapshot = BundleStore.open(output_root).load_active(bundle_key)
+    if snapshot is None:
+        return None
+    frames = snapshot.manifest.get("frames")
+    if not isinstance(frames, list):
+        # A manifest another process wrote is input rather than fact, and a
+        # missing or malformed `frames` is not evidence of zero readings.
+        return None
+    return sum(
+        1
+        for frame in frames
+        if isinstance(frame, dict) and document_carries_a_reading(frame.get("interpretation"))
+    )
 
 
 class LocalSourceProvider:
@@ -595,9 +609,7 @@ class LocalSourceProvider:
             duration_sec=duration,
             processed_at=request.processed_at,
             redaction=(
-                RedactionState.NOT_APPLIED
-                if options.redact_secrets
-                else RedactionState.DISABLED
+                RedactionState.NOT_APPLIED if options.redact_secrets else RedactionState.DISABLED
             ),
         )
         warnings.extend(dict(item) for item in provenance.warnings)
@@ -781,8 +793,7 @@ def sensitive_path_match(
     parts = [part if case_sensitive else part.lower() for part in Path(root).parts]
     for sensitive in sorted(SENSITIVE_COMPONENTS):
         wanted = [
-            component if case_sensitive else component.lower()
-            for component in sensitive.split("/")
+            component if case_sensitive else component.lower() for component in sensitive.split("/")
         ]
         for start in range(len(parts) - len(wanted) + 1):
             if parts[start : start + len(wanted)] == wanted:
@@ -882,9 +893,7 @@ def select_downloaded_media(staging_dir: Path) -> Path:
 
 def _reject_media(path: Path, reason: str, message: str, **detail: Any) -> DistillError:
     """Record a rejection verdict and build the error that carries it."""
-    _acquisition_log(
-        "media_validated", path=str(path), verdict="rejected", reason=reason, **detail
-    )
+    _acquisition_log("media_validated", path=str(path), verdict="rejected", reason=reason, **detail)
     return DistillError("E_BAD_MEDIA", "youtube", message, {"path": str(path), **detail})
 
 
@@ -956,9 +965,7 @@ def validate_media_file(path: Path) -> list[WarningRecord]:
     except DistillError:
         # ffprobe could not read it at all, which is its own answer. The error it
         # raised already names the tool and the failure, so it travels as-is.
-        _acquisition_log(
-            "media_validated", path=str(path), verdict="rejected", reason="unreadable"
-        )
+        _acquisition_log("media_validated", path=str(path), verdict="rejected", reason="unreadable")
         raise
     codec_types = _probed_codec_types(probe)
     if "video" not in codec_types:
@@ -1059,9 +1066,7 @@ class YoutubeDownloader:
                 result = self._download(url, staging_dir, progress)
                 produced = select_downloaded_media(staging_dir)
                 validation_warnings = validate_media_file(produced)
-                promoted = promote_media(
-                    produced, self._media_dir(lock_key), root=self.output_root
-                )
+                promoted = promote_media(produced, self._media_dir(lock_key), root=self.output_root)
             finally:
                 # The staging directory is scratch: whatever survived the run -
                 # a rejected file, an unmerged fragment, a `.part` - is
@@ -1116,9 +1121,7 @@ class YoutubeDownloader:
             confined_path(stale, self.output_root)
             if stale.is_dir():
                 shutil.rmtree(stale, ignore_errors=True)
-        staging_dir = confined_path(
-            parent / f"{os.getpid()}-{uuid.uuid4().hex}", self.output_root
-        )
+        staging_dir = confined_path(parent / f"{os.getpid()}-{uuid.uuid4().hex}", self.output_root)
         staging_dir.mkdir()
         return staging_dir
 
@@ -1136,9 +1139,7 @@ class YoutubeDownloader:
             progress.update("youtube_download", status="running", detail={"step": "lock"})
         lease, lock_warnings = self._acquire(lock_key, lock)
         if lease is None:
-            _acquisition_log(
-                "lease_denied", lock_key=lock_key, lock_path=str(lock), reason="held"
-            )
+            _acquisition_log("lease_denied", lock_key=lock_key, lock_path=str(lock), reason="held")
             raise DistillError("E_LOCKED", "youtube", "YouTube source is locked by another process")
         lease.warnings.extend(lock_warnings)
         _acquisition_log("lease_acquired", lock_key=lock_key, lock_path=str(lock))
@@ -1296,15 +1297,12 @@ def _manifest_provenance(
         description=optional_string("description"),
         upload_date=optional_string("upload_date"),
         canonical_url=(
-            optional_string("canonical_url")
-            or f"https://www.youtube.com/watch?v={video_id}"
+            optional_string("canonical_url") or f"https://www.youtube.com/watch?v={video_id}"
         ),
         duration_sec=duration_sec,
         processed_at=optional_string("processed_at") or processed_at,
         redaction=(
-            RedactionState.NOT_APPLIED
-            if options.redact_secrets
-            else RedactionState.DISABLED
+            RedactionState.NOT_APPLIED if options.redact_secrets else RedactionState.DISABLED
         ),
     )
 
@@ -1617,9 +1615,7 @@ class SourceResolver:
             progress=progress,
         )
 
-    def _served_from_cache(
-        self, request: SourceRequest, video_id: str
-    ) -> SourceResolution | None:
+    def _served_from_cache(self, request: SourceRequest, video_id: str) -> SourceResolution | None:
         """This run's resolution if `video_id` names a servable bundle, else `None`.
 
         `force_reprocess` never consults the cache: that run is going to produce
