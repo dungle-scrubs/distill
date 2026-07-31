@@ -554,6 +554,139 @@ def test_an_entry_inherits_neither_credential_nor_remote_authorization(
     assert second.allow_remote_endpoint is False
 
 
+def test_a_later_layers_chain_replaces_an_earlier_one(tmp_path: Path) -> None:
+    """M1.1: layers replace the chain, they never concatenate it.
+
+    Concatenating would make a chain something no single file states, and an
+    operator adding a two-entry chain in one file would silently get four.
+    Order is preference, so a merged chain would also mean the layers were
+    arguing about preference order with no way to express who won.
+
+    The earlier layer names two entries and the later names one, so a
+    concatenation would be visible as a length of three.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "first-a", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "first-b", "base_url": "http://127.0.0.1:8001/v1"},
+                ]
+            }
+        )
+    )
+    (tmp_path / "distill.json").write_text(
+        json.dumps(
+            {
+                "local_vision": {
+                    "endpoints": [{"model": "second", "base_url": "http://127.0.0.1:9000/v1"}]
+                }
+            }
+        )
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert [entry.model for entry in config.endpoints or ()] == ["second"]
+
+
+def test_an_entry_resolves_its_own_credential_with_the_env_var_winning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-016 per entry: inline `api_key` still works, `api_key_env` still wins.
+
+    Entry 0 names both, so the precedence is observable rather than assumed;
+    entry 1 names neither, which is intentional no-auth and must leave the entry
+    in the chain rather than dropping it. An endpoint with no credential is an
+    ordinary thing to configure - a loopback server that asks for nothing.
+    """
+    monkeypatch.setenv("CHAIN_ENTRY_KEY", "sk-from-the-env-var")
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "api_key": "sk-inline-and-losing",
+                        "api_key_env": "CHAIN_ENTRY_KEY",
+                    },
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+    first, second = load_local_vision_config(tmp_path).endpoints or ()
+
+    assert _request_headers(first.credential)["Authorization"] == "Bearer sk-from-the-env-var"
+    assert second.credential is None
+    # Kept and probed, not skipped: absence is a configuration, not an omission.
+    assert second.credential_configured is False
+
+
+def test_an_inline_key_alone_is_still_honored_per_entry(tmp_path: Path) -> None:
+    """The inline form has no env var to lose to, so it is what is carried."""
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "api_key": "sk-inline-only",
+                    }
+                ]
+            }
+        )
+    )
+
+    (only,) = load_local_vision_config(tmp_path).endpoints or ()
+
+    assert _request_headers(only.credential)["Authorization"] == "Bearer sk-inline-only"
+
+
+def test_a_configured_credential_resolving_empty_is_fatal_per_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-016's typo guard is per endpoint, so a chain gets it per entry.
+
+    An operator who names `api_key_env` has said this endpoint needs a
+    credential. If it resolves to nothing and the endpoint is one that leaves
+    the machine, sending keyframes anyway would be doing the thing they tried to
+    authenticate, unauthenticated. Entry 0 is loopback and fine; the guard has
+    to reach entry 1 regardless.
+
+    Configuring no credential at all remains intentional no-auth, which the
+    entry-with-no-credential test above pins.
+    """
+    monkeypatch.delenv("MISSING_CHAIN_KEY", raising=False)
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {
+                        "model": "qwen3-vl:32b",
+                        "base_url": "https://10.0.0.5/v1",
+                        "api_key_env": "MISSING_CHAIN_KEY",
+                        "allow_remote_endpoint": True,
+                    },
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.details["entry"] == 1
+    assert refusal.value.details["reason"] == "credential_configured_but_empty"
+
+
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
     (tmp_path / "distill.local-vision.json").write_text(
         json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})

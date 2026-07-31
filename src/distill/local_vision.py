@@ -707,31 +707,56 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
             # (D-007). Re-adding the raw base_url here defeated exactly that.
             dict(exc.detail),
         ) from exc
-    if (
-        config.caption_frames
-        and config.credential_configured
-        and config.credential is None
-        and config_is_non_local(config)
-    ):
-        # D-016's typo guard: a credential the operator *configured* resolved
-        # to nothing, on a config that says remote is intended and whose host
-        # is not literally loopback. Without allow_remote_endpoint the
-        # per-request resolved-address check already proves the endpoint
-        # local (D-029), so a hostname like `localhost` is not punished.
-        # Configuring no credential at all remains intentional no-auth.
-        named = (
-            f" (env var '{config.credential_env}' is unset or empty)"
-            if config.credential_env
-            else ""
-        )
-        raise DistillError(
-            "E_BAD_OPTIONS",
-            "local_vision",
-            f"local_vision credential is configured but empty{named}; refusing "
-            "to send keyframes to a non-loopback endpoint without it.",
-            {"reason": "credential_configured_but_empty", "api_key_env": config.credential_env},
-        )
+    _check_credential_is_not_empty(config, captioning=config.caption_frames)
+    for index, entry in enumerate(config.endpoints or ()):
+        # The guard is a property of one endpoint, so a chain gets it per
+        # entry. `caption_frames` is the run's, not the entry's, which is why
+        # it is passed in rather than read off the entry - an entry's copy is
+        # whatever the default was.
+        _check_credential_is_not_empty(entry, captioning=config.caption_frames, index=index)
     return config
+
+
+def _check_credential_is_not_empty(
+    endpoint: LocalVisionConfig,
+    *,
+    captioning: bool,
+    index: int | None = None,
+) -> None:
+    """D-016's typo guard: a credential the operator *configured* resolved to
+    nothing, on an endpoint that says remote is intended and whose host is not
+    literally loopback.
+
+    Without `allow_remote_endpoint` the per-request resolved-address check
+    already proves the endpoint local (D-029), so a hostname like `localhost` is
+    not punished. Configuring no credential at all remains intentional no-auth.
+    """
+    if not (
+        captioning
+        and endpoint.credential_configured
+        and endpoint.credential is None
+        and config_is_non_local(endpoint)
+    ):
+        return
+    named = (
+        f" (env var '{endpoint.credential_env}' is unset or empty)"
+        if endpoint.credential_env
+        else ""
+    )
+    where = "" if index is None else f"endpoint {index}: "
+    details: dict[str, Any] = {
+        "reason": "credential_configured_but_empty",
+        "api_key_env": endpoint.credential_env,
+    }
+    if index is not None:
+        details["entry"] = index
+    raise DistillError(
+        "E_BAD_OPTIONS",
+        "local_vision",
+        f"{where}local_vision credential is configured but empty{named}; refusing "
+        "to send keyframes to a non-loopback endpoint without it.",
+        details,
+    )
 
 
 config_dir = general_config_dir
