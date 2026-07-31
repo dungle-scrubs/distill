@@ -86,9 +86,7 @@ def test_provenance_is_a_carrier_that_classifies_fields_by_origin() -> None:
 def test_provenance_requires_a_caller_supplied_rfc3339_utc_processing_time() -> None:
     fixed = "2026-07-29T14:20:00Z"
 
-    document = serialize(
-        Provenance(title="demo.mp4", duration_sec=12.5, processed_at=fixed)
-    )
+    document = serialize(Provenance(title="demo.mp4", duration_sec=12.5, processed_at=fixed))
 
     assert document["processed_at"] == fixed
     with pytest.raises(ValueError, match="RFC 3339 UTC"):
@@ -110,7 +108,7 @@ def test_provenance_redacts_a_credential_shaped_title_at_construction() -> None:
 
     assert provenance.title is not None
     assert secret not in provenance.title
-    assert provenance.title == "Deploy with [REDACTED]"
+    assert provenance.title == "Deploy with [REDACTED:api-key]"
 
 
 def test_serializing_unredacted_provenance_is_refused() -> None:
@@ -391,9 +389,7 @@ def test_youtube_metadata_exception_warns_and_keeps_processing(
             frames=[],
             warnings=source.warnings,
         )
-        assert [item["code"] for item in manifest["warnings"]] == [
-            "metadata_unavailable"
-        ]
+        assert [item["code"] for item in manifest["warnings"]] == ["metadata_unavailable"]
     finally:
         lease.release()
 
@@ -407,9 +403,7 @@ def test_nonzero_youtube_metadata_lookup_yields_partial_metadata(
 
     assert metadata.video_id == "abcdefghijk"
     assert metadata.title is None
-    assert [item["code"] for item in metadata.warnings] == [
-        "metadata_unavailable"
-    ]
+    assert [item["code"] for item in metadata.warnings] == ["metadata_unavailable"]
 
 
 def test_non_object_youtube_metadata_json_yields_partial_metadata(
@@ -428,9 +422,7 @@ print(json.dumps("scalar-json"))
 
     assert metadata.video_id == "abcdefghijk"
     assert metadata.title is None
-    assert [item["code"] for item in metadata.warnings] == [
-        "metadata_unavailable"
-    ]
+    assert [item["code"] for item in metadata.warnings] == ["metadata_unavailable"]
 
 
 def test_youtube_resolution_reuses_one_request_for_cache_and_acquisition(
@@ -576,7 +568,7 @@ def test_manifest_serializes_redacted_provenance_without_the_raw_secret(
         warnings=[],
     )
 
-    assert manifest["provenance"]["title"] == "Deploy with [REDACTED]"
+    assert manifest["provenance"]["title"] == "Deploy with [REDACTED:api-key]"
     assert secret not in json.dumps(manifest)
     run = BundleStore.open(tmp_path).begin("bundle-key")
     assert isinstance(run, BundleRun)

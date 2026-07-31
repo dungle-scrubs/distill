@@ -330,3 +330,27 @@ def test_the_render_note_is_neutral_and_collapses_the_uncorroborated_levels() ->
     # One note for all three, not three differently-worded ones.
     assert len(notes) == 1
     assert "did not" in notes.pop()
+
+
+def test_a_redaction_mark_is_not_evidence_that_two_readers_agreed() -> None:
+    """M1.4: Distill's own words must not count as reader agreement.
+
+    `assess_grounding` receives both sides after redaction, deliberately - a
+    secret-bearing frame must not be marked uncorroborated because the model
+    honestly echoed the mark. The cost is that the mark itself becomes a token
+    on both sides: `[REDACTED:api-key]` lowercases into `redacted`, `api` and
+    `key`, three tokens that agree with themselves.
+
+    Here the two readers recovered *nothing* in common. Everything they share
+    is text Distill wrote. That is not corroboration, and before the marks are
+    stripped the overlap says it is.
+    """
+    assessment = assess_grounding(
+        ocr_text="[REDACTED:api-key] [REDACTED:assigned-secret] alpha",
+        verbatim_text="[REDACTED:api-key] [REDACTED:assigned-secret] omega",
+        text_confidence="high",
+        has_interpretation=True,
+        carries_a_reading=True,
+    )
+
+    assert assessment.level != CORROBORATED

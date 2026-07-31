@@ -70,8 +70,8 @@ def test_links_are_counted_as_written_and_redacted_afterwards() -> None:
 
     assert [link.label for link in links] == ["Repo", "Docs"]
     assert [link.url for link in links] == [
-        "https://github.com/example/repo?api_key=[REDACTED]",
-        "https://github.com/example/repo?api_key=[REDACTED]",
+        "https://github.com/example/repo?api_key=[REDACTED:assigned-secret]",
+        "https://github.com/example/repo?api_key=[REDACTED:assigned-secret]",
     ]
 
 

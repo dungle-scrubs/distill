@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .emit import EMITTER, UNTRUSTED_TEXT_LABEL
-from .redact_secrets import redact_for_prompt
+from .redact_secrets import cut_without_splitting_a_mark, redact_for_prompt
 
 TECHNICAL_PROMPT_PROFILE = "technical"
 FRAME_KINDS = (
@@ -207,7 +207,7 @@ def build_technical_frame_prompt(
         # HERE, inside the builder, so no caller - pipeline, eval, or future
         # transcript window - can forget it.
         ocr_text = redact_for_prompt(ocr_text)
-        carried = ocr_text[:MAX_EXTRACTED_TEXT_CHARACTERS]
+        carried = cut_without_splitting_a_mark(ocr_text[:MAX_EXTRACTED_TEXT_CHARACTERS])
         parts.append(UNTRUSTED_TEXT_INSTRUCTION)
         parts.extend(EMITTER.delimit(carried))
         if carried != ocr_text:
@@ -220,7 +220,9 @@ def build_technical_frame_prompt(
         # Stripped first: a whitespace-only window is D-003's "no transcript",
         # and fencing it would ask for salience judged against nothing.
         transcript_window = redact_for_prompt(transcript_window)
-        carried_window = transcript_window[:MAX_EXTRACTED_TEXT_CHARACTERS]
+        carried_window = cut_without_splitting_a_mark(
+            transcript_window[:MAX_EXTRACTED_TEXT_CHARACTERS]
+        )
         parts.append(UNTRUSTED_TRANSCRIPT_INSTRUCTION)
         parts.extend(EMITTER.delimit(carried_window))
         if carried_window != transcript_window:

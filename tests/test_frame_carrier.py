@@ -279,7 +279,7 @@ def test_a_stage_result_is_written_by_serializing_the_carriers_in_it(
 
     assert recovered is not None
     document = recovered["frames"][0]
-    assert document["extracted_text"] == "OPENAI_API_KEY=[REDACTED]"
+    assert document["extracted_text"] == "OPENAI_API_KEY=[REDACTED:assigned-secret]"
     assert document["redaction"] == RedactionState.APPLIED.value
     assert secret not in (began.paths.generation / "_ocr.json").read_text()
 
@@ -334,9 +334,7 @@ def test_a_resumed_run_rebuilds_its_carriers_from_the_stage_result(tmp_path: Pat
     second.release()
     assert payload is not None
 
-    resumed = FrameArtifact.from_document(
-        payload["frames"][0], redaction=RedactionState.DISABLED
-    )
+    resumed = FrameArtifact.from_document(payload["frames"][0], redaction=RedactionState.DISABLED)
     assert resumed.redaction is RedactionState.DISABLED
     assert resumed.extracted_text == secret
     assert resumed.relative_path == "frames/frame_0001.png"
@@ -364,7 +362,7 @@ def test_a_stage_result_cannot_talk_a_resume_out_of_the_policy_it_is_under() -> 
     resumed = FrameArtifact.from_document(forged, redaction=RedactionState.NOT_APPLIED)
 
     assert resumed.redaction is RedactionState.APPLIED
-    assert resumed.extracted_text == "OPENAI_API_KEY=[REDACTED]"
+    assert resumed.extracted_text == "OPENAI_API_KEY=[REDACTED:assigned-secret]"
 
 
 def test_the_render_refuses_a_carrier_whose_policy_never_ran() -> None:
@@ -451,4 +449,4 @@ def test_the_policy_does_not_rewrite_the_paths_distill_chose(tmp_path: Path) -> 
     assert key in on_disk
     # The extracted text beside it is still redacted: the exemption is the path
     # field, not the document.
-    assert recovered["frames"][0]["extracted_text"] == "OPENAI_API_KEY=[REDACTED]"
+    assert recovered["frames"][0]["extracted_text"] == "OPENAI_API_KEY=[REDACTED:assigned-secret]"

@@ -175,7 +175,7 @@ def test_a_credential_named_local_source_leaves_no_name_or_absolute_path_in_the_
     assert secret_name not in archived
     assert str(video) not in archived
     assert str(tmp_path) not in archived
-    assert "[REDACTED].mp4" in archived
+    assert "[REDACTED:github-token].mp4" in archived
     # The artifact is a copy of the archive written outside the cache, into a
     # directory the operator may commit. Keeping the credential out of the
     # reading and then writing it back as the filename would defeat the gate.
@@ -588,9 +588,7 @@ def test_a_truncated_ocr_invocation_records_its_warning_in_the_bundle(
         }
     )
 
-    truncations = [
-        item for item in response["warnings"] if item["code"] == TRUNCATION_WARNING_CODE
-    ]
+    truncations = [item for item in response["warnings"] if item["code"] == TRUNCATION_WARNING_CODE]
     assert truncations, response["warnings"]
     assert truncations[0]["stage"] == "ocr"
     assert "stderr" in truncations[0]["message"]

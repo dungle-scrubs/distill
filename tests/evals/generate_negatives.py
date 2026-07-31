@@ -307,6 +307,56 @@ def _terminal_shape(_text: str) -> Image.Image:
     return image.filter(ImageFilter.GaussianBlur(radius=9))
 
 
+_MONO_FONT_PATHS = (
+    Path("/System/Library/Fonts/Menlo.ttc"),
+    Path("/System/Library/Fonts/Monaco.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Courier New.ttf"),
+)
+
+
+def _mono_font(size: int) -> ImageFont.FreeTypeFont:
+    """A monospace face, for the one fixture whose subject is character shapes.
+
+    Identifiers are read character by character, and a proportional face makes
+    `0`/`O` and `1`/`l` decisions harder in a way that would be measuring the
+    font rather than the reader.
+    """
+    for path in _MONO_FONT_PATHS:
+        if path.exists():
+            return ImageFont.truetype(str(path), size)
+    # Refused rather than fallen back to the default face, matching `_font`
+    # above: the committed PNGs are canonical, and regenerating them with a
+    # different face would rewrite every fixture's pixels while the ground
+    # truth went on claiming the same frame.
+    raise RuntimeError(
+        "fixture regeneration requires the macOS monospace fonts the fixtures were built with"
+    )
+
+
+def _terminal_identifiers(text: str) -> Image.Image:
+    """A legible terminal showing identifiers - the shapes redaction must keep.
+
+    Distinct from `_terminal_shape`, which is deliberately unreadable: this one
+    exists to be *read*. It is the only frame in the corpus carrying a commit
+    SHA, a content digest, and a bare hex run, which is what makes it the fixture
+    the redaction rules can be written against instead of against invented
+    strings.
+    """
+    image = Image.new("RGB", FRAME_SIZE, "#0d1117")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((60, 60, 1220, 660), fill="#161b22")
+    draw.rectangle((60, 60, 1220, 106), fill="#21262d")
+    for dot_x, fill in ((88, "#e06c5a"), (116, "#d9b45c"), (144, "#63b862")):
+        draw.ellipse((dot_x, 74, dot_x + 18, 92), fill=fill)
+    font = _mono_font(17)
+    for row, line in enumerate(text.splitlines()):
+        # Prompts in green, output in light grey: the ordinary terminal
+        # convention, and it keeps the identifier lines the high-contrast ones.
+        colour = "#7ee787" if line.startswith("$") else "#c9d1d9"
+        draw.text((88, 136 + row * 32), line, font=font, fill=colour)
+    return image
+
+
 @dataclass(frozen=True)
 class SyntheticCase:
     text: str
@@ -357,6 +407,22 @@ Vision should recover this sentence""",
     "27_synth_textless_f05": SyntheticCase(text="", render=_soft_gradient),
     "28_synth_textless_f06": SyntheticCase(text="", render=_blurred_slide_shape),
     "29_synth_textless_f07": SyntheticCase(text="", render=_terminal_shape),
+    # The identifiers frame. Every hex run here is a shape redaction currently
+    # deletes, and the last one is the control that must keep being deleted:
+    # a bare 40-character lowercase run with nothing beside it to say what it
+    # is, which is indistinguishable from a credential of the same shape.
+    "30_synth_identifiers_f01": SyntheticCase(
+        text="""$ git log -1
+commit f9a1a14aabbccddeeff00112233445566778899a
+$ git log --oneline -1
+c4d8e2b7a0916f35bd82ce41708a9d63f5e0b1a2 Pin the connection
+$ docker pull ghcr.io/org/app@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934
+$ grep integrity app.lock
+integrity a3f5c9d2e8b14760af23dc9915ee88b4c70d6a21
+$ cat build.id
+a1b2c3d4e5f60718293a4b5c6d7e8f9012345678""",
+        render=_terminal_identifiers,
+    ),
 }
 
 SYNTHETIC_CASE_TEXT = {

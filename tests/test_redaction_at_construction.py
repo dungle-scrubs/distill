@@ -52,7 +52,7 @@ from distill.source import (
 )
 
 # One shape of secret used throughout, so that "the secret is gone" means the
-# same thing at every sink. `redact_secrets.SECRET_PATTERNS` matches it on the
+# same thing at every sink. `redact_secrets.SECRET_RULES` matches it on the
 # OpenAI-style rule.
 SECRET = "sk-live-0123456789abcdefghij"
 
@@ -434,7 +434,7 @@ def test_a_secret_straddling_the_label_cap_is_redacted_before_it_is_cut() -> Non
 
     label = links[0].label
     assert len(label) <= 160
-    assert label.endswith("[REDACTED]")
+    assert label.endswith("[REDACTED:api-key]")
     assert "sk-" not in label
 
 
@@ -588,9 +588,7 @@ def test_a_cache_hit_reads_its_related_links_back_as_carriers(tmp_path: Path) ->
     assert isinstance(run, BundleRun)
     run.write_render("# Video\n")
     run.write_self_contained_render("# Video\n")
-    run.commit(
-        manifest_document(fresh, options, transcript_present=False, frames=[], warnings=[])
-    )
+    run.commit(manifest_document(fresh, options, transcript_present=False, frames=[], warnings=[]))
 
     served = YouTubeSourceProvider().cached(
         SourceRequest(value=f"https://youtu.be/{video_id}", options=options, output_root=root),
@@ -659,9 +657,9 @@ def test_a_warning_a_link_raised_at_construction_reaches_the_runs_warnings(
         "possible_confusable_secret",
     ]
     assert source.provenance is not None
-    assert "[REDACTED]" in (source.provenance.description or "")
+    assert "[REDACTED:assigned-secret]" in (source.provenance.description or "")
     assert source.related_links is not None
-    assert "[REDACTED]" in source.related_links[0].url
+    assert "[REDACTED:assigned-secret]" in source.related_links[0].url
 
 
 def resolve_youtube_source(
@@ -721,9 +719,7 @@ def test_the_link_policy_is_the_users_option_and_not_a_default(
     for, so it is asserted from the surface the user's option enters.
     """
     redacted = resolve_youtube_source(monkeypatch, tmp_path, DistillOptions())
-    opted_out = resolve_youtube_source(
-        monkeypatch, tmp_path, DistillOptions(redact_secrets=False)
-    )
+    opted_out = resolve_youtube_source(monkeypatch, tmp_path, DistillOptions(redact_secrets=False))
 
     # Asserted on the documents the sinks produce rather than on the carriers,
     # because that is the form the user's option has to survive all the way to.
@@ -893,7 +889,7 @@ def test_a_newly_covered_credential_format_is_redacted_in_a_published_generation
     # Each sink is asserted present in redacted form as well as absent in raw
     # form, so a sink that quietly stopped being written cannot pass by having
     # nothing in it to find.
-    assert "Bearer [REDACTED]" in render
+    assert "Bearer [REDACTED:oauth-token]" in render
     assert "the runner token is" in render
     assert "gitlab.com/example/repo" in render
     assert files_holding(output_root, gitlab_token) == []

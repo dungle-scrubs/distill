@@ -45,7 +45,7 @@ def spoken(*segments: dict[str, object]) -> Transcript:
     return Transcript(language="en", segments=tuple(segments))
 
 
-# Secret-shaped by `redact_secrets.SECRET_PATTERNS`, placed in both halves of a
+# Secret-shaped by `redact_secrets.SECRET_RULES`, placed in both halves of a
 # **related link** so the manifest is asked about the label and the destination.
 LINK_SECRET = "sk-live-0123456789abcdefghij"
 

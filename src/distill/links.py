@@ -29,6 +29,7 @@ from typing import Any, ClassVar
 from urllib.parse import urlparse, urlunparse
 
 from .artifacts import Carrier, RedactionState
+from .redact_secrets import cut_without_splitting_a_mark
 
 URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+")
 TRAILING_PUNCTUATION = ".,;:!?"
@@ -143,7 +144,9 @@ class RelatedLink(Carrier):
         # matches no pattern, and that prefix is then durable in full. This is
         # the same ordering `artifacts._redact` states for the 256 KiB cap, for
         # the same reason.
-        object.__setattr__(self, "label", self.label[:LABEL_LIMIT_CHARS])
+        object.__setattr__(
+            self, "label", cut_without_splitting_a_mark(self.label[:LABEL_LIMIT_CHARS])
+        )
 
     @classmethod
     def from_document(

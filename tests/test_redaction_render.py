@@ -101,7 +101,7 @@ def test_an_interpretation_survives_intact_under_an_explicitly_disabled_policy()
 
 def test_redacts_env_value_but_not_tutorial_placeholder() -> None:
     result = redact_text("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\nDEMO_API_KEY=your_api_key")
-    assert "OPENAI_API_KEY=[REDACTED]" in result.text
+    assert "OPENAI_API_KEY=[REDACTED:assigned-secret]" in result.text
     assert "DEMO_API_KEY=your_api_key" in result.text
 
 
@@ -111,7 +111,7 @@ def test_env_tutorial_variable_names_are_preserved() -> None:
         "GITHUB_TOKEN=<your-api-key>\n"
         "DATABASE_PASSWORD=changeme"
     )
-    assert "OPENAI_API_KEY=[REDACTED]" in result.text
+    assert "OPENAI_API_KEY=[REDACTED:assigned-secret]" in result.text
     assert "GITHUB_TOKEN=<your-api-key>" in result.text
     assert "DATABASE_PASSWORD=changeme" in result.text
     assert "OPENAI_API_KEY" in result.text
@@ -124,7 +124,7 @@ def test_confusable_secret_produces_warning() -> None:
 
 def test_confusable_secret_is_redacted_not_just_warned() -> None:
     result = redact_text("ｓｋ-abcdefghijklmnopqrstuvwxyzabcdef")
-    assert "[REDACTED]" in result.text
+    assert "[REDACTED:api-key]" in result.text
     assert "ｓｋ" not in result.text
     assert result.redaction_count >= 1
 
@@ -143,7 +143,7 @@ def test_additional_secret_formats_are_redacted() -> None:
 def test_lowercase_colon_config_assignment_is_redacted() -> None:
     result = redact_text("api_key: sk-abcdefghijklmnopqrstuvwxyz")
     assert "sk-abcdefghijklmnopqrstuvwxyz" not in result.text
-    assert "[REDACTED]" in result.text
+    assert "[REDACTED:assigned-secret]" in result.text
 
 
 def test_bare_and_camelcase_secret_assignments_are_redacted() -> None:
@@ -154,7 +154,7 @@ def test_bare_and_camelcase_secret_assignments_are_redacted() -> None:
         "access-token: abcdefghijklmnop",
     ):
         result = redact_text(text)
-        assert "[REDACTED]" in result.text, text
+        assert "[REDACTED:assigned-secret]" in result.text, text
         assert result.redaction_count >= 1, text
 
 

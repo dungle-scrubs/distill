@@ -50,7 +50,7 @@ def test_an_authorization_bearer_header_value_is_redacted() -> None:
     assert result.redaction_count >= 1
     # The header itself is not a secret. It stays, so a reader can still see
     # that the frame showed an authenticated request.
-    assert "Authorization: Bearer [REDACTED]" in result.text
+    assert "Authorization: Bearer [REDACTED:oauth-token]" in result.text
 
 
 def test_prose_about_bearer_tokens_is_not_redacted() -> None:
@@ -74,7 +74,7 @@ def test_a_bare_token_assignment_is_redacted() -> None:
 
     assert OPAQUE not in result.text
     assert result.redaction_count >= 1
-    assert "token: [REDACTED]" in result.text
+    assert "token: [REDACTED:assigned-secret]" in result.text
 
 
 def test_prose_after_a_bare_token_label_is_not_redacted() -> None:
@@ -96,7 +96,7 @@ def test_a_bare_apikey_assignment_is_redacted() -> None:
 
     assert OPAQUE not in result.text
     assert result.redaction_count >= 1
-    assert "apikey: [REDACTED]" in result.text
+    assert "apikey: [REDACTED:assigned-secret]" in result.text
 
 
 def test_prose_after_a_bare_apikey_label_is_not_redacted() -> None:
@@ -221,19 +221,19 @@ def test_pem_headers_that_are_not_private_keys_are_not_redacted() -> None:
 def test_an_assignment_is_redacted_with_the_separator_it_was_written_with() -> None:
     """The **redaction** output is still the screen the recording showed.
 
-    Rewriting `api_key: x` as `api_key=[REDACTED]` changes YAML into an env
+    Rewriting `api_key: x` as `api_key=[REDACTED:assigned-secret]` changes YAML into an env
     file, which is a small lie about what was on screen and a confusing one in
     a **render** that carries both.
     """
     colon = redact_text("api_key: sk-abcdefghijklmnopqrstuvwxyz")
-    assert "api_key: [REDACTED]" in colon.text
+    assert "api_key: [REDACTED:assigned-secret]" in colon.text
     assert "api_key=" not in colon.text
 
     equals = redact_text("API_KEY=sk-abcdefghijklmnopqrstuvwxyz")
-    assert "API_KEY=[REDACTED]" in equals.text
+    assert "API_KEY=[REDACTED:assigned-secret]" in equals.text
 
     spaced = redact_text("password = hunter2length")
-    assert "password = [REDACTED]" in spaced.text
+    assert "password = [REDACTED:assigned-secret]" in spaced.text
 
 
 # 12. No pattern uses a nested quantifier
@@ -388,7 +388,8 @@ def test_an_assignment_name_cannot_scan_the_whole_frame() -> None:
 
     checked = 0
     offenders: list[str] = []
-    for pattern in redact_secrets.ASSIGNMENT_PATTERNS:
+    for rule in redact_secrets.ASSIGNMENT_RULES:
+        pattern = rule.pattern
         body = group_body(pattern, "name")
         assert body is not None, pattern.pattern
         checked += 1
@@ -397,7 +398,7 @@ def test_an_assignment_name_cannot_scan_the_whole_frame() -> None:
                 offenders.append(pattern.pattern)
                 break
 
-    assert checked == len(redact_secrets.ASSIGNMENT_PATTERNS)
+    assert checked == len(redact_secrets.ASSIGNMENT_RULES)
     assert offenders == [], f"unbounded repeat in an assignment name: {offenders}"
 
 
@@ -415,7 +416,12 @@ def test_url_userinfo_leaves_benign_authority_shapes_intact() -> None:
         "mailto:someone@example.com",
         "http://[::1]:8000/v1",
         "meet at 12:30@cafe",
-        "image ghcr.io/org/app:1.2@sha256:abcdef",
+        # Full length, not the six-character abbreviation this fixture used to
+        # carry. A truncated digest never reaches the 40-character floor, so it
+        # asserted nothing about the rule that was deleting real ones - which is
+        # exactly how the defect stayed invisible.
+        "image ghcr.io/org/app:1.2@sha256:"
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "HTTPS://EXAMPLE.COM/PLAIN/PATH",
     ]
     for text in benign:
@@ -437,3 +443,171 @@ def test_url_userinfo_escape_hatches_are_covered() -> None:
 
     # Short service usernames stay: a username is not a credential shape.
     assert_intact("git clone ssh://git@github.com/org/repo.git")
+
+
+# --- M1.2: kinds and re-entrancy -------------------------------------------
+
+
+def test_the_mark_names_the_kind_of_value_it_replaced() -> None:
+    """P2: a reader cannot act on `[REDACTED]` because it says nothing.
+
+    A frame that lost an API key and a frame that lost a content digest read
+    identically today, so a downstream agent cannot tell whether the frame still
+    carries what it needed. The kind comes from the rule that matched, never
+    from the value, so it discloses a category and nothing narrower.
+    """
+    assert "[REDACTED:api-key]" in redact_text("sk-abcdefghijklmnopqrstuvwx").text
+    assert (
+        "[REDACTED:jwt]"
+        in redact_text(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+        ).text
+    )
+    assert "[REDACTED:aws-key]" in redact_text("AKIAIOSFODNN7EXAMPLE").text
+
+
+def test_the_mark_carries_no_whitespace() -> None:
+    """<!-- D-008 --> Whitespace in the mark breaks the second pass.
+
+    `ENV_ASSIGNMENT_RE` captures its value as `[^\\s#]+`, so a mark containing a
+    space is captured only up to that space and re-substituted, corrupting the
+    text and leaving a stray bracket. Today's idempotence is accidental - it
+    holds only because `[REDACTED]` happens to have no space in it.
+    """
+    marked = redact_text("api_key: sk-abcdefghijklmnopqrstuvwx").text
+
+    assert " " not in marked.split("api_key:")[1].strip()
+
+
+def test_redaction_is_re_entrant_over_every_fixture() -> None:
+    """<!-- D-018 --> A second pass changes nothing - text, count, or warnings.
+
+    `redact_for_prompt` is documented as an idempotent second pass over
+    already-redacted text, so this is a live path rather than a hypothetical.
+    Asserted as a property over a table rather than on one hand-picked example,
+    because the cases that break it are the ones nobody thinks to pick: an
+    assignment wrapping a mark, and the confusable path.
+    """
+    fixtures = [
+        "api_key: sk-abcdefghijklmnopqrstuvwx",
+        "password: hunter2hunter2hunter2",
+        "Authorization: Bearer abcdefghijklmnop1234",
+        "curl https://admin:s3cr3t-value-here@api.example.com/v1",
+        "AKIAIOSFODNN7EXAMPLE",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        # The confusable path: a fullwidth digit normalizes into a secret shape.
+        "ｓk-abcdefghijklmnopqrstuvwx",
+    ]
+    for text in fixtures:
+        once = redact_text(text)
+        twice = redact_text(once.text)
+        assert twice.text == once.text, text
+        assert twice.redaction_count == 0, text
+        assert twice.warnings == [], text
+
+
+# --- M1.3: the cue-gated hex exemption -------------------------------------
+
+# Verbatim from the M1.1 corpus frame (30_synth_identifiers_f01), so these are
+# the shapes as they actually appear on a screen rather than as invented here.
+FRAME_COMMIT = "commit f9a1a14aabbccddeeff00112233445566778899a"
+FRAME_ONELINE = "c4d8e2b7a0916f35bd82ce41708a9d63f5e0b1a2 Pin the connection"
+FRAME_DIGEST = "docker pull ghcr.io/org/app@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934"
+FRAME_INTEGRITY = "integrity a3f5c9d2e8b14760af23dc9915ee88b4c70d6a21"
+FRAME_BARE = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+
+
+def test_an_identifier_with_a_cue_beside_it_survives() -> None:
+    """<!-- D-013 --> A render exists to be read; deleting a commit SHA
+    protects nothing and removes the one fact the frame was carrying.
+
+    The fixtures are lifted from the corpus frame rather than written here, so
+    what is asserted is the shape a terminal actually prints.
+    """
+    assert_intact(FRAME_COMMIT)
+    assert_intact(FRAME_INTEGRITY)
+    # The cue can be punctuation: `@sha256:` is how a digest is written.
+    assert "e3b0c44298fc" in redact_text(FRAME_DIGEST).text
+
+
+def test_a_hex_run_with_no_cue_is_still_redacted() -> None:
+    """<!-- D-013 --> The exemption needs evidence; absence of it is not a
+    reason to keep a value.
+
+    Both controls come from the same frame. A bare run could equally be a
+    40-character lowercase-hex `device_code`, which is a real GitHub credential
+    that no name-based rule covers - so a rule keyed on position rather than on
+    evidence would hand it through.
+    """
+    assert "[REDACTED:base64-blob]" in redact_text(FRAME_BARE).text
+    # <!-- D-023 --> And the oneline form, which prints no cue word at all.
+    assert "c4d8e2b7a091" not in redact_text(FRAME_ONELINE).text
+
+
+def test_a_cue_on_the_previous_line_does_not_reach_across_it() -> None:
+    """<!-- D-027 --> Adjacency is same-line, and this is why.
+
+    The frame prints `$ grep integrity app.lock` directly above its hash. A rule
+    that reached backwards past a newline would start exempting runs on the
+    strength of a previous command line - and the same reach would exempt a
+    credential printed under any line that happened to say `hash`.
+    """
+    across = "$ grep integrity app.lock\n" + FRAME_BARE
+
+    assert "[REDACTED:base64-blob]" in redact_text(across).text
+
+
+def test_the_generic_rule_consumes_its_own_padding() -> None:
+    """<!-- D-014 --> Redaction left `=` characters behind.
+
+    `\\b` cannot sit between `=` and end-of-string, so the match excluded its own
+    padding and the substitution left it stranded. Cosmetic until a predicate
+    inspects the match, which is exactly what the exemption does.
+    """
+    result = redact_text("blob QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ== end")
+
+    assert "=" not in result.text
+    assert "[REDACTED:base64-blob]" in result.text
+
+
+def test_the_cue_lookback_is_bounded_so_a_long_line_cannot_stall_a_run() -> None:
+    """The exemption's own denial of service, closed before it shipped.
+
+    `_PRECEDING_TOKEN` is anchored at the end and searched backwards, so on a
+    line that does not end in a cue it retries at every start position. A line
+    of `a` followed by one non-matching character is quadratic in that line's
+    length - measured at 18ms for 2 KB, 278ms for 8 KB and 1.1s for 16 KB - and
+    screen text is chosen by whoever produced the source, so it is attacker
+    input on the same terms as the 25.7s and 45s incidents this module already
+    records.
+
+    Asserted as the bound rather than as a wall-clock threshold, for the reason
+    the assignment-name guard gives: a timing assertion is slow when it passes
+    and flaky when it does not. What matters is that the window is a constant.
+    """
+    assert redact_secrets.CUE_LOOKBACK_CHARACTERS <= 128
+    # Long enough for any cue plus its separators; `integrity` is the longest at
+    # nine characters.
+    assert redact_secrets.CUE_LOOKBACK_CHARACTERS > 16
+
+    # And the behaviour the bound protects: a hostile line still resolves, and
+    # still redacts, because a cue that far away is not adjacent to anything.
+    hostile = "a" * 40_000 + "! " + "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+
+    assert "[REDACTED:base64-blob]" in redact_text(hostile).text
+
+
+def test_every_kind_produces_a_mark_the_rules_can_recognize() -> None:
+    """The guard that keeps re-entrancy from breaking silently.
+
+    Re-entrancy rests on `MARK_RE` recognizing what `_mark` wrote. Nothing
+    connects the two but convention, so a kind spelled with an underscore or a
+    capital would produce a mark no rule recognizes - and the failure would not
+    be an error, it would be a second pass quietly re-marking already-marked
+    text under a different kind.
+
+    Asserted over the closed set rather than over the rules, so a kind added for
+    an assignment or a URL is covered too.
+    """
+    for kind in redact_secrets.KINDS:
+        assert redact_secrets.MARK_RE.fullmatch(redact_secrets._mark(kind)), kind

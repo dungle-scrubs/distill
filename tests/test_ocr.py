@@ -274,7 +274,7 @@ def test_what_tesseract_read_lands_on_the_carrier_redacted(tmp_path: Path) -> No
     ):
         updated, warnings = ocr_frames([keyframe(1, frame_path)], "eng", enabled=True)
 
-    assert updated[0].extracted_text == "hello world OPENAI_API_KEY=[REDACTED]"
+    assert updated[0].extracted_text == "hello world OPENAI_API_KEY=[REDACTED:assigned-secret]"
     assert updated[0].redaction is RedactionState.APPLIED
     assert warnings == []
 
