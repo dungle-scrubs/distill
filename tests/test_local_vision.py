@@ -2762,7 +2762,7 @@ class TestPromptSideRedaction:
         )
 
         assert "sk-prompt-secret-value" not in prompt.prompt
-        assert "[REDACTED]" in prompt.prompt
+        assert "[REDACTED:assigned-secret]" in prompt.prompt
         assert "plain slide text" in prompt.prompt
 
     def test_url_userinfo_credentials_are_redacted(self) -> None:
@@ -2825,7 +2825,7 @@ class TestPromptSideRedaction:
         assert len(captured) == 2
         assert captured[0] == captured[1]
         assert "sk-uniform-secret" not in captured[0]
-        assert "[REDACTED]" in captured[0]
+        assert "[REDACTED:assigned-secret]" in captured[0]
 
 
 class TestNonLocalProvenance:

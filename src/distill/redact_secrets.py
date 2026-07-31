@@ -29,34 +29,82 @@ CONFUSABLES = str.maketrans(
         "Ｋ": "K",
     }
 )
-SECRET_PATTERNS = [
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),  # OpenAI-style
-    re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{10,}\b"),  # Stripe
+MARK_RE = re.compile(r"\[REDACTED:[a-z0-9-]{1,32}\]")
+"""What a **redaction mark** looks like, so a rule can recognize its own work.
+
+<!-- D-008 --> Every replacement checks this before substituting. Redaction runs
+twice over the same text by design - `redact_for_prompt` is documented as an
+idempotent second pass - and without recognition the second pass re-marks an
+already-marked value under whichever rule matched it that time.
+"""
+
+
+def _mark(kind: str) -> str:
+    """The text written where a **credential-shaped value** stood.
+
+    Contains no whitespace, deliberately. `ENV_ASSIGNMENT_RE` captures its value
+    as `[^\\s#]+`, so a mark with a space in it is captured only up to that
+    space and re-substituted, corrupting the text and leaving a stray bracket.
+    Today's idempotence is accidental: it holds only because `[REDACTED]`
+    happens to have no space.
+    """
+    return f"[REDACTED:{kind}]"
+
+
+@dataclass(frozen=True)
+class SecretRule:
+    """One pattern, what it removes, and an optional say in whether to.
+
+    A record rather than a bare pattern because two things need per-rule
+    knowledge: the **redaction mark** has to name a kind, and a rule has to be
+    able to match and then decline. Both passes iterate these same records, so
+    neither can drift from the other <!-- D-017 -->.
+    """
+
+    pattern: re.Pattern[str]
+    kind: str
+
+
+SECRET_RULES = [
+    SecretRule(re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), "api-key"),  # OpenAI-style
+    SecretRule(re.compile(r"\bsk_(?:live|test)_[A-Za-z0-9]{10,}\b"), "stripe-key"),
     # GitHub tokens: `ghp_` classic PAT, `gho_` OAuth, `ghs_` server-to-server,
     # `ghu_` user-to-server. All four are what `gh auth status` or a `git
     # config` on screen shows, and all four are credentials.
-    re.compile(r"\bgh[opsu]_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),  # GitHub PAT (fine-grained)
-    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),  # Google API key
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),  # Slack token
-    re.compile(  # JWT (header.payload.signature)
-        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+    SecretRule(re.compile(r"\bgh[opsu]_[A-Za-z0-9_]{20,}\b"), "github-token"),
+    SecretRule(re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "github-token"),
+    SecretRule(re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "google-api-key"),
+    SecretRule(re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), "slack-token"),
+    SecretRule(  # JWT (header.payload.signature)
+        re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+        "jwt",
     ),
-    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),  # generic base64 blob
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id
-    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),  # GitLab personal access token
+    SecretRule(re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"), "base64-blob"),
+    SecretRule(re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "aws-key"),
+    SecretRule(re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"), "gitlab-token"),
     # `npm_` and `hf_` are also ordinary identifier prefixes (`npm_config_*`,
     # `hf_hub_download`), so these take the issued length exactly rather than a
     # floor: alphanumeric only, so an underscore ends the run, and 36 or 34
     # characters of it, so a long camelCase identifier is not a token.
-    re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"),  # npm automation/publish token
-    re.compile(r"\bhf_[A-Za-z0-9]{34}\b"),  # HuggingFace user access token
+    SecretRule(re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"), "npm-token"),
+    SecretRule(re.compile(r"\bhf_[A-Za-z0-9]{34}\b"), "hf-token"),
     # PEM private-key headers - `RSA`, `EC`, `OPENSSH`, `ENCRYPTED`, `PGP ...
     # BLOCK` and the bare form. The armour is what makes a screenful of base64
     # identifiable as a key; the body itself is caught by the base64 rule above.
     # `PUBLIC KEY` and `CERTIFICATE` are not secrets and are left alone.
-    re.compile(r"-----(?:BEGIN|END) [A-Z0-9 ]{0,20}PRIVATE KEY(?: BLOCK)?-----"),
+    SecretRule(
+        re.compile(r"-----(?:BEGIN|END) [A-Z0-9 ]{0,20}PRIVATE KEY(?: BLOCK)?-----"),
+        "private-key",
+    ),
 ]
+
+KINDS = frozenset({rule.kind for rule in SECRET_RULES} | {"assigned-secret", "url-password"})
+"""Every kind a **redaction mark** may name, as a closed set.
+
+Closed so that a rule added without a kind fails a test rather than shipping a
+mark nobody defined. Fixed in source rather than configurable: a caller choosing
+its own kinds would make the mark mean different things in different bundles.
+"""
 # Config-style assignments: `API_KEY=...`, `api_key: ...`, `access-token = ...`,
 # `apiKey: ...`, and bare `password: ...` / `secret: ...`. The name must be a
 # compound identifier (a `_`/`-` separator or a camelCase boundary right before
@@ -101,10 +149,13 @@ WEAK_ASSIGNMENT_RE = re.compile(
     rf"(?P<name>\b(?i:token|apikey))(?P<sep>\s*[:=]\s*)(?P<value>{_CREDENTIAL_VALUE}{{12,}})"
 )
 # Assignment-shaped rules, each replaced as name + separator + [REDACTED].
-ASSIGNMENT_PATTERNS = (
-    ENV_ASSIGNMENT_RE,
-    BEARER_RE,
-    WEAK_ASSIGNMENT_RE,
+ASSIGNMENT_RULES = (
+    SecretRule(ENV_ASSIGNMENT_RE, "assigned-secret"),
+    # A bearer token is an issued credential rather than a configured value, so
+    # it keeps its own kind: a reader seeing `oauth-token` next to a header
+    # learns something a generic `assigned-secret` would not tell them.
+    SecretRule(BEARER_RE, "oauth-token"),
+    SecretRule(WEAK_ASSIGNMENT_RE, "assigned-secret"),
 )
 # A URL whose authority embeds a credential (`scheme://user:secret@host`).
 # The password is the secret; the username can be a key id and the host is
@@ -173,34 +224,45 @@ def redact_text(text: str) -> RedactionResult:
     redacted = text
     count = 0
 
-    def replace_assignment(match: re.Match[str]) -> str:
-        nonlocal count
-        value = match.group("value")
-        if value.lower() in TUTORIAL_PLACEHOLDERS or value.startswith("<"):
-            return match.group(0)
-        count += 1
-        # The separator is reproduced as it was written: rewriting `api_key: x`
-        # as `api_key=x` turns YAML into an env file, which is a small lie about
-        # what the screen showed.
-        return f"{match.group('name')}{match.group('sep')}[REDACTED]"
+    def replace_assignment(kind: str) -> Any:
+        def replace(match: re.Match[str]) -> str:
+            nonlocal count
+            value = match.group("value")
+            if value.lower() in TUTORIAL_PLACEHOLDERS or value.startswith("<"):
+                return match.group(0)
+            # <!-- D-008 --> Already marked: leave it exactly as it is. Without
+            # this the second pass re-marks the mark under whichever rule
+            # matched it this time, which is a different kind and a changed
+            # count for text that lost nothing new.
+            if MARK_RE.fullmatch(value):
+                return match.group(0)
+            count += 1
+            # The separator is reproduced as it was written: rewriting
+            # `api_key: x` as `api_key=x` turns YAML into an env file, which is
+            # a small lie about what the screen showed.
+            return f"{match.group('name')}{match.group('sep')}{_mark(kind)}"
 
-    for assignment in ASSIGNMENT_PATTERNS:
-        redacted = assignment.sub(replace_assignment, redacted)
+        return replace
+
+    for rule in ASSIGNMENT_RULES:
+        redacted = rule.pattern.sub(replace_assignment(rule.kind), redacted)
 
     def replace_userinfo(match: re.Match[str]) -> str:
         nonlocal count
+        if MARK_RE.fullmatch(match.group("value")):
+            return match.group(0)
         count += 1
-        return f"{match.group('prefix')}[REDACTED]"
+        return f"{match.group('prefix')}{_mark('url-password')}"
 
     redacted = URL_USERINFO_RE.sub(replace_userinfo, redacted)
     redacted = URL_USERINFO_TOKEN_RE.sub(replace_userinfo, redacted)
     redacted = URL_USERINFO_OVERLONG_RE.sub(replace_userinfo, redacted)
 
-    for pattern in SECRET_PATTERNS:
-        matches = pattern.findall(redacted)
+    for rule in SECRET_RULES:
+        matches = rule.pattern.findall(redacted)
         if matches:
             count += len(matches)
-            redacted = pattern.sub("[REDACTED]", redacted)
+            redacted = rule.pattern.sub(_mark(rule.kind), redacted)
 
     normalized = normalize_confusables(text)
     if normalized != text:
@@ -208,13 +270,13 @@ def redact_text(text: str) -> RedactionResult:
         # normalized string line up 1:1 with the raw text. Redact the raw slice
         # (not just warn) so obfuscated secrets do not survive into the bundle.
         possible_matches: list[str] = []
-        for pattern in SECRET_PATTERNS:
-            for match in pattern.finditer(normalized):
+        for rule in SECRET_RULES:
+            for match in rule.pattern.finditer(normalized):
                 possible_matches.append(match.group(0))
                 original_slice = text[match.start() : match.end()]
                 if original_slice and original_slice in redacted:
                     count += redacted.count(original_slice)
-                    redacted = redacted.replace(original_slice, "[REDACTED]")
+                    redacted = redacted.replace(original_slice, _mark(rule.kind))
         if possible_matches:
             # R-41: one record per match would bury a **manifest**, which is
             # what the old cap was for - it emitted ten and then a second

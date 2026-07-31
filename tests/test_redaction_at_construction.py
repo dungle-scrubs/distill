@@ -434,7 +434,7 @@ def test_a_secret_straddling_the_label_cap_is_redacted_before_it_is_cut() -> Non
 
     label = links[0].label
     assert len(label) <= 160
-    assert label.endswith("[REDACTED]")
+    assert label.endswith("[REDACTED:api-key]")
     assert "sk-" not in label
 
 
@@ -893,7 +893,7 @@ def test_a_newly_covered_credential_format_is_redacted_in_a_published_generation
     # Each sink is asserted present in redacted form as well as absent in raw
     # form, so a sink that quietly stopped being written cannot pass by having
     # nothing in it to find.
-    assert "Bearer [REDACTED]" in render
+    assert "Bearer [REDACTED:oauth-token]" in render
     assert "the runner token is" in render
     assert "gitlab.com/example/repo" in render
     assert files_holding(output_root, gitlab_token) == []

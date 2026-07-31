@@ -242,7 +242,7 @@ def test_disabled_is_a_policy_state_and_not_inferred_from_the_text(  # D-020
     """
     innocuous = make_frame(extracted_text="the title slide")
     pre_redacted = make_frame(
-        extracted_text="API_KEY=[REDACTED]",
+        extracted_text="API_KEY=[REDACTED:assigned-secret]",
         redaction=RedactionState.DISABLED,
     )
 
@@ -346,7 +346,7 @@ def test_a_secret_straddling_the_cap_is_redacted_before_it_is_cut() -> None:
 
     document = serialize(make_frame(extracted_text=text))
 
-    assert document["extracted_text"].endswith("[REDACTED]")
+    assert document["extracted_text"].endswith("[REDACTED:api-key]")
     assert "sk-" not in document["extracted_text"]
     assert document["warnings"] == []
 
@@ -513,7 +513,7 @@ def test_a_stage_results_payload_is_redacted_before_it_reaches_the_disk(tmp_path
         run.release()
 
     assert secret not in recorded
-    assert "API_KEY=[REDACTED]" in recorded
+    assert "API_KEY=[REDACTED:assigned-secret]" in recorded
 
 
 def test_bytes_are_refused_rather_than_transcoded_past_the_policy() -> None:

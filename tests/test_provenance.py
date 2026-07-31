@@ -110,7 +110,7 @@ def test_provenance_redacts_a_credential_shaped_title_at_construction() -> None:
 
     assert provenance.title is not None
     assert secret not in provenance.title
-    assert provenance.title == "Deploy with [REDACTED]"
+    assert provenance.title == "Deploy with [REDACTED:api-key]"
 
 
 def test_serializing_unredacted_provenance_is_refused() -> None:
@@ -576,7 +576,7 @@ def test_manifest_serializes_redacted_provenance_without_the_raw_secret(
         warnings=[],
     )
 
-    assert manifest["provenance"]["title"] == "Deploy with [REDACTED]"
+    assert manifest["provenance"]["title"] == "Deploy with [REDACTED:api-key]"
     assert secret not in json.dumps(manifest)
     run = BundleStore.open(tmp_path).begin("bundle-key")
     assert isinstance(run, BundleRun)
