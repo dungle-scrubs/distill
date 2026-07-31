@@ -17,7 +17,13 @@ from distill.options import (
     VISION_MODE_SELECTED,
     DistillOptions,
 )
-from distill.vision_chain import candidate_keys
+from distill.vision_chain import (
+    SELECTED,
+    UNAVAILABLE,
+    EntryOutcome,
+    candidate_keys,
+    resolve_chain,
+)
 
 LOCAL_A = LocalVisionConfig(model="qwen3-vl:8b", base_url="http://127.0.0.1:8000/v1")
 LOCAL_B = LocalVisionConfig(model="qwen3-vl:32b", base_url="http://127.0.0.1:9000/v1")
@@ -114,3 +120,106 @@ def test_derivation_touches_no_network_and_no_filesystem(
     keys = candidate_keys(DistillOptions(), (LOCAL_A, REMOTE_A), "local")
 
     assert len(keys) == 3
+
+
+# --- M2.1: the resolution walk ---------------------------------------------
+
+
+def never_probed(config: object) -> bool:
+    """A probe that fails the test if resolution reaches the network."""
+    raise AssertionError("a cache hit must not probe any endpoint")
+
+
+def test_a_cache_hit_at_any_preference_level_touches_no_network() -> None:
+    """<!-- P3-D-011 --> Phase 1 scans every candidate key before asking anything.
+
+    The point of deriving all the keys up front: if any of them is already on
+    disk, the run has its answer and no endpoint needs to be reachable. Probing
+    first and consulting the cache second would make an offline machine unable
+    to serve a bundle it already has.
+
+    Asserted with a probe that raises rather than by counting calls, so the test
+    fails loudly at the moment resolution reaches for the network instead of
+    afterwards on a mismatch.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+    # The *second* entry's key is the cached one - a hit below the top of the
+    # chain still means no probing, which is the case a "probe entry 0 first"
+    # implementation would get wrong.
+    cached = {keys[1].opts_hash}
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: key in cached,
+        probe=never_probed,
+    )
+
+    assert resolved.served_from_cache is True
+    assert resolved.entry == 1
+    assert resolved.opts_hash == keys[1].opts_hash
+
+
+def test_nothing_cached_selects_the_first_available_endpoint() -> None:
+    """The ordinary cold run: preference order decides who is asked first."""
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: False,
+        probe=lambda config: True,
+    )
+
+    assert resolved.entry == 0
+    assert resolved.endpoint is LOCAL_A
+    assert resolved.served_from_cache is False
+
+
+def test_an_unavailable_entry_is_passed_over_and_the_reason_is_recorded() -> None:
+    """<!-- P3-D-018 --> "we used the second endpoint" is not actionable alone.
+
+    An operator who configured a cloud reader first and finds their bundles
+    produced locally needs to know the cloud endpoint was asked and could not
+    serve - which entry, and that it was asked rather than skipped. The index is
+    what carries that: an endpoint's address is a **machine-local claim** and
+    never enters a bundle.
+    """
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: False,
+        probe=lambda config: config is not LOCAL_A,
+    )
+
+    assert resolved.entry == 1
+    assert resolved.endpoint is LOCAL_B
+    assert resolved.evidence == (
+        EntryOutcome(entry=0, outcome=UNAVAILABLE),
+        EntryOutcome(entry=1, outcome=SELECTED),
+    )
+
+
+def test_every_endpoint_unavailable_and_nothing_cached_exhausts_the_chain() -> None:
+    """<!-- P3-D-012 --> A walked-out chain still produces a bundle, under its
+    own key.
+
+    Not the disabled key: the operator asked for vision and did not get it,
+    which is a different bundle from one where vision was never wanted. Every
+    entry is recorded as asked, so the degradation is explicable rather than
+    just visible.
+    """
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: False,
+        probe=lambda config: False,
+    )
+
+    assert resolved.entry is None
+    assert resolved.endpoint is None
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert [outcome.outcome for outcome in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE]

@@ -13,6 +13,7 @@ and the walk's to consume.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 from .local_vision import LocalVisionConfig
@@ -90,6 +91,122 @@ def candidate_keys(
         )
     )
     return tuple(keys)
+
+
+@dataclass(frozen=True)
+class EntryOutcome:
+    """What happened to one entry during the walk, for the operator to read.
+
+    <!-- P3-D-018 --> An entry passed over is a fact the run has to be able to
+    explain: "we used the second endpoint" is not actionable without "because
+    the first answered with the wrong model". Recorded per entry and correlated
+    to its index, which is the only stable name an entry has - the address is a
+    **machine-local claim** and never enters a **bundle**.
+    """
+
+    entry: int
+    outcome: str
+    detail: str = ""
+
+
+CACHE_HIT = "cache_hit"
+"""A candidate key was already on disk, so nothing was asked of any endpoint."""
+
+SELECTED = "selected"
+"""This endpoint answered and will produce the run's **interpretations**."""
+
+UNAVAILABLE = "unavailable"
+"""This endpoint was asked and could not serve - unreachable, unauthenticated,
+or serving a different model. The ordinary case an **endpoint chain** absorbs."""
+
+
+@dataclass(frozen=True)
+class ResolvedRun:
+    """The one outcome resolution settles on, and the evidence for it.
+
+    <!-- P3-D-015 --> Every consumer reads the selection from this object rather
+    than deriving its own. The partial implementation that sets a bundle key and
+    stops leaves the options holding the *previous* entry's fields, so the
+    pipeline calls one endpoint while the manifest records another's options
+    under a third's key - three artifacts, each internally consistent, agreeing
+    on a lie.
+    """
+
+    entry: int | None
+    vision_mode: str
+    opts_hash: str
+    endpoint: LocalVisionConfig | None
+    served_from_cache: bool
+    evidence: tuple[EntryOutcome, ...] = ()
+
+
+def resolve_chain(
+    options: DistillOptions,
+    chain: tuple[LocalVisionConfig, ...],
+    source_type: str,
+    *,
+    cached: Callable[[str], bool],
+    probe: Callable[[LocalVisionConfig], bool],
+) -> ResolvedRun:
+    """The one endpoint - or the one cached bundle - this run will use.
+
+    Two phases, and the order is the whole point. <!-- P3-D-011 --> Phase 1
+    scans every candidate key against the cache and asks nothing of the network:
+    if any of them is already on disk the run has its answer, and an offline
+    machine can still serve a bundle it already has. Probing first and consulting
+    the cache second would make reachability a precondition for reading
+    something already written.
+
+    A hit *below* the top of the chain is still a hit. The preference order says
+    which endpoint to ask when work must be done; it does not say that a bundle
+    produced by a less-preferred reader should be rebuilt by a better one.
+
+    `cached` and `probe` are injected rather than reached for, so the walk can be
+    tested without a store or a server - and so this module keeps its promise to
+    talk to no endpoint itself.
+    """
+    keys = candidate_keys(options, chain, source_type)
+    for key in keys:
+        if cached(key.opts_hash):
+            return ResolvedRun(
+                entry=key.entry,
+                vision_mode=key.vision_mode,
+                opts_hash=key.opts_hash,
+                endpoint=None if key.entry is None else chain[key.entry],
+                served_from_cache=True,
+                evidence=(
+                    () if key.entry is None else (EntryOutcome(entry=key.entry, outcome=CACHE_HIT),)
+                ),
+            )
+    # Phase 2: nothing on disk, so the endpoints are asked - in preference
+    # order, and only now.
+    evidence: list[EntryOutcome] = []
+    for index, entry in enumerate(chain):
+        if probe(entry):
+            evidence.append(EntryOutcome(entry=index, outcome=SELECTED))
+            selected = keys[index]
+            return ResolvedRun(
+                entry=index,
+                vision_mode=selected.vision_mode,
+                opts_hash=selected.opts_hash,
+                endpoint=entry,
+                served_from_cache=False,
+                evidence=tuple(evidence),
+            )
+        evidence.append(EntryOutcome(entry=index, outcome=UNAVAILABLE))
+    # Every endpoint was asked and none could serve. That is **degradation**,
+    # and it publishes under the exhausted key rather than the disabled one:
+    # the operator asked for vision and did not get it, which is a different
+    # bundle from one where vision was never wanted (P3-D-012).
+    exhausted = keys[-1]
+    return ResolvedRun(
+        entry=None,
+        vision_mode=exhausted.vision_mode,
+        opts_hash=exhausted.opts_hash,
+        endpoint=None,
+        served_from_cache=False,
+        evidence=tuple(evidence),
+    )
 
 
 def _as_entry(options: DistillOptions, entry: LocalVisionConfig) -> DistillOptions:
