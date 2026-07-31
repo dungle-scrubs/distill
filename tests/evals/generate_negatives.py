@@ -324,7 +324,13 @@ def _mono_font(size: int) -> ImageFont.FreeTypeFont:
     for path in _MONO_FONT_PATHS:
         if path.exists():
             return ImageFont.truetype(str(path), size)
-    return ImageFont.load_default(size)
+    # Refused rather than fallen back to the default face, matching `_font`
+    # above: the committed PNGs are canonical, and regenerating them with a
+    # different face would rewrite every fixture's pixels while the ground
+    # truth went on claiming the same frame.
+    raise RuntimeError(
+        "fixture regeneration requires the macOS monospace fonts the fixtures were built with"
+    )
 
 
 def _terminal_identifiers(text: str) -> Image.Image:
