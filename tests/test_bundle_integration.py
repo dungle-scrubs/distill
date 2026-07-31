@@ -29,7 +29,7 @@ from distill.response import (
     response_related_links,
     run_response,
 )
-from distill.source import SourceInfo
+from distill.source import SourceInfo, servable_interpretation_count
 from distill.version import PIPELINE_VERSION
 
 BUNDLE_KEY = "hash"
@@ -513,3 +513,52 @@ def test_a_manifest_written_before_the_rename_is_still_a_bundle(tmp_path: Path) 
     assert active is not None
     assert active.bundle_key == BUNDLE_KEY
     assert active.manifest["source_hash"] == BUNDLE_KEY
+
+
+def test_servable_interpretation_count_reads_what_the_manifest_already_holds(
+    tmp_path: Path,
+) -> None:
+    """<!-- D-036 --> The count a cache check needs, at the cost of one read.
+
+    Chain resolution has to know whether a generation under a `selected`
+    candidate key actually holds a reader's work, because a key that promises
+    one and delivers none must be a miss rather than a hit (P3-D-019). Asking
+    that question by opening every frame document of every candidate would
+    make Phase 1's scan cost exactly what it exists to avoid.
+
+    It does not have to. The manifest already embeds the frame documents, and
+    those carry their interpretation - so this is the same single manifest read
+    `servable_duration` makes.
+    """
+    root = tmp_path / "cache"
+    store, run = begin(root)
+    write_renders(run)
+    manifest = minimal_manifest(tmp_path)
+    # `visual_interpretation`, which is what a real manifest holds: it embeds
+    # the *response* shape via `response_frames`, not the frame document. My
+    # first version of this test used the document key and passed against a
+    # reader that had the same mistake - so it agreed with the code instead of
+    # checking it.
+    manifest["frames"] = [
+        {"index": 1, "visual_interpretation": {"visual_summary": "a slide"}},
+        {"index": 2, "visual_interpretation": None},
+        {"index": 3, "visual_interpretation": {"visual_summary": "   "}},
+    ]
+    run.commit(manifest)
+
+    # Only the frame whose reading says something counts: an absent
+    # interpretation and one holding nothing but whitespace are both "no
+    # reader's work here".
+    assert servable_interpretation_count(root, BUNDLE_KEY) == 1
+
+
+def test_servable_interpretation_count_is_none_when_there_is_no_bundle(
+    tmp_path: Path,
+) -> None:
+    """`None` is "no generation", which is a different answer from zero.
+
+    Zero means a generation exists and holds no readings - a miss under a
+    `selected` key, and expected under a disabled or exhausted one. `None`
+    means there is nothing there at all.
+    """
+    assert servable_interpretation_count(tmp_path / "cache", BUNDLE_KEY) is None

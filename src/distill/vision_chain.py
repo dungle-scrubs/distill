@@ -13,7 +13,8 @@ and the walk's to consume.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 
 from .local_vision import LocalVisionConfig
 from .options import (
@@ -90,6 +91,323 @@ def candidate_keys(
         )
     )
     return tuple(keys)
+
+
+@dataclass(frozen=True)
+class EntryOutcome:
+    """What happened to one entry during the walk, for the operator to read.
+
+    <!-- P3-D-018 --> An entry passed over is a fact the run has to be able to
+    explain: "we used the second endpoint" is not actionable without "because
+    the first answered with the wrong model". Recorded per entry and correlated
+    to its index, which is the only stable name an entry has - the address is a
+    **machine-local claim** and never enters a **bundle**.
+    """
+
+    entry: int
+    outcome: str
+    detail: str = ""
+
+
+CACHE_HIT = "cache_hit"
+"""A candidate key was already on disk, so nothing was asked of any endpoint."""
+
+SELECTED = "selected"
+"""This endpoint answered and will produce the run's **interpretations**."""
+
+UNAVAILABLE = "unavailable"
+"""This endpoint was asked and could not serve - unreachable, unauthenticated,
+or serving a different model. The ordinary case an **endpoint chain** absorbs."""
+
+SKIPPED = "skipped"
+"""This endpoint was passed over without being asked, on the memo.
+
+Distinct from `UNAVAILABLE`, and the distinction is user-visible: an
+**unavailable** entry cost a round trip and means "we just checked", a
+**skipped** one cost nothing and means "we already know". A chain that looks
+slow because every entry is probed every run is a different problem from one
+where the memo is doing its job.
+"""
+
+
+CACHE_VANISHED = "cache_vanished"
+"""A Phase 1 hit was gone by the time it was claimed.
+
+Phase 1 scans without a lock - taking one over the whole scan would serialise
+every run against every other - so a prune between the scan and the claim is
+the ordinary case rather than a defect. The scan is optimistic and the claim is
+authoritative.
+"""
+
+DEADLINE_SPENT = "deadline_spent"
+"""This endpoint was never reached: the walk's shared ceiling ran out first.
+
+Distinct from **skipped**, which means the memo already had an answer, and from
+**unavailable**, which means the endpoint was asked. This one says the run gave
+up before its turn - a fact about how long the chain took, not about this
+endpoint at all.
+"""
+
+PROBE_CEILING_SEC = 30.0
+"""The longest the whole probing walk may take, before `timeout_sec` narrows it.
+
+<!-- P3-D-020 --> Shared across every entry rather than allowed per entry. How
+many endpoints a chain names is the operator's choice; how long a run waits
+should not be that choice multiplied by a timeout. Four entries each given the
+full ceiling is four times the wait anyone asked for, and the vision stage's
+budget is charged between requests, so nothing else would cut it short.
+"""
+
+DEFAULT_MEMO_TTL_SEC = 300.0
+"""How long an endpoint's unavailability is trusted before it is asked again.
+
+Long enough that a chain does not pay the same timeout on every run in a batch,
+short enough that a server coming back is noticed within a few minutes. It is a
+bound on how stale an answer may be, not a verdict: an endpoint is unavailable
+because something got fixed later, not because it stopped existing.
+"""
+
+
+@dataclass
+class AvailabilityMemo:
+    """Which endpoints were found unavailable recently, and when.
+
+    Keyed on the address as well as the model, because reachability is a fact
+    about a *place*: the same model served locally and in the cloud are two
+    endpoints, and one being unreachable says nothing about the other.
+
+    Machine-local by nature - it records what *this* machine could reach - so it
+    belongs beside the cache rather than inside a **bundle**. A bundle carrying
+    it would be asserting one machine's network conditions as a property of the
+    reading.
+    """
+
+    ttl_sec: float = DEFAULT_MEMO_TTL_SEC
+    recorded: dict[tuple[str, str], float] = field(default_factory=dict)
+
+    @staticmethod
+    def _key(endpoint: LocalVisionConfig) -> tuple[str, str]:
+        return (endpoint.model, endpoint.base_url)
+
+    def record_unavailable(self, endpoint: LocalVisionConfig, *, now: float) -> None:
+        self.recorded[self._key(endpoint)] = now
+
+    def skips(self, endpoint: LocalVisionConfig, *, now: float) -> bool:
+        """Whether this endpoint should be passed over without being asked.
+
+        An interval that runs backwards - a clock corrected, or a cache root
+        shared between machines that disagree - is read as stale rather than as
+        fresh. "Recorded in the future, so still trusted" would skip the
+        endpoint until the clock caught up, which is a long time to honour an
+        answer that cannot be right.
+        """
+        at = self.recorded.get(self._key(endpoint))
+        if at is None:
+            return False
+        elapsed = now - at
+        return 0.0 <= elapsed < self.ttl_sec
+
+
+@dataclass(frozen=True)
+class ResolvedRun:
+    """The one outcome resolution settles on, and the evidence for it.
+
+    <!-- P3-D-015 --> Every consumer reads the selection from this object rather
+    than deriving its own. The partial implementation that sets a bundle key and
+    stops leaves the options holding the *previous* entry's fields, so the
+    pipeline calls one endpoint while the manifest records another's options
+    under a third's key - three artifacts, each internally consistent, agreeing
+    on a lie.
+    """
+
+    entry: int | None
+    vision_mode: str
+    opts_hash: str
+    endpoint: LocalVisionConfig | None
+    served_from_cache: bool
+    options: DistillOptions
+    """The options as they are *for the endpoint this resolution selected*.
+
+    The binding half of the contract. Without it a consumer reads identity off
+    the `DistillOptions` the run started with, which still names whichever
+    endpoint the chain happened to list first - so the pipeline calls entry 1
+    while the manifest records entry 0's options under entry 1's key.
+
+    `options.opts_hash(...)` equals `opts_hash` by construction. They are the
+    same fact stated twice, and a test says so: if they can drift, one of the
+    three artifacts a run writes is wrong.
+    """
+    evidence: tuple[EntryOutcome, ...] = ()
+
+
+def _is_servable(key: CandidateKey, interpretations: int | None) -> bool:
+    """Whether the generation found under `key` is the bundle that key describes.
+
+    `None` means no generation at all. An integer is how many
+    **interpretations** it holds, and that number only means something under a
+    `selected` key: <!-- P3-D-019 --> such a key promises a reader's work is in
+    there, so a generation holding none is not that bundle - it is the residue
+    of a run that selected an endpoint and then got nothing out of it. Serving
+    it would answer a request for a vision reading with a bundle that has none,
+    forever, because the key would keep hitting.
+
+    A `disabled` or `chain_exhausted` bundle is *expected* to hold none, which
+    is why this asks about the mode rather than refusing every empty generation.
+    """
+    if interpretations is None:
+        return False
+    if key.vision_mode == VISION_MODE_SELECTED:
+        return interpretations > 0
+    return True
+
+
+def resolve_chain(
+    options: DistillOptions,
+    chain: tuple[LocalVisionConfig, ...],
+    source_type: str,
+    *,
+    cached: Callable[[str], int | None],
+    probe: Callable[[LocalVisionConfig], bool],
+    skip: Callable[[LocalVisionConfig], bool] = lambda _endpoint: False,
+    now: Callable[[], float] | None = None,
+    ceiling_sec: float = PROBE_CEILING_SEC,
+    claim: Callable[[str], bool] = lambda _key: True,
+) -> ResolvedRun:
+    """The one endpoint - or the one cached bundle - this run will use.
+
+    Two phases, and the order is the whole point. <!-- P3-D-011 --> Phase 1
+    scans every candidate key against the cache and asks nothing of the network:
+    if any of them is already on disk the run has its answer, and an offline
+    machine can still serve a bundle it already has. Probing first and consulting
+    the cache second would make reachability a precondition for reading
+    something already written.
+
+    A hit *below* the top of the chain is still a hit. The preference order says
+    which endpoint to ask when work must be done; it does not say that a bundle
+    produced by a less-preferred reader should be rebuilt by a better one.
+
+    `cached`, `probe` and `skip` are injected rather than reached for, so the
+    walk can be tested without a store, a server or a clock - and so this module
+    keeps its promise to talk to no endpoint itself.
+
+    `skip` is the negative-availability memo's answer. It defaults to asking
+    everything: a caller that has no memo gets the plain walk rather than having
+    to supply a predicate that always says no.
+    """
+    keys = candidate_keys(options, chain, source_type)
+    if not options.caption_frames:
+        # No reader was asked for, so none is asked. The single key is neither a
+        # selection nor an exhaustion, and probing here would be a network call
+        # made on behalf of an operator who said not to.
+        disabled = keys[0]
+        return ResolvedRun(
+            entry=None,
+            vision_mode=disabled.vision_mode,
+            opts_hash=disabled.opts_hash,
+            endpoint=None,
+            served_from_cache=False,
+            options=replace(options, vision_mode=disabled.vision_mode),
+        )
+    vanished: list[EntryOutcome] = []
+    for key in keys if not options.force_reprocess else ():
+        # Phase 1 is skipped entirely under `--force-reprocess` rather than
+        # consulted and ignored: a run told to reprocess must reach the
+        # endpoints, and a scan whose result is discarded is one that can still
+        # pick the wrong answer if the skip is ever made conditional.
+        if _is_servable(key, cached(key.opts_hash)):
+            if not claim(key.opts_hash):
+                # Pruned between the scan and the claim. The generation is
+                # gone, but the endpoints may still be there and the run's job
+                # is to produce a reading - so this falls through to probing
+                # rather than failing.
+                if key.entry is not None:
+                    vanished.append(
+                        EntryOutcome(
+                            entry=key.entry,
+                            outcome=CACHE_VANISHED,
+                            detail="claim failed after a Phase 1 hit",
+                        )
+                    )
+                continue
+            return ResolvedRun(
+                entry=key.entry,
+                vision_mode=key.vision_mode,
+                opts_hash=key.opts_hash,
+                endpoint=None if key.entry is None else chain[key.entry],
+                served_from_cache=True,
+                options=(
+                    replace(options, vision_mode=key.vision_mode)
+                    if key.entry is None
+                    else _as_entry(options, chain[key.entry])
+                ),
+                evidence=(
+                    () if key.entry is None else (EntryOutcome(entry=key.entry, outcome=CACHE_HIT),)
+                ),
+            )
+    # Phase 2: nothing on disk, so the endpoints are asked - in preference
+    # order, and only now.
+    evidence: list[EntryOutcome] = list(vanished)
+    # <!-- P3-D-020 --> One deadline for the whole walk, armed at the first
+    # question rather than per entry. `None` means no clock was supplied and
+    # the ceiling is not enforced, which is what the tests that are about
+    # selection rather than time use.
+    started = None if now is None else now()
+    for index, entry in enumerate(chain):
+        if started is not None and now is not None and now() - started >= ceiling_sec:
+            # Out of time. Every remaining entry is recorded as unreached
+            # rather than silently dropped: a chain that exhausted because it
+            # ran out of clock is a different diagnosis from one whose
+            # endpoints all answered no.
+            evidence.extend(
+                EntryOutcome(entry=later, outcome=DEADLINE_SPENT)
+                for later in range(index, len(chain))
+            )
+            break
+        if skip(entry):
+            # Passed over without a round trip. Recorded as its own outcome
+            # rather than folded into `unavailable`, because "we already know"
+            # and "we just checked" are different answers to an operator asking
+            # why a chain behaved the way it did.
+            evidence.append(EntryOutcome(entry=index, outcome=SKIPPED))
+            continue
+        # ADR-0002: an endpoint that cannot be reached is **degradation**, and
+        # a chain exists so one wrong entry does not stop a run. A probe that
+        # raised used to take the whole run with it, and the later entries that
+        # would have answered were never asked - the opposite of what a chain
+        # is for. The reason is kept, because "entry 0 was unavailable" without
+        # saying why is not something an operator can act on.
+        try:
+            answered = probe(entry)
+            detail = ""
+        except Exception as exc:  # noqa: BLE001 - any failure is unavailability
+            answered, detail = False, f"{type(exc).__name__}: {exc}"
+        if answered:
+            evidence.append(EntryOutcome(entry=index, outcome=SELECTED))
+            selected = keys[index]
+            return ResolvedRun(
+                entry=index,
+                vision_mode=selected.vision_mode,
+                opts_hash=selected.opts_hash,
+                endpoint=entry,
+                served_from_cache=False,
+                options=_as_entry(options, entry),
+                evidence=tuple(evidence),
+            )
+        evidence.append(EntryOutcome(entry=index, outcome=UNAVAILABLE, detail=detail))
+    # Every endpoint was asked and none could serve. That is **degradation**,
+    # and it publishes under the exhausted key rather than the disabled one:
+    # the operator asked for vision and did not get it, which is a different
+    # bundle from one where vision was never wanted (P3-D-012).
+    exhausted = keys[-1]
+    return ResolvedRun(
+        entry=None,
+        vision_mode=exhausted.vision_mode,
+        opts_hash=exhausted.opts_hash,
+        endpoint=None,
+        served_from_cache=False,
+        options=replace(options, vision_mode=exhausted.vision_mode),
+        evidence=tuple(evidence),
+    )
 
 
 def _as_entry(options: DistillOptions, entry: LocalVisionConfig) -> DistillOptions:

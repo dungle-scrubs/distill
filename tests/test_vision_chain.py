@@ -17,7 +17,17 @@ from distill.options import (
     VISION_MODE_SELECTED,
     DistillOptions,
 )
-from distill.vision_chain import candidate_keys
+from distill.vision_chain import (
+    CACHE_VANISHED,
+    DEADLINE_SPENT,
+    SELECTED,
+    SKIPPED,
+    UNAVAILABLE,
+    AvailabilityMemo,
+    EntryOutcome,
+    candidate_keys,
+    resolve_chain,
+)
 
 LOCAL_A = LocalVisionConfig(model="qwen3-vl:8b", base_url="http://127.0.0.1:8000/v1")
 LOCAL_B = LocalVisionConfig(model="qwen3-vl:32b", base_url="http://127.0.0.1:9000/v1")
@@ -114,3 +124,600 @@ def test_derivation_touches_no_network_and_no_filesystem(
     keys = candidate_keys(DistillOptions(), (LOCAL_A, REMOTE_A), "local")
 
     assert len(keys) == 3
+
+
+# --- M2.1: the resolution walk ---------------------------------------------
+
+
+def never_probed(config: object) -> bool:
+    """A probe that fails the test if resolution reaches the network."""
+    raise AssertionError("a cache hit must not probe any endpoint")
+
+
+def test_a_cache_hit_at_any_preference_level_touches_no_network() -> None:
+    """<!-- P3-D-011 --> Phase 1 scans every candidate key before asking anything.
+
+    The point of deriving all the keys up front: if any of them is already on
+    disk, the run has its answer and no endpoint needs to be reachable. Probing
+    first and consulting the cache second would make an offline machine unable
+    to serve a bundle it already has.
+
+    Asserted with a probe that raises rather than by counting calls, so the test
+    fails loudly at the moment resolution reaches for the network instead of
+    afterwards on a mismatch.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+    # The *second* entry's key is the cached one - a hit below the top of the
+    # chain still means no probing, which is the case a "probe entry 0 first"
+    # implementation would get wrong.
+    cached = {keys[1].opts_hash}
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: 1 if key in cached else None,
+        probe=never_probed,
+    )
+
+    assert resolved.served_from_cache is True
+    assert resolved.entry == 1
+    assert resolved.opts_hash == keys[1].opts_hash
+
+
+def test_nothing_cached_selects_the_first_available_endpoint() -> None:
+    """The ordinary cold run: preference order decides who is asked first."""
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: True,
+    )
+
+    assert resolved.entry == 0
+    assert resolved.endpoint is LOCAL_A
+    assert resolved.served_from_cache is False
+
+
+def test_an_unavailable_entry_is_passed_over_and_the_reason_is_recorded() -> None:
+    """<!-- P3-D-018 --> "we used the second endpoint" is not actionable alone.
+
+    An operator who configured a cloud reader first and finds their bundles
+    produced locally needs to know the cloud endpoint was asked and could not
+    serve - which entry, and that it was asked rather than skipped. The index is
+    what carries that: an endpoint's address is a **machine-local claim** and
+    never enters a bundle.
+    """
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: config is not LOCAL_A,
+    )
+
+    assert resolved.entry == 1
+    assert resolved.endpoint is LOCAL_B
+    assert resolved.evidence == (
+        EntryOutcome(entry=0, outcome=UNAVAILABLE),
+        EntryOutcome(entry=1, outcome=SELECTED),
+    )
+
+
+def test_every_endpoint_unavailable_and_nothing_cached_exhausts_the_chain() -> None:
+    """<!-- P3-D-012 --> A walked-out chain still produces a bundle, under its
+    own key.
+
+    Not the disabled key: the operator asked for vision and did not get it,
+    which is a different bundle from one where vision was never wanted. Every
+    entry is recorded as asked, so the degradation is explicable rather than
+    just visible.
+    """
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: False,
+    )
+
+    assert resolved.entry is None
+    assert resolved.endpoint is None
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert [outcome.outcome for outcome in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE]
+
+
+def test_force_reprocess_bypasses_the_cache_and_probes_from_the_top() -> None:
+    """`--force-reprocess` means do the work, not find a reason not to.
+
+    Phase 1 is skipped entirely rather than consulted and ignored: a run told to
+    reprocess must reach the endpoints, and a cache scan whose result is thrown
+    away is a scan that can still pick the wrong answer if the skip is ever
+    made conditional.
+    """
+    asked: list[str] = []
+
+    def probe(config: LocalVisionConfig) -> bool:
+        asked.append(config.model)
+        return True
+
+    resolved = resolve_chain(
+        DistillOptions(force_reprocess=True),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: 1,
+        probe=probe,
+    )
+
+    assert resolved.served_from_cache is False
+    assert resolved.entry == 0
+    assert asked == [LOCAL_A.model]
+
+
+def test_a_disabled_run_is_settled_without_probing_anything() -> None:
+    """`--no-caption-frames` asks for no reader, so none is asked for.
+
+    Its one key is neither a selection nor an exhaustion, and a probe here would
+    be a network call made on behalf of an operator who said not to.
+    """
+    resolved = resolve_chain(
+        DistillOptions(caption_frames=False),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=never_probed,
+    )
+
+    assert resolved.entry is None
+    assert resolved.endpoint is None
+    assert resolved.vision_mode == VISION_MODE_DISABLED
+    assert resolved.evidence == ()
+
+
+def test_a_generation_with_no_interpretations_under_a_selected_key_is_a_miss() -> None:
+    """<!-- P3-D-019 --> A `selected` key promises a reader's work is in there.
+
+    A generation under that key holding zero **interpretations** is not the
+    bundle the key describes - it is the residue of a run that selected an
+    endpoint and then got nothing out of it. Serving it would answer a request
+    for a vision reading with a bundle that has none, forever, because the key
+    would keep hitting.
+
+    Zero is only meaningful under a `selected` key. A disabled or exhausted run
+    is *expected* to hold none, which is why the rule is per vision mode rather
+    than a blanket "generations must be non-empty".
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+    empty = {keys[0].opts_hash: 0, keys[1].opts_hash: 3}
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: empty.get(key),
+        probe=never_probed,
+    )
+
+    # Entry 0's generation is empty, so the walk passes it over and serves
+    # entry 1's - still without probing.
+    assert resolved.entry == 1
+    assert resolved.served_from_cache is True
+
+
+def test_an_exhausted_bundle_is_served_rather_than_walked_again() -> None:
+    """A degraded run's bundle is a bundle, and its key is meant to hit.
+
+    Without this the machine that could not reach any endpoint walks the whole
+    chain again on every run, paying every timeout, to arrive at the reading it
+    already has on disk.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: 0 if key == keys[-1].opts_hash else None,
+        probe=never_probed,
+    )
+
+    assert resolved.entry is None
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert resolved.served_from_cache is True
+
+
+def test_an_offline_machine_serves_the_local_reading_rather_than_ocr_only() -> None:
+    """<!-- P3-D-011 --> The case the earlier drafts got wrong.
+
+    Chain is `[cloud, local]`, only the *local* key is cached, and nothing is
+    reachable. The right answer is the cached local vision reading - a real
+    reading, produced by the second-preference endpoint - not a degraded
+    OCR-only bundle. Preference order says who to *ask*; it does not say a
+    bundle from a less-preferred reader should be thrown away.
+    """
+    chain = (REMOTE_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: 5 if key == keys[1].opts_hash else None,
+        probe=lambda config: False,
+    )
+
+    assert resolved.entry == 1
+    assert resolved.endpoint is LOCAL_B
+    assert resolved.vision_mode == VISION_MODE_SELECTED
+    assert resolved.served_from_cache is True
+
+
+def test_a_memoized_endpoint_is_skipped_rather_than_asked_again() -> None:
+    """**Skipped** and **unavailable** are different facts, and both are reported.
+
+    An endpoint asked *this run* and found wanting cost a round trip and means
+    "we just checked". One passed over on the memo cost nothing and means "we
+    already know". An operator reading diagnostics needs to tell those apart -
+    a chain that looks slow because every entry is probed every run is a
+    different problem from one where the memo is working.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    asked: list[str] = []
+
+    def probe(config: LocalVisionConfig) -> bool:
+        asked.append(config.model)
+        return True
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=probe,
+        skip=lambda config: config is LOCAL_A,
+    )
+
+    # Entry 0 was never asked, so it cost no round trip.
+    assert asked == [LOCAL_B.model]
+    assert resolved.entry == 1
+    assert resolved.evidence == (
+        EntryOutcome(entry=0, outcome=SKIPPED),
+        EntryOutcome(entry=1, outcome=SELECTED),
+    )
+
+
+def test_a_chain_skipped_all_the_way_down_still_exhausts_rather_than_hangs() -> None:
+    """Every entry memoized is still an answer, not a reason to ask anyway.
+
+    The memo exists so a run on a machine that cannot reach anything is fast.
+    Falling back to probing when every entry is memoized would give that run the
+    full cost of the chain precisely when the memo said it was pointless.
+    """
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=never_probed,
+        skip=lambda config: True,
+    )
+
+    assert resolved.entry is None
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert [o.outcome for o in resolved.evidence] == [SKIPPED, SKIPPED]
+
+
+# --- the negative-availability memo ----------------------------------------
+
+
+def test_the_memo_forgets_an_endpoint_once_its_ttl_has_passed() -> None:
+    """A memo that never expires is a permanent verdict on a temporary fact.
+
+    An endpoint is unavailable because a server is down, a laptop is on a
+    different network, or a key expired - all things that get fixed. The memo
+    exists to stop a chain paying the same timeout every run, not to decide
+    once and for all that an endpoint is gone.
+
+    The clock is injected: a test that slept for the TTL would be slow when it
+    passed and flaky when it did not.
+    """
+    memo = AvailabilityMemo(ttl_sec=300.0)
+    memo.record_unavailable(LOCAL_A, now=1000.0)
+
+    assert memo.skips(LOCAL_A, now=1000.0) is True
+    assert memo.skips(LOCAL_A, now=1299.0) is True
+    # Exactly at the TTL the memo has expired: the bound is how long the answer
+    # is trusted, so the moment it runs out the endpoint is asked again.
+    assert memo.skips(LOCAL_A, now=1300.0) is False
+    assert memo.skips(LOCAL_A, now=9999.0) is False
+
+
+def test_the_memo_answers_per_endpoint_and_not_per_chain() -> None:
+    """One endpoint being down says nothing about the next.
+
+    The memo is keyed on the address as well as the model, because
+    reachability is a fact about a *place*: the same model served locally and
+    in the cloud are two endpoints, and one being unreachable is no reason to
+    skip the other.
+    """
+    memo = AvailabilityMemo(ttl_sec=300.0)
+    memo.record_unavailable(REMOTE_A, now=1000.0)
+
+    assert memo.skips(REMOTE_A, now=1000.0) is True
+    # Same model, different address - a different endpoint.
+    assert memo.skips(LOCAL_A, now=1000.0) is False
+
+
+def test_a_clock_that_went_backwards_expires_the_memo_rather_than_trusting_it() -> None:
+    """Clock skew must not pin an endpoint as skipped indefinitely.
+
+    A shared cache root across machines, or a clock corrected backwards, makes
+    `now` earlier than the recorded time. Treating that as "recorded in the
+    future, so still fresh" would skip the endpoint until the clock caught up.
+    The safe reading of an impossible interval is that the memo is stale.
+    """
+    memo = AvailabilityMemo(ttl_sec=300.0)
+    memo.record_unavailable(LOCAL_A, now=5000.0)
+
+    assert memo.skips(LOCAL_A, now=1000.0) is False
+
+
+def test_the_whole_walk_shares_one_probing_deadline() -> None:
+    """<!-- P3-D-020 --> A chain of slow endpoints degrades; it does not hang.
+
+    How many entries there are is the operator's choice, but how long a run
+    waits should not be that choice multiplied by a timeout. Four entries each
+    given the full ceiling is four times the wait an operator asked for, and the
+    vision budget is charged between requests, so nothing else would cut it
+    short.
+
+    So the ceiling is shared: once it is spent the remaining entries are not
+    asked at all, and the chain exhausts. The clock is injected for the same
+    reason the memo's is.
+    """
+    chain = (LOCAL_A, LOCAL_B, REMOTE_A)
+    asked: list[str] = []
+    # Each probe consumes 20 seconds of a 30 second ceiling. The clock is read
+    # once to arm the deadline and once before each entry, so: armed at 0,
+    # entry 0 at 0 (probe), entry 1 at 20 (still inside, probe), entry 2 at 40
+    # (spent, never asked).
+    clock = iter([0.0, 0.0, 20.0, 40.0])
+
+    def probe(config: LocalVisionConfig) -> bool:
+        asked.append(config.model)
+        return False
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=probe,
+        now=lambda: next(clock),
+        ceiling_sec=30.0,
+    )
+
+    # Two entries fit inside the ceiling; the third is never asked.
+    assert asked == [LOCAL_A.model, LOCAL_B.model]
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert [o.outcome for o in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE, DEADLINE_SPENT]
+
+
+def test_a_hit_that_vanished_before_it_was_claimed_restarts_the_walk() -> None:
+    """Phase 1 scans without a lock, so a hit can be gone by claim time.
+
+    A prune between the scan and the claim is the ordinary case: `cleanup-cache`
+    is allowed to run while a read is in flight, and taking a lock over the
+    whole scan would serialise every run against every other. So the scan is
+    optimistic and the *claim* is authoritative - and when the claim fails,
+    resolution starts over rather than proceeding with a key it can no longer
+    serve.
+
+    Restarting is not the same as failing. The generation is gone, but the
+    endpoints may still be there, and the run's job is to produce a reading.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+    claims: list[str] = []
+
+    def claim(key: str) -> bool:
+        claims.append(key)
+        return False  # pruned between the scan and here
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: 4 if key == keys[0].opts_hash else None,
+        probe=lambda config: config is LOCAL_B,
+        claim=claim,
+    )
+
+    # The hit was attempted and lost, so the walk fell through to probing and
+    # entry 1 answered.
+    assert claims == [keys[0].opts_hash]
+    assert resolved.served_from_cache is False
+    assert resolved.entry == 1
+    assert resolved.evidence[0] == EntryOutcome(
+        entry=0, outcome=CACHE_VANISHED, detail="claim failed after a Phase 1 hit"
+    )
+
+
+def test_the_resolution_carries_the_options_that_describe_it() -> None:
+    """<!-- P3-D-015 --> The binding contract, asserted rather than assumed.
+
+    The partial implementation this exists to prevent sets a bundle key and
+    stops: `DistillOptions` goes on holding the *previous* entry's model, so the
+    pipeline calls entry 1 while the manifest records entry 0's options under
+    entry 1's key. Three artifacts, each internally consistent, agreeing on a
+    lie.
+
+    So the resolution carries the options as they are *for the endpoint it
+    selected*, and every consumer reads identity from there rather than
+    deriving its own. The check is that those options hash to the key the
+    resolution published under - if they did not, they would be describing a
+    different bundle than the one being written.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: config is LOCAL_B,
+    )
+
+    assert resolved.entry == 1
+    assert resolved.options.local_vision_model == LOCAL_B.model
+    assert resolved.options.local_vision_base_url == LOCAL_B.base_url
+    assert resolved.options.vision_mode == VISION_MODE_SELECTED
+    # The key and the options are the same fact stated twice; if they can
+    # disagree, one of the three artifacts is wrong.
+    assert resolved.options.opts_hash("local") == resolved.opts_hash
+
+
+def test_an_exhausted_resolution_names_no_endpoint_in_its_options() -> None:
+    """A degraded run must not carry the last endpoint it tried.
+
+    Publishing under the exhausted key while the options still name entry 1's
+    model would record a reader that produced nothing as the reader of the
+    bundle.
+    """
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: False,
+    )
+
+    assert resolved.options.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert resolved.options.cache_payload("local")["local_vision_model"] is None
+    assert resolved.options.opts_hash("local") == resolved.opts_hash
+
+
+def test_the_walk_itself_opens_nothing_so_it_can_hold_no_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolution cannot hold a lock across a probe, because it takes none.
+
+    The plan asks that no candidate lock be held across source acquisition or
+    across a network probe. The strongest form of that is structural rather
+    than procedural: every I/O the walk needs arrives as an injected callable,
+    so the walk has nothing to lock *with*. A future change that reached for a
+    store or a socket directly would fail here rather than deadlock in
+    production.
+
+    The injected callables are the seam: what they do - take a bundle lock,
+    open a socket - is their caller's business and is ordered by the pipeline,
+    which takes the acquisition lease before the bundle lock.
+    """
+    import socket
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("chain resolution must reach the world only through its seams")
+
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+    monkeypatch.setattr("pathlib.Path.open", forbidden)
+    monkeypatch.setattr("pathlib.Path.exists", forbidden)
+    monkeypatch.setattr("pathlib.Path.mkdir", forbidden)
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, REMOTE_A),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: config is REMOTE_A,
+        skip=lambda config: False,
+    )
+
+    assert resolved.entry == 1
+
+
+def test_two_runs_seeing_different_availability_settle_on_different_keys() -> None:
+    """Gate 2→3: concurrent runs must not publish conflicting generations.
+
+    Two runs of one source, one reaching the cloud endpoint and one not - a
+    laptop that moved networks mid-batch, or a token that expired for one
+    process. They select different endpoints, so they must publish under
+    *different* keys rather than two different readings under one.
+
+    That is what makes the concurrency safe without coordination: the bundle
+    key already separates them, so neither has to wait for the other and
+    neither can overwrite the other's generation. Two runs that agree on
+    availability agree on a key and contend for the same lock, which is the
+    case the store's run lock already handles.
+    """
+    chain = (REMOTE_A, LOCAL_B)
+
+    reaches_cloud = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: True,
+    )
+    offline = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: config is LOCAL_B,
+    )
+
+    assert reaches_cloud.entry == 0
+    assert offline.entry == 1
+    assert reaches_cloud.opts_hash != offline.opts_hash
+    # And each key describes the reader that produced it, so neither
+    # generation claims the other's endpoint.
+    assert reaches_cloud.options.local_vision_model == REMOTE_A.model
+    assert offline.options.local_vision_model == LOCAL_B.model
+
+
+def test_an_endpoint_whose_probe_raises_is_passed_over_not_propagated() -> None:
+    """ADR-0002: an endpoint that cannot be reached is degradation.
+
+    A chain exists so that one endpoint being wrong does not stop a run. If a
+    probe raising propagates, a single misconfigured entry - a rejected
+    endpoint, a DNS failure, a transport error - takes the whole run with it,
+    and the later entries that would have answered are never asked. That is the
+    opposite of what a chain is for.
+
+    The reason is kept, on the entry's own outcome, because "entry 0 was
+    unavailable" without saying why is not something an operator can act on.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+
+    def probe(config: LocalVisionConfig) -> bool:
+        if config is LOCAL_A:
+            raise OSError("connection refused")
+        return True
+
+    resolved = resolve_chain(
+        DistillOptions(), chain, "local", cached=lambda key: None, probe=probe
+    )
+
+    assert resolved.entry == 1
+    assert resolved.evidence[0].entry == 0
+    assert resolved.evidence[0].outcome == UNAVAILABLE
+    assert "connection refused" in resolved.evidence[0].detail
+
+
+def test_a_chain_whose_every_probe_raises_degrades_rather_than_failing() -> None:
+    """The same rule at the end of the chain: exhaustion, not an exception."""
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: (_ for _ in ()).throw(OSError("nothing here")),
+    )
+
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert [o.outcome for o in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE]

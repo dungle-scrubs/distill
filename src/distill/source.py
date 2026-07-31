@@ -71,7 +71,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from .artifacts import Provenance, RedactionState
+from .artifacts import Provenance, RedactionState, document_carries_a_reading
 from .bundle_store import (
     SINGLE_SOURCE_LOCK_WAIT_SEC,
     BundleStore,
@@ -81,6 +81,7 @@ from .bundle_store import (
 )
 from .errors import DistillError, WarningRecord, errno_name, warning
 from .links import RelatedLink, extract_relevant_links
+from .local_vision import LocalVisionConfig
 from .media_inspect import (  # noqa: F401  re-exported: media inspection
     CONTENT_HASH_LIMIT_BYTES as CONTENT_HASH_LIMIT_BYTES,
 )
@@ -122,6 +123,7 @@ from .run_command import (
     run_json,
     stream,
 )
+from .vision_chain import ResolvedRun, resolve_chain
 from .youtube import (  # noqa: F401  re-exported: the YouTube client
     NO_PLAYLIST_ARG as NO_PLAYLIST_ARG,
 )
@@ -382,6 +384,19 @@ class SourceInfo:
     provenance: Provenance | None = None
     youtube_video_id: str | None = None
     youtube_lock_key: str | None = None
+    resolved_options: DistillOptions | None = None
+    """The options as the **endpoint chain** walk settled them, if it ran.
+
+    <!-- P3-D-015 --> The **bundle key** on this object was derived from these,
+    so anything else derived from the run's original options describes a
+    different bundle. The **manifest** is the one that matters: built from the
+    options a run carries, it would otherwise record whichever endpoint the
+    chain listed first while the key names the one that answered.
+
+    `None` for a resolution that never walked a chain - a cached YouTube hit
+    read straight from a manifest - where the caller's own options are already
+    the right ones.
+    """
     related_links: list[RelatedLink] | None = None
     """The **related links** this source's metadata named, as carriers (R-21).
 
@@ -434,12 +449,7 @@ def release_acquisition_lease(source: Any, *, during: BaseException | None = Non
 
 
 def _processed_at_utc() -> str:
-    return (
-        datetime.now(UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -477,20 +487,6 @@ class YouTubeDownloaderProtocol(Protocol):
     ) -> AcquiredSource: ...
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def servable_duration(output_root: Path, bundle_key: str) -> float | None:
     """The duration of the **bundle** `bundle_key` names, if it is servable.
 
@@ -511,6 +507,96 @@ def servable_duration(output_root: Path, bundle_key: str) -> float | None:
     if snapshot is None:
         return None
     return manifest_duration(snapshot.manifest)
+
+
+def _probe_endpoint(endpoint: LocalVisionConfig) -> bool:
+    """Whether this **vision endpoint** can serve this run.
+
+    A module-level seam rather than an import at the call site, so a test can
+    replace it without a live server and without reaching into
+    `local_vision`'s internals. Imported lazily because `local_vision` pulls in
+    the vision client, and source resolution is reached by runs that never
+    caption a frame.
+    """
+    from .local_vision import probe_local_vision
+
+    return probe_local_vision(endpoint).available
+
+
+def _resolved_for(
+    options: DistillOptions,
+    fingerprint: str,
+    source_type: str,
+    output_root: Path | None,
+) -> ResolvedRun:
+    """Walk the **endpoint chain** and settle which bundle this run is about.
+
+    <!-- D-033 --> Here rather than in the pipeline, because a candidate key is
+    an **options hash** but whether one is *cached* is a question about
+    `source_hash(fingerprint, opts_hash)` - and the fingerprint only exists once
+    resolution is under way. Resolving earlier would look tidier and could only
+    ever probe, never serve a hit, which is the cache-before-network property
+    the walk exists to guarantee.
+
+    A caller that named no **output root** has no store to ask, so every
+    candidate reads as absent and the walk goes straight to probing.
+    """
+    # A config that names no chain still names an endpoint. `DistillOptions`
+    # reached through `from_args` carries the one-entry chain `_with_chain`
+    # derived, but one constructed directly does not - and resolving an empty
+    # chain would exhaust immediately, re-keying a run that has a perfectly good
+    # endpoint configured the old way.
+    chain = options.local_vision_endpoints or (options.local_vision_config(),)
+    return resolve_chain(
+        options,
+        chain,
+        source_type,
+        cached=lambda opts_hash: (
+            None
+            if output_root is None
+            else servable_interpretation_count(output_root, source_hash(fingerprint, opts_hash))
+        ),
+        probe=_probe_endpoint,
+    )
+
+
+def servable_interpretation_count(output_root: Path, bundle_key: str) -> int | None:
+    """How many frames of the servable **generation** carry a reading.
+
+    <!-- D-036 --> The question chain resolution asks before treating a
+    candidate key as a hit: a `selected` key promises a reader's work is in
+    there, so a generation holding none is not the bundle that key describes
+    (P3-D-019).
+
+    `None` and zero are different answers. `None` is "no generation" - nothing
+    to serve. Zero is "a generation, holding no readings", which is a miss under
+    a `selected` key and exactly what a disabled or exhausted bundle is expected
+    to hold.
+
+    Answered from the **manifest** alone, which already embeds the frame
+    documents. Opening every frame of every candidate would make Phase 1's scan
+    cost what it exists to avoid - the same reason `servable_duration` reads a
+    recorded duration rather than re-probing the media.
+    """
+    snapshot = BundleStore.open(output_root).load_active(bundle_key)
+    if snapshot is None:
+        return None
+    frames = snapshot.manifest.get("frames")
+    if not isinstance(frames, list):
+        # A manifest another process wrote is input rather than fact, and a
+        # missing or malformed `frames` is not evidence of zero readings.
+        return None
+    # `visual_interpretation`, not `interpretation`: the manifest embeds the
+    # *response* shape (`response_frames`), which renames the field on the way
+    # out. Reading the document key here silently counted zero for every
+    # generation, which made a cache hit with vision on probe anyway - the
+    # exact property Gate 2->3 exists to check.
+    return sum(
+        1
+        for frame in frames
+        if isinstance(frame, dict)
+        and document_carries_a_reading(frame.get("visual_interpretation"))
+    )
 
 
 class LocalSourceProvider:
@@ -569,7 +655,16 @@ class LocalSourceProvider:
                 )
             )
         fingerprint = local_fingerprint(resolved, options.cache_mode, progress)
-        bundle_key = source_hash(fingerprint, options.opts_hash("local"))
+        # <!-- P3-D-015 --> The key comes from the resolution, not from the
+        # options the run started with. Those still name whichever endpoint the
+        # chain happened to list first, so deriving from them publishes entry
+        # 0's key for a run that called entry 1.
+        # Named `resolution`, not `resolved`: `resolved` is already the source
+        # path in this scope, and shadowing it hands a ResolvedRun to
+        # `probe_duration`.
+        resolution = _resolved_for(options, fingerprint, "local", request.output_root)
+        options = resolution.options
+        bundle_key = source_hash(fingerprint, resolution.opts_hash)
         duration = self._served_duration(request, bundle_key)
         if duration is None:
             if progress:
@@ -595,9 +690,7 @@ class LocalSourceProvider:
             duration_sec=duration,
             processed_at=request.processed_at,
             redaction=(
-                RedactionState.NOT_APPLIED
-                if options.redact_secrets
-                else RedactionState.DISABLED
+                RedactionState.NOT_APPLIED if options.redact_secrets else RedactionState.DISABLED
             ),
         )
         warnings.extend(dict(item) for item in provenance.warnings)
@@ -609,6 +702,7 @@ class LocalSourceProvider:
             source_hash=bundle_key,
             warnings=warnings,
             provenance=provenance,
+            resolved_options=options,
         )
 
     def _served_duration(self, request: SourceRequest, bundle_key: str) -> float | None:
@@ -781,8 +875,7 @@ def sensitive_path_match(
     parts = [part if case_sensitive else part.lower() for part in Path(root).parts]
     for sensitive in sorted(SENSITIVE_COMPONENTS):
         wanted = [
-            component if case_sensitive else component.lower()
-            for component in sensitive.split("/")
+            component if case_sensitive else component.lower() for component in sensitive.split("/")
         ]
         for start in range(len(parts) - len(wanted) + 1):
             if parts[start : start + len(wanted)] == wanted:
@@ -882,9 +975,7 @@ def select_downloaded_media(staging_dir: Path) -> Path:
 
 def _reject_media(path: Path, reason: str, message: str, **detail: Any) -> DistillError:
     """Record a rejection verdict and build the error that carries it."""
-    _acquisition_log(
-        "media_validated", path=str(path), verdict="rejected", reason=reason, **detail
-    )
+    _acquisition_log("media_validated", path=str(path), verdict="rejected", reason=reason, **detail)
     return DistillError("E_BAD_MEDIA", "youtube", message, {"path": str(path), **detail})
 
 
@@ -956,9 +1047,7 @@ def validate_media_file(path: Path) -> list[WarningRecord]:
     except DistillError:
         # ffprobe could not read it at all, which is its own answer. The error it
         # raised already names the tool and the failure, so it travels as-is.
-        _acquisition_log(
-            "media_validated", path=str(path), verdict="rejected", reason="unreadable"
-        )
+        _acquisition_log("media_validated", path=str(path), verdict="rejected", reason="unreadable")
         raise
     codec_types = _probed_codec_types(probe)
     if "video" not in codec_types:
@@ -1059,9 +1148,7 @@ class YoutubeDownloader:
                 result = self._download(url, staging_dir, progress)
                 produced = select_downloaded_media(staging_dir)
                 validation_warnings = validate_media_file(produced)
-                promoted = promote_media(
-                    produced, self._media_dir(lock_key), root=self.output_root
-                )
+                promoted = promote_media(produced, self._media_dir(lock_key), root=self.output_root)
             finally:
                 # The staging directory is scratch: whatever survived the run -
                 # a rejected file, an unmerged fragment, a `.part` - is
@@ -1116,9 +1203,7 @@ class YoutubeDownloader:
             confined_path(stale, self.output_root)
             if stale.is_dir():
                 shutil.rmtree(stale, ignore_errors=True)
-        staging_dir = confined_path(
-            parent / f"{os.getpid()}-{uuid.uuid4().hex}", self.output_root
-        )
+        staging_dir = confined_path(parent / f"{os.getpid()}-{uuid.uuid4().hex}", self.output_root)
         staging_dir.mkdir()
         return staging_dir
 
@@ -1136,9 +1221,7 @@ class YoutubeDownloader:
             progress.update("youtube_download", status="running", detail={"step": "lock"})
         lease, lock_warnings = self._acquire(lock_key, lock)
         if lease is None:
-            _acquisition_log(
-                "lease_denied", lock_key=lock_key, lock_path=str(lock), reason="held"
-            )
+            _acquisition_log("lease_denied", lock_key=lock_key, lock_path=str(lock), reason="held")
             raise DistillError("E_LOCKED", "youtube", "YouTube source is locked by another process")
         lease.warnings.extend(lock_warnings)
         _acquisition_log("lease_acquired", lock_key=lock_key, lock_path=str(lock))
@@ -1296,15 +1379,12 @@ def _manifest_provenance(
         description=optional_string("description"),
         upload_date=optional_string("upload_date"),
         canonical_url=(
-            optional_string("canonical_url")
-            or f"https://www.youtube.com/watch?v={video_id}"
+            optional_string("canonical_url") or f"https://www.youtube.com/watch?v={video_id}"
         ),
         duration_sec=duration_sec,
         processed_at=optional_string("processed_at") or processed_at,
         redaction=(
-            RedactionState.NOT_APPLIED
-            if options.redact_secrets
-            else RedactionState.DISABLED
+            RedactionState.NOT_APPLIED if options.redact_secrets else RedactionState.DISABLED
         ),
     )
 
@@ -1362,7 +1442,13 @@ class YouTubeSourceProvider:
         if request.output_root is None:
             raise DistillError("E_BAD_OUTPUT_DIR", "youtube", "output_root is required")
         fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
-        sh = source_hash(fingerprint, request.options.opts_hash("youtube"))
+        # <!-- P3-D-011 --> The cache question is asked about the key the walk
+        # settles on, which may be a less-preferred entry's or the exhausted
+        # one - a bundle already on disk is servable whichever endpoint made
+        # it, and asking only about entry 0's key would re-download a video
+        # whose reading is already here.
+        resolution = _resolved_for(request.options, fingerprint, "youtube", request.output_root)
+        sh = source_hash(fingerprint, resolution.opts_hash)
         snapshot = BundleStore.open(request.output_root).load_active(sh)
         if snapshot is None:
             return None
@@ -1411,7 +1497,12 @@ class YouTubeSourceProvider:
         video_id = metadata.video_id
         lock_key = youtube_lock_key(video_id)
         fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
-        source = source_hash(fingerprint, options.opts_hash("youtube"))
+        # <!-- P3-D-015 --> The key names the endpoint the walk selected, not
+        # whichever one the chain listed first. `resolution`, not `resolved` or
+        # `source`, because both already mean something else here.
+        resolution = _resolved_for(options, fingerprint, "youtube", output_root)
+        options = resolution.options
+        source = source_hash(fingerprint, resolution.opts_hash)
         downloader = downloader or YoutubeDownloader(
             output_root, lock_wait_sec=request.lock_wait_sec
         )
@@ -1477,6 +1568,7 @@ class YouTubeSourceProvider:
             source_hash=source,
             warnings=warnings,
             provenance=provenance,
+            resolved_options=options,
             youtube_video_id=video_id,
             youtube_lock_key=lock_key,
             related_links=related_links,
@@ -1617,9 +1709,7 @@ class SourceResolver:
             progress=progress,
         )
 
-    def _served_from_cache(
-        self, request: SourceRequest, video_id: str
-    ) -> SourceResolution | None:
+    def _served_from_cache(self, request: SourceRequest, video_id: str) -> SourceResolution | None:
         """This run's resolution if `video_id` names a servable bundle, else `None`.
 
         `force_reprocess` never consults the cache: that run is going to produce

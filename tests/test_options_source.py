@@ -1264,3 +1264,164 @@ def test_a_dense_but_bounded_schedule_is_accepted() -> None:
     # 3600 / 0.01 = 360_000 candidates, under the 500_000 ceiling.
     options = DistillOptions.from_args({"max_duration_sec": 3600.0, "max_static_window_sec": 0.01})
     assert options.max_duration_sec / options.max_static_window_sec < MAX_CANDIDATE_SCHEDULE
+
+
+def test_a_configured_chain_survives_into_the_config_the_pipeline_uses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """<!-- D-028 --> The gap Phase 1 left open, closed.
+
+    `DistillOptions.local_vision_config()` rebuilds a `LocalVisionConfig` from
+    flattened scalars, and the interpret path uses that reconstruction. Until
+    the chain rides along, a multi-entry chain parses, validates, and is then
+    ignored at runtime - which is a configuration silently not taking effect,
+    the worst of the three possible behaviours.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+
+    options = DistillOptions.from_args({})
+    config = options.local_vision_config()
+
+    assert [entry.model for entry in config.endpoints or ()] == [
+        "qwen3-vl:8b",
+        "qwen3-vl:32b",
+    ]
+
+
+def test_key_derivation_uses_the_endpoint_the_walk_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """<!-- P3-D-015 --> The three-way agreement, at the site the key is made.
+
+    A chain names two endpoints and only the second answers. The options the
+    key is derived from have to be *that* endpoint's - not the ones the run
+    started with, which still name whichever endpoint the chain listed first.
+
+    That is the failure this decision exists to prevent: the pipeline calls one
+    endpoint while the manifest records another's options under a third's key.
+    Asserted at `_resolved_for`, which is the seam source resolution calls and
+    the one place the substitution happens.
+    """
+    from distill.source import _resolved_for
+    from distill.vision_chain import candidate_keys
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    options = DistillOptions.from_args({})
+
+    # Only the second endpoint answers, and nothing is cached.
+    monkeypatch.setattr(
+        "distill.source._probe_endpoint",
+        lambda config: config.model == "qwen3-vl:32b",
+    )
+
+    resolved = _resolved_for(options, "a-fingerprint", "local", None)
+
+    chain = options.local_vision_endpoints or ()
+    assert resolved.entry == 1
+    assert resolved.options.local_vision_model == "qwen3-vl:32b"
+    assert resolved.opts_hash == candidate_keys(options, chain, "local")[1].opts_hash
+    # And the options the key came from hash to that key - the same fact twice.
+    assert resolved.options.opts_hash("local") == resolved.opts_hash
+
+
+def test_a_resolution_selecting_entry_one_leaves_no_entry_zero_field_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """<!-- P3-D-015 --> The lie this decision exists to prevent, asserted.
+
+    A run that called entry 1 must not describe itself with entry 0's fields
+    anywhere. The manifest is built from the options a run carries, so the
+    options that reach it have to be the resolution's - otherwise the pipeline
+    calls one endpoint, the manifest records another's model, and the key names
+    a third, each artifact internally consistent and all three wrong together.
+
+    Asserted on the serialized options, which is exactly what the manifest
+    embeds.
+    """
+    from distill.source import _resolved_for
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "entry-zero-model", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "entry-one-model", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    options = DistillOptions.from_args({})
+
+    monkeypatch.setattr(
+        "distill.source._probe_endpoint",
+        lambda config: config.model == "entry-one-model",
+    )
+
+    resolution = _resolved_for(options, "a-fingerprint", "local", None)
+    published = json.dumps(resolution.options.public_dict("local"))
+
+    assert "entry-one-model" in published
+    assert "entry-zero-model" not in published
+
+
+def test_the_source_carries_the_options_its_key_was_derived_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_tool: Callable[[str, str], Path]
+) -> None:
+    """<!-- P3-D-015 --> The manifest is built from the options a run carries.
+
+    A resolution derives the **bundle key** from the endpoint the walk selected,
+    then hands the source on. If those options do not travel with it, the run
+    goes on holding the ones it started with - and builds a manifest naming
+    entry 0 while publishing under entry 1's key.
+
+    So the source carries them, and `process_resolved_source` adopts them. This
+    asserts the carrying half; the adoption is one line above the run.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "entry-zero-model", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "entry-one-model", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "distill.source._probe_endpoint",
+        lambda config: config.model == "entry-one-model",
+    )
+    fake_tool("ffprobe", FAKE_FFPROBE)
+
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"\x00" * 4096)
+    info = resolve_local_source(str(video), DistillOptions.from_args({}), output_root=tmp_path)
+
+    assert info.resolved_options is not None
+    assert info.resolved_options.local_vision_model == "entry-one-model"
+    # And the key on the source is the one those options describe.
+    assert info.source_hash == source_hash(
+        info.source_fingerprint, info.resolved_options.opts_hash("local")
+    )
