@@ -191,8 +191,8 @@ def test_an_endpoints_array_parses_to_an_ordered_chain(tmp_path: Path) -> None:
 
     config = load_local_vision_config(tmp_path)
 
-    assert [entry.model for entry in config.endpoints] == ["qwen3-vl:8b", "qwen3-vl:32b"]
-    assert [entry.base_url for entry in config.endpoints] == [
+    assert [entry.model for entry in config.endpoints or ()] == ["qwen3-vl:8b", "qwen3-vl:32b"]
+    assert [entry.base_url for entry in config.endpoints or ()] == [
         "http://127.0.0.1:8000/v1",
         "http://127.0.0.1:9000/v1",
     ]
@@ -212,7 +212,7 @@ def test_todays_single_endpoint_config_reads_as_a_one_entry_chain(tmp_path: Path
 
     config = load_local_vision_config(tmp_path)
 
-    assert [(entry.model, entry.base_url) for entry in config.endpoints] == [
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
         ("qwen3-vl:32b", "http://127.0.0.1:9000/v1")
     ]
 
@@ -221,7 +221,7 @@ def test_a_config_naming_nothing_still_reads_as_a_one_entry_chain(tmp_path: Path
     """The defaults are an endpoint too, so an unconfigured run is a one-entry chain."""
     config = load_local_vision_config(tmp_path)
 
-    assert [(entry.model, entry.base_url) for entry in config.endpoints] == [
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
         (DEFAULT_MODEL, DEFAULT_LOCAL_VISION_BASE_URL)
     ]
 
@@ -255,7 +255,7 @@ def test_an_entry_omitting_a_field_takes_the_default_not_its_neighbours(
 
     config = load_local_vision_config(tmp_path)
 
-    assert [(entry.model, entry.base_url) for entry in config.endpoints] == [
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
         ("qwen3-vl:8b", DEFAULT_LOCAL_VISION_BASE_URL),
         (DEFAULT_MODEL, "http://127.0.0.1:9000/v1"),
     ]
@@ -544,7 +544,9 @@ def test_an_entry_inherits_neither_credential_nor_remote_authorization(
         )
     )
 
-    first, second = load_local_vision_config(tmp_path).endpoints or ()
+    endpoints = load_local_vision_config(tmp_path).endpoints
+    assert endpoints is not None
+    first, second = endpoints
 
     assert _request_headers(first.credential)["Authorization"] == "Bearer sk-entry-zero-secret"
     assert "Authorization" not in _request_headers(second.credential)
@@ -618,7 +620,9 @@ def test_an_entry_resolves_its_own_credential_with_the_env_var_winning(
         )
     )
 
-    first, second = load_local_vision_config(tmp_path).endpoints or ()
+    endpoints = load_local_vision_config(tmp_path).endpoints
+    assert endpoints is not None
+    first, second = endpoints
 
     assert _request_headers(first.credential)["Authorization"] == "Bearer sk-from-the-env-var"
     assert second.credential is None
@@ -642,7 +646,9 @@ def test_an_inline_key_alone_is_still_honored_per_entry(tmp_path: Path) -> None:
         )
     )
 
-    (only,) = load_local_vision_config(tmp_path).endpoints or ()
+    endpoints = load_local_vision_config(tmp_path).endpoints
+    assert endpoints is not None
+    (only,) = endpoints
 
     assert _request_headers(only.credential)["Authorization"] == "Bearer sk-inline-only"
 
