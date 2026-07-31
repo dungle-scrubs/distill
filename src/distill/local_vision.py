@@ -296,6 +296,21 @@ class LocalVisionConfig:
     the surrounding config, so entry 2 cannot inherit entry 1's credential or
     its remote authorization.
     """
+    top_level_endpoint_fields: tuple[str, ...] = field(
+        default=(), repr=False, compare=False, metadata={"runtime": True}
+    )
+    """Which top-level endpoint fields the config *files* named, if any.
+
+    Parse bookkeeping in the same spirit as `credential_configured`: recorded
+    while layers are folded, consumed once by the settle-time check, and never
+    part of what a **bundle** records - it describes how the configuration was
+    written rather than what the endpoint is.
+
+    Carried rather than checked in place because P3-D-013 is about *any* layer:
+    one file naming a chain and another naming a top-level `base_url` reads as
+    good configuration in each file alone, and the conflict exists only once
+    they are folded together.
+    """
 
     def public_dict(self) -> dict[str, Any]:
         # Excluded by the `secret` metadata flag and by carrier type - a rule
@@ -567,6 +582,16 @@ def _debug_enabled(value: bool | None = None) -> bool:
     return os.environ.get(DEBUG_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+ENDPOINT_FIELD_NAMES = ("model", "base_url", "api_key", "api_key_env", "allow_remote_endpoint")
+"""The config keys that describe *one* **vision endpoint**.
+
+Named as a set rather than checked inline because two rules need the same
+answer: these are what a chain entry is made of, and they are what a top-level
+config names when it configures the single endpoint the old way. `backend`,
+`timeout_sec` and `caption_frames` are deliberately absent - those are
+chain-wide and belong at the top level next to an `endpoints` array.
+"""
+
 MAX_ENDPOINTS = 4
 """How many **vision endpoints** one **endpoint chain** may name.
 
@@ -641,6 +666,15 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     operator's configuration was ignored.
     """
     _validate_chain(config.endpoints)
+    if config.endpoints is not None and config.top_level_endpoint_fields:
+        named = ", ".join(f"'{name}'" for name in config.top_level_endpoint_fields)
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            f"{named} names an endpoint at the top level while 'endpoints' names a chain. "
+            "Move the top-level fields into an entry, or remove 'endpoints'.",
+            {"fields": list(config.top_level_endpoint_fields)},
+        )
     try:
         _checked_endpoint_url(config.base_url, allow_remote_endpoint=config.allow_remote_endpoint)
     except EndpointRejected as exc:
@@ -760,13 +794,17 @@ def _merged_local_vision_config(base_dir: Path | None = None) -> LocalVisionConf
     """
     root = (base_dir or config_dir()).expanduser()
     config = LocalVisionConfig()
+    named: list[str] = []
     for filename in CONFIG_FILENAMES:
         payload = _read_json(root / filename)
         if filename == "distill.json":
             nested = payload.get("local_vision")
             payload = nested if isinstance(nested, dict) else {}
+        # Recorded per layer and folded afterwards, because the conflict
+        # P3-D-013 names can span two files that are each fine alone.
+        named.extend(key for key in ENDPOINT_FIELD_NAMES if key in payload)
         config = _config_from_payload(payload, config)
-    return config
+    return replace(config, top_level_endpoint_fields=tuple(dict.fromkeys(named)))
 
 
 def _with_chain(config: LocalVisionConfig) -> LocalVisionConfig:

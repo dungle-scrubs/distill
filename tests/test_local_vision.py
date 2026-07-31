@@ -397,6 +397,55 @@ def test_the_same_model_local_and_remote_is_not_a_collision(tmp_path: Path) -> N
     assert len(load_local_vision_config(tmp_path).endpoints or ()) == 2
 
 
+def test_a_top_level_endpoint_field_beside_endpoints_is_refused(tmp_path: Path) -> None:
+    """P3-D-013: naming an endpoint twice, two ways, means neither is settled.
+
+    Top-level `model`/`base_url`/credential fields *are* an endpoint - that is
+    what the one-entry chain is derived from. Naming them next to an
+    `endpoints` array asks for two chains at once, and any rule for picking a
+    winner would be Distill guessing at intent. Refused, so the operator says
+    which they meant.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "model": "qwen3-vl:8b",
+                "endpoints": [{"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"}],
+            }
+        )
+    )
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert "model" in refusal.value.details["fields"]
+
+
+def test_a_top_level_endpoint_field_in_another_layer_is_refused_too(tmp_path: Path) -> None:
+    """P3-D-013 says *any* layer, and across layers is the case that hides.
+
+    One file naming a chain and another naming a top-level model reads as
+    perfectly good configuration in each file on its own. The ambiguity only
+    exists once they are folded together, which is exactly why the check has to
+    run against the settled config rather than against a payload.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {"endpoints": [{"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"}]}
+        )
+    )
+    (tmp_path / "distill.json").write_text(
+        json.dumps({"local_vision": {"base_url": "http://127.0.0.1:8000/v1"}})
+    )
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert "base_url" in refusal.value.details["fields"]
+
+
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
     (tmp_path / "distill.local-vision.json").write_text(
         json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})
