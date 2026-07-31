@@ -307,6 +307,96 @@ def test_an_empty_endpoints_array_is_refused(tmp_path: Path) -> None:
     assert refusal.value.code == "E_BAD_OPTIONS"
 
 
+def _chain_of(count: int) -> str:
+    """A config naming `count` distinct loopback entries."""
+    return json.dumps(
+        {
+            "endpoints": [
+                {"model": f"qwen3-vl:{index}b", "base_url": f"http://127.0.0.1:{8000 + index}/v1"}
+                for index in range(count)
+            ]
+        }
+    )
+
+
+def test_a_chain_of_four_is_allowed_and_a_fifth_entry_is_refused(tmp_path: Path) -> None:
+    """P3-D-005: the ceiling is four, and the boundary is asserted from both sides.
+
+    A ceiling only tested from above is a ceiling nobody knows the height of.
+    Each entry costs a probe on a cold run, so the bound is what keeps a
+    misconfigured chain from turning one run into a long walk through endpoints
+    that are not there.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(_chain_of(4))
+    assert len(load_local_vision_config(tmp_path).endpoints or ()) == 4
+
+    (tmp_path / "distill.local-vision.json").write_text(_chain_of(5))
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+
+
+def test_two_entries_sharing_model_and_remoteness_are_refused_naming_both(
+    tmp_path: Path,
+) -> None:
+    """P3-D-020: two entries that cannot be told apart by **bundle key**.
+
+    ADR-0004 keeps the address out of identity, so what names a reader is its
+    model and whether it is remote. Two entries agreeing on both derive the same
+    candidate key: whichever answered first would publish under it, and the
+    other would be served that generation while the manifest named its own
+    address. Refused at configuration time, because at resolution time there is
+    nothing left to tell them apart with.
+
+    Both indices are named. "Two of your endpoints collide" leaves the operator
+    to work out which two out of four.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:9100/v1"},
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.details["entries"] == [0, 2]
+
+
+def test_the_same_model_local_and_remote_is_not_a_collision(tmp_path: Path) -> None:
+    """The pair is `(model, remoteness)`, and remoteness is half of it.
+
+    The same model served locally and in the cloud is the case the **endpoint
+    chain** most obviously exists for. They derive different keys because
+    `local_vision_non_local` differs, so nothing collides and nothing is
+    refused.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "https://api.example.com/v1",
+                        "allow_remote_endpoint": True,
+                    },
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                ]
+            }
+        )
+    )
+
+    assert len(load_local_vision_config(tmp_path).endpoints or ()) == 2
+
+
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
     (tmp_path / "distill.local-vision.json").write_text(
         json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})

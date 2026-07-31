@@ -567,6 +567,71 @@ def _debug_enabled(value: bool | None = None) -> bool:
     return os.environ.get(DEBUG_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+MAX_ENDPOINTS = 4
+"""How many **vision endpoints** one **endpoint chain** may name.
+
+<!-- P3-D-005 --> A bound rather than a preference: each entry costs a probe on
+a cold run, and the chain is walked in order, so an unbounded chain turns one
+misconfigured run into a long walk through endpoints that are not there. Four is
+enough for the cases the chain exists for (a cloud reader with a local
+fallback, or a couple of each) and small enough that the walk stays short.
+"""
+
+
+def _validate_chain(endpoints: tuple[LocalVisionConfig, ...] | None) -> None:
+    """The chain's shape, checked once the config is settled.
+
+    Called from `_with_validated_endpoint` rather than while merging layers,
+    for the reason `_merged_local_vision_config` states: a per-call override is
+    allowed to rescue a file that names something unusable, and naming both
+    `--local-vision-model` and `--local-vision-base-url` replaces the chain
+    outright. Only the settled config is checked.
+
+    `None` is not a chain anybody configured and is nothing to check - the
+    top-level fields answer for it, and `_with_chain` derives the one entry.
+    """
+    if endpoints is None:
+        return
+    if not endpoints:
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            "'endpoints' was configured but names no endpoint. Remove it to use "
+            "the default endpoint, or pass --no-caption-frames to run without vision.",
+            {"endpoints": 0},
+        )
+    if len(endpoints) > MAX_ENDPOINTS:
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            f"'endpoints' names {len(endpoints)} endpoints; at most {MAX_ENDPOINTS} are allowed.",
+            {"endpoints": len(endpoints), "max": MAX_ENDPOINTS},
+        )
+    # <!-- P3-D-020 --> ADR-0004 keeps the address out of identity, so what
+    # names a reader is its model and whether it is remote. Two entries
+    # agreeing on both derive the same candidate key, and at resolution time
+    # there is nothing left to tell them apart with: whichever answered first
+    # would publish under that key and the other would be served its
+    # generation while the manifest named a different address.
+    seen: dict[tuple[str, bool], int] = {}
+    for index, entry in enumerate(endpoints):
+        identity = (entry.model, config_is_non_local(entry))
+        first = seen.get(identity)
+        if first is not None:
+            where = "remote" if identity[1] else "local"
+            raise DistillError(
+                "E_BAD_OPTIONS",
+                "local_vision",
+                f"endpoints {first} and {index} both name model '{entry.model}' "
+                f"{where}ly, so they cannot be told apart by bundle key. "
+                "Give them different models, or remove one.",
+                # Both indices, because "two of your endpoints collide" leaves
+                # the operator to work out which two out of four.
+                {"entries": [first, index], "model": entry.model, "remote": identity[1]},
+            )
+        seen[identity] = index
+
+
 def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     """The same config, once its `base_url` is one Distill will speak to.
 
@@ -575,19 +640,7 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     address allowed, and silently degrading to OCR-only would hide that the
     operator's configuration was ignored.
     """
-    if config.endpoints == ():
-        # Refused here rather than while merging layers, for the reason
-        # `_merged_local_vision_config` states: a per-call override is allowed
-        # to rescue a file that names something unusable, and naming both
-        # `--local-vision-model` and `--local-vision-base-url` replaces the
-        # chain outright. Only the settled config is checked.
-        raise DistillError(
-            "E_BAD_OPTIONS",
-            "local_vision",
-            "'endpoints' was configured but names no endpoint. Remove it to use "
-            "the default endpoint, or pass --no-caption-frames to run without vision.",
-            {"endpoints": 0},
-        )
+    _validate_chain(config.endpoints)
     try:
         _checked_endpoint_url(config.base_url, allow_remote_endpoint=config.allow_remote_endpoint)
     except EndpointRejected as exc:
