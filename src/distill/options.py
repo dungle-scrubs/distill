@@ -314,12 +314,34 @@ def _annotate_configured_refusal(
 
 CACHE_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.cache_key)
 PROCESSING_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.name != "cache_mode")
+VISION_MODE_DISABLED = "disabled"
+"""Vision was never asked for - `--no-caption-frames`. No reader, by choice."""
+
+VISION_MODE_SELECTED = "selected"
+"""An endpoint answered and produced the **interpretations** in this bundle."""
+
+VISION_MODE_CHAIN_EXHAUSTED = "chain_exhausted"
+"""Every endpoint in the **endpoint chain** was asked and none answered.
+
+A bundle without **interpretations**, like `disabled` - and not the same
+bundle. What differs is what the operator asked for, so it differs in the key
+(P3-D-012).
+"""
+
+VISION_MODES = frozenset({VISION_MODE_DISABLED, VISION_MODE_SELECTED, VISION_MODE_CHAIN_EXHAUSTED})
+
 LOCAL_VISION_IDENTITY_OPTION_NAMES = (
-    "caption_frames",
     "local_vision_backend",
-    "local_vision_model",
     "local_vision_timeout_sec",
 )
+"""The identity-bearing vision options carried through verbatim.
+
+`caption_frames` left this tuple for `vision_mode`, which says which of three
+outcomes happened rather than which of two (P3-D-017), and
+`local_vision_model` left it because it is nullable now - it is written by
+`cache_payload`, which is the only place that knows whether a reader produced
+this bundle at all.
+"""
 
 
 @dataclass(frozen=True)
@@ -370,6 +392,16 @@ class DistillOptions:
     artifact_dir: str | None = None
     force_reprocess: bool = False
     caption_frames: bool = True
+    vision_mode: str = VISION_MODE_SELECTED
+    """Which of the three vision outcomes this run's key describes (P3-D-017).
+
+    Runtime state that resolution settles, not something an operator types:
+    `caption_frames` is still the flag, and `disabled` is derived from it. What
+    an operator cannot express is `chain_exhausted`, which only the **endpoint
+    chain** walk can discover, and which must not share a key with `disabled` -
+    a run whose endpoints were all down would otherwise be served the
+    deliberate `--no-caption-frames` bundle forever after (P3-D-012).
+    """
     local_vision_backend: str = DEFAULT_LOCAL_VISION_BACKEND
     local_vision_model: str = DEFAULT_LOCAL_VISION_MODEL
     local_vision_base_url: str = DEFAULT_LOCAL_VISION_BASE_URL
@@ -542,6 +574,19 @@ class DistillOptions:
     def cache_payload(self, source_type: str) -> dict[str, Any]:
         payload = {name: getattr(self, name) for name in CACHE_OPTION_NAMES}
         payload.update({name: getattr(self, name) for name in LOCAL_VISION_IDENTITY_OPTION_NAMES})
+        # <!-- P3-D-017 --> Three outcomes, not two. `caption_frames` is the
+        # flag an operator sets; `vision_mode` is what the run turned out to
+        # be, and only it can distinguish a walked-out chain from a deliberate
+        # opt-out - two bundles with no interpretations that must never share a
+        # key (P3-D-012).
+        mode = VISION_MODE_DISABLED if not self.caption_frames else self.vision_mode
+        payload["vision_mode"] = mode
+        # Nullable, and null exactly when no reader produced this bundle.
+        # Naming a model on a disabled or exhausted run would put a reader in
+        # the key of a bundle it had nothing to do with.
+        payload["local_vision_model"] = (
+            self.local_vision_model if mode == VISION_MODE_SELECTED else None
+        )
         # D-012 narrows ADR-0004 for exactly one case: WAS this produced via
         # a (possibly) remote endpoint. The boolean folds into identity so
         # remote- and local-produced bundles never share a key; the address
