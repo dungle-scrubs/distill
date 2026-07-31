@@ -13,6 +13,13 @@ stay readable where the format allows and are otherwise reprocessed.
 
 ### Breaking
 
+- **Every cache written by 0.2.0 reprocesses on first run.** The pipeline
+  version moves 54 → 55 because the vision client changed: it now connects to
+  the address the endpoint check approved instead of resolving the hostname a
+  second time. The pipeline version participates in every **bundle key**, so
+  existing bundles are not overwritten and not served — the first run after
+  upgrading rebuilds them. The note above covers caches written by 0.1.0; this
+  one is separate and applies to 0.2.0 as well.
 - **Distill installs nothing.** A missing `tesseract` used to make Distill run
   `brew install tesseract` on the user's behalf. It now records a warning and
   the run continues without image-text extraction. Installing the system

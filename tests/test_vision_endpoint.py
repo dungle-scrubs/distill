@@ -13,11 +13,16 @@ every test drives a fake resolver rather than asking the machine's.
 from __future__ import annotations
 
 import http.client
+import http.server
 import json
 import logging
+import socket
+import ssl
+import threading
 import urllib.request
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -27,13 +32,24 @@ from distill.local_vision import (
     MAX_RESPONSE_BYTES,
     LocalVisionConfig,
     LocalVisionFailure,
+    SecretCredential,
     _build_opener,
     _urlopen_json,
+    config_is_non_local,
     local_vision_config_from_args,
     probe_local_vision,
     try_interpret_image,
 )
 from distill.options import DistillOptions
+
+# Direct, not through `local_vision`'s re-exports: the pinning transport is an
+# internal of the client module, and the facade should not widen to name it.
+from distill.rapid_mlx import (
+    _connect_to_a_validated_address,
+    _connection_pinned_to,
+    _DialsOnlyTheValidatedAddress,
+    _EndpointRequest,
+)
 
 LOOPBACK_URL = "http://127.0.0.1:8000/v1"
 # https, not http: since M2.3 (D-008) a non-loopback endpoint requires TLS
@@ -140,6 +156,184 @@ def _json_response(url: str, payload: Any) -> _CannedResponse:
 
 def _redirect_response(url: str, location: str) -> _CannedResponse:
     return _CannedResponse(url, status=302, headers={"Location": location})
+
+
+class _Received(NamedTuple):
+    """One request as the server on the other end saw it."""
+
+    path: str
+    headers: dict[str, str]
+    body: bytes
+
+
+class _RecordingHTTPServer(http.server.ThreadingHTTPServer):
+    """A loopback server that keeps what reached it."""
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), _RecordingHandler)
+        self.received: list[_Received] = []
+
+
+class _RecordingHandler(http.server.BaseHTTPRequestHandler):
+    def _record_and_answer(self, payload: Any) -> None:
+        server = self.server
+        assert isinstance(server, _RecordingHTTPServer)
+        length = int(self.headers.get("Content-Length") or 0)
+        server.received.append(
+            _Received(self.path, dict(self.headers), self.rfile.read(length) if length else b"")
+        )
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's name
+        self._record_and_answer({"data": []})
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's name
+        self._record_and_answer({"choices": [{"message": {"content": "{}"}}]})
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib's name
+        return None
+
+
+class _RealEndpoint:
+    """One real HTTP endpoint on loopback, for the tests about the socket.
+
+    `_FakeTransport` replaces urllib's HTTP handlers outright, so the socket -
+    which is the entire subject of the pinning tests - is never opened under
+    it. These tests need the production chain all the way down, so they need a
+    server actually listening.
+    """
+
+    def __init__(self) -> None:
+        self._httpd = _RecordingHTTPServer()
+        self.port: int = self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        try:
+            self._thread.start()
+        except BaseException:
+            # Otherwise the listening socket outlives the failure, holding its
+            # port for the rest of the session.
+            self._httpd.server_close()
+            raise
+
+    @property
+    def received(self) -> list[_Received]:
+        return self._httpd.received
+
+    def close(self) -> None:
+        # Guarded: `shutdown()` waits unconditionally on an event only
+        # `serve_forever`'s exit sets, so calling it on a thread that never got
+        # there hangs the whole run with no diagnostic.
+        if self._thread.is_alive():
+            self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+        assert not self._thread.is_alive(), "loopback endpoint did not shut down"
+
+
+class _AcceptOnlyEndpoint:
+    """A loopback listener that records connections and speaks no protocol.
+
+    Enough to answer "which address was dialled" for a scheme whose handshake
+    cannot complete here: an `https` request against it fails, and failing is
+    fine - the question is which of two listeners the socket went to.
+    """
+
+    def __init__(self) -> None:
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(8)
+        self.port: int = self._listener.getsockname()[1]
+        self.connections = 0
+        self._closing = threading.Event()
+        self._thread = threading.Thread(target=self._accept_until_closed, daemon=True)
+        try:
+            self._thread.start()
+        except BaseException:
+            self._listener.close()
+            raise
+
+    def _accept_until_closed(self) -> None:
+        while not self._closing.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except OSError:
+                return
+            self.connections += 1
+            connection.close()
+
+    def close(self) -> None:
+        self._closing.set()
+        self._listener.close()
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture
+def accept_only_endpoint() -> Iterator[Callable[[], _AcceptOnlyEndpoint]]:
+    """Bare loopback listeners on demand, torn down whatever the test does."""
+    endpoints: list[_AcceptOnlyEndpoint] = []
+
+    def build() -> _AcceptOnlyEndpoint:
+        endpoint = _AcceptOnlyEndpoint()
+        endpoints.append(endpoint)
+        return endpoint
+
+    try:
+        yield build
+    finally:
+        for endpoint in endpoints:
+            endpoint.close()
+
+
+@pytest.fixture
+def real_endpoint() -> Iterator[Callable[[], _RealEndpoint]]:
+    """Live loopback endpoints on demand, torn down whatever the test does.
+
+    A factory rather than a fixed pair: the tests want one or two, and every
+    one built inside the guarded region so a failure part-way through still
+    closes the ones already listening.
+    """
+    endpoints: list[_RealEndpoint] = []
+
+    def build() -> _RealEndpoint:
+        endpoint = _RealEndpoint()
+        endpoints.append(endpoint)
+        return endpoint
+
+    try:
+        yield build
+    finally:
+        for endpoint in endpoints:
+            endpoint.close()
+
+
+def _answers_with_ports(monkeypatch: pytest.MonkeyPatch, *ports: int) -> None:
+    """Resolve `vision.test` to 127.0.0.1 on a different port each lookup.
+
+    The address is loopback every time, so the endpoint check passes every
+    time; the *port* is what moves, and that is what makes a second lookup
+    observable. `socket.create_connection` connects to the whole sockaddr
+    `getaddrinfo` hands back, port included, so an unpinned connection lands on
+    whichever server the later answer names while the URL never changed.
+
+    The last port keeps answering once the sequence runs out, and any other
+    host is passed through to the real resolver.
+    """
+    real_getaddrinfo = socket.getaddrinfo
+    remaining = list(ports)
+
+    def fake(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
+        if host != "vision.test":
+            return real_getaddrinfo(host, port, *args, **kwargs)
+        answered = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", answered))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
 
 
 def test_a_non_loopback_host_is_rejected_without_the_opt_out(tmp_path: Path) -> None:
@@ -339,6 +533,263 @@ def test_the_resolved_address_is_checked_on_every_request(
     assert caught.value.detail["address"] == "169.254.169.254"
     assert asked == [("vision.test", 8000), ("vision.test", 8000)]
     assert transport.requested == [named_url]
+
+
+def test_a_supplied_transport_replaces_the_real_one_rather_than_racing_it() -> None:
+    """What keeps the rest of this suite off the network, asserted once.
+
+    Every other test that installs a `_FakeTransport` is trusting that the real
+    transport is not also installed and merely sorted behind it. That would
+    make suite-wide network isolation a property of `handler_order`, and a fake
+    whose `http_open` returned `None` would fall through to a real socket. The
+    substitution is what makes it structural, so it is worth one assertion.
+    """
+    fake = _FakeTransport({})
+    # `Any`: `handle_open` is built in `OpenerDirector.__init__` and typeshed
+    # does not declare it.
+    opener_with_fake: Any = _build_opener(fake)
+    production_opener: Any = _build_opener()
+    with_fake = opener_with_fake.handle_open
+    production = production_opener.handle_open
+
+    for scheme in ("http", "https"):
+        # The fake is the only opener, so nothing can fall through to a socket.
+        assert with_fake[scheme] == [fake]
+        # And with nothing supplied, the pinning transport is the only opener,
+        # so no request escapes it either.
+        assert [type(handler) for handler in production[scheme]] == [_DialsOnlyTheValidatedAddress]
+
+
+def test_the_request_goes_to_the_address_that_was_validated(
+    monkeypatch: pytest.MonkeyPatch,
+    real_endpoint: Callable[[], _RealEndpoint],
+) -> None:
+    """D-021: the name is resolved once, and *that* answer is what is dialled.
+
+    Checking a resolved address and then handing the *name* to the connection
+    validates nothing: the name is free to answer differently the second time,
+    and the second answer is the one the socket goes to. A name that is
+    loopback while the check runs and something else when the connection is
+    made sends the credential and the **keyframe** to the something else, while
+    every check this module made passed and the bundle records local-only.
+
+    Reproduced with two real servers and a resolver that answers with the first
+    and then the second: both are loopback, so nothing here depends on being
+    able to bind an address the machine may not have, and the port is what
+    makes the swap observable. The second endpoint must receive nothing at all
+    - not a request without the credential, nothing - because a request that
+    arrives has already told an unvalidated host that this machine is running
+    Distill against a vision endpoint.
+    """
+    validated, swapped = real_endpoint(), real_endpoint()
+    _answers_with_ports(monkeypatch, validated.port, swapped.port)
+    url = f"http://vision.test:{validated.port}/v1/models"
+
+    assert _urlopen_json("GET", url, None, 5.0, credential=SecretCredential("s3cr3t")) == {
+        "data": []
+    }
+
+    assert [request.path for request in validated.received] == ["/v1/models"]
+    assert swapped.received == []
+
+
+def test_an_unreachable_validated_address_fails_rather_than_falling_back(
+    monkeypatch: pytest.MonkeyPatch,
+    real_endpoint: Callable[[], _RealEndpoint],
+) -> None:
+    """D-021: the pin is load-bearing, not an optimisation with a safety net.
+
+    A pin that quietly falls back to resolving the name when the validated
+    address refuses the connection closes nothing - the swap just needs the
+    first address to be down, which whoever is steering DNS controls anyway.
+    So the validated address failing is the end of the request, and the name is
+    never dialled, even though something is listening on it.
+
+    Asserted through the probe, where an operator meets it: an endpoint that
+    cannot be reached at the address it was approved at is *unavailable*, which
+    ADR-0002 degrades on, and not a rejection - nothing about the endpoint's
+    policy was wrong.
+    """
+    live = real_endpoint()
+    with socket.socket() as spare:
+        spare.bind(("127.0.0.1", 0))
+        closed_port = spare.getsockname()[1]
+    # One fake, not two: `_resolve_addresses` reduces this answer to
+    # ["127.0.0.1"] on its own, so patching it as well would hide which seam
+    # the test actually drives.
+    _answers_with_ports(monkeypatch, live.port)
+
+    probe = probe_local_vision(LocalVisionConfig(base_url=f"http://vision.test:{closed_port}/v1"))
+
+    assert probe.available is False
+    assert probe.code == "local_vision_rapid_mlx_unavailable"
+    assert live.received == []
+
+
+def test_the_validated_addresses_share_one_deadline_rather_than_each_getting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One request stays one request's worth of time, however many answers.
+
+    How many addresses there are is not Distill's choice: a zone may answer with
+    fifty, and if every one of them is inside `127.0.0.0/8` then every one of
+    them passes the loopback check. Giving each the full timeout turns a 30
+    second bound into 25 minutes, and the vision budget is charged between
+    requests, so nothing else would cut it short. So the attempts share the
+    request's deadline: each is handed what is *left* of it, and once it is
+    spent the remaining addresses are not dialled at all.
+    """
+    handed: list[tuple[str, float]] = []
+    # Read once per address considered: two attempts, then a reading past the
+    # deadline that ends the loop before the third is dialled.
+    clock = iter([100.0, 100.5, 102.5])
+
+    def refuse(address: tuple[str, int], timeout: float, *args: Any) -> socket.socket:
+        handed.append((address[0], timeout))
+        raise ConnectionRefusedError(f"nothing on {address}")
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: next(clock))
+
+    with pytest.raises(ConnectionRefusedError):
+        _connect_to_a_validated_address(
+            # The repeat is what `getaddrinfo` produces when one address serves
+            # several protocols; dialling it twice would spend the deadline on
+            # the same host twice.
+            ("127.0.0.1", "127.0.0.1", "127.0.0.2", "127.0.0.3"),
+            102.0,
+            ("vision.test", 8000),
+            5.0,
+            None,
+        )
+
+    # Each attempt given only what the deadline still had, the repeat collapsed,
+    # and the last address never dialled because the deadline had run out.
+    assert handed == [("127.0.0.1", 2.0), ("127.0.0.2", 1.5)]
+
+
+def test_https_is_pinned_too_and_still_names_the_host_for_tls(
+    monkeypatch: pytest.MonkeyPatch,
+    accept_only_endpoint: Callable[[], _AcceptOnlyEndpoint],
+) -> None:
+    """`https_open` is its own code path, so it gets its own proof.
+
+    An implementation that pinned `http` and left `https` to urllib's ordinary
+    resolution would pass every other test here, because every other live test
+    reaches for an `http` URL. Two things have to hold for `https`, and they
+    pull in opposite directions: the socket goes to the *address* the check
+    approved, and TLS is still verified against the *hostname* the operator
+    configured - `HTTPSConnection.connect()` wraps with
+    `server_hostname=self.host`, so a pin that replaced the host would quietly
+    verify the certificate against an IP instead.
+
+    The handshake itself cannot complete against a listener with no
+    certificate, and does not need to: what is asserted is which of the two
+    listeners was dialled, and that the connection kept the name.
+    """
+    validated, swapped = accept_only_endpoint(), accept_only_endpoint()
+    _answers_with_ports(monkeypatch, validated.port, swapped.port)
+
+    # No injected resolver: the check must take the *first* answer and the
+    # connect the *second*, or an unpinned `https_open` would land on the
+    # validated port by accident and the test would prove nothing.
+    with pytest.raises((LocalVisionFailure, OSError, ssl.SSLError, RuntimeError)):
+        _urlopen_json("GET", f"https://vision.test:{validated.port}/v1/models", None, 5.0)
+
+    assert validated.connections == 1
+    assert swapped.connections == 0
+
+    # And the connection TLS would have wrapped is still named by the host, so
+    # `server_hostname` is the hostname and not the pinned address.
+    request = _EndpointRequest(
+        "https://vision.test:443/v1/models", validated_addresses=("127.0.0.1",), deadline=None
+    )
+    connection = _connection_pinned_to(http.client.HTTPSConnection, request)("vision.test")
+    assert connection.host == "vision.test"
+
+
+def test_a_deadline_already_spent_dials_nothing_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exhausted case is a timeout, not a silent success on address two."""
+
+    def refuse(*args: Any, **kwargs: Any) -> socket.socket:
+        raise AssertionError("a spent deadline must not reach the network")
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: 100.0)
+
+    with pytest.raises(TimeoutError):
+        _connect_to_a_validated_address(("127.0.0.1",), 99.0, ("vision.test", 8000), 5.0, None)
+
+
+def test_a_local_only_claim_is_backed_by_where_the_keyframe_actually_went(
+    monkeypatch: pytest.MonkeyPatch,
+    real_endpoint: Callable[[], _RealEndpoint],
+) -> None:
+    """D-021: the disclosure and the socket now agree.
+
+    `local_vision_non_local` is false for a hostname endpoint without the
+    remote opt-in, on the grounds that the transport proves every resolved
+    address loopback on every request. The race made that a claim the transport
+    did not keep: the **keyframe** and the credential could go to the second
+    answer while the **bundle** recorded local-only, and nothing anywhere
+    recorded otherwise. So the claim is asserted against the body that actually
+    arrived, not against the config that predicted it.
+    """
+    validated, swapped = real_endpoint(), real_endpoint()
+    config = LocalVisionConfig(base_url=f"http://vision.test:{validated.port}/v1")
+    assert config_is_non_local(config) is False
+    payload = DistillOptions.from_args(
+        {"local_vision_base_url": f"http://vision.test:{validated.port}/v1"}
+    ).cache_payload("local")
+    assert payload["local_vision_non_local"] is False
+
+    _answers_with_ports(monkeypatch, validated.port, swapped.port)
+
+    _urlopen_json(
+        "POST",
+        f"http://vision.test:{validated.port}/v1/chat/completions",
+        {"model": "a-model", "messages": [{"role": "user", "content": "a keyframe"}]},
+        5.0,
+        credential=SecretCredential("s3cr3t"),
+    )
+
+    (request,) = validated.received
+    assert b"a keyframe" in request.body
+    assert request.headers["Authorization"] == "Bearer s3cr3t"
+    # And the address the second lookup named learned nothing: not the
+    # keyframe, not the credential, not that this machine asked at all.
+    assert swapped.received == []
+
+
+def test_the_connection_is_dialled_by_address_but_named_by_hostname(
+    monkeypatch: pytest.MonkeyPatch,
+    real_endpoint: Callable[[], _RealEndpoint],
+) -> None:
+    """D-021: pinning replaces the address, and nothing else.
+
+    Rewriting the URL to the validated address would pin just as well and would
+    break two things at once: the `Host` header stops naming what the operator
+    configured, and TLS would verify a certificate against an address instead
+    of the hostname - so an `https` endpoint named by a hostname, with an
+    ordinary certificate, would stop working. The address is the only thing
+    the connection is allowed to lose.
+
+    Only the check's resolver is faked, and `vision.test` is a name the machine
+    genuinely cannot resolve, so the request arriving at all is itself the
+    evidence: an unpinned connection would have looked the name up for real and
+    failed. The `Host` header then says which of the two pins was built.
+    """
+    endpoint = real_endpoint()
+    url = f"http://vision.test:{endpoint.port}/v1/models"
+
+    assert _urlopen_json("GET", url, None, 5.0, resolver=lambda host, port: ["127.0.0.1"]) == {
+        "data": []
+    }
+
+    (request,) = endpoint.received
+    assert request.headers["Host"] == f"vision.test:{endpoint.port}"
 
 
 def test_a_redirect_urllib_will_not_act_on_still_tells_the_operator_it_was_one(
