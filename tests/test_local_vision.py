@@ -446,6 +446,61 @@ def test_a_top_level_endpoint_field_in_another_layer_is_refused_too(tmp_path: Pa
     assert "base_url" in refusal.value.details["fields"]
 
 
+def test_every_entry_is_held_to_the_endpoint_rules_not_just_the_first(
+    tmp_path: Path,
+) -> None:
+    """R-43 and D-008 are per endpoint, so they are per entry.
+
+    A chain whose first entry is loopback would otherwise pass the only check
+    there was, and entry 1 - the one that actually leaves the machine - would
+    reach the network unexamined. Both refusals are asserted: an entry off
+    loopback without the opt-in, and an entry that has the opt-in but speaks
+    plain `http`, which D-008 refuses wherever it is.
+
+    The index is in the error, because "one of your endpoints is not allowed"
+    is not something an operator can act on.
+
+    Literal addresses, deliberately. A *hostname* is not settled here and must
+    not be: what it resolves to is a question with an answer that can change,
+    which is why the loopback rule is re-checked per request against the
+    resolved address (D-029) rather than guessed at from the URL. Only what is
+    decidable from the text is decided from the text.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "https://10.0.0.5/v1"},
+                ]
+            }
+        )
+    )
+    with pytest.raises(DistillError) as no_opt_in:
+        load_local_vision_config(tmp_path)
+    assert no_opt_in.value.code == "E_BAD_OPTIONS"
+    assert no_opt_in.value.details["entry"] == 1
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {
+                        "model": "qwen3-vl:32b",
+                        "base_url": "http://10.0.0.5/v1",
+                        "allow_remote_endpoint": True,
+                    },
+                ]
+            }
+        )
+    )
+    with pytest.raises(DistillError) as plain_http:
+        load_local_vision_config(tmp_path)
+    assert plain_http.value.code == "E_BAD_OPTIONS"
+    assert plain_http.value.details["entry"] == 1
+
+
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
     (tmp_path / "distill.local-vision.json").write_text(
         json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})

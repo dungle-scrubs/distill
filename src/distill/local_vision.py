@@ -675,6 +675,25 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
             "Move the top-level fields into an entry, or remove 'endpoints'.",
             {"fields": list(config.top_level_endpoint_fields)},
         )
+    for index, entry in enumerate(config.endpoints or ()):
+        # R-43's loopback rule and D-008's scheme rule are properties of one
+        # endpoint, so a chain has to be held to them once per entry. Checking
+        # only the top-level `base_url` would clear a chain whose first entry
+        # is loopback and let entry 1 - the one that actually leaves the
+        # machine - reach the network unexamined.
+        try:
+            _checked_endpoint_url(entry.base_url, allow_remote_endpoint=entry.allow_remote_endpoint)
+        except EndpointRejected as exc:
+            raise DistillError(
+                "E_BAD_OPTIONS",
+                "local_vision",
+                f"endpoint {index}: {exc.message}",
+                # The index, because "one of your endpoints is not allowed" is
+                # not something an operator can act on. The rejection's own
+                # detail still decides whether the URL itself can be named
+                # (D-007).
+                {"entry": index, **dict(exc.detail)},
+            ) from exc
     try:
         _checked_endpoint_url(config.base_url, allow_remote_endpoint=config.allow_remote_endpoint)
     except EndpointRejected as exc:
