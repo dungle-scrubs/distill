@@ -21,6 +21,7 @@ from distill.vision_chain import (
     SELECTED,
     SKIPPED,
     UNAVAILABLE,
+    AvailabilityMemo,
     EntryOutcome,
     candidate_keys,
     resolve_chain,
@@ -406,3 +407,58 @@ def test_a_chain_skipped_all_the_way_down_still_exhausts_rather_than_hangs() -> 
     assert resolved.entry is None
     assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
     assert [o.outcome for o in resolved.evidence] == [SKIPPED, SKIPPED]
+
+
+# --- the negative-availability memo ----------------------------------------
+
+
+def test_the_memo_forgets_an_endpoint_once_its_ttl_has_passed() -> None:
+    """A memo that never expires is a permanent verdict on a temporary fact.
+
+    An endpoint is unavailable because a server is down, a laptop is on a
+    different network, or a key expired - all things that get fixed. The memo
+    exists to stop a chain paying the same timeout every run, not to decide
+    once and for all that an endpoint is gone.
+
+    The clock is injected: a test that slept for the TTL would be slow when it
+    passed and flaky when it did not.
+    """
+    memo = AvailabilityMemo(ttl_sec=300.0)
+    memo.record_unavailable(LOCAL_A, now=1000.0)
+
+    assert memo.skips(LOCAL_A, now=1000.0) is True
+    assert memo.skips(LOCAL_A, now=1299.0) is True
+    # Exactly at the TTL the memo has expired: the bound is how long the answer
+    # is trusted, so the moment it runs out the endpoint is asked again.
+    assert memo.skips(LOCAL_A, now=1300.0) is False
+    assert memo.skips(LOCAL_A, now=9999.0) is False
+
+
+def test_the_memo_answers_per_endpoint_and_not_per_chain() -> None:
+    """One endpoint being down says nothing about the next.
+
+    The memo is keyed on the address as well as the model, because
+    reachability is a fact about a *place*: the same model served locally and
+    in the cloud are two endpoints, and one being unreachable is no reason to
+    skip the other.
+    """
+    memo = AvailabilityMemo(ttl_sec=300.0)
+    memo.record_unavailable(REMOTE_A, now=1000.0)
+
+    assert memo.skips(REMOTE_A, now=1000.0) is True
+    # Same model, different address - a different endpoint.
+    assert memo.skips(LOCAL_A, now=1000.0) is False
+
+
+def test_a_clock_that_went_backwards_expires_the_memo_rather_than_trusting_it() -> None:
+    """Clock skew must not pin an endpoint as skipped indefinitely.
+
+    A shared cache root across machines, or a clock corrected backwards, makes
+    `now` earlier than the recorded time. Treating that as "recorded in the
+    future, so still fresh" would skip the endpoint until the clock caught up.
+    The safe reading of an impossible interval is that the memo is stale.
+    """
+    memo = AvailabilityMemo(ttl_sec=300.0)
+    memo.record_unavailable(LOCAL_A, now=5000.0)
+
+    assert memo.skips(LOCAL_A, now=1000.0) is False

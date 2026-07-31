@@ -14,7 +14,7 @@ and the walk's to consume.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from .local_vision import LocalVisionConfig
 from .options import (
@@ -128,6 +128,56 @@ Distinct from `UNAVAILABLE`, and the distinction is user-visible: an
 slow because every entry is probed every run is a different problem from one
 where the memo is doing its job.
 """
+
+
+DEFAULT_MEMO_TTL_SEC = 300.0
+"""How long an endpoint's unavailability is trusted before it is asked again.
+
+Long enough that a chain does not pay the same timeout on every run in a batch,
+short enough that a server coming back is noticed within a few minutes. It is a
+bound on how stale an answer may be, not a verdict: an endpoint is unavailable
+because something got fixed later, not because it stopped existing.
+"""
+
+
+@dataclass
+class AvailabilityMemo:
+    """Which endpoints were found unavailable recently, and when.
+
+    Keyed on the address as well as the model, because reachability is a fact
+    about a *place*: the same model served locally and in the cloud are two
+    endpoints, and one being unreachable says nothing about the other.
+
+    Machine-local by nature - it records what *this* machine could reach - so it
+    belongs beside the cache rather than inside a **bundle**. A bundle carrying
+    it would be asserting one machine's network conditions as a property of the
+    reading.
+    """
+
+    ttl_sec: float = DEFAULT_MEMO_TTL_SEC
+    recorded: dict[tuple[str, str], float] = field(default_factory=dict)
+
+    @staticmethod
+    def _key(endpoint: LocalVisionConfig) -> tuple[str, str]:
+        return (endpoint.model, endpoint.base_url)
+
+    def record_unavailable(self, endpoint: LocalVisionConfig, *, now: float) -> None:
+        self.recorded[self._key(endpoint)] = now
+
+    def skips(self, endpoint: LocalVisionConfig, *, now: float) -> bool:
+        """Whether this endpoint should be passed over without being asked.
+
+        An interval that runs backwards - a clock corrected, or a cache root
+        shared between machines that disagree - is read as stale rather than as
+        fresh. "Recorded in the future, so still trusted" would skip the
+        endpoint until the clock caught up, which is a long time to honour an
+        answer that cannot be right.
+        """
+        at = self.recorded.get(self._key(endpoint))
+        if at is None:
+            return False
+        elapsed = now - at
+        return 0.0 <= elapsed < self.ttl_sec
 
 
 @dataclass(frozen=True)
