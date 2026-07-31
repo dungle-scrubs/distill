@@ -563,3 +563,30 @@ def test_the_generic_rule_consumes_its_own_padding() -> None:
 
     assert "=" not in result.text
     assert "[REDACTED:base64-blob]" in result.text
+
+
+def test_the_cue_lookback_is_bounded_so_a_long_line_cannot_stall_a_run() -> None:
+    """The exemption's own denial of service, closed before it shipped.
+
+    `_PRECEDING_TOKEN` is anchored at the end and searched backwards, so on a
+    line that does not end in a cue it retries at every start position. A line
+    of `a` followed by one non-matching character is quadratic in that line's
+    length - measured at 18ms for 2 KB, 278ms for 8 KB and 1.1s for 16 KB - and
+    screen text is chosen by whoever produced the source, so it is attacker
+    input on the same terms as the 25.7s and 45s incidents this module already
+    records.
+
+    Asserted as the bound rather than as a wall-clock threshold, for the reason
+    the assignment-name guard gives: a timing assertion is slow when it passes
+    and flaky when it does not. What matters is that the window is a constant.
+    """
+    assert redact_secrets.CUE_LOOKBACK_CHARACTERS <= 128
+    # Long enough for any cue plus its separators; `integrity` is the longest at
+    # nine characters.
+    assert redact_secrets.CUE_LOOKBACK_CHARACTERS > 16
+
+    # And the behaviour the bound protects: a hostile line still resolves, and
+    # still redacts, because a cue that far away is not adjacent to anything.
+    hostile = "a" * 40_000 + "! " + "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+
+    assert "[REDACTED:base64-blob]" in redact_text(hostile).text

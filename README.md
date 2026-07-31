@@ -5,7 +5,11 @@ LLM-readable bundles: transcript JSON, keyframes, OCR text, local vision
 captions, and a markdown render. Designed for feeding recorded talks, demos, and
 screen recordings into LLM agents.
 
-> **Platform:** Apple Silicon (macOS). Local vision uses [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX), an MLX inference server.
+> **Platform:** tested on macOS and Linux. Transcript, image-text extraction,
+> keyframes and render need only Python 3.13+, `ffmpeg` and `ffprobe`.
+> The **default** vision server, [Rapid-MLX](https://github.com/raullenchai/Rapid-MLX),
+> requires Apple Silicon — but vision is optional, and any OpenAI-compatible
+> endpoint can serve it instead.
 
 ## Install
 

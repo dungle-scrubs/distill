@@ -83,6 +83,21 @@ _PURE_HEX = re.compile(r"[0-9a-fA-F]+\Z")
 # them: whitespace, or the punctuation a digest is written with (`sha256:`,
 # `app@sha256`, `rev-`).
 _PRECEDING_TOKEN = re.compile(r"([A-Za-z0-9]+)[ \t:@-]*\Z")
+CUE_LOOKBACK_CHARACTERS = 64
+"""How far back a cue may be looked for, and the reason there is a bound at all.
+
+`_PRECEDING_TOKEN` is anchored at the end and searched backwards, so on a line
+that does not end in a cue it retries at every start position: `a` * n followed
+by one non-matching character is quadratic, and it was measured at 18ms for
+2 KB, 278ms for 8 KB and 1.1s for 16 KB before this bound. Screen text is chosen
+by whoever produced the **source**, so that is an attacker's input on the same
+terms as every other run in this module (the 25.7s and 45s incidents its other
+comments record).
+
+64 characters is far more than any cue plus its separators - the longest is
+`integrity` at nine - so a real cue is never cut off. A window that clipped a
+cue would fail to exempt, which is the direction this rule fails in anyway.
+"""
 
 
 def _names_a_public_identifier(text: str, match: re.Match[str]) -> bool:
@@ -101,7 +116,10 @@ def _names_a_public_identifier(text: str, match: re.Match[str]) -> bool:
     """
     if not _PURE_HEX.match(match.group(0)):
         return False
-    line_start = text.rfind("\n", 0, match.start()) + 1
+    line_start = max(
+        text.rfind("\n", 0, match.start()) + 1,
+        match.start() - CUE_LOOKBACK_CHARACTERS,
+    )
     preceding = _PRECEDING_TOKEN.search(text[line_start : match.start()])
     return preceding is not None and preceding.group(1).lower() in IDENTIFIER_CUES
 
@@ -230,9 +248,15 @@ ASSIGNMENT_RULES = (
 # The password is the secret; the username can be a key id and the host is
 # what makes the line diagnosable, so only the password is replaced. Every
 # run is bounded and the scheme is anchored by a lookbehind, for the same
-# reason the entropy rules above are: unanchored unbounded runs went
-# quadratic on attacker-chosen screen text (measured 25.7s on 256 KiB of
-# 'a's before the bounds, 14ms after).
+# reason every other bound in this module exists: unanchored unbounded runs
+# went quadratic on attacker-chosen screen text (measured 25.7s on 256 KiB of
+# 'a's before the bounds, 14ms after; and see `CUE_LOOKBACK_CHARACTERS`, which
+# is the same failure found again).
+#
+# These were called "the entropy rules" here, and nothing in this module
+# computes entropy - every rule matches on shape and length. A comment naming a
+# technique the code does not use sends a reader looking for something that was
+# never there.
 URL_USERINFO_RE = re.compile(
     r"(?P<prefix>(?<![a-zA-Z0-9+.-])(?i:[a-z][a-z0-9+.-]{0,31})://[^/@\s:]{1,256}:)"
     r"(?P<value>[^@/\s]{1,512})(?=@)"
