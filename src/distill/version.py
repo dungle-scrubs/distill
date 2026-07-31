@@ -25,7 +25,7 @@ the cryptographic sense, and nothing verifies who produced it.
 
 from __future__ import annotations
 
-PIPELINE_VERSION = 53
+PIPELINE_VERSION = 54
 
 # Output-affecting source files covered by PIPELINE_SIGNATURE, named by their
 # path relative to `src/distill/` in posix form so that modules in subpackages
@@ -75,6 +75,15 @@ SIGNED_MODULES = (
 # claim about the module's role; if that role changes, the module becomes
 # signed.
 EXEMPT_MODULES: dict[str, str] = {
+    "artifact.py": (
+        "Decides where the finished self-contained render is copied to and what "
+        "that copy is called. It runs after publish, reads the bundle and never "
+        "writes into one, and the copy it makes is never read back as pipeline "
+        "input. Editing it moves or renames a deliverable outside the cache; it "
+        "cannot make a served bundle differ from what the current code would "
+        "produce. Copying out is what this exemption rests on - a mode that "
+        "wrote back into a bundle would make the module signed."
+    ),
     "__init__.py": (
         "Re-exports DISTILL_VERSION from the signed release.py and nothing "
         "else. response.py stamps manifests from release.py directly, so this "
@@ -116,4 +125,4 @@ EXEMPT_MODULES: dict[str, str] = {
 }
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "fa7c53387f69db2f5e006f7f929e3c8638fbf6488eba9052e92171dd6ea8bdf1"
+PIPELINE_SIGNATURE = "cf1a93e85b011faee7135f88f629881abd4207f26dff1c00ec9a4268e7710bfa"

@@ -72,6 +72,10 @@ OPTION_SPECS: tuple[OptionSpec, ...] = (
     OptionSpec("max_static_window_sec", 90.0, float),
     OptionSpec("cache_mode", "fingerprint", str, cache_key=False),
     OptionSpec("output_dir", None, lambda value: value, cache_key=False),
+    # Where the deliverable goes, as distinct from where derived state lives.
+    # cache_key=False for the same reason output_dir is: moving the artifact
+    # does not change what the run produced.
+    OptionSpec("artifact_dir", None, lambda value: value, cache_key=False),
     OptionSpec("force_reprocess", False, bool, boolean=True, cache_key=False),
     OptionSpec("job_id", "", str, cache_key=False),
     OptionSpec("resume_partial", True, bool, boolean=True, cache_key=False),
@@ -363,6 +367,7 @@ class DistillOptions:
     max_static_window_sec: float = 90.0
     cache_mode: str = "fingerprint"
     output_dir: str | None = None
+    artifact_dir: str | None = None
     force_reprocess: bool = False
     caption_frames: bool = True
     local_vision_backend: str = DEFAULT_LOCAL_VISION_BACKEND
@@ -426,6 +431,7 @@ class DistillOptions:
             max_static_window_sec=values["max_static_window_sec"],
             cache_mode=values["cache_mode"],
             output_dir=values["output_dir"],
+            artifact_dir=values["artifact_dir"],
             force_reprocess=values["force_reprocess"],
             caption_frames=local_vision.caption_frames,
             local_vision_backend=local_vision.backend,

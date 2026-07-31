@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .artifact import artifact_entry_name, resolve_artifact_dir, write_artifact
 from .artifacts import FrameArtifact, RedactionState, Transcript
 from .bundle_store import (
     BATCH_ITEM_LOCK_WAIT_SEC,
@@ -76,6 +78,8 @@ TOOLS = {
     "cache_doctor": "Report bundles, markers, generations, locks and a prune preview for an output root",
     "get_job_status": "Read a Distill job status record by job id",
 }
+LOGGER = logging.getLogger(__name__)
+
 DEFAULT_CONFIGURED_TIMEOUT_MS = 5_400_000
 
 TIMEOUT_ENV = "DISTILL_EFFECTIVE_TIMEOUT_MS"
@@ -354,6 +358,7 @@ class ProcessingRun:
             bool(manifest.get("transcript_present")),
             list(manifest.get("warnings", [])),
             cached=True,
+            artifact_path=self._emit_artifact(snapshot),
             progress=progress_summary,
             job_id=self.options.job_id,
         )
@@ -548,6 +553,34 @@ class ProcessingRun:
         )
         return carrier, [dict(item) for item in carrier.warnings]
 
+    def _emit_artifact(self, snapshot: BundleSnapshot) -> str | None:
+        """Copy the self-contained render out of the cache, into the project.
+
+        Runs for a cache hit as well as a fresh publish: a caller standing in a
+        new project wants that project's artifact, and whether the reading was
+        computed just now or read from the store is not their question.
+
+        Never fatal. The bundle is complete and the response still names every
+        path inside it, so a read-only artifact directory costs the caller a
+        convenience rather than the run (ADR-0002).
+        """
+        try:
+            artifact_dir = resolve_artifact_dir(
+                explicit=self.options.artifact_dir,
+                env=dict(os.environ),
+                configured=None,
+                cwd=Path.cwd(),
+            )
+            entry = artifact_entry_name(
+                self.source.youtube_video_id,
+                self.source.source_hash,
+                Path(self.source.resolved_path).stem,
+            )
+            return str(write_artifact(snapshot.self_contained_markdown, artifact_dir, entry))
+        except OSError as exc:
+            LOGGER.warning("artifact not written: %s", exc)
+            return None
+
     def _produce_local_vision(
         self, frames: list[FrameArtifact], transcript: Transcript | None
     ) -> dict[str, Any]:
@@ -704,6 +737,7 @@ class ProcessingRun:
             transcript is not None,
             warnings,
             cached=False,
+            artifact_path=self._emit_artifact(snapshot),
             progress=progress_summary,
             job_id=self.options.job_id,
         )
