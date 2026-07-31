@@ -8,6 +8,8 @@ selection, no cache.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from distill.local_vision import LocalVisionConfig
@@ -699,9 +701,7 @@ def test_an_endpoint_whose_probe_raises_is_passed_over_not_propagated() -> None:
             raise OSError("connection refused")
         return True
 
-    resolved = resolve_chain(
-        DistillOptions(), chain, "local", cached=lambda key: None, probe=probe
-    )
+    resolved = resolve_chain(DistillOptions(), chain, "local", cached=lambda key: None, probe=probe)
 
     assert resolved.entry == 1
     assert resolved.evidence[0].entry == 0
@@ -721,3 +721,131 @@ def test_a_chain_whose_every_probe_raises_degrades_rather_than_failing() -> None
 
     assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
     assert [o.outcome for o in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE]
+
+
+def test_three_chains_selecting_the_same_endpoint_agree_on_everything() -> None:
+    """ADR-0004: what a chain *offered* is not part of what a run produced.
+
+    The same endpoint reached from three different chains - alone, first of
+    two, second of two - is the same reader producing the same reading. If the
+    chain entered identity, adding a fallback nobody used would re-key every
+    bundle and reprocess a whole cache to arrive at byte-identical output.
+
+    So all three agree on the key *and* on the options that describe it. The
+    options are the stronger half: a manifest built from them is what makes the
+    bundles byte-identical rather than merely co-located.
+    """
+    alone = resolve_chain(
+        DistillOptions(), (LOCAL_B,), "local", cached=lambda k: None, probe=lambda c: True
+    )
+    first_of_two = resolve_chain(
+        DistillOptions(),
+        (LOCAL_B, REMOTE_A),
+        "local",
+        cached=lambda k: None,
+        probe=lambda c: c is LOCAL_B,
+    )
+    second_of_two = resolve_chain(
+        DistillOptions(),
+        (REMOTE_A, LOCAL_B),
+        "local",
+        cached=lambda k: None,
+        probe=lambda c: c is LOCAL_B,
+    )
+
+    assert alone.opts_hash == first_of_two.opts_hash == second_of_two.opts_hash
+    payloads = {
+        json.dumps(run.options.cache_payload("local"), sort_keys=True)
+        for run in (alone, first_of_two, second_of_two)
+    }
+    assert len(payloads) == 1
+    # The position differs, and that is *about the run* rather than about the
+    # bundle - which is why `entry` is not in the payload.
+    assert (alone.entry, first_of_two.entry, second_of_two.entry) == (0, 0, 1)
+
+
+def test_selection_evidence_is_about_the_run_and_not_about_the_bundle() -> None:
+    """Where the walk's evidence belongs, and where it must not go.
+
+    Which endpoints were asked, which were skipped on the memo, and which the
+    deadline never reached are facts about *this machine on this run* - the
+    same category as a **machine-local claim**. They belong in the response the
+    caller reads and nowhere in the bundle.
+
+    Putting them in a **bundle** would be worse than noise: two machines that
+    resolved the same source differently would write different bundles for the
+    same reading, and a cache hit would then serve one machine's network
+    conditions as though they described the other's.
+    """
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: config is LOCAL_B,
+    )
+
+    assert [outcome.outcome for outcome in resolved.evidence] == [UNAVAILABLE, SELECTED]
+
+    # Nothing about the walk reaches the payload that becomes the bundle key.
+    # `vision_mode` names the *outcome* a bundle has - selected, disabled,
+    # exhausted - which is identity; how the run got there is not.
+    payload = resolved.options.cache_payload("local")
+    assert payload["vision_mode"] == VISION_MODE_SELECTED
+    assert not {key for key in payload if "evidence" in key or "entry" in key}
+    assert UNAVAILABLE not in json.dumps(payload)
+
+
+def test_a_walked_out_chain_and_a_deliberate_opt_out_are_told_apart() -> None:
+    """Two bundles with no readings, and only one of them is a disappointment.
+
+    `--no-caption-frames` got exactly what it asked for. A chain that was walked
+    and answered by nobody did not, and a reader deciding whether to re-run
+    needs to know which they are holding. The **vision mode** carries that, so
+    the distinction survives into the bundle rather than living only in a
+    warning the manifest folds.
+    """
+    disabled = resolve_chain(
+        DistillOptions(caption_frames=False),
+        (LOCAL_A,),
+        "local",
+        cached=lambda key: None,
+        probe=never_probed,
+    )
+    exhausted = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A,),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: False,
+    )
+
+    assert disabled.vision_mode == VISION_MODE_DISABLED
+    assert exhausted.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert disabled.opts_hash != exhausted.opts_hash
+    # And neither names a reader, which is what makes the mode the only thing
+    # telling them apart.
+    for run in (disabled, exhausted):
+        assert run.options.cache_payload("local")["local_vision_model"] is None
+
+
+def test_a_remote_selection_still_says_the_run_was_not_local_only() -> None:
+    """D-012 survives the chain: remoteness is identity, and it is per selection.
+
+    A chain whose second entry is remote produces a bundle that left the
+    machine when that entry answers, and one that did not when the first does.
+    Those are different bundles and the flag is what says so - it cannot be
+    read off the chain, only off the endpoint that was actually selected.
+    """
+    chain = (LOCAL_A, REMOTE_A)
+
+    local_won = resolve_chain(
+        DistillOptions(), chain, "local", cached=lambda k: None, probe=lambda c: c is LOCAL_A
+    )
+    remote_won = resolve_chain(
+        DistillOptions(), chain, "local", cached=lambda k: None, probe=lambda c: c is REMOTE_A
+    )
+
+    assert local_won.options.cache_payload("local")["local_vision_non_local"] is False
+    assert remote_won.options.cache_payload("local")["local_vision_non_local"] is True
+    assert local_won.opts_hash != remote_won.opts_hash

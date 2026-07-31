@@ -1339,18 +1339,65 @@ def local_vision_diagnostics(args: dict[str, Any] | None = None) -> dict[str, An
             "local_vision_timeout_sec", args["local_vision_timeout_sec"]
         )
     config = local_vision_config_from_args(args)
-    probe = probe_local_vision(config)
-    return {
+    chain = config.endpoints or (config,)
+    entries: list[dict[str, Any]] = []
+    selected: Any = None
+    for index, endpoint in enumerate(chain):
+        # Every entry is asked, even after one has answered. This command is
+        # for diagnosing a chain, and "why is the third endpoint never used"
+        # is unanswerable if the walk stopped at the first that worked.
+        probe = probe_local_vision(endpoint)
+        if probe.available and selected is None:
+            selected, outcome = probe, "selected"
+        else:
+            outcome = "available" if probe.available else "unavailable"
+        entries.append(
+            {
+                "entry": index,
+                "model": endpoint.model,
+                "base_url": endpoint.base_url,
+                "outcome": outcome,
+                # The name, never the value. A name is diagnostics and this
+                # command's output is meant to be pasteable; a value is a
+                # secret, and D-007 keeps it out of every text form.
+                "credential_env": endpoint.credential_env,
+                "credential_set": endpoint.credential is not None,
+                "code": probe.code,
+                "message": probe.message,
+                "detail": probe.detail,
+            }
+        )
+    answered = selected is not None
+    # An endpoint that rejected a credential *answered*: something is listening
+    # and it said no. Telling an operator to start a server points at the wrong
+    # problem, and does so at the moment they are trying to work out what the
+    # right one is. `local_vision_backend_unsupported` is the same shape - a
+    # configuration answer, not a missing process.
+    responded = any(
+        entry["code"] in {"local_vision_auth_rejected", "local_vision_backend_unsupported"}
+        for entry in entries
+    )
+    report: dict[str, Any] = {
         "config": config.public_dict(),
+        "endpoints": entries,
         "probe": {
-            "available": probe.available,
-            "backend": probe.backend,
-            "model": probe.model,
-            "base_url": probe.base_url,
-            "code": probe.code,
-            "message": probe.message,
-            "detail": probe.detail,
+            "available": answered,
+            "backend": (selected or probe).backend,
+            "model": (selected or probe).model,
+            "base_url": (selected or probe).base_url,
+            "code": (selected or probe).code,
+            "message": (selected or probe).message,
+            "detail": (selected or probe).detail,
         },
-        "setup_command": f"rapid-mlx serve {config.model}",
-        "rapid_mlx_note": "Distill posts OpenAI-compatible chat completions to the configured base_url (default http://127.0.0.1:8000/v1). The server must already be running.",
     }
+    if not answered and not responded:
+        # Only when nothing answered. Telling an operator whose endpoint replied
+        # - and whose credential was rejected - to start a server points at the
+        # wrong diagnosis, which is the failure Gate 3 asks about.
+        report["setup_command"] = f"rapid-mlx serve {chain[0].model}"
+        report["rapid_mlx_note"] = (
+            "Distill posts OpenAI-compatible chat completions to the configured "
+            "base_url (default http://127.0.0.1:8000/v1). The server must already "
+            "be running."
+        )
+    return report

@@ -8,11 +8,13 @@ import struct
 import urllib.error
 import zlib
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from untrusted_blocks import SENTINEL, assert_delimited, attack
 
+from distill import pipeline as distill_session
 from distill.artifacts import FrameArtifact, Interpretation
 from distill.errors import DistillError
 from distill.grounding import UNGROUNDED
@@ -3434,3 +3436,146 @@ class TestFilteredRenderView:
         )
 
         assert frames[0].salience is not None
+
+
+def test_diagnostics_report_every_entry_in_the_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chain's diagnostics have to be about the chain, not about entry 0.
+
+    The command exists to answer "why is vision not working". With a chain that
+    question is per entry: one endpoint may be unauthenticated, another
+    unreachable, a third fine. Reporting only the first turns a four-entry
+    misconfiguration into one line about one endpoint.
+
+    Each entry reports the env var its credential comes from and whether that
+    variable is set - never the value. A name is diagnostics; a value is a
+    secret, and this command's whole output is meant to be pasteable.
+    """
+    monkeypatch.setenv("ENTRY_ZERO_KEY", "sk-not-printed-anywhere")
+    monkeypatch.delenv("ENTRY_ONE_KEY", raising=False)
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "api_key_env": "ENTRY_ZERO_KEY",
+                    },
+                    {
+                        "model": "qwen3-vl:32b",
+                        "base_url": "http://127.0.0.1:9000/v1",
+                        "api_key_env": "ENTRY_ONE_KEY",
+                    },
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "distill.pipeline.probe_local_vision",
+        lambda config: SimpleNamespace(
+            available=config.model == "qwen3-vl:32b",
+            backend="rapid-mlx",
+            model=config.model,
+            base_url=config.base_url,
+            code=None if config.model == "qwen3-vl:32b" else "local_vision_auth_rejected",
+            message="",
+            detail={},
+        ),
+    )
+
+    report = distill_session.local_vision_diagnostics({})
+
+    entries = report["endpoints"]
+    assert [entry["model"] for entry in entries] == ["qwen3-vl:8b", "qwen3-vl:32b"]
+    assert [entry["outcome"] for entry in entries] == ["unavailable", "selected"]
+    assert entries[0]["credential_env"] == "ENTRY_ZERO_KEY"
+    assert entries[0]["credential_set"] is True
+    assert entries[1]["credential_set"] is False
+    # The name is diagnostics; the value never is.
+    assert "sk-not-printed-anywhere" not in json.dumps(report)
+
+
+def test_diagnostics_do_not_tell_you_to_start_a_server_that_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`setup_command` answers "nothing is running"; it is noise when one is.
+
+    An operator whose endpoint answered and whose *credential* was rejected does
+    not need to be told to start a server. Printing it anyway is the output
+    suggesting the wrong diagnosis, which is what Gate 3 asks about.
+    """
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "distill.pipeline.probe_local_vision",
+        lambda config: SimpleNamespace(
+            available=True,
+            backend="rapid-mlx",
+            model=config.model,
+            base_url=config.base_url,
+            code=None,
+            message="",
+            detail={},
+        ),
+    )
+
+    report = distill_session.local_vision_diagnostics({})
+
+    assert "setup_command" not in report
+    assert "rapid_mlx_note" not in report
+
+
+def test_a_rejected_credential_does_not_read_as_a_server_that_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gate 3: the output must point at the actual problem.
+
+    A live endpoint that answers 401 is a *credential* problem. The old output
+    printed `setup_command: rapid-mlx serve ...` and a note that the server
+    must already be running - for a server that was running and had just
+    replied. An operator following that restarts a healthy server and learns
+    nothing.
+
+    What the report has to carry instead is the endpoint's own code, and the
+    credential variable it used, so the next thing to check is obvious.
+    """
+    monkeypatch.setenv("A_KEY", "sk-whatever")
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "api_key_env": "A_KEY",
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "distill.pipeline.probe_local_vision",
+        lambda config: SimpleNamespace(
+            available=False,
+            backend="rapid-mlx",
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_auth_rejected",
+            message="endpoint rejected the credential (401)",
+            detail={"status": 401},
+        ),
+    )
+
+    report = distill_session.local_vision_diagnostics({})
+
+    (entry,) = report["endpoints"]
+    assert entry["code"] == "local_vision_auth_rejected"
+    assert entry["credential_env"] == "A_KEY"
+    assert entry["credential_set"] is True
+    assert "401" in json.dumps(report)
+    # The server answered. Nothing in the report may suggest starting one.
+    assert "setup_command" not in report
+    assert "rapid_mlx_note" not in report

@@ -33,6 +33,48 @@ Or add it to an existing uv project:
 uv add "distill-video @ git+https://github.com/dungle-scrubs/distill.git"
 ```
 
+### Several vision endpoints
+
+`endpoints` names the **vision endpoints** a run may use, in preference order:
+
+```json
+{
+  "endpoints": [
+    { "model": "gemini-3.6-flash", "base_url": "https://...", "api_key_env": "MY_KEY",
+      "allow_remote_endpoint": true },
+    { "model": "mlx-community/Qwen3-VL-8B-Instruct-8bit", "base_url": "http://127.0.0.1:8000/v1" }
+  ]
+}
+```
+
+A run uses **exactly one** of them. Order is preference, not fallback in the
+degradation sense: moving from a cloud endpoint to a local one produces a full
+reading from a different reader, and only losing every endpoint is degradation.
+
+At most four entries, and no two may share a model *and* remoteness — such
+entries derive the same **bundle key** and there would be nothing left to tell
+their bundles apart. Each entry is read from a fresh default, so entry 2 never
+inherits entry 1's credential or its remote opt-in.
+
+**The cache is asked before any endpoint is.** If a bundle for any of the keys
+the chain could publish under is already on disk, it is served and no endpoint
+is contacted at all — including when the cached bundle came from a
+less-preferred entry. An offline machine serves what it already has.
+
+Configuring `endpoints` alongside a top-level `model` or `base_url` is refused:
+that names an endpoint twice, in two ways, and no rule for picking a winner
+would be anything but a guess.
+
+**One-time reprocess.** Which endpoint produced a reading is part of a bundle's
+identity, so upgrading to a version that resolves a chain re-keys existing
+bundles and the first run afterwards rebuilds them. Adding a fallback that never
+gets used does *not* re-key anything: three chains selecting the same endpoint
+produce byte-identical bundles.
+
+`distill local-vision-diagnostics` reports every entry — its outcome, the env
+var its credential comes from, and whether that variable is set (never the
+value).
+
 ### System dependencies
 
 Install these with your platform's package manager. Distill names what it needs
