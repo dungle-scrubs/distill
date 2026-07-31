@@ -1342,3 +1342,86 @@ def test_key_derivation_uses_the_endpoint_the_walk_selected(
     assert resolved.opts_hash == candidate_keys(options, chain, "local")[1].opts_hash
     # And the options the key came from hash to that key - the same fact twice.
     assert resolved.options.opts_hash("local") == resolved.opts_hash
+
+
+def test_a_resolution_selecting_entry_one_leaves_no_entry_zero_field_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """<!-- P3-D-015 --> The lie this decision exists to prevent, asserted.
+
+    A run that called entry 1 must not describe itself with entry 0's fields
+    anywhere. The manifest is built from the options a run carries, so the
+    options that reach it have to be the resolution's - otherwise the pipeline
+    calls one endpoint, the manifest records another's model, and the key names
+    a third, each artifact internally consistent and all three wrong together.
+
+    Asserted on the serialized options, which is exactly what the manifest
+    embeds.
+    """
+    from distill.source import _resolved_for
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "entry-zero-model", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "entry-one-model", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    options = DistillOptions.from_args({})
+
+    monkeypatch.setattr(
+        "distill.source._probe_endpoint",
+        lambda config: config.model == "entry-one-model",
+    )
+
+    resolution = _resolved_for(options, "a-fingerprint", "local", None)
+    published = json.dumps(resolution.options.public_dict("local"))
+
+    assert "entry-one-model" in published
+    assert "entry-zero-model" not in published
+
+
+def test_the_source_carries_the_options_its_key_was_derived_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_tool: Callable[[str, str], Path]
+) -> None:
+    """<!-- P3-D-015 --> The manifest is built from the options a run carries.
+
+    A resolution derives the **bundle key** from the endpoint the walk selected,
+    then hands the source on. If those options do not travel with it, the run
+    goes on holding the ones it started with - and builds a manifest naming
+    entry 0 while publishing under entry 1's key.
+
+    So the source carries them, and `process_resolved_source` adopts them. This
+    asserts the carrying half; the adoption is one line above the run.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "entry-zero-model", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "entry-one-model", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "distill.source._probe_endpoint",
+        lambda config: config.model == "entry-one-model",
+    )
+    fake_tool("ffprobe", FAKE_FFPROBE)
+
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"\x00" * 4096)
+    info = resolve_local_source(str(video), DistillOptions.from_args({}), output_root=tmp_path)
+
+    assert info.resolved_options is not None
+    assert info.resolved_options.local_vision_model == "entry-one-model"
+    # And the key on the source is the one those options describe.
+    assert info.source_hash == source_hash(
+        info.source_fingerprint, info.resolved_options.opts_hash("local")
+    )

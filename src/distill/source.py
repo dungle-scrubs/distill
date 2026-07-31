@@ -384,6 +384,19 @@ class SourceInfo:
     provenance: Provenance | None = None
     youtube_video_id: str | None = None
     youtube_lock_key: str | None = None
+    resolved_options: DistillOptions | None = None
+    """The options as the **endpoint chain** walk settled them, if it ran.
+
+    <!-- P3-D-015 --> The **bundle key** on this object was derived from these,
+    so anything else derived from the run's original options describes a
+    different bundle. The **manifest** is the one that matters: built from the
+    options a run carries, it would otherwise record whichever endpoint the
+    chain listed first while the key names the one that answered.
+
+    `None` for a resolution that never walked a chain - a cached YouTube hit
+    read straight from a manifest - where the caller's own options are already
+    the right ones.
+    """
     related_links: list[RelatedLink] | None = None
     """The **related links** this source's metadata named, as carriers (R-21).
 
@@ -683,6 +696,7 @@ class LocalSourceProvider:
             source_hash=bundle_key,
             warnings=warnings,
             provenance=provenance,
+            resolved_options=options,
         )
 
     def _served_duration(self, request: SourceRequest, bundle_key: str) -> float | None:
@@ -1548,6 +1562,7 @@ class YouTubeSourceProvider:
             source_hash=source,
             warnings=warnings,
             provenance=provenance,
+            resolved_options=options,
             youtube_video_id=video_id,
             youtube_lock_key=lock_key,
             related_links=related_links,

@@ -259,9 +259,7 @@ def _manifest_progress_summary(progress_summary: dict[str, Any]) -> dict[str, An
         name: {
             **state,
             "detail": {
-                key: value
-                for key, value in state.get("detail", {}).items()
-                if key != "path"
+                key: value for key, value in state.get("detail", {}).items() if key != "path"
             },
         }
         if isinstance(state, dict) and isinstance(state.get("detail"), dict)
@@ -422,9 +420,7 @@ class ProcessingRun:
         warnings.extend(_stage_warnings(payload))
         return produced.value
 
-    def _recovered_frames(
-        self, payload: dict[str, Any]
-    ) -> _Recovered[list[FrameArtifact]] | None:
+    def _recovered_frames(self, payload: dict[str, Any]) -> _Recovered[list[FrameArtifact]] | None:
         """The **frame artifacts** `payload` holds, or `None` if it holds none.
 
         A stage that just ran hands back carriers. A stage a **resume**
@@ -455,9 +451,7 @@ class ProcessingRun:
             if not isinstance(item, Mapping):
                 return None
             try:
-                frames.append(
-                    FrameArtifact.from_document(item, redaction=self._redaction_policy)
-                )
+                frames.append(FrameArtifact.from_document(item, redaction=self._redaction_policy))
             except Exception:
                 # Deliberately broad, for the reason `read_stage_result`'s guard
                 # is: every way a document can fail to become a carrier - a
@@ -467,7 +461,9 @@ class ProcessingRun:
                 return None
         return _Recovered(frames)
 
-    def _recovered_transcript(self, payload: dict[str, Any]) -> _Recovered[Transcript | None] | None:
+    def _recovered_transcript(
+        self, payload: dict[str, Any]
+    ) -> _Recovered[Transcript | None] | None:
         """The **transcript** carrier `payload` holds, on the same terms.
 
         A run that produced no transcript carries nothing at all, which is why
@@ -521,9 +517,7 @@ class ProcessingRun:
         publishes; anything else means the policy runs (D-020).
         """
         return (
-            RedactionState.NOT_APPLIED
-            if self.options.redact_secrets
-            else RedactionState.DISABLED
+            RedactionState.NOT_APPLIED if self.options.redact_secrets else RedactionState.DISABLED
         )
 
     def _carry_transcript(self, transcript: Any) -> tuple[Transcript | None, list[dict]]:
@@ -857,6 +851,12 @@ def process_resolved_source(
     # replaces the failure it is cleaning up after; on the way out of a success
     # it must, because nothing else would report a lease that was not given up.
     try:
+        # <!-- P3-D-015 --> The options the **endpoint chain** walk settled on,
+        # if it ran. The source's **bundle key** was derived from these, so a
+        # run that went on carrying its original options would build a
+        # **manifest** naming whichever endpoint the chain listed first while
+        # publishing under the key of the one that answered.
+        options = getattr(source, "resolved_options", None) or options
         output_root = output_root or validate_output_root(options.output_dir)
         progress = progress or ProgressReporter(emitter=progress_emitter(options.job_id))
         run = ProcessingRun(source, options, output_root, progress, tool, lock_wait_sec)
@@ -926,7 +926,9 @@ class BatchRunner:
                 result["batch_index"] = index
                 results.append(result)
             except Exception as exc:
-                failure = exc if isinstance(exc, DistillError) else DistillError.from_unexpected(exc)
+                failure = (
+                    exc if isinstance(exc, DistillError) else DistillError.from_unexpected(exc)
+                )
                 errors.append({self.item_key: item, "batch_index": index, **failure.to_dict()})
                 if not self.continue_on_error:
                     raise
