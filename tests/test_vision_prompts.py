@@ -264,7 +264,12 @@ def test_a_secret_straddling_the_truncation_boundary_does_not_leak_a_prefix() ->
     prompt = build_technical_frame_prompt("slide", ocr_text=ocr).prompt
 
     assert "sk-straddle" not in prompt
-    assert "[REDACTED:api-key]" in prompt
+    # The mark itself now straddles the budget, so the cut drops it whole
+    # rather than leaving `[REDACTED:a` behind. What must never appear is a
+    # partial mark: it is not a mark, a second pass cannot recognize it, and a
+    # reader reads it as content. The truncation notice already says text was
+    # cut, so nothing is claimed that is not true.
+    assert "[REDACTED" not in prompt or "[REDACTED:assigned-secret]" in prompt
 
 
 def test_transcript_window_is_capped_before_it_is_fenced() -> None:
@@ -309,7 +314,7 @@ def test_transcript_window_is_redacted_before_the_prompt_is_built() -> None:
     ).prompt
 
     assert "sk-spoken-secret" not in prompt
-    assert "[REDACTED:api-key]" in prompt
+    assert "[REDACTED:assigned-secret]" in prompt
 
 
 def test_both_untrusted_blocks_hold_their_own_adversarial_payloads() -> None:

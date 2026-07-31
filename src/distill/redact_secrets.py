@@ -7,6 +7,7 @@ It is independent of Tesseract and bundle rendering.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .errors import WarningRecord, warning
@@ -197,6 +198,32 @@ class RedactionResult:
     redaction_count: int
 
 
+def cut_without_splitting_a_mark(text: str) -> str:
+    """`text`, minus a trailing **redaction mark** that a cut left half-written.
+
+    Truncation runs *after* redaction, so no secret can be split by a cap - only
+    the mark standing where one used to be. A half-written mark is worse than
+    either keeping it or dropping it: `[REDACTED:a` is not a mark, so a second
+    pass cannot recognize it, and a reader sees it as truncated content rather
+    than as a redaction. The cap is a byte limit, so the whole mark cannot be
+    kept; what is left is to drop it.
+
+    Called by every site that cuts already-redacted text. The alternative -
+    giving each cap its own headroom for the longest kind - puts a fact about
+    the mark in four places, and the mark's shape lives here.
+    """
+    opened = text.rfind("[REDACTED:")
+    if opened == -1:
+        return text
+    # `match`, not `fullmatch`: the question is whether a *complete* mark starts
+    # at the last opener, not whether the remainder is only that mark. Ordinary
+    # text follows a mark all the time, and treating that as a partial cut every
+    # line after the last redaction.
+    if MARK_RE.match(text, opened):
+        return text
+    return text[:opened]
+
+
 def normalize_confusables(text: str) -> str:
     return text.translate(CONFUSABLES)
 
@@ -224,7 +251,7 @@ def redact_text(text: str) -> RedactionResult:
     redacted = text
     count = 0
 
-    def replace_assignment(kind: str) -> Any:
+    def replace_assignment(kind: str) -> Callable[[re.Match[str]], str]:
         def replace(match: re.Match[str]) -> str:
             nonlocal count
             value = match.group("value")

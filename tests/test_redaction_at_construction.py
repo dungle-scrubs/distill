@@ -659,9 +659,9 @@ def test_a_warning_a_link_raised_at_construction_reaches_the_runs_warnings(
         "possible_confusable_secret",
     ]
     assert source.provenance is not None
-    assert "[REDACTED]" in (source.provenance.description or "")
+    assert "[REDACTED:assigned-secret]" in (source.provenance.description or "")
     assert source.related_links is not None
-    assert "[REDACTED]" in source.related_links[0].url
+    assert "[REDACTED:assigned-secret]" in source.related_links[0].url
 
 
 def resolve_youtube_source(

@@ -388,7 +388,8 @@ def test_an_assignment_name_cannot_scan_the_whole_frame() -> None:
 
     checked = 0
     offenders: list[str] = []
-    for pattern in redact_secrets.ASSIGNMENT_PATTERNS:
+    for rule in redact_secrets.ASSIGNMENT_RULES:
+        pattern = rule.pattern
         body = group_body(pattern, "name")
         assert body is not None, pattern.pattern
         checked += 1
@@ -397,7 +398,7 @@ def test_an_assignment_name_cannot_scan_the_whole_frame() -> None:
                 offenders.append(pattern.pattern)
                 break
 
-    assert checked == len(redact_secrets.ASSIGNMENT_PATTERNS)
+    assert checked == len(redact_secrets.ASSIGNMENT_RULES)
     assert offenders == [], f"unbounded repeat in an assignment name: {offenders}"
 
 

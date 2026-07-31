@@ -339,9 +339,15 @@ def test_a_secret_straddling_the_cap_is_redacted_before_it_is_cut() -> None:
     cap, so there is no **warning** to raise.
     """
     secret = "sk-live-0123456789abcdefghij"
-    # The cut lands eleven characters into the key: long enough to be a durable
-    # prefix, short enough that no pattern in `redact_secrets` matches it.
-    text = f"{prose(EXTRACTED_TEXT_LIMIT_BYTES - 12)} {secret}"
+    # The cut lands well inside the key: long enough to be a durable prefix,
+    # short enough that no pattern in `redact_secrets` matches it.
+    #
+    # The prose length is calibrated against the **redaction mark**, not chosen
+    # freely: the test needs redaction to bring the field back under the cap so
+    # that nothing is truncated, and the mark is what the key is replaced *by*.
+    # A longer mark buys less headroom, which is how lengthening it turned this
+    # case from "shortened back under the cap" into "truncated after all".
+    text = f"{prose(EXTRACTED_TEXT_LIMIT_BYTES - 20)} {secret}"
     assert len(text.encode()) > EXTRACTED_TEXT_LIMIT_BYTES
 
     document = serialize(make_frame(extracted_text=text))

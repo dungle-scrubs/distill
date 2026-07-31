@@ -42,7 +42,7 @@ from types import MappingProxyType, NoneType, UnionType
 from typing import Any, ClassVar, Union, get_args, get_origin, get_type_hints
 
 from .errors import DistillError, FrozenWarningRecord, WarningRecord, warning
-from .redact_secrets import redact_text
+from .redact_secrets import cut_without_splitting_a_mark, redact_text
 
 # R-58 / D-045: each individual extracted-text field is capped, and no aggregate
 # bundle cap is imposed on top of it. Eighty keyframes at this cap already bounds
@@ -153,7 +153,12 @@ def _cap_extracted_text(
     encoded = text.text.encode("utf-8")
     if len(encoded) <= EXTRACTED_TEXT_LIMIT_BYTES:
         return text.text
-    truncated = encoded[:EXTRACTED_TEXT_LIMIT_BYTES].decode("utf-8", errors="ignore")
+    # A redaction mark the cap lands inside is dropped rather than left half
+    # written: truncation runs after redaction, so the cut can only split the
+    # mark, and `[REDACTED:a` is neither a mark nor content.
+    truncated = cut_without_splitting_a_mark(
+        encoded[:EXTRACTED_TEXT_LIMIT_BYTES].decode("utf-8", errors="ignore")
+    )
     warnings.append(
         _frozen_warning(
             warning(
