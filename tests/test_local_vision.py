@@ -687,6 +687,86 @@ def test_a_configured_credential_resolving_empty_is_fatal_per_entry(
     assert refusal.value.details["reason"] == "credential_configured_but_empty"
 
 
+def _two_entry_chain(tmp_path: Path) -> None:
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+
+def test_base_url_alone_moves_entry_zero_and_nothing_else(tmp_path: Path) -> None:
+    """P3-D-016: the address flag is key-neutral, so it may act on a chain.
+
+    ADR-0004 keeps the address out of identity, so pointing entry 0 somewhere
+    else changes no candidate key - the same reader is being reached at a
+    different address. That is what makes this override safe to honor against a
+    chain when `--local-vision-model` is not: it cannot make the run publish
+    under a key that describes a different reader.
+
+    Entry 0, because the flag names one address and the chain has an order.
+    """
+    _two_entry_chain(tmp_path)
+
+    config = local_vision_config_from_args(
+        {"local_vision_base_url": "http://127.0.0.1:8100/v1"}, tmp_path
+    )
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
+        ("qwen3-vl:8b", "http://127.0.0.1:8100/v1"),
+        ("qwen3-vl:32b", "http://127.0.0.1:9000/v1"),
+    ]
+
+
+def test_model_alone_against_a_chain_is_refused(tmp_path: Path) -> None:
+    """P3-D-016: the model flag is identity-bearing, so it cannot mean "entry 0".
+
+    The model is in the **options hash**. Applying it to one entry of a chain
+    would leave the other entries naming readers the operator did not ask for,
+    under keys that describe them - and picking entry 0 silently would be
+    Distill choosing which endpoint the flag meant. Against a one-entry chain
+    there is nothing to choose, so it behaves as it always did.
+    """
+    _two_entry_chain(tmp_path)
+
+    with pytest.raises(DistillError) as refusal:
+        local_vision_config_from_args({"local_vision_model": "qwen3-vl:4b"}, tmp_path)
+    assert refusal.value.code == "E_BAD_OPTIONS"
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {"endpoints": [{"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"}]}
+        )
+    )
+    one_entry = local_vision_config_from_args({"local_vision_model": "qwen3-vl:4b"}, tmp_path)
+    assert [entry.model for entry in one_entry.endpoints or ()] == ["qwen3-vl:4b"]
+
+
+def test_both_flags_together_replace_the_chain(tmp_path: Path) -> None:
+    """Naming a model *and* an address names one endpoint completely.
+
+    There is nothing ambiguous left: the operator has said which reader, at
+    which address. So the chain is replaced rather than edited - a run told to
+    use this endpoint should not still be carrying three others it may fall
+    through to.
+    """
+    _two_entry_chain(tmp_path)
+
+    config = local_vision_config_from_args(
+        {"local_vision_model": "qwen3-vl:4b", "local_vision_base_url": "http://127.0.0.1:8200/v1"},
+        tmp_path,
+    )
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
+        ("qwen3-vl:4b", "http://127.0.0.1:8200/v1")
+    ]
+
+
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
     (tmp_path / "distill.local-vision.json").write_text(
         json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})

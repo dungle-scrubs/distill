@@ -907,7 +907,52 @@ def local_vision_config_from_args(
         overrides["allow_remote_endpoint"] = _coerce_bool(
             args.get("local_vision_allow_remote_endpoint"), config.allow_remote_endpoint
         )
+    config = _chain_after_overrides(config, overrides)
     return _with_chain(_with_validated_endpoint(_config_from_payload(overrides, config)))
+
+
+def _chain_after_overrides(
+    config: LocalVisionConfig, overrides: dict[str, Any]
+) -> LocalVisionConfig:
+    """What `--local-vision-model` / `--local-vision-base-url` do to a chain.
+
+    <!-- P3-D-016 --> The two flags are not symmetric, because identity is not.
+    ADR-0004 keeps the address out of the **options hash**, so moving an
+    endpoint's address reaches the same reader at a different place and changes
+    no candidate key; the model *is* identity, and applying it to one entry
+    would leave the rest naming readers nobody asked for under keys that
+    describe them.
+
+    So: the address alone moves entry 0 and leaves the chain otherwise intact.
+    The model alone against a chain of more than one is refused, because
+    choosing which entry it meant is a decision Distill does not get to make
+    silently. Both together name one endpoint completely, and a run told to use
+    that endpoint should not still carry others it might fall through to - so
+    the chain is replaced.
+    """
+    chain = config.endpoints
+    if chain is None:
+        return config
+    names_model = "model" in overrides
+    names_address = "base_url" in overrides
+    if names_model and names_address:
+        return replace(config, endpoints=None)
+    if names_model:
+        if len(chain) > 1:
+            raise DistillError(
+                "E_BAD_OPTIONS",
+                "local_vision",
+                "--local-vision-model names one model but 'endpoints' names "
+                f"{len(chain)} endpoints, and the model decides which bundle a run "
+                "publishes under. Name --local-vision-base-url too to use a single "
+                "endpoint, or edit the chain.",
+                {"endpoints": len(chain)},
+            )
+        return replace(config, endpoints=None)
+    if names_address:
+        moved = replace(chain[0], base_url=str(overrides["base_url"]).rstrip("/"))
+        return replace(config, endpoints=(moved, *chain[1:]))
+    return config
 
 
 def _resolved_credential(
