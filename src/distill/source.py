@@ -116,6 +116,7 @@ from .media_inspect import (
 )
 from .options import DistillOptions
 from .progress import ProgressReporter
+from .redact_secrets import redact_text
 from .run_command import (
     CommandResult,
     run_json,
@@ -553,11 +554,18 @@ class LocalSourceProvider:
         resolved = original.resolve()
         warnings: list[WarningRecord] = []
         if resolved != original.absolute():
+            # The target's name, redacted, and not the absolute path it was
+            # found at. A warning is rendered into the archive verbatim, so the
+            # path form put the operator's home directory layout - and, when a
+            # link pointed at a credential-shaped filename, the credential
+            # itself - into a document gate 4->5 exists to keep both out of.
+            # Which link resolved where is a fact about this machine; that the
+            # source was a link, and what it named, is the diagnosis.
             warnings.append(
                 warning(
                     "source",
                     "symlink_resolved",
-                    f"source path resolved to {resolved}",
+                    f"source path resolved to {redact_text(resolved.name).text}",
                 )
             )
         fingerprint = local_fingerprint(resolved, options.cache_mode, progress)
@@ -674,6 +682,22 @@ def source_path_kind(path: Path) -> SourcePathKind:
     return "file" if stat.S_ISREG(info.st_mode) else "other"
 
 
+def _default_cache_root() -> Path:
+    """`$XDG_CACHE_HOME/distill`, or `~/.cache/distill` when it is unset.
+
+    The bundle store is derived state a cache cleaner may reclaim, so it lives
+    where the platform says caches live. Only an absolute `XDG_CACHE_HOME` is
+    honoured: a relative one would put the store under the process working
+    directory, which is how a cache ends up inside somebody's repository.
+    """
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        candidate = Path(xdg_cache_home).expanduser()
+        if candidate.is_absolute():
+            return candidate / "distill"
+    return Path.home() / ".cache" / "distill"
+
+
 def validate_output_root(output_dir: str | None, *, create: bool = True) -> Path:
     """Accept an output root, or refuse it before anything is written under it.
 
@@ -706,7 +730,7 @@ def validate_output_root(output_dir: str | None, *, create: bool = True) -> Path
             "output_dir must be a path written as text",
             {"output_dir": repr(output_dir)},
         )
-    root = Path(output_dir).expanduser() if output_dir else Path.home() / ".cache" / "distill"
+    root = Path(output_dir).expanduser() if output_dir else _default_cache_root()
     root = root.resolve()
     home = Path.home().resolve()
     temp = Path(tempfile.gettempdir()).resolve()

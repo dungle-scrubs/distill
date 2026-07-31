@@ -93,3 +93,36 @@ def test_autouse_fixture_has_already_neutralized_this_process() -> None:
     assert "DISTILL_ENABLE_LONG_TIMEOUT_PROBE" not in os.environ
     assert "DISTILL_EFFECTIVE_TIMEOUT_MS" not in os.environ
     assert Path(os.environ["DISTILL_CONFIG_DIR"]).is_dir()
+
+
+def test_the_artifact_directory_is_redirected_away_from_the_checkout(
+    tmp_path: Path,
+) -> None:
+    """Redirecting HOME does not contain the artifact directory.
+
+    Artifact resolution walks from the *working directory* to a git work tree
+    root, and a test run stands in the checkout - so without this redirection
+    every fixture that completes a run writes its artifact into the repository
+    under test. That is not a hypothetical: the suite wrote 176 of them before
+    the fixture learned about this variable.
+    """
+    home = tmp_path / "home"
+    config_dir = home / ".distill"
+    config_dir.mkdir(parents=True)
+    artifacts = tmp_path / "artifacts"
+
+    with pytest.MonkeyPatch.context() as environment:
+        neutralize_distill_environment(
+            environment, home=home, config_dir=config_dir, artifact_dir=artifacts
+        )
+
+        assert os.environ["DISTILL_ARTIFACT_DIR"] == str(artifacts)
+
+
+def test_the_running_suite_writes_no_artifacts_into_the_checkout() -> None:
+    """The live fixture, not a hand-driven call: this asserts against the
+    environment the rest of the suite is actually running under."""
+    resolved = Path(os.environ["DISTILL_ARTIFACT_DIR"]).resolve()
+    checkout = Path(__file__).resolve().parent.parent
+
+    assert checkout not in resolved.parents

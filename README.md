@@ -91,9 +91,30 @@ distill cleanup-cache --keep-generations 3 --dry-run
 
 ## Output layout
 
-Output lands under `~/.cache/distill` by default; override the root with
-`--output-dir`, with `DISTILL_OUTPUT_DIR`, or with `output_dir` in a config file
-(see [Configuration](#configuration)). A run that does the work publishes one **generation** into the
+Distill writes two different things, with two different lifetimes.
+
+The **bundle** is derived state - generations, keyframes, manifests, locks -
+and it is disposable: everything in it can be rebuilt from the source. By
+default the bundle output root is `~/.cache/distill`, or `$XDG_CACHE_HOME/distill`
+when that variable is set to an absolute path. Override it with `--output-dir`,
+`DISTILL_OUTPUT_DIR`, or `output_dir` in a config file (see
+[Configuration](#configuration)).
+
+The **artifact** is the deliverable: one self-contained markdown file per
+source, carrying the whole account and no machine-local path. It is *not* put in
+the cache, because a deliverable a cache cleaner may delete is not a
+deliverable. By default it lands in the project you are standing in -
+`<git work tree root>/.distill/<entry>.md` - so a run inside a repository leaves
+its output where the work is. Resolution, highest precedence first:
+`--artifact-dir`, `DISTILL_ARTIFACT_DIR`, a `.distill` directory that already
+exists at or above the working directory, `artifact_dir` in a config file, the
+git work tree root, and finally `$XDG_DATA_HOME/distill/artifacts` outside any
+repository. The run's JSON result names it as `artifact_path`.
+
+Distill never edits your `.gitignore`. Whether `.distill/` is committed is
+your decision.
+
+A run that does the work publishes one **generation** into the
 **bundle** that its **bundle key** names; a run that hits the cache publishes
 nothing and serves the generation already there:
 
@@ -264,7 +285,8 @@ stdout's contents survives a descriptor the caller broke.
 The processing commands (`process-local-video`, `process-youtube-video`,
 `process-video-directory`, `process-youtube-playlist`) share these options: `--whisper-model`,
 `--whisper-language`, `--ocr`/`--no-ocr`, `--ocr-language`, `--ocr-preprocess`,
-`--redact-secrets`/`--no-redact-secrets`, `--frame-salience`/`--no-frame-salience`
+`--redact-secrets`/`--no-redact-secrets`, `--artifact-dir`,
+`--frame-salience`/`--no-frame-salience`
 (whether keyframes are judged against the surrounding speech; on by default, and
 part of bundle identity), `--max-keyframes`, `--min-interval-sec`,
 `--max-duration-sec`, `--vad-filter`/`--no-vad-filter`, `--max-static-window-sec`,

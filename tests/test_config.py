@@ -410,16 +410,23 @@ def test_a_job_lookup_reads_the_configured_root(
     assert configured.is_dir()
 
 
-def test_the_environment_layer_names_only_the_output_root() -> None:
-    """The environment sets one option, and no diagnostic variable is that option.
+def test_the_environment_layer_names_only_the_two_directories() -> None:
+    """The environment sets where things go, and nothing else about a run.
+
+    Both entries are the same kind of decision: a machine or a project, rather
+    than an invocation, says where the cache lives and where the deliverable
+    lands. No option that changes what a run *produces* belongs here.
 
     Held against the table rather than against behaviour, because the failure
     this guards against is a variable *added* to the layer: a debug toggle read
     as an option would change what a run produces, and the run that proves it
     would be the one nobody ran.
     """
-    assert set(OPTION_ENV_VARIABLES) == {"output_dir"}
-    assert set(OPTION_ENV_VARIABLES.values()) == {"DISTILL_OUTPUT_DIR"}
+    assert set(OPTION_ENV_VARIABLES) == {"artifact_dir", "output_dir"}
+    assert set(OPTION_ENV_VARIABLES.values()) == {
+        "DISTILL_ARTIFACT_DIR",
+        "DISTILL_OUTPUT_DIR",
+    }
     assert not set(OPTION_ENV_VARIABLES.values()) & set(DIAGNOSTIC_VARIABLES)
 
 
@@ -475,13 +482,20 @@ def test_the_local_vision_section_is_not_a_general_option(tmp_path: Path) -> Non
     assert local_vision.load_local_vision_config(tmp_path).model == "qwen3-vl:32b"
 
 
-def test_an_unused_flag_does_not_overrule_a_configured_value(tmp_path: Path) -> None:
+def test_an_unused_flag_does_not_overrule_a_configured_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """`None` in the argument mapping is a flag nobody typed, not a request.
 
     That is how a parser spells an option left off the command line, and a
     configured value has to survive one - otherwise the file layer would be
     overwritten by the absence of the layer above it.
+
+    The environment layer is emptied so the result can be asserted whole: the
+    suite's own hermeticity fixture sets `DISTILL_ARTIFACT_DIR`, which is a
+    real setting and would otherwise appear here as one.
     """
+    monkeypatch.delenv("DISTILL_ARTIFACT_DIR", raising=False)
     write_config(tmp_path, {"max_keyframes": 7})
 
     resolved = resolve_options(
@@ -493,8 +507,11 @@ def test_an_unused_flag_does_not_overrule_a_configured_value(tmp_path: Path) -> 
     assert resolved == {"max_keyframes": 7}
 
 
-def test_an_empty_file_output_root_is_not_a_setting(tmp_path: Path) -> None:
+def test_an_empty_file_output_root_is_not_a_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """An empty file value follows the environment layer's no-setting rule."""
+    monkeypatch.delenv("DISTILL_ARTIFACT_DIR", raising=False)
     write_config(tmp_path, {"output_dir": "", "max_keyframes": 7})
 
     resolved = resolve_options(

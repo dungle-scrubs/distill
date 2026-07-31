@@ -28,6 +28,7 @@ def neutralize_distill_environment(
     *,
     home: Path,
     config_dir: Path,
+    artifact_dir: Path | None = None,
 ) -> None:
     """Point Distill's environment inputs at throwaway directories.
 
@@ -51,6 +52,13 @@ def neutralize_distill_environment(
     environment.setenv("HOME", str(home))
     environment.setenv("USERPROFILE", str(home))
     environment.setenv("DISTILL_CONFIG_DIR", str(config_dir))
+    # The artifact directory is resolved from the *working directory*, not from
+    # HOME, so redirecting HOME does not contain it: a test run standing in the
+    # checkout resolves the checkout's own `.distill` and writes a fixture's
+    # artifact into the repository being tested. Redirected rather than
+    # disabled, so the write still happens and a test can inspect it.
+    if artifact_dir is not None:
+        environment.setenv("DISTILL_ARTIFACT_DIR", str(artifact_dir))
 
 
 @pytest.fixture
@@ -89,10 +97,14 @@ def hermetic_user_directories(
     test_home = tmp_path_factory.mktemp("home")
     config_dir = test_home / ".distill"
     config_dir.mkdir()
+    artifact_dir = tmp_path_factory.mktemp("artifacts")
 
     with pytest.MonkeyPatch.context() as environment:
         neutralize_distill_environment(
-            environment, home=test_home, config_dir=config_dir
+            environment,
+            home=test_home,
+            config_dir=config_dir,
+            artifact_dir=artifact_dir,
         )
         yield
 

@@ -17,8 +17,9 @@ This module owns three things:
   path, because a run that falls back to the defaults for a file somebody wrote
   produces a **bundle** nobody asked for (D-011).
 - **The resolution order.** CLI > environment > file > default (the environment
-  layer being `DISTILL_OUTPUT_DIR`, the one option a machine rather than a run
-  decides), applied by
+  layer being `DISTILL_OUTPUT_DIR` and `DISTILL_ARTIFACT_DIR`, the two options
+  a machine or a project rather than a run decides - where derived state lives
+  and where the deliverable lands), applied by
   folding the layers into the argument mapping that reaches
   `DistillOptions.from_args`. A configured value therefore arrives at exactly
   the door a typed value arrives at, and is validated by the same code rather
@@ -61,6 +62,7 @@ GENERAL_CONFIG_FILENAME = "distill.json"
 LOCAL_VISION_SECTION = "local_vision"
 
 OPTION_ENV_VARIABLES: dict[str, str] = {
+    "artifact_dir": "DISTILL_ARTIFACT_DIR",
     "output_dir": "DISTILL_OUTPUT_DIR",
 }
 """The options an environment variable may set, and the variable that sets one.
@@ -68,9 +70,14 @@ OPTION_ENV_VARIABLES: dict[str, str] = {
 A table rather than a prefix rule, so the environment layer is a list somebody
 decided on: a `DISTILL_*` variable is an option input only by appearing here,
 and the diagnostic variables cannot become option inputs by being named well.
-The output root is the one option that belongs in the environment - it is where
-a machine keeps its bundles, which is a property of the machine rather than of
-the processing being asked for (ADR-0004).
+
+Both entries answer *where something goes*, and neither changes what a run
+produces. The output root is where a machine keeps its bundles, a property of
+the machine rather than of the processing being asked for (ADR-0004). The
+artifact directory is where the deliverable lands, which a caller standing in
+a project - an editor, an agent, an MCP server - decides once for everything
+it runs, not per invocation. An option that changed the reading itself would
+not belong here.
 """
 
 

@@ -184,6 +184,7 @@ def run_response(
     cached: bool,
     progress: dict[str, Any] | None = None,
     job_id: str | None = None,
+    artifact_path: str | None = None,
 ) -> dict[str, Any]:
     """What a caller receives, whether the run produced the bundle or read it.
 
@@ -208,6 +209,10 @@ def run_response(
     response: dict[str, Any] = {
         "markdown_path": str(snapshot.markdown),
         "self_contained_markdown_path": str(snapshot.self_contained_markdown),
+        # The deliverable, outside the cache. What an MCP caller quotes back to
+        # a user and what a later turn can read without re-running anything;
+        # the paths above point into a store a cleaner may reclaim.
+        "artifact_path": artifact_path,
         "transcript_path": str(snapshot.transcript)
         if transcript_present and snapshot.transcript.exists()
         else None,
