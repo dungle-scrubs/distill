@@ -394,7 +394,7 @@ class Carrier(ABC):
     says so - `DISABLED`, which is the `--no-redact-secrets` opt-out and is
     recorded as such. What this base still does not do is decide whether the
     text is *safe*: it applies a policy of patterns, and a secret shaped like
-    nothing in `redact_secrets.SECRET_PATTERNS` passes through it untouched.
+    nothing in `redact_secrets.SECRET_RULES` passes through it untouched.
     """
 
     EXTRACTED_TEXT_FIELDS: ClassVar[tuple[str, ...]] = ()

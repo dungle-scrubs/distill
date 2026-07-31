@@ -590,3 +590,19 @@ def test_the_cue_lookback_is_bounded_so_a_long_line_cannot_stall_a_run() -> None
     hostile = "a" * 40_000 + "! " + "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 
     assert "[REDACTED:base64-blob]" in redact_text(hostile).text
+
+
+def test_every_kind_produces_a_mark_the_rules_can_recognize() -> None:
+    """The guard that keeps re-entrancy from breaking silently.
+
+    Re-entrancy rests on `MARK_RE` recognizing what `_mark` wrote. Nothing
+    connects the two but convention, so a kind spelled with an underscore or a
+    capital would produce a mark no rule recognizes - and the failure would not
+    be an error, it would be a second pass quietly re-marking already-marked
+    text under a different kind.
+
+    Asserted over the closed set rather than over the rules, so a kind added for
+    an assignment or a URL is covered too.
+    """
+    for kind in redact_secrets.KINDS:
+        assert redact_secrets.MARK_RE.fullmatch(redact_secrets._mark(kind)), kind

@@ -52,7 +52,7 @@ from distill.source import (
 )
 
 # One shape of secret used throughout, so that "the secret is gone" means the
-# same thing at every sink. `redact_secrets.SECRET_PATTERNS` matches it on the
+# same thing at every sink. `redact_secrets.SECRET_RULES` matches it on the
 # OpenAI-style rule.
 SECRET = "sk-live-0123456789abcdefghij"
 
