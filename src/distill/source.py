@@ -528,9 +528,15 @@ def _resolved_for(
     A caller that named no **output root** has no store to ask, so every
     candidate reads as absent and the walk goes straight to probing.
     """
+    # A config that names no chain still names an endpoint. `DistillOptions`
+    # reached through `from_args` carries the one-entry chain `_with_chain`
+    # derived, but one constructed directly does not - and resolving an empty
+    # chain would exhaust immediately, re-keying a run that has a perfectly good
+    # endpoint configured the old way.
+    chain = options.local_vision_endpoints or (options.local_vision_config(),)
     return resolve_chain(
         options,
-        options.local_vision_endpoints or (),
+        chain,
         source_type,
         cached=lambda opts_hash: (
             None
@@ -1416,7 +1422,13 @@ class YouTubeSourceProvider:
         if request.output_root is None:
             raise DistillError("E_BAD_OUTPUT_DIR", "youtube", "output_root is required")
         fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
-        sh = source_hash(fingerprint, request.options.opts_hash("youtube"))
+        # <!-- P3-D-011 --> The cache question is asked about the key the walk
+        # settles on, which may be a less-preferred entry's or the exhausted
+        # one - a bundle already on disk is servable whichever endpoint made
+        # it, and asking only about entry 0's key would re-download a video
+        # whose reading is already here.
+        resolution = _resolved_for(request.options, fingerprint, "youtube", request.output_root)
+        sh = source_hash(fingerprint, resolution.opts_hash)
         snapshot = BundleStore.open(request.output_root).load_active(sh)
         if snapshot is None:
             return None
@@ -1465,7 +1477,12 @@ class YouTubeSourceProvider:
         video_id = metadata.video_id
         lock_key = youtube_lock_key(video_id)
         fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
-        source = source_hash(fingerprint, options.opts_hash("youtube"))
+        # <!-- P3-D-015 --> The key names the endpoint the walk selected, not
+        # whichever one the chain listed first. `resolution`, not `resolved` or
+        # `source`, because both already mean something else here.
+        resolution = _resolved_for(options, fingerprint, "youtube", output_root)
+        options = resolution.options
+        source = source_hash(fingerprint, resolution.opts_hash)
         downloader = downloader or YoutubeDownloader(
             output_root, lock_wait_sec=request.lock_wait_sec
         )
