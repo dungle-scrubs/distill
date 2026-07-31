@@ -164,6 +164,36 @@ def test_nested_distill_config_is_supported(tmp_path: Path) -> None:
     assert config.caption_frames is True
 
 
+def test_an_endpoints_array_parses_to_an_ordered_chain(tmp_path: Path) -> None:
+    """M1.1: the array *is* the **endpoint chain**, and its order is the whole
+    of the preference order.
+
+    Two loopback entries with different models, deliberately: the subject here
+    is that the array parses and keeps its order, so the fixture avoids the
+    remote opt-in (which validation governs) and the duplicate
+    `(model, remoteness)` pair (which P3-D-020 refuses). Both of those get
+    their own tests.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert [entry.model for entry in config.endpoints] == ["qwen3-vl:8b", "qwen3-vl:32b"]
+    assert [entry.base_url for entry in config.endpoints] == [
+        "http://127.0.0.1:8000/v1",
+        "http://127.0.0.1:9000/v1",
+    ]
+
+
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
     (tmp_path / "distill.local-vision.json").write_text(
         json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})

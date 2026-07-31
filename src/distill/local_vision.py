@@ -274,6 +274,20 @@ class LocalVisionConfig:
     """The run's vision-stage budget, attached by the interpreter to its
     per-run resolved config. Runtime state, not configuration: excluded from
     identity, `repr`, and `public_dict`."""
+    endpoints: tuple[LocalVisionConfig, ...] = ()
+    """The configured **endpoint chain**, in preference order; empty when the
+    operator configured a single endpoint the old way.
+
+    Entries are `LocalVisionConfig` values rather than a type of their own, so
+    this module keeps no knowledge of what a chain *means* - order, selection,
+    and candidate keys all belong to `vision_chain.py`. What lives here is what
+    already lived here: reading configuration layers into the fields an endpoint
+    is made of.
+
+    <!-- P3-D-010 --> Each entry is parsed from a fresh default rather than from
+    the surrounding config, so entry 2 cannot inherit entry 1's credential or
+    its remote authorization.
+    """
 
     def public_dict(self) -> dict[str, Any]:
         # Excluded by the `secret` metadata flag and by carrier type - a rule
@@ -724,6 +738,32 @@ def _resolved_credential(
     return SecretCredential(value), True, env_name
 
 
+def _endpoints_from_payload(
+    payload: dict[str, Any],
+    inherited: tuple[LocalVisionConfig, ...],
+) -> tuple[LocalVisionConfig, ...]:
+    """The **endpoint chain** this layer configured, or the one it inherited.
+
+    <!-- P3-D-010 --> Every entry is folded onto a fresh `LocalVisionConfig`,
+    never onto the surrounding config: inheriting would give entry 2 entry 1's
+    credential and its remote authorization, and the outgoing `Authorization`
+    header is where that would first be visible.
+
+    A layer that names no `endpoints` leaves the inherited chain alone. What a
+    layer that *does* name one should do to an earlier layer's - replace it
+    rather than concatenate - is asserted separately, and is why this returns
+    the new chain whole rather than extending.
+    """
+    configured = payload.get("endpoints")
+    if not isinstance(configured, list):
+        return inherited
+    return tuple(
+        _config_from_payload(entry, LocalVisionConfig())
+        for entry in configured
+        if isinstance(entry, dict)
+    )
+
+
 def _config_from_payload(
     payload: dict[str, Any],
     base: LocalVisionConfig,
@@ -733,6 +773,7 @@ def _config_from_payload(
     credential, credential_configured, credential_env = _resolved_credential(payload, base)
     return replace(
         base,
+        endpoints=_endpoints_from_payload(payload, base.endpoints),
         credential=credential,
         credential_configured=credential_configured,
         credential_env=credential_env,
