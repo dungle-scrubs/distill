@@ -196,3 +196,22 @@ def test_an_entry_that_is_not_one_filename_is_refused(tmp_path: Path) -> None:
             emit_artifact(
                 _render(tmp_path), tmp_path / "out", entry, output_root=tmp_path / "cache"
             )
+
+
+def test_the_environment_reaches_a_caller_that_skipped_the_config_layer(
+    tmp_path: Path,
+) -> None:
+    """`config.py` folds `DISTILL_ARTIFACT_DIR` into the options a CLI run
+    resolves, so this branch is only reached by a caller that constructed
+    `DistillOptions` directly. Without it that caller silently ignores the
+    operator's environment and writes into whatever repository it is standing
+    in - which is how the test suite came to write into this one."""
+    repo = _git_repo(tmp_path / "repo")
+
+    resolved = resolve_artifact_dir(
+        explicit=None,
+        env={"DISTILL_ARTIFACT_DIR": str(tmp_path / "from-env")},
+        cwd=repo,
+    )
+
+    assert resolved == tmp_path / "from-env"

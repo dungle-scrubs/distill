@@ -36,6 +36,7 @@ from pathlib import Path
 from .bundle_store import atomic_write_text
 from .redact_secrets import redact_text
 
+ARTIFACT_DIR_ENV = "DISTILL_ARTIFACT_DIR"
 XDG_DATA_HOME_ENV = "XDG_DATA_HOME"
 PROJECT_ARTIFACT_DIRNAME = ".distill"
 
@@ -65,14 +66,21 @@ def resolve_artifact_dir(
        happened in `config.py`, which owns that order for every option; this
        module receiving one value rather than three is what keeps the two from
        disagreeing about which layer wins.
-    2. a `.distill` that already exists at or above `cwd` **within the same
+    2. `DISTILL_ARTIFACT_DIR` read directly, for a caller that reached the
+       pipeline without passing through `config.py` - constructing
+       `DistillOptions` rather than `DistillOptions.from_args`. Not a second
+       opinion about precedence: when the layering did run, either it already
+       folded this variable into `explicit` or the variable is unset. It is
+       here so that a library caller and the CLI cannot disagree about where
+       an operator's environment says artifacts go.
+    3. a `.distill` that already exists at or above `cwd` **within the same
        work tree** - someone already decided where this project's artifacts go
-    3. `<git work tree root>/.distill` - the *root*, not `cwd`, so a run
+    4. `<git work tree root>/.distill` - the *root*, not `cwd`, so a run
        invoked from a subdirectory does not scatter artifacts through the tree
-    4. `$XDG_DATA_HOME/distill/artifacts` - data, not cache: a deliverable a
+    5. `$XDG_DATA_HOME/distill/artifacts` - data, not cache: a deliverable a
        cache cleaner may delete is not a deliverable
 
-    The walk in (2) stops at the work tree root, and outside a work tree does
+    The walk in (3) stops at the work tree root, and outside a work tree does
     not happen at all. An unbounded walk reaches `$HOME`, where `~/.distill` is
     Distill's own legacy config directory: every repository on the machine
     without its own `.distill` would have adopted it and written artifacts into
@@ -83,6 +91,9 @@ def resolve_artifact_dir(
     """
     if explicit:
         return Path(explicit).expanduser()
+    from_env = env.get(ARTIFACT_DIR_ENV)
+    if from_env:
+        return Path(from_env).expanduser()
     work_tree = _git_work_tree_root(cwd)
     if work_tree is not None:
         adopted = _existing_project_dir(cwd, boundary=work_tree)
