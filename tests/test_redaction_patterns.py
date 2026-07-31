@@ -416,7 +416,12 @@ def test_url_userinfo_leaves_benign_authority_shapes_intact() -> None:
         "mailto:someone@example.com",
         "http://[::1]:8000/v1",
         "meet at 12:30@cafe",
-        "image ghcr.io/org/app:1.2@sha256:abcdef",
+        # Full length, not the six-character abbreviation this fixture used to
+        # carry. A truncated digest never reaches the 40-character floor, so it
+        # asserted nothing about the rule that was deleting real ones - which is
+        # exactly how the defect stayed invisible.
+        "image ghcr.io/org/app:1.2@sha256:"
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "HTTPS://EXAMPLE.COM/PLAIN/PATH",
     ]
     for text in benign:
