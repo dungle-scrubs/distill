@@ -52,6 +52,60 @@ def _mark(kind: str) -> str:
     return f"[REDACTED:{kind}]"
 
 
+IDENTIFIER_CUES = frozenset(
+    {
+        "commit",
+        "sha",
+        "sha1",
+        "sha256",
+        "sha384",
+        "sha512",
+        "digest",
+        "blob",
+        "tree",
+        "integrity",
+        "checksum",
+        "hash",
+        "rev",
+        "revision",
+    }
+)
+"""Words that name what a long hex run *is*, so it can be kept.
+
+<!-- D-013 --> The list is a blocklist like any other and will miss formats.
+That is a failure to *improve* fidelity, never a failure open: a run is kept
+only when one of these stands beside it, so a missing or OCR-mangled cue leaves
+today's behavior exactly as it was.
+"""
+
+_PURE_HEX = re.compile(r"[0-9a-fA-F]+\Z")
+# The token immediately before a run, and the separators that may stand between
+# them: whitespace, or the punctuation a digest is written with (`sha256:`,
+# `app@sha256`, `rev-`).
+_PRECEDING_TOKEN = re.compile(r"([A-Za-z0-9]+)[ \t:@-]*\Z")
+
+
+def _names_a_public_identifier(text: str, match: re.Match[str]) -> bool:
+    """Whether a matched run is an **identifier-shaped value** kept on evidence.
+
+    <!-- D-027 --> Two conditions, both required. The run is pure hexadecimal -
+    base64 cannot be told from an encoded secret by looking, so it is never
+    exempted (ADR-0006). And a cue is the immediately preceding token *on the
+    same line*.
+
+    Same-line is the bound the corpus frame settled. It prints
+    `$ grep integrity app.lock` directly above its hash, so a rule reaching back
+    past a newline would exempt runs on the strength of a previous command line -
+    and the same reach would exempt a credential printed under any line that
+    happened to say `hash`.
+    """
+    if not _PURE_HEX.match(match.group(0)):
+        return False
+    line_start = text.rfind("\n", 0, match.start()) + 1
+    preceding = _PRECEDING_TOKEN.search(text[line_start : match.start()])
+    return preceding is not None and preceding.group(1).lower() in IDENTIFIER_CUES
+
+
 @dataclass(frozen=True)
 class SecretRule:
     """One pattern, what it removes, and an optional say in whether to.
@@ -64,6 +118,13 @@ class SecretRule:
 
     pattern: re.Pattern[str]
     kind: str
+    exempt: Callable[[str, re.Match[str]], bool] | None = None
+    """Asked, after a match, whether to leave it alone.
+
+    A rule that can match and then decline is what lets the generic run rule
+    keep an **identifier-shaped value** without a second pattern trying to
+    describe every shape an identifier takes.
+    """
 
 
 SECRET_RULES = [
@@ -80,7 +141,14 @@ SECRET_RULES = [
         re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
         "jwt",
     ),
-    SecretRule(re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"), "base64-blob"),
+    # <!-- D-014 --> The trailing lookahead, not `\b`: a word boundary cannot
+    # sit between `=` and end-of-string, so the match excluded its own padding
+    # and redaction left it stranded as `[REDACTED:base64-blob]==`.
+    SecretRule(
+        re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])"),
+        "base64-blob",
+        exempt=_names_a_public_identifier,
+    ),
     SecretRule(re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "aws-key"),
     SecretRule(re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"), "gitlab-token"),
     # `npm_` and `hf_` are also ordinary identifier prefixes (`npm_config_*`,
@@ -286,10 +354,15 @@ def redact_text(text: str) -> RedactionResult:
     redacted = URL_USERINFO_OVERLONG_RE.sub(replace_userinfo, redacted)
 
     for rule in SECRET_RULES:
-        matches = rule.pattern.findall(redacted)
-        if matches:
-            count += len(matches)
-            redacted = rule.pattern.sub(_mark(rule.kind), redacted)
+
+        def replace_run(match: re.Match[str], rule: SecretRule = rule) -> str:
+            nonlocal count
+            if rule.exempt is not None and rule.exempt(match.string, match):
+                return match.group(0)
+            count += 1
+            return _mark(rule.kind)
+
+        redacted = rule.pattern.sub(replace_run, redacted)
 
     normalized = normalize_confusables(text)
     if normalized != text:
@@ -299,6 +372,15 @@ def redact_text(text: str) -> RedactionResult:
         possible_matches: list[str] = []
         for rule in SECRET_RULES:
             for match in rule.pattern.finditer(normalized):
+                # <!-- D-017 --> The exemption governs this pass identically.
+                # Applied against `normalized`, which is the string the pattern
+                # matched: evaluating the cue on the raw slice would let the
+                # same fullwidth characters this pass exists to neutralize
+                # defeat the rule from the other direction. Skipped before the
+                # match is counted, so an exempted identifier raises no
+                # `possible_confusable_secret` either.
+                if rule.exempt is not None and rule.exempt(normalized, match):
+                    continue
                 possible_matches.append(match.group(0))
                 original_slice = text[match.start() : match.end()]
                 if original_slice and original_slice in redacted:

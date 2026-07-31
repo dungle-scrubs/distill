@@ -499,3 +499,67 @@ def test_redaction_is_re_entrant_over_every_fixture() -> None:
         assert twice.text == once.text, text
         assert twice.redaction_count == 0, text
         assert twice.warnings == [], text
+
+
+# --- M1.3: the cue-gated hex exemption -------------------------------------
+
+# Verbatim from the M1.1 corpus frame (30_synth_identifiers_f01), so these are
+# the shapes as they actually appear on a screen rather than as invented here.
+FRAME_COMMIT = "commit f9a1a14aabbccddeeff00112233445566778899a"
+FRAME_ONELINE = "c4d8e2b7a0916f35bd82ce41708a9d63f5e0b1a2 Pin the connection"
+FRAME_DIGEST = "docker pull ghcr.io/org/app@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934"
+FRAME_INTEGRITY = "integrity a3f5c9d2e8b14760af23dc9915ee88b4c70d6a21"
+FRAME_BARE = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+
+
+def test_an_identifier_with_a_cue_beside_it_survives() -> None:
+    """<!-- D-013 --> A render exists to be read; deleting a commit SHA
+    protects nothing and removes the one fact the frame was carrying.
+
+    The fixtures are lifted from the corpus frame rather than written here, so
+    what is asserted is the shape a terminal actually prints.
+    """
+    assert_intact(FRAME_COMMIT)
+    assert_intact(FRAME_INTEGRITY)
+    # The cue can be punctuation: `@sha256:` is how a digest is written.
+    assert "e3b0c44298fc" in redact_text(FRAME_DIGEST).text
+
+
+def test_a_hex_run_with_no_cue_is_still_redacted() -> None:
+    """<!-- D-013 --> The exemption needs evidence; absence of it is not a
+    reason to keep a value.
+
+    Both controls come from the same frame. A bare run could equally be a
+    40-character lowercase-hex `device_code`, which is a real GitHub credential
+    that no name-based rule covers - so a rule keyed on position rather than on
+    evidence would hand it through.
+    """
+    assert "[REDACTED:base64-blob]" in redact_text(FRAME_BARE).text
+    # <!-- D-023 --> And the oneline form, which prints no cue word at all.
+    assert "c4d8e2b7a091" not in redact_text(FRAME_ONELINE).text
+
+
+def test_a_cue_on_the_previous_line_does_not_reach_across_it() -> None:
+    """<!-- D-027 --> Adjacency is same-line, and this is why.
+
+    The frame prints `$ grep integrity app.lock` directly above its hash. A rule
+    that reached backwards past a newline would start exempting runs on the
+    strength of a previous command line - and the same reach would exempt a
+    credential printed under any line that happened to say `hash`.
+    """
+    across = "$ grep integrity app.lock\n" + FRAME_BARE
+
+    assert "[REDACTED:base64-blob]" in redact_text(across).text
+
+
+def test_the_generic_rule_consumes_its_own_padding() -> None:
+    """<!-- D-014 --> Redaction left `=` characters behind.
+
+    `\\b` cannot sit between `=` and end-of-string, so the match excluded its own
+    padding and the substitution left it stranded. Cosmetic until a predicate
+    inspects the match, which is exactly what the exemption does.
+    """
+    result = redact_text("blob QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQQ== end")
+
+    assert "=" not in result.text
+    assert "[REDACTED:base64-blob]" in result.text
