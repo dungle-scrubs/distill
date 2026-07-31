@@ -228,7 +228,10 @@ _Avoid_: secret-shaped (names the intent rather than the evidence)
 **Identifier-shaped value**:
 A long opaque value whose form names something public — a commit SHA, a content
 digest, a build id. Removing one protects nothing and costs a reader the name of
-the thing on screen, so **redaction** leaves it intact.
+the thing on screen, so **redaction** leaves it intact *where it can tell*.
+Telling requires positive evidence, and Distill only has that for a hexadecimal
+run with an identifier cue beside it; an encoded identifier with nothing to mark
+it as one is indistinguishable from an encoded secret and is still removed.
 
 **Redaction mark**:
 The text Distill writes where a **credential-shaped value** stood. It names the
@@ -398,6 +401,13 @@ Staging directory ─────────> Generation   (indivisible: the ge
 > costs the reader the one thing the frame was showing them. **Redaction** takes
 > **credential-shaped values**. Length and opacity aren't the test — form is."
 >
+> **Dev:** "So any forty-character hex run stays?"
+> **Domain expert:** "Only one with something beside it saying what it is —
+> `commit`, `sha256`, the `@` in an image reference. A bare run with nothing
+> around it could just as easily be a credential, and nothing about looking at
+> it settles that, so it goes. The exemption needs evidence. Not having any is
+> not a reason to keep it."
+>
 > **Dev:** "Then make the **redaction mark** say how long the value was, so a
 > reader can tell two removed keys apart."
 > **Domain expert:** "No. A mark names the kind and stops. Length is a real
@@ -527,8 +537,12 @@ Staging directory ─────────> Generation   (indivisible: the ge
   commit SHA and a content digest were removed as though they were credentials -
   resolved: a **credential-shaped value** and an **identifier-shaped value** are
   different things and form is the only test. Removing the second protects
-  nothing and costs the reader the name of the thing on screen, so a rule named
-  for base64 must match base64 rather than any long run.
+  nothing and costs the reader the name of the thing on screen. Making the rule
+  match base64, since that is what it is named for, was tried and rejected: it
+  kept a real secret whose match excluded its own padding, and left every
+  base64-shaped public identifier redacted anyway. What replaced it exempts a
+  run only on positive evidence that it names something public, so the rule can
+  fail to improve fidelity but cannot fail open.
 - **"[REDACTED]"** was one opaque mark that said nothing about what it replaced,
   so a reader could not tell a removed key from a removed digest - resolved: a
   **redaction mark** names the kind and stops. Length was proposed and rejected:
