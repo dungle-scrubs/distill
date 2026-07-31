@@ -599,3 +599,42 @@ def test_an_exhausted_resolution_names_no_endpoint_in_its_options() -> None:
     assert resolved.options.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
     assert resolved.options.cache_payload("local")["local_vision_model"] is None
     assert resolved.options.opts_hash("local") == resolved.opts_hash
+
+
+def test_the_walk_itself_opens_nothing_so_it_can_hold_no_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolution cannot hold a lock across a probe, because it takes none.
+
+    The plan asks that no candidate lock be held across source acquisition or
+    across a network probe. The strongest form of that is structural rather
+    than procedural: every I/O the walk needs arrives as an injected callable,
+    so the walk has nothing to lock *with*. A future change that reached for a
+    store or a socket directly would fail here rather than deadlock in
+    production.
+
+    The injected callables are the seam: what they do - take a bundle lock,
+    open a socket - is their caller's business and is ordered by the pipeline,
+    which takes the acquisition lease before the bundle lock.
+    """
+    import socket
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("chain resolution must reach the world only through its seams")
+
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(socket, "getaddrinfo", forbidden)
+    monkeypatch.setattr("pathlib.Path.open", forbidden)
+    monkeypatch.setattr("pathlib.Path.exists", forbidden)
+    monkeypatch.setattr("pathlib.Path.mkdir", forbidden)
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, REMOTE_A),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: config is REMOTE_A,
+        skip=lambda config: False,
+    )
+
+    assert resolved.entry == 1
