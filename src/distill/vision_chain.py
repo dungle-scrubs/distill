@@ -119,6 +119,16 @@ UNAVAILABLE = "unavailable"
 """This endpoint was asked and could not serve - unreachable, unauthenticated,
 or serving a different model. The ordinary case an **endpoint chain** absorbs."""
 
+SKIPPED = "skipped"
+"""This endpoint was passed over without being asked, on the memo.
+
+Distinct from `UNAVAILABLE`, and the distinction is user-visible: an
+**unavailable** entry cost a round trip and means "we just checked", a
+**skipped** one cost nothing and means "we already know". A chain that looks
+slow because every entry is probed every run is a different problem from one
+where the memo is doing its job.
+"""
+
 
 @dataclass(frozen=True)
 class ResolvedRun:
@@ -168,6 +178,7 @@ def resolve_chain(
     *,
     cached: Callable[[str], int | None],
     probe: Callable[[LocalVisionConfig], bool],
+    skip: Callable[[LocalVisionConfig], bool] = lambda _endpoint: False,
 ) -> ResolvedRun:
     """The one endpoint - or the one cached bundle - this run will use.
 
@@ -182,9 +193,13 @@ def resolve_chain(
     which endpoint to ask when work must be done; it does not say that a bundle
     produced by a less-preferred reader should be rebuilt by a better one.
 
-    `cached` and `probe` are injected rather than reached for, so the walk can be
-    tested without a store or a server - and so this module keeps its promise to
-    talk to no endpoint itself.
+    `cached`, `probe` and `skip` are injected rather than reached for, so the
+    walk can be tested without a store, a server or a clock - and so this module
+    keeps its promise to talk to no endpoint itself.
+
+    `skip` is the negative-availability memo's answer. It defaults to asking
+    everything: a caller that has no memo gets the plain walk rather than having
+    to supply a predicate that always says no.
     """
     keys = candidate_keys(options, chain, source_type)
     if not options.caption_frames:
@@ -219,6 +234,13 @@ def resolve_chain(
     # order, and only now.
     evidence: list[EntryOutcome] = []
     for index, entry in enumerate(chain):
+        if skip(entry):
+            # Passed over without a round trip. Recorded as its own outcome
+            # rather than folded into `unavailable`, because "we already know"
+            # and "we just checked" are different answers to an operator asking
+            # why a chain behaved the way it did.
+            evidence.append(EntryOutcome(entry=index, outcome=SKIPPED))
+            continue
         if probe(entry):
             evidence.append(EntryOutcome(entry=index, outcome=SELECTED))
             selected = keys[index]

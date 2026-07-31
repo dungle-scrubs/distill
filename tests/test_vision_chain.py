@@ -19,6 +19,7 @@ from distill.options import (
 )
 from distill.vision_chain import (
     SELECTED,
+    SKIPPED,
     UNAVAILABLE,
     EntryOutcome,
     candidate_keys,
@@ -350,3 +351,58 @@ def test_an_offline_machine_serves_the_local_reading_rather_than_ocr_only() -> N
     assert resolved.endpoint is LOCAL_B
     assert resolved.vision_mode == VISION_MODE_SELECTED
     assert resolved.served_from_cache is True
+
+
+def test_a_memoized_endpoint_is_skipped_rather_than_asked_again() -> None:
+    """**Skipped** and **unavailable** are different facts, and both are reported.
+
+    An endpoint asked *this run* and found wanting cost a round trip and means
+    "we just checked". One passed over on the memo cost nothing and means "we
+    already know". An operator reading diagnostics needs to tell those apart -
+    a chain that looks slow because every entry is probed every run is a
+    different problem from one where the memo is working.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    asked: list[str] = []
+
+    def probe(config: LocalVisionConfig) -> bool:
+        asked.append(config.model)
+        return True
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=probe,
+        skip=lambda config: config is LOCAL_A,
+    )
+
+    # Entry 0 was never asked, so it cost no round trip.
+    assert asked == [LOCAL_B.model]
+    assert resolved.entry == 1
+    assert resolved.evidence == (
+        EntryOutcome(entry=0, outcome=SKIPPED),
+        EntryOutcome(entry=1, outcome=SELECTED),
+    )
+
+
+def test_a_chain_skipped_all_the_way_down_still_exhausts_rather_than_hangs() -> None:
+    """Every entry memoized is still an answer, not a reason to ask anyway.
+
+    The memo exists so a run on a machine that cannot reach anything is fast.
+    Falling back to probing when every entry is memoized would give that run the
+    full cost of the chain precisely when the memo said it was pointless.
+    """
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=never_probed,
+        skip=lambda config: True,
+    )
+
+    assert resolved.entry is None
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert [o.outcome for o in resolved.evidence] == [SKIPPED, SKIPPED]
