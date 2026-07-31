@@ -153,7 +153,7 @@ def test_a_cache_hit_at_any_preference_level_touches_no_network() -> None:
         DistillOptions(),
         chain,
         "local",
-        cached=lambda key: key in cached,
+        cached=lambda key: 1 if key in cached else None,
         probe=never_probed,
     )
 
@@ -168,7 +168,7 @@ def test_nothing_cached_selects_the_first_available_endpoint() -> None:
         DistillOptions(),
         (LOCAL_A, LOCAL_B),
         "local",
-        cached=lambda key: False,
+        cached=lambda key: None,
         probe=lambda config: True,
     )
 
@@ -190,7 +190,7 @@ def test_an_unavailable_entry_is_passed_over_and_the_reason_is_recorded() -> Non
         DistillOptions(),
         (LOCAL_A, LOCAL_B),
         "local",
-        cached=lambda key: False,
+        cached=lambda key: None,
         probe=lambda config: config is not LOCAL_A,
     )
 
@@ -215,7 +215,7 @@ def test_every_endpoint_unavailable_and_nothing_cached_exhausts_the_chain() -> N
         DistillOptions(),
         (LOCAL_A, LOCAL_B),
         "local",
-        cached=lambda key: False,
+        cached=lambda key: None,
         probe=lambda config: False,
     )
 
@@ -243,7 +243,7 @@ def test_force_reprocess_bypasses_the_cache_and_probes_from_the_top() -> None:
         DistillOptions(force_reprocess=True),
         (LOCAL_A, LOCAL_B),
         "local",
-        cached=lambda key: True,
+        cached=lambda key: 1,
         probe=probe,
     )
 
@@ -262,7 +262,7 @@ def test_a_disabled_run_is_settled_without_probing_anything() -> None:
         DistillOptions(caption_frames=False),
         (LOCAL_A, LOCAL_B),
         "local",
-        cached=lambda key: False,
+        cached=lambda key: None,
         probe=never_probed,
     )
 
@@ -270,3 +270,83 @@ def test_a_disabled_run_is_settled_without_probing_anything() -> None:
     assert resolved.endpoint is None
     assert resolved.vision_mode == VISION_MODE_DISABLED
     assert resolved.evidence == ()
+
+
+def test_a_generation_with_no_interpretations_under_a_selected_key_is_a_miss() -> None:
+    """<!-- P3-D-019 --> A `selected` key promises a reader's work is in there.
+
+    A generation under that key holding zero **interpretations** is not the
+    bundle the key describes - it is the residue of a run that selected an
+    endpoint and then got nothing out of it. Serving it would answer a request
+    for a vision reading with a bundle that has none, forever, because the key
+    would keep hitting.
+
+    Zero is only meaningful under a `selected` key. A disabled or exhausted run
+    is *expected* to hold none, which is why the rule is per vision mode rather
+    than a blanket "generations must be non-empty".
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+    empty = {keys[0].opts_hash: 0, keys[1].opts_hash: 3}
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: empty.get(key),
+        probe=never_probed,
+    )
+
+    # Entry 0's generation is empty, so the walk passes it over and serves
+    # entry 1's - still without probing.
+    assert resolved.entry == 1
+    assert resolved.served_from_cache is True
+
+
+def test_an_exhausted_bundle_is_served_rather_than_walked_again() -> None:
+    """A degraded run's bundle is a bundle, and its key is meant to hit.
+
+    Without this the machine that could not reach any endpoint walks the whole
+    chain again on every run, paying every timeout, to arrive at the reading it
+    already has on disk.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: 0 if key == keys[-1].opts_hash else None,
+        probe=never_probed,
+    )
+
+    assert resolved.entry is None
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert resolved.served_from_cache is True
+
+
+def test_an_offline_machine_serves_the_local_reading_rather_than_ocr_only() -> None:
+    """<!-- P3-D-011 --> The case the earlier drafts got wrong.
+
+    Chain is `[cloud, local]`, only the *local* key is cached, and nothing is
+    reachable. The right answer is the cached local vision reading - a real
+    reading, produced by the second-preference endpoint - not a degraded
+    OCR-only bundle. Preference order says who to *ask*; it does not say a
+    bundle from a less-preferred reader should be thrown away.
+    """
+    chain = (REMOTE_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: 5 if key == keys[1].opts_hash else None,
+        probe=lambda config: False,
+    )
+
+    assert resolved.entry == 1
+    assert resolved.endpoint is LOCAL_B
+    assert resolved.vision_mode == VISION_MODE_SELECTED
+    assert resolved.served_from_cache is True

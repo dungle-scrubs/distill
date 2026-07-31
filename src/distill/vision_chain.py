@@ -140,12 +140,33 @@ class ResolvedRun:
     evidence: tuple[EntryOutcome, ...] = ()
 
 
+def _is_servable(key: CandidateKey, interpretations: int | None) -> bool:
+    """Whether the generation found under `key` is the bundle that key describes.
+
+    `None` means no generation at all. An integer is how many
+    **interpretations** it holds, and that number only means something under a
+    `selected` key: <!-- P3-D-019 --> such a key promises a reader's work is in
+    there, so a generation holding none is not that bundle - it is the residue
+    of a run that selected an endpoint and then got nothing out of it. Serving
+    it would answer a request for a vision reading with a bundle that has none,
+    forever, because the key would keep hitting.
+
+    A `disabled` or `chain_exhausted` bundle is *expected* to hold none, which
+    is why this asks about the mode rather than refusing every empty generation.
+    """
+    if interpretations is None:
+        return False
+    if key.vision_mode == VISION_MODE_SELECTED:
+        return interpretations > 0
+    return True
+
+
 def resolve_chain(
     options: DistillOptions,
     chain: tuple[LocalVisionConfig, ...],
     source_type: str,
     *,
-    cached: Callable[[str], bool],
+    cached: Callable[[str], int | None],
     probe: Callable[[LocalVisionConfig], bool],
 ) -> ResolvedRun:
     """The one endpoint - or the one cached bundle - this run will use.
@@ -183,7 +204,7 @@ def resolve_chain(
         # consulted and ignored: a run told to reprocess must reach the
         # endpoints, and a scan whose result is discarded is one that can still
         # pick the wrong answer if the skip is ever made conditional.
-        if cached(key.opts_hash):
+        if _is_servable(key, cached(key.opts_hash)):
             return ResolvedRun(
                 entry=key.entry,
                 vision_mode=key.vision_mode,
