@@ -222,6 +222,41 @@ def test_a_config_naming_nothing_still_reads_as_a_one_entry_chain(tmp_path: Path
     ]
 
 
+def test_an_entry_omitting_a_field_takes_the_default_not_its_neighbours(
+    tmp_path: Path,
+) -> None:
+    """M1.1: an omitted field on an entry resolves to the default.
+
+    Two entries, each naming only one of the two fields, so neither can be
+    passing by accident on a value it inherited from the payload it sits in.
+
+    What this does *not* prove, stated so nobody reads it as more: it does not
+    catch an entry folded onto the surrounding config instead of onto a fresh
+    default (P3-D-010). Top-level endpoint fields alongside `endpoints` are
+    `E_BAD_OPTIONS`, so the surrounding config here holds the defaults too and
+    both spellings produce this same result. The credential and
+    `allow_remote_endpoint` are what make inheritance observable, and the test
+    that asserts the outgoing `Authorization` header is where that is proved.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b"},
+                    {"base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints] == [
+        ("qwen3-vl:8b", DEFAULT_LOCAL_VISION_BASE_URL),
+        (DEFAULT_MODEL, "http://127.0.0.1:9000/v1"),
+    ]
+
+
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
     (tmp_path / "distill.local-vision.json").write_text(
         json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})
