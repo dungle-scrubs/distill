@@ -211,12 +211,31 @@ attacker-controlled input to a downstream model, and the boundary is what keeps
 it data rather than instruction.
 
 **Redaction**:
-Replacing secret-shaped values in **extracted text** before that text becomes
-durable.
+Replacing **credential-shaped values** in **extracted text** with a **redaction
+mark** before that text becomes durable.
 
 **Redaction sink**:
 Any point at which **extracted text** becomes durable — written to disk, or
 placed into a **render**. Redaction is complete only when every sink is covered.
+
+**Credential-shaped value**:
+A value whose form marks it as a secret — an issued token's prefix, private-key
+armour, a value assigned to a secret-named key, a password in a URL authority.
+Form is the whole of the evidence: Distill reads what a value looks like and
+never what it is for.
+_Avoid_: secret-shaped (names the intent rather than the evidence)
+
+**Identifier-shaped value**:
+A long opaque value whose form names something public — a commit SHA, a content
+digest, a build id. Removing one protects nothing and costs a reader the name of
+the thing on screen, so **redaction** leaves it intact.
+
+**Redaction mark**:
+The text Distill writes where a **credential-shaped value** stood. It names the
+kind of value removed and discloses nothing further — not the value, and not its
+length, which is a disclosure a password can least afford.
+_Avoid_: placeholder, mask (both name the shape of the text rather than what it
+is permitted to say)
 
 **Local-only processing**:
 The property that a run sends no **source** content off the machine that
@@ -235,12 +254,18 @@ it, not a gate that lowers confidence in an uncorroborated reading.
 **Corroborated**:
 Two readers, the image-text reader and the vision model, independently recovered
 the same text from a **keyframe**. The word keeps this strict meaning: a lone
-confident reader is never corroborated, however sure it is.
-_Caveat_: today the vision model is shown the image-text reader's output in its
-prompt, so the two are not truly independent - the vision reader can echo what
-the image-text reader recovered. The reader-facing note therefore says "matches
-the on-screen-text reader" and claims no independence; genuine independence would
-need a blind second reading (a possible future change).
+confident reader is never corroborated however sure it is, and the vision model's
+reading counts as a second reader only when it is a **blind reading**. A reader
+shown the other's answer is one reader twice.
+
+**Blind reading**:
+A reading of a **keyframe** produced without sight of any other reader's output.
+What makes a second reader a second opinion rather than an echo. The reading that
+carries an **interpretation** is not blind — it is shown **extracted text**
+because that lifts its accuracy — so corroboration is established against a
+separate blind transcription rather than against it.
+_Avoid_: independent reading (independence is the property blindness buys; naming
+the property invites claiming it without the mechanism)
 
 **Ungrounded**:
 The vision model produced an **interpretation** that no second reader
@@ -311,6 +336,11 @@ came from an eval may only be changed by another eval.
   text** across the machine boundary
 - **Extracted text** flows from a **source** into **frame artifacts** and the
   **transcript**, and reaches a reader only through a **redaction sink**
+- A **redaction sink** turns every **credential-shaped value** into a **redaction
+  mark** and leaves every **identifier-shaped value** intact
+- **Corroborated** is established between the image-text reader and a **blind
+  reading**; the reading that carries an **interpretation** is shown **extracted
+  text** and so can never be the second reader
 - A **generation** records the **provenance** of the **source** it came from;
   the source-chosen half crosses the **untrusted-data boundary** like any other
   **extracted text**
@@ -356,10 +386,31 @@ Staging directory ─────────> Generation   (indivisible: the ge
 > hallucinated slide look verified."
 >
 > **Dev:** "The transcript has a customer's API key in it. The render shows
-> `[REDACTED]`, so we're fine?"
+> `[REDACTED api-key]`, so we're fine?"
 > **Domain expert:** "Only if every **redaction sink** is covered. The render
 > is one sink. If that text is also written to disk anywhere else, that's
 > another sink, and the secret is still in the bundle."
+>
+> **Dev:** "The frame shows `commit f9a1a14aabbc...` — forty characters of
+> gibberish. Redact it."
+> **Domain expert:** "That's an **identifier-shaped value**. It names a commit
+> anybody with the repository can look up, so removing it protects nothing and
+> costs the reader the one thing the frame was showing them. **Redaction** takes
+> **credential-shaped values**. Length and opacity aren't the test — form is."
+>
+> **Dev:** "Then make the **redaction mark** say how long the value was, so a
+> reader can tell two removed keys apart."
+> **Domain expert:** "No. A mark names the kind and stops. Length is a real
+> disclosure — for a password it narrows the search directly — and telling two
+> secrets apart is not something a reader needs to do."
+>
+> **Dev:** "The vision model transcribed the slide and it matches the OCR text.
+> That's **corroborated**."
+> **Domain expert:** "Only if that reading was a **blind reading**. The reading
+> that carries an **interpretation** is shown the OCR text — we show it on
+> purpose, it reads hard slides better that way — so when it agrees, we've
+> learned it can copy. Corroboration is established against a separate blind
+> transcription, or it isn't established."
 >
 > **Dev:** "I'll put the video's title at the top of the render as a heading, so
 > you can tell the files apart."
@@ -472,3 +523,19 @@ Staging directory ─────────> Generation   (indivisible: the ge
   **interpretation** is authoritative, so **grounding** is an informational note
   rather than a gate. **Corroborated** keeps its strict two-readers meaning, so
   a lone reader still cannot borrow the authority of agreement.
+- **"secret-shaped"** let length and opacity stand in for the evidence, so a
+  commit SHA and a content digest were removed as though they were credentials -
+  resolved: a **credential-shaped value** and an **identifier-shaped value** are
+  different things and form is the only test. Removing the second protects
+  nothing and costs the reader the name of the thing on screen, so a rule named
+  for base64 must match base64 rather than any long run.
+- **"[REDACTED]"** was one opaque mark that said nothing about what it replaced,
+  so a reader could not tell a removed key from a removed digest - resolved: a
+  **redaction mark** names the kind and stops. Length was proposed and rejected:
+  it is the disclosure a password can least afford, and telling two removed
+  secrets apart is not a reader's task.
+- **Corroborated** claimed independence that the prompt design contradicted, and
+  the contradiction was carried as a caveat on the definition rather than fixed -
+  resolved: **blind reading** names the mechanism independence actually requires,
+  and corroboration is established against one. A caveat saying a term does not
+  mean what it says is a defect with a note attached, not a definition.
