@@ -123,7 +123,7 @@ On-screen text the vision model reports it could actually read, as opposed to
 what it inferred.
 
 **Vision endpoint**:
-The OpenAI-compatible service a run sends **keyframes** to for
+An OpenAI-compatible service a run may send **keyframes** to for
 **interpretation**, named by its address, the model it serves, and a
 credential. Whether it runs on the machine producing the **bundle** or in the
 cloud, and who provides it, is a configuration choice Distill does not otherwise
@@ -131,6 +131,40 @@ track. The model it serves is identity-affecting and enters the **options
 hash**; the address and credential are **machine-local claims** and never enter
 a **bundle**.
 _Avoid_: provider, backend (Distill knows the endpoint, not who runs it)
+
+**Endpoint chain**:
+The **vision endpoints** an operator configured, in the order they should be
+tried. Order is preference, not precedence over correctness: every endpoint in
+a chain is one the operator is willing to have read their **keyframes**, and a
+run uses exactly one of them.
+_Avoid_: fallback chain (**degradation** already owns that word, and moving
+from one endpoint to another is not degradation - the reading is not reduced,
+a different reader produced it), provider list, tiers
+
+**Available**:
+Said of a **vision endpoint** Distill reached and got a usable completion from.
+Availability is a fact about this run and this machine, established by asking:
+an endpoint can be configured and unavailable - unreachable, unauthenticated,
+or serving a different model - and that is the ordinary case an **endpoint
+chain** exists to absorb.
+_Avoid_: healthy, up, enabled (enabled is configuration; available is the
+answer to having asked)
+
+**Skipped**:
+Said of a **vision endpoint** an **endpoint chain** passed over without asking,
+because it was asked recently enough and found unavailable. Distinct from
+unavailable, which is what an endpoint asked *this run* turned out to be, and
+the distinction is user-visible: a skipped entry costs no round trip and means
+"we already know", an unavailable one costs a round trip and means "we just
+checked". An operator reading diagnostics needs to tell those apart.
+
+**Selected endpoint**:
+The first **available** **vision endpoint** in the **endpoint chain**: the one
+that produced a run's **interpretations**, and therefore the one whose model
+enters the **options hash**. A run has at most one - selection happens once,
+so no **bundle** ever holds **interpretations** from two readers.
+_Avoid_: active endpoint, winner, primary (primary reader already names the
+vision model's role against the image-text reader in **grounding**)
 
 **Frame salience**:
 Whether a **keyframe** adds information the **transcript** does not already
@@ -397,6 +431,12 @@ Staging directory ─────────> Generation   (indivisible: the ge
   reading — resolved: the **output root** holds **bundles**, the **artifact
   directory** holds **artifacts**, and a caller asking where the output went is
   asking about the second.
+- **"fallback"** was the obvious word for trying a second **vision endpoint**,
+  and **degradation** already forbids it — resolved: an **endpoint chain**
+  *selects*, it does not degrade. Moving from a cloud endpoint to a local one
+  produces a full reading from a different reader; only losing every endpoint
+  and continuing on **extracted text** alone is **degradation**, which is the
+  behavior that already existed and keeps its name.
 - **"signed module"** was treated as a maintained list rather than a property —
   resolved: signed-ness is definitional (editing it can change bundle content),
   so an unsigned output-affecting module is a defect, not an omission.
