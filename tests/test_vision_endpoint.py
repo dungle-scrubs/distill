@@ -19,6 +19,7 @@ import logging
 import socket
 import threading
 import urllib.request
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -39,6 +40,10 @@ from distill.local_vision import (
     try_interpret_image,
 )
 from distill.options import DistillOptions
+
+# Direct, not through `local_vision`'s re-exports: the pinning transport is an
+# internal of the client module, and the facade should not widen to name it.
+from distill.rapid_mlx import _connect_to_a_validated_address, _DialsOnlyTheValidatedAddress
 
 LOOPBACK_URL = "http://127.0.0.1:8000/v1"
 # https, not http: since M2.3 (D-008) a non-loopback endpoint requires TLS
@@ -158,8 +163,8 @@ class _Received(NamedTuple):
 class _RecordingHTTPServer(http.server.ThreadingHTTPServer):
     """A loopback server that keeps what reached it."""
 
-    def __init__(self, handler: type[http.server.BaseHTTPRequestHandler]) -> None:
-        super().__init__(("127.0.0.1", 0), handler)
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), _RecordingHandler)
         self.received: list[_Received] = []
 
 
@@ -198,30 +203,76 @@ class _RealEndpoint:
     """
 
     def __init__(self) -> None:
-        self._httpd = _RecordingHTTPServer(_RecordingHandler)
+        self._httpd = _RecordingHTTPServer()
         self.port: int = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            # Otherwise the listening socket outlives the failure, holding its
+            # port for the rest of the session.
+            self._httpd.server_close()
+            raise
 
     @property
     def received(self) -> list[_Received]:
         return self._httpd.received
 
     def close(self) -> None:
-        self._httpd.shutdown()
+        # Guarded: `shutdown()` waits unconditionally on an event only
+        # `serve_forever`'s exit sets, so calling it on a thread that never got
+        # there hangs the whole run with no diagnostic.
+        if self._thread.is_alive():
+            self._httpd.shutdown()
         self._httpd.server_close()
         self._thread.join(timeout=5)
+        assert not self._thread.is_alive(), "loopback endpoint did not shut down"
 
 
 @pytest.fixture
-def real_endpoints() -> Any:
-    """Two live loopback endpoints, torn down whatever the test does."""
-    endpoints: list[_RealEndpoint] = [_RealEndpoint(), _RealEndpoint()]
+def real_endpoint() -> Iterator[Callable[[], _RealEndpoint]]:
+    """Live loopback endpoints on demand, torn down whatever the test does.
+
+    A factory rather than a fixed pair: the tests want one or two, and every
+    one built inside the guarded region so a failure part-way through still
+    closes the ones already listening.
+    """
+    endpoints: list[_RealEndpoint] = []
+
+    def build() -> _RealEndpoint:
+        endpoint = _RealEndpoint()
+        endpoints.append(endpoint)
+        return endpoint
+
     try:
-        yield endpoints
+        yield build
     finally:
         for endpoint in endpoints:
             endpoint.close()
+
+
+def _answers_with_ports(monkeypatch: pytest.MonkeyPatch, *ports: int) -> None:
+    """Resolve `vision.test` to 127.0.0.1 on a different port each lookup.
+
+    The address is loopback every time, so the endpoint check passes every
+    time; the *port* is what moves, and that is what makes a second lookup
+    observable. `socket.create_connection` connects to the whole sockaddr
+    `getaddrinfo` hands back, port included, so an unpinned connection lands on
+    whichever server the later answer names while the URL never changed.
+
+    The last port keeps answering once the sequence runs out, and any other
+    host is passed through to the real resolver.
+    """
+    real_getaddrinfo = socket.getaddrinfo
+    remaining = list(ports)
+
+    def fake(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
+        if host != "vision.test":
+            return real_getaddrinfo(host, port, *args, **kwargs)
+        answered = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", answered))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
 
 
 def test_a_non_loopback_host_is_rejected_without_the_opt_out(tmp_path: Path) -> None:
@@ -423,9 +474,34 @@ def test_the_resolved_address_is_checked_on_every_request(
     assert transport.requested == [named_url]
 
 
+def test_a_supplied_transport_replaces_the_real_one_rather_than_racing_it() -> None:
+    """What keeps the rest of this suite off the network, asserted once.
+
+    Every other test that installs a `_FakeTransport` is trusting that the real
+    transport is not also installed and merely sorted behind it. That would
+    make suite-wide network isolation a property of `handler_order`, and a fake
+    whose `http_open` returned `None` would fall through to a real socket. The
+    substitution is what makes it structural, so it is worth one assertion.
+    """
+    fake = _FakeTransport({})
+    # `Any`: `handle_open` is built in `OpenerDirector.__init__` and typeshed
+    # does not declare it.
+    opener_with_fake: Any = _build_opener(fake)
+    production_opener: Any = _build_opener()
+    with_fake = opener_with_fake.handle_open
+    production = production_opener.handle_open
+
+    for scheme in ("http", "https"):
+        # The fake is the only opener, so nothing can fall through to a socket.
+        assert with_fake[scheme] == [fake]
+        # And with nothing supplied, the pinning transport is the only opener,
+        # so no request escapes it either.
+        assert [type(handler) for handler in production[scheme]] == [_DialsOnlyTheValidatedAddress]
+
+
 def test_the_request_goes_to_the_address_that_was_validated(
     monkeypatch: pytest.MonkeyPatch,
-    real_endpoints: list[_RealEndpoint],
+    real_endpoint: Callable[[], _RealEndpoint],
 ) -> None:
     """D-021: the name is resolved once, and *that* answer is what is dialled.
 
@@ -444,22 +520,13 @@ def test_the_request_goes_to_the_address_that_was_validated(
     arrives has already told an unvalidated host that this machine is running
     Distill against a vision endpoint.
     """
-    validated, swapped = real_endpoints
-    real_getaddrinfo = socket.getaddrinfo
-    answers = [validated.port, swapped.port]
-
-    def rebinding_getaddrinfo(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
-        if host != "vision.test":
-            return real_getaddrinfo(host, port, *args, **kwargs)
-        answered = answers.pop(0) if answers else swapped.port
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", answered))]
-
-    monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
+    validated, swapped = real_endpoint(), real_endpoint()
+    _answers_with_ports(monkeypatch, validated.port, swapped.port)
     url = f"http://vision.test:{validated.port}/v1/models"
 
-    assert _urlopen_json(
-        "GET", url, None, 5.0, credential=SecretCredential("s3cr3t")
-    ) == {"data": []}
+    assert _urlopen_json("GET", url, None, 5.0, credential=SecretCredential("s3cr3t")) == {
+        "data": []
+    }
 
     assert [request.path for request in validated.received] == ["/v1/models"]
     assert swapped.received == []
@@ -467,7 +534,7 @@ def test_the_request_goes_to_the_address_that_was_validated(
 
 def test_an_unreachable_validated_address_fails_rather_than_falling_back(
     monkeypatch: pytest.MonkeyPatch,
-    real_endpoints: list[_RealEndpoint],
+    real_endpoint: Callable[[], _RealEndpoint],
 ) -> None:
     """D-021: the pin is load-bearing, not an optimisation with a safety net.
 
@@ -482,19 +549,14 @@ def test_an_unreachable_validated_address_fails_rather_than_falling_back(
     ADR-0002 degrades on, and not a rejection - nothing about the endpoint's
     policy was wrong.
     """
-    live, _ = real_endpoints
+    live = real_endpoint()
     with socket.socket() as spare:
         spare.bind(("127.0.0.1", 0))
         closed_port = spare.getsockname()[1]
-    real_getaddrinfo = socket.getaddrinfo
-
-    def resolves_to_the_live_endpoint(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
-        if host != "vision.test":
-            return real_getaddrinfo(host, port, *args, **kwargs)
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", live.port))]
-
-    monkeypatch.setattr(socket, "getaddrinfo", resolves_to_the_live_endpoint)
-    monkeypatch.setattr("distill.rapid_mlx._resolve_addresses", lambda host, port: ["127.0.0.1"])
+    # One fake, not two: `_resolve_addresses` reduces this answer to
+    # ["127.0.0.1"] on its own, so patching it as well would hide which seam
+    # the test actually drives.
+    _answers_with_ports(monkeypatch, live.port)
 
     probe = probe_local_vision(LocalVisionConfig(base_url=f"http://vision.test:{closed_port}/v1"))
 
@@ -503,9 +565,66 @@ def test_an_unreachable_validated_address_fails_rather_than_falling_back(
     assert live.received == []
 
 
+def test_the_validated_addresses_share_one_deadline_rather_than_each_getting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One request stays one request's worth of time, however many answers.
+
+    How many addresses there are is not Distill's choice: a zone may answer with
+    fifty, and if every one of them is inside `127.0.0.0/8` then every one of
+    them passes the loopback check. Giving each the full timeout turns a 30
+    second bound into 25 minutes, and the vision budget is charged between
+    requests, so nothing else would cut it short. So the attempts share the
+    request's deadline: each is handed what is *left* of it, and once it is
+    spent the remaining addresses are not dialled at all.
+    """
+    handed: list[tuple[str, float]] = []
+    # Read once per address considered: two attempts, then a reading past the
+    # deadline that ends the loop before the third is dialled.
+    clock = iter([100.0, 100.5, 102.5])
+
+    def refuse(address: tuple[str, int], timeout: float, *args: Any) -> socket.socket:
+        handed.append((address[0], timeout))
+        raise ConnectionRefusedError(f"nothing on {address}")
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: next(clock))
+
+    with pytest.raises(ConnectionRefusedError):
+        _connect_to_a_validated_address(
+            # The repeat is what `getaddrinfo` produces when one address serves
+            # several protocols; dialling it twice would spend the deadline on
+            # the same host twice.
+            ("127.0.0.1", "127.0.0.1", "127.0.0.2", "127.0.0.3"),
+            102.0,
+            ("vision.test", 8000),
+            5.0,
+            None,
+        )
+
+    # Each attempt given only what the deadline still had, the repeat collapsed,
+    # and the last address never dialled because the deadline had run out.
+    assert handed == [("127.0.0.1", 2.0), ("127.0.0.2", 1.5)]
+
+
+def test_a_deadline_already_spent_dials_nothing_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exhausted case is a timeout, not a silent success on address two."""
+
+    def refuse(*args: Any, **kwargs: Any) -> socket.socket:
+        raise AssertionError("a spent deadline must not reach the network")
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    monkeypatch.setattr("distill.rapid_mlx._monotonic", lambda: 100.0)
+
+    with pytest.raises(TimeoutError):
+        _connect_to_a_validated_address(("127.0.0.1",), 99.0, ("vision.test", 8000), 5.0, None)
+
+
 def test_a_local_only_claim_is_backed_by_where_the_keyframe_actually_went(
     monkeypatch: pytest.MonkeyPatch,
-    real_endpoints: list[_RealEndpoint],
+    real_endpoint: Callable[[], _RealEndpoint],
 ) -> None:
     """D-021: the disclosure and the socket now agree.
 
@@ -517,7 +636,7 @@ def test_a_local_only_claim_is_backed_by_where_the_keyframe_actually_went(
     recorded otherwise. So the claim is asserted against the body that actually
     arrived, not against the config that predicted it.
     """
-    validated, swapped = real_endpoints
+    validated, swapped = real_endpoint(), real_endpoint()
     config = LocalVisionConfig(base_url=f"http://vision.test:{validated.port}/v1")
     assert config_is_non_local(config) is False
     payload = DistillOptions.from_args(
@@ -525,15 +644,7 @@ def test_a_local_only_claim_is_backed_by_where_the_keyframe_actually_went(
     ).cache_payload("local")
     assert payload["local_vision_non_local"] is False
 
-    real_getaddrinfo = socket.getaddrinfo
-    answers = [validated.port, swapped.port]
-
-    def rebinding_getaddrinfo(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
-        if host != "vision.test":
-            return real_getaddrinfo(host, port, *args, **kwargs)
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", answers.pop(0)))]
-
-    monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
+    _answers_with_ports(monkeypatch, validated.port, swapped.port)
 
     _urlopen_json(
         "POST",
@@ -553,7 +664,7 @@ def test_a_local_only_claim_is_backed_by_where_the_keyframe_actually_went(
 
 def test_the_connection_is_dialled_by_address_but_named_by_hostname(
     monkeypatch: pytest.MonkeyPatch,
-    real_endpoints: list[_RealEndpoint],
+    real_endpoint: Callable[[], _RealEndpoint],
 ) -> None:
     """D-021: pinning replaces the address, and nothing else.
 
@@ -563,19 +674,18 @@ def test_the_connection_is_dialled_by_address_but_named_by_hostname(
     of the hostname - so an `https` endpoint named by a hostname, with an
     ordinary certificate, would stop working. The address is the only thing
     the connection is allowed to lose.
+
+    Only the check's resolver is faked, and `vision.test` is a name the machine
+    genuinely cannot resolve, so the request arriving at all is itself the
+    evidence: an unpinned connection would have looked the name up for real and
+    failed. The `Host` header then says which of the two pins was built.
     """
-    endpoint, _ = real_endpoints
-    real_getaddrinfo = socket.getaddrinfo
-
-    def resolver(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
-        if host != "vision.test":
-            return real_getaddrinfo(host, port, *args, **kwargs)
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", endpoint.port))]
-
-    monkeypatch.setattr(socket, "getaddrinfo", resolver)
+    endpoint = real_endpoint()
     url = f"http://vision.test:{endpoint.port}/v1/models"
 
-    assert _urlopen_json("GET", url, None, 5.0) == {"data": []}
+    assert _urlopen_json("GET", url, None, 5.0, resolver=lambda host, port: ["127.0.0.1"]) == {
+        "data": []
+    }
 
     (request,) = endpoint.received
     assert request.headers["Host"] == f"vision.test:{endpoint.port}"

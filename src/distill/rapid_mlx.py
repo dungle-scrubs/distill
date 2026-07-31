@@ -1,7 +1,9 @@
 """The Rapid-MLX vision client: how Distill talks to the local server and what it will listen to.
 
 This module owns the transport (the HTTP request, the opener that follows no
-redirect and consults no proxy, the 32 MiB read bound), the OpenAI-style
+redirect and consults no proxy, the connection pinned to the addresses the
+endpoint check approved rather than to a second lookup of the name (D-021), the
+32 MiB read bound), the OpenAI-style
 envelope parsing, and the endpoint policy (scheme, the loopback rule and its
 per-request re-check, the refusal to follow a redirect). It is one
 OpenAI-compatible client, not a provider abstraction: `backend` names the wire
@@ -631,26 +633,34 @@ class _RedirectsAreRejected(urllib.request.HTTPRedirectHandler):
 
 
 class _EndpointRequest(urllib.request.Request):
-    """A request carrying the addresses its host was *proved* to resolve to.
+    """A request carrying the addresses its host was *proved* to resolve to,
+    and the deadline the whole request is bounded by.
 
-    The pin travels on the request rather than in module state, so it cannot be
+    Both travel on the request rather than in module state, so neither can be
     read by the wrong one: two threads posting **keyframes** to two endpoints
-    each connect to the addresses their own check approved.
+    each connect to the addresses their own check approved, under their own
+    clock.
     """
 
     def __init__(
         self,
-        *args: Any,
+        url: str,
+        *,
+        data: bytes | None = None,
+        method: str | None = None,
+        headers: dict[str, str] | None = None,
         validated_addresses: tuple[str, ...] = (),
-        **kwargs: Any,
+        deadline: float | None = None,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(url, data=data, method=method, headers=headers or {})
         self.validated_addresses = validated_addresses
+        self.deadline = deadline
 
 
 def _connect_to_a_validated_address(
     addresses: tuple[str, ...],
-    address: tuple[str, int],
+    deadline: float | None,
+    host_and_port: tuple[str, int],
     *args: Any,
     **kwargs: Any,
 ) -> socket.socket:
@@ -665,22 +675,48 @@ def _connect_to_a_validated_address(
     Every approved address is tried rather than only the first, because a name
     may answer with several and `localhost` routinely answers with both `::1`
     and `127.0.0.1` while the server listens on one of them.
+
+    The attempts share the request's deadline instead of each getting the full
+    timeout, which is where this stops merely reproducing what
+    `create_connection` does with a name. How many addresses there are is not
+    Distill's choice: a zone is free to answer with fifty, every one of them
+    inside `127.0.0.0/8` and so every one of them passing the loopback check,
+    and fifty blackholed attempts at the full timeout is a single request that
+    runs for half an hour. The budget is charged between requests, so nothing
+    else would have cut it short.
     """
-    port = address[1]
+    # urllib hands `(self.host, self.port)`; the host half is exactly what must
+    # not be dialled, so only the port is taken from it.
+    port = host_and_port[1]
     last: OSError | None = None
-    for validated in addresses:
+    # Deduplicated: `getaddrinfo` answers per (family, socktype, proto), so one
+    # address can appear several times and would otherwise be dialled - and
+    # timed out on - once per appearance.
+    for validated in dict.fromkeys(addresses):
+        attempt = args[0] if args else None
+        rest = args[1:]
+        if deadline is not None:
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                break
+            # Never larger than the caller's timeout: the deadline was armed at
+            # `timeout_sec` from entry, so what is left of it is bounded by it.
+            attempt = remaining
         try:
-            return socket.create_connection((validated, port), *args, **kwargs)
+            return socket.create_connection((validated, port), attempt, *rest, **kwargs)
         except OSError as exc:
             last = exc
     if last is not None:
         raise last
-    raise OSError(f"no validated address to connect to for port {port}")
+    # Reachable exactly when the deadline was already spent before the first
+    # attempt - a timeout, and typed as one so the caller degrades on it the
+    # way it degrades on any other unreachable endpoint.
+    raise TimeoutError(f"no validated address for port {port} was dialled within the deadline")
 
 
 def _connection_pinned_to(
     base: type[http.client.HTTPConnection], request: urllib.request.Request
-) -> Any:
+) -> Callable[..., http.client.HTTPConnection]:
     """`base`, but dialling the request's validated addresses.
 
     `_create_connection` is `http.client`'s own indirection for exactly this:
@@ -692,12 +728,16 @@ def _connection_pinned_to(
     would have broken certificate verification for an `https` endpoint named by
     a hostname.
     """
-    addresses = getattr(request, "validated_addresses", ())
-    if not addresses:
+    # A type test rather than a `getattr` default: the handler's signature is
+    # urllib's and must accept any `Request`, but "the check ran and had
+    # nothing to pin" and "this never came through `_urlopen_json`" are
+    # different facts, and only the first is legitimate.
+    if not isinstance(request, _EndpointRequest) or not request.validated_addresses:
         # Nothing was validated, so there is nothing to pin to: the remote
         # `https` opt-in runs no resolved-address check at all (D-008), and its
         # connection stays urllib's ordinary one.
         return base
+    addresses, deadline = request.validated_addresses, request.deadline
 
     def build(host: str, **kwargs: Any) -> http.client.HTTPConnection:
         # Typed `Any` deliberately: `_create_connection` is assigned per
@@ -706,7 +746,7 @@ def _connection_pinned_to(
         # proves it is still the hook `connect()` reaches the network through.
         connection: Any = base(host, **kwargs)
         connection._create_connection = functools.partial(
-            _connect_to_a_validated_address, addresses
+            _connect_to_a_validated_address, addresses, deadline
         )
         return connection
 
@@ -714,17 +754,11 @@ def _connection_pinned_to(
 
 
 class _DialsOnlyTheValidatedAddress(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
-    """The transport, replacing urllib's, so the socket goes where the check said.
+    """The transport, replacing urllib's, so the socket goes where the check said."""
 
-    Ordered last rather than first (`handler_order`): a test that installs a
-    fake transport is still served by the fake, and this is what opens an
-    actual socket when nothing else answered.
-    """
-
-    handler_order = 900
-
-    # Declared, not assigned: `HTTPSHandler.__init__` sets it, and inheriting
-    # both handlers leaves it undeclared on this class.
+    # Declared, not assigned: typeshed does not declare `_context` on
+    # `HTTPSHandler`, though `HTTPSHandler.__init__` - which the MRO reaches -
+    # always sets it.
     _context: ssl.SSLContext
 
     def http_open(self, req: urllib.request.Request) -> Any:
@@ -753,13 +787,16 @@ def _build_opener(*handlers: urllib.request.BaseHandler) -> urllib.request.Opene
 
     Built by a function so a test can put a fake transport under the *same*
     chain production uses, instead of asserting against a chain it assembled
-    itself.
+    itself. A supplied handler *replaces* the transport rather than racing it:
+    leaving both installed and relying on `handler_order` to pick the fake
+    would make the suite's isolation from the network a matter of sort order,
+    and a fake that returned `None` from `http_open` would fall through and
+    open a real socket.
     """
     return urllib.request.build_opener(
         _RedirectsAreRejected,
         urllib.request.ProxyHandler({}),
-        *handlers,
-        _DialsOnlyTheValidatedAddress,
+        *(handlers or (_DialsOnlyTheValidatedAddress,)),
     )
 
 
@@ -814,14 +851,16 @@ def _urlopen_json(
         method=method,
         headers=_request_headers(credential),
         validated_addresses=tuple(validated_addresses),
+        deadline=deadline,
     )
-    # The deadline is absolute and covers the whole request - connect, send,
-    # and every chunk of the answer. urllib's timeout is per socket operation,
-    # so without this a body arriving one drip at a time never times out
-    # (D-008).
+    # Not re-armed here. urllib's timeout is per socket operation, so without an
+    # absolute deadline a body arriving one drip at a time never times out
+    # (D-008) - but restarting the clock at this point refunded the resolution
+    # above, which is the one part of the request that can hit DNS, and left the
+    # comment at the top of the function describing something the code did not
+    # do.
     if budget is not None:
         budget.check()
-    deadline = _monotonic() + timeout_sec
     try:
         with _OPENER.open(request, timeout=timeout_sec) as response:
             # One byte past the cap, so a body that is exactly at it still
