@@ -450,3 +450,46 @@ def test_the_policy_does_not_rewrite_the_paths_distill_chose(tmp_path: Path) -> 
     # The extracted text beside it is still redacted: the exemption is the path
     # field, not the document.
     assert recovered["frames"][0]["extracted_text"] == "OPENAI_API_KEY=[REDACTED:assigned-secret]"
+
+
+# --- M3.1: render disclosure -----------------------------------------------
+
+
+def test_the_render_names_the_model_that_read_the_frames() -> None:
+    """A reader has to be able to tell which model produced the interpretations.
+
+    With one endpoint that was implicit - there was only ever one it could have
+    been. A chain makes it a real question: the same source read by a cloud
+    model and by a local one produce different bundles, and a reader holding one
+    of them cannot tell which without being told.
+    """
+    frame = FrameArtifact(
+        index=1,
+        timestamp_sec=0.0,
+        path="/tmp/f.png",
+        relative_path="frames/f1.png",
+        extracted_text="a slide",
+    )
+    rendered = render_markdown("demo.mp4", 1.0, None, [frame], [], vision_model="qwen3-vl:32b")
+
+    assert "qwen3-vl:32b" in rendered
+
+
+def test_the_render_says_plainly_when_no_endpoint_read_the_frames() -> None:
+    """Absence is stated, not left to be inferred from missing sections.
+
+    A degraded run and a `--no-caption-frames` run both produce a bundle with no
+    interpretations. A reader who cannot tell them apart does not know whether
+    to re-run: one is a bundle that would look different on a better day, and
+    the other is exactly what was asked for.
+    """
+    frame = FrameArtifact(
+        index=1,
+        timestamp_sec=0.0,
+        path="/tmp/f.png",
+        relative_path="frames/f1.png",
+        extracted_text="a slide",
+    )
+    degraded = render_markdown("demo.mp4", 1.0, None, [frame], [], vision_model=None)
+
+    assert "No vision endpoint" in degraded

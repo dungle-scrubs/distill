@@ -108,6 +108,19 @@ model is now authoritative for.
 
 NO_OUTPUT_NOTE = "The vision model returned no usable output for this frame."
 
+NO_ENDPOINT_NOTE = (
+    "No vision endpoint read these frames. What follows is the transcript and "
+    "whatever text was read off the images; nothing here is a model's account "
+    "of what a frame showed."
+)
+"""Said when no endpoint produced a reading, rather than left to be inferred.
+
+A degraded run and a `--no-caption-frames` run both publish a **bundle** with
+no **interpretations**, and a reader holding one cannot tell which they have.
+That decides whether re-running is worth anything: one would look different on
+a better day, and the other is exactly what was asked for.
+"""
+
 
 def transcript_is_empty(transcript: Transcript | None) -> bool:
     """Return true when transcript text has fewer than 3 non-space characters."""
@@ -170,6 +183,7 @@ def render_markdown(
     *,
     provenance: Provenance | None = None,
     include_frame_links: bool = True,
+    vision_model: str | None = None,
 ) -> str:
     _require_redaction_policy(
         *frames,
@@ -199,6 +213,10 @@ def render_markdown(
             if provenance is None
             else _provenance_lines(provenance)
         ),
+        # Distill's own words, outside the untrusted boundary: which reader
+        # produced the interpretations is a fact about the run, not text
+        # anybody else chose.
+        *([f"Frames read by: {vision_model}", ""] if vision_model else [NO_ENDPOINT_NOTE, ""]),
     ]
     if warnings:
         lines.extend(["## Warnings", ""])

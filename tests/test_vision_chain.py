@@ -8,6 +8,8 @@ selection, no cache.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from distill.local_vision import LocalVisionConfig
@@ -699,9 +701,7 @@ def test_an_endpoint_whose_probe_raises_is_passed_over_not_propagated() -> None:
             raise OSError("connection refused")
         return True
 
-    resolved = resolve_chain(
-        DistillOptions(), chain, "local", cached=lambda key: None, probe=probe
-    )
+    resolved = resolve_chain(DistillOptions(), chain, "local", cached=lambda key: None, probe=probe)
 
     assert resolved.entry == 1
     assert resolved.evidence[0].entry == 0
@@ -721,3 +721,44 @@ def test_a_chain_whose_every_probe_raises_degrades_rather_than_failing() -> None
 
     assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
     assert [o.outcome for o in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE]
+
+
+def test_three_chains_selecting_the_same_endpoint_agree_on_everything() -> None:
+    """ADR-0004: what a chain *offered* is not part of what a run produced.
+
+    The same endpoint reached from three different chains - alone, first of
+    two, second of two - is the same reader producing the same reading. If the
+    chain entered identity, adding a fallback nobody used would re-key every
+    bundle and reprocess a whole cache to arrive at byte-identical output.
+
+    So all three agree on the key *and* on the options that describe it. The
+    options are the stronger half: a manifest built from them is what makes the
+    bundles byte-identical rather than merely co-located.
+    """
+    alone = resolve_chain(
+        DistillOptions(), (LOCAL_B,), "local", cached=lambda k: None, probe=lambda c: True
+    )
+    first_of_two = resolve_chain(
+        DistillOptions(),
+        (LOCAL_B, REMOTE_A),
+        "local",
+        cached=lambda k: None,
+        probe=lambda c: c is LOCAL_B,
+    )
+    second_of_two = resolve_chain(
+        DistillOptions(),
+        (REMOTE_A, LOCAL_B),
+        "local",
+        cached=lambda k: None,
+        probe=lambda c: c is LOCAL_B,
+    )
+
+    assert alone.opts_hash == first_of_two.opts_hash == second_of_two.opts_hash
+    payloads = {
+        json.dumps(run.options.cache_payload("local"), sort_keys=True)
+        for run in (alone, first_of_two, second_of_two)
+    }
+    assert len(payloads) == 1
+    # The position differs, and that is *about the run* rather than about the
+    # bundle - which is why `entry` is not in the payload.
+    assert (alone.entry, first_of_two.entry, second_of_two.entry) == (0, 0, 1)
