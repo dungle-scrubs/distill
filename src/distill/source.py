@@ -586,10 +586,16 @@ def servable_interpretation_count(output_root: Path, bundle_key: str) -> int | N
         # A manifest another process wrote is input rather than fact, and a
         # missing or malformed `frames` is not evidence of zero readings.
         return None
+    # `visual_interpretation`, not `interpretation`: the manifest embeds the
+    # *response* shape (`response_frames`), which renames the field on the way
+    # out. Reading the document key here silently counted zero for every
+    # generation, which made a cache hit with vision on probe anyway - the
+    # exact property Gate 2->3 exists to check.
     return sum(
         1
         for frame in frames
-        if isinstance(frame, dict) and document_carries_a_reading(frame.get("interpretation"))
+        if isinstance(frame, dict)
+        and document_carries_a_reading(frame.get("visual_interpretation"))
     )
 
 

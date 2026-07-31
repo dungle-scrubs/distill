@@ -916,3 +916,72 @@ def test_a_symlinked_source_leaks_neither_its_path_nor_its_name(
     assert str(target) not in archived
     assert str(tmp_path) not in archived
     assert secret_name not in Path(response["artifact_path"]).read_text()
+
+
+def test_a_cache_hit_with_vision_on_never_probes_and_returns_under_one_second(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """<!-- P3-D-011 --> Gate 2→3's criterion, and the gap the review found.
+
+    `test_cache_hit_returns_under_one_second` above runs with
+    `caption_frames: False`, so it proves nothing about the endpoint: a
+    disabled run was never going to ask one. The property that matters is the
+    other one - a run that *wants* vision and already has the bundle must serve
+    it without reaching for a server at all.
+
+    Asserted with a probe that raises rather than by timing alone. A run that
+    probed and happened to be fast would pass a timing check; this one fails at
+    the moment resolution reaches for the network.
+    """
+    video = tmp_path / "fixture.mp4"
+    make_short_screencast(video)
+    args = {
+        "path": str(video),
+        "output_dir": str(tmp_path / "cache"),
+        "ocr": False,
+        "redact_secrets": False,
+        "caption_frames": True,
+        "max_keyframes": 3,
+        "max_static_window_sec": 1,
+    }
+    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+
+    def one_interpretation(
+        frames: list[Any], _options: Any, _progress: Any, **_kwargs: Any
+    ) -> tuple[list[Any], list[Any]]:
+        """A reader that produced something, so the generation is servable.
+
+        A generation with no interpretations under a `selected` key is a miss
+        by design (P3-D-019), so a fixture that captioned nothing would test the
+        miss path rather than the hit path.
+        """
+        return (
+            [
+                frame.with_interpretation(
+                    Interpretation(visual_summary="a slide", text_confidence="high"),
+                    grounding={"level": "self_report", "text_overlap": None, "reason": "only"},
+                )[0]
+                for frame in frames
+            ],
+            [],
+        )
+
+    monkeypatch.setattr(distill_session, "interpret_frames_with_local_vision", one_interpretation)
+    first = distill_session.process_local_video(args)
+    assert first["cached"] is False
+    # The generation has to hold a reading, or the second run is testing the
+    # miss path: a `selected` key over a generation with no interpretations is
+    # a miss by design (P3-D-019).
+    assert any(frame.get("visual_interpretation") for frame in first["frames"])
+
+    def never_probe(_endpoint: object) -> bool:
+        raise AssertionError("a cache hit must not reach for an endpoint")
+
+    monkeypatch.setattr("distill.source._probe_endpoint", never_probe)
+    started = time.perf_counter()
+    cached = distill_session.process_local_video(args)
+    elapsed = time.perf_counter() - started
+
+    assert cached["cached"] is True
+    assert elapsed < 1.0

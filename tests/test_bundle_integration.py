@@ -534,10 +534,15 @@ def test_servable_interpretation_count_reads_what_the_manifest_already_holds(
     store, run = begin(root)
     write_renders(run)
     manifest = minimal_manifest(tmp_path)
+    # `visual_interpretation`, which is what a real manifest holds: it embeds
+    # the *response* shape via `response_frames`, not the frame document. My
+    # first version of this test used the document key and passed against a
+    # reader that had the same mistake - so it agreed with the code instead of
+    # checking it.
     manifest["frames"] = [
-        {"index": 1, "interpretation": {"visual_summary": "a slide"}},
-        {"index": 2, "interpretation": None},
-        {"index": 3, "interpretation": {"visual_summary": "   "}},
+        {"index": 1, "visual_interpretation": {"visual_summary": "a slide"}},
+        {"index": 2, "visual_interpretation": None},
+        {"index": 3, "visual_interpretation": {"visual_summary": "   "}},
     ]
     run.commit(manifest)
 
