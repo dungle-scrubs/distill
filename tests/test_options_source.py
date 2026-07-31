@@ -1296,3 +1296,49 @@ def test_a_configured_chain_survives_into_the_config_the_pipeline_uses(
         "qwen3-vl:8b",
         "qwen3-vl:32b",
     ]
+
+
+def test_key_derivation_uses_the_endpoint_the_walk_selected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """<!-- P3-D-015 --> The three-way agreement, at the site the key is made.
+
+    A chain names two endpoints and only the second answers. The options the
+    key is derived from have to be *that* endpoint's - not the ones the run
+    started with, which still name whichever endpoint the chain listed first.
+
+    That is the failure this decision exists to prevent: the pipeline calls one
+    endpoint while the manifest records another's options under a third's key.
+    Asserted at `_resolved_for`, which is the seam source resolution calls and
+    the one place the substitution happens.
+    """
+    from distill.source import _resolved_for
+    from distill.vision_chain import candidate_keys
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    options = DistillOptions.from_args({})
+
+    # Only the second endpoint answers, and nothing is cached.
+    monkeypatch.setattr(
+        "distill.source._probe_endpoint",
+        lambda config: config.model == "qwen3-vl:32b",
+    )
+
+    resolved = _resolved_for(options, "a-fingerprint", "local", None)
+
+    chain = options.local_vision_endpoints or ()
+    assert resolved.entry == 1
+    assert resolved.options.local_vision_model == "qwen3-vl:32b"
+    assert resolved.opts_hash == candidate_keys(options, chain, "local")[1].opts_hash
+    # And the options the key came from hash to that key - the same fact twice.
+    assert resolved.options.opts_hash("local") == resolved.opts_hash

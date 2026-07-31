@@ -81,6 +81,7 @@ from .bundle_store import (
 )
 from .errors import DistillError, WarningRecord, errno_name, warning
 from .links import RelatedLink, extract_relevant_links
+from .local_vision import LocalVisionConfig
 from .media_inspect import (  # noqa: F401  re-exported: media inspection
     CONTENT_HASH_LIMIT_BYTES as CONTENT_HASH_LIMIT_BYTES,
 )
@@ -122,6 +123,7 @@ from .run_command import (
     run_json,
     stream,
 )
+from .vision_chain import ResolvedRun, resolve_chain
 from .youtube import (  # noqa: F401  re-exported: the YouTube client
     NO_PLAYLIST_ARG as NO_PLAYLIST_ARG,
 )
@@ -494,6 +496,51 @@ def servable_duration(output_root: Path, bundle_key: str) -> float | None:
     return manifest_duration(snapshot.manifest)
 
 
+def _probe_endpoint(endpoint: LocalVisionConfig) -> bool:
+    """Whether this **vision endpoint** can serve this run.
+
+    A module-level seam rather than an import at the call site, so a test can
+    replace it without a live server and without reaching into
+    `local_vision`'s internals. Imported lazily because `local_vision` pulls in
+    the vision client, and source resolution is reached by runs that never
+    caption a frame.
+    """
+    from .local_vision import probe_local_vision
+
+    return probe_local_vision(endpoint).available
+
+
+def _resolved_for(
+    options: DistillOptions,
+    fingerprint: str,
+    source_type: str,
+    output_root: Path | None,
+) -> ResolvedRun:
+    """Walk the **endpoint chain** and settle which bundle this run is about.
+
+    <!-- D-033 --> Here rather than in the pipeline, because a candidate key is
+    an **options hash** but whether one is *cached* is a question about
+    `source_hash(fingerprint, opts_hash)` - and the fingerprint only exists once
+    resolution is under way. Resolving earlier would look tidier and could only
+    ever probe, never serve a hit, which is the cache-before-network property
+    the walk exists to guarantee.
+
+    A caller that named no **output root** has no store to ask, so every
+    candidate reads as absent and the walk goes straight to probing.
+    """
+    return resolve_chain(
+        options,
+        options.local_vision_endpoints or (),
+        source_type,
+        cached=lambda opts_hash: (
+            None
+            if output_root is None
+            else servable_interpretation_count(output_root, source_hash(fingerprint, opts_hash))
+        ),
+        probe=_probe_endpoint,
+    )
+
+
 def servable_interpretation_count(output_root: Path, bundle_key: str) -> int | None:
     """How many frames of the servable **generation** carry a reading.
 
@@ -583,6 +630,14 @@ class LocalSourceProvider:
                 )
             )
         fingerprint = local_fingerprint(resolved, options.cache_mode, progress)
+        # <!-- D-037 --> NOT YET wired to `_resolved_for`. Substituting the
+        # resolution's options here is correct and is what M2.2 exists to do,
+        # and it changes the key of every run that cannot reach an endpoint:
+        # such a run resolves to `chain_exhausted` and publishes under that key
+        # rather than the `selected` one. That is the intended behaviour
+        # (P3-D-012) and it invalidates 36 tests that encode the old
+        # single-endpoint assumption. The migration is the milestone's real
+        # scope, not a line change.
         bundle_key = source_hash(fingerprint, options.opts_hash("local"))
         duration = self._served_duration(request, bundle_key)
         if duration is None:
