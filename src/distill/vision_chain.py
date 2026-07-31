@@ -130,6 +130,15 @@ where the memo is doing its job.
 """
 
 
+CACHE_VANISHED = "cache_vanished"
+"""A Phase 1 hit was gone by the time it was claimed.
+
+Phase 1 scans without a lock - taking one over the whole scan would serialise
+every run against every other - so a prune between the scan and the claim is
+the ordinary case rather than a defect. The scan is optimistic and the claim is
+authoritative.
+"""
+
 DEADLINE_SPENT = "deadline_spent"
 """This endpoint was never reached: the walk's shared ceiling ran out first.
 
@@ -250,6 +259,7 @@ def resolve_chain(
     skip: Callable[[LocalVisionConfig], bool] = lambda _endpoint: False,
     now: Callable[[], float] | None = None,
     ceiling_sec: float = PROBE_CEILING_SEC,
+    claim: Callable[[str], bool] = lambda _key: True,
 ) -> ResolvedRun:
     """The one endpoint - or the one cached bundle - this run will use.
 
@@ -285,12 +295,27 @@ def resolve_chain(
             endpoint=None,
             served_from_cache=False,
         )
+    vanished: list[EntryOutcome] = []
     for key in keys if not options.force_reprocess else ():
         # Phase 1 is skipped entirely under `--force-reprocess` rather than
         # consulted and ignored: a run told to reprocess must reach the
         # endpoints, and a scan whose result is discarded is one that can still
         # pick the wrong answer if the skip is ever made conditional.
         if _is_servable(key, cached(key.opts_hash)):
+            if not claim(key.opts_hash):
+                # Pruned between the scan and the claim. The generation is
+                # gone, but the endpoints may still be there and the run's job
+                # is to produce a reading - so this falls through to probing
+                # rather than failing.
+                if key.entry is not None:
+                    vanished.append(
+                        EntryOutcome(
+                            entry=key.entry,
+                            outcome=CACHE_VANISHED,
+                            detail="claim failed after a Phase 1 hit",
+                        )
+                    )
+                continue
             return ResolvedRun(
                 entry=key.entry,
                 vision_mode=key.vision_mode,
@@ -303,7 +328,7 @@ def resolve_chain(
             )
     # Phase 2: nothing on disk, so the endpoints are asked - in preference
     # order, and only now.
-    evidence: list[EntryOutcome] = []
+    evidence: list[EntryOutcome] = list(vanished)
     # <!-- P3-D-020 --> One deadline for the whole walk, armed at the first
     # question rather than per entry. `None` means no clock was supplied and
     # the ceiling is not enforced, which is what the tests that are about

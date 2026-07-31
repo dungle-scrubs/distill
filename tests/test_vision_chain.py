@@ -18,6 +18,7 @@ from distill.options import (
     DistillOptions,
 )
 from distill.vision_chain import (
+    CACHE_VANISHED,
     DEADLINE_SPENT,
     SELECTED,
     SKIPPED,
@@ -504,3 +505,43 @@ def test_the_whole_walk_shares_one_probing_deadline() -> None:
     assert asked == [LOCAL_A.model, LOCAL_B.model]
     assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
     assert [o.outcome for o in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE, DEADLINE_SPENT]
+
+
+def test_a_hit_that_vanished_before_it_was_claimed_restarts_the_walk() -> None:
+    """Phase 1 scans without a lock, so a hit can be gone by claim time.
+
+    A prune between the scan and the claim is the ordinary case: `cleanup-cache`
+    is allowed to run while a read is in flight, and taking a lock over the
+    whole scan would serialise every run against every other. So the scan is
+    optimistic and the *claim* is authoritative - and when the claim fails,
+    resolution starts over rather than proceeding with a key it can no longer
+    serve.
+
+    Restarting is not the same as failing. The generation is gone, but the
+    endpoints may still be there, and the run's job is to produce a reading.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+    keys = candidate_keys(DistillOptions(), chain, "local")
+    claims: list[str] = []
+
+    def claim(key: str) -> bool:
+        claims.append(key)
+        return False  # pruned between the scan and here
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: 4 if key == keys[0].opts_hash else None,
+        probe=lambda config: config is LOCAL_B,
+        claim=claim,
+    )
+
+    # The hit was attempted and lost, so the walk fell through to probing and
+    # entry 1 answered.
+    assert claims == [keys[0].opts_hash]
+    assert resolved.served_from_cache is False
+    assert resolved.entry == 1
+    assert resolved.evidence[0] == EntryOutcome(
+        entry=0, outcome=CACHE_VANISHED, detail="claim failed after a Phase 1 hit"
+    )
