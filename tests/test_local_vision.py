@@ -37,6 +37,10 @@ from distill.local_vision import (
 from distill.options import DistillOptions
 from distill.pipeline import local_vision_diagnostics
 
+# Direct, not through `local_vision`'s re-exports: the header builder is an
+# internal of the client module, and the facade should not widen to name it.
+from distill.rapid_mlx import _request_headers
+
 DEFAULT_MODEL = DEFAULT_LOCAL_VISION_MODEL
 
 
@@ -499,6 +503,55 @@ def test_every_entry_is_held_to_the_endpoint_rules_not_just_the_first(
         load_local_vision_config(tmp_path)
     assert plain_http.value.code == "E_BAD_OPTIONS"
     assert plain_http.value.details["entry"] == 1
+
+
+def test_an_entry_inherits_neither_credential_nor_remote_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3-D-010: the two things an entry must never pick up from a neighbour.
+
+    A credential and a remote opt-in are the two fields where inheritance is not
+    a tidiness problem but a disclosure: entry 1 would present entry 0's key to
+    a different operator's server, and an entry nobody authorized for remote use
+    would be allowed to leave the machine.
+
+    Asserted against the **outgoing header**, per P3-D-010, and not against the
+    config object. `public_dict` excludes credentials by design, so a leak is
+    invisible there - a public config looks correct whether or not entry 1 is
+    carrying entry 0's secret. `_request_headers` is where the difference
+    between "no credential" and "somebody else's credential" becomes a fact on
+    the wire.
+
+    (The socket-level version of this assertion wants the recording loopback
+    server that arrives with the § 0 PR. This asserts the same header at the
+    seam that builds it, which is what makes the leak observable.)
+    """
+    monkeypatch.setenv("ENTRY_ZERO_KEY", "sk-entry-zero-secret")
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "https://10.0.0.5/v1",
+                        "api_key_env": "ENTRY_ZERO_KEY",
+                        "allow_remote_endpoint": True,
+                    },
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+    first, second = load_local_vision_config(tmp_path).endpoints or ()
+
+    assert _request_headers(first.credential)["Authorization"] == "Bearer sk-entry-zero-secret"
+    assert "Authorization" not in _request_headers(second.credential)
+    # The other half of the inheritance: entry 1 was never authorized to leave
+    # the machine, and entry 0 saying so does not speak for it.
+    assert first.allow_remote_endpoint is True
+    assert second.allow_remote_endpoint is False
 
 
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
