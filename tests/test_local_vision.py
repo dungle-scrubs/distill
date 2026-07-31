@@ -37,6 +37,10 @@ from distill.local_vision import (
 from distill.options import DistillOptions
 from distill.pipeline import local_vision_diagnostics
 
+# Direct, not through `local_vision`'s re-exports: the header builder is an
+# internal of the client module, and the facade should not widen to name it.
+from distill.rapid_mlx import _request_headers
+
 DEFAULT_MODEL = DEFAULT_LOCAL_VISION_MODEL
 
 
@@ -162,6 +166,611 @@ def test_nested_distill_config_is_supported(tmp_path: Path) -> None:
 
     assert config.model == "qwen3-vl:30b-a3b"
     assert config.caption_frames is True
+
+
+def test_an_endpoints_array_parses_to_an_ordered_chain(tmp_path: Path) -> None:
+    """M1.1: the array *is* the **endpoint chain**, and its order is the whole
+    of the preference order.
+
+    Two loopback entries with different models, deliberately: the subject here
+    is that the array parses and keeps its order, so the fixture avoids the
+    remote opt-in (which validation governs) and the duplicate
+    `(model, remoteness)` pair (which P3-D-020 refuses). Both of those get
+    their own tests.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert [entry.model for entry in config.endpoints or ()] == ["qwen3-vl:8b", "qwen3-vl:32b"]
+    assert [entry.base_url for entry in config.endpoints or ()] == [
+        "http://127.0.0.1:8000/v1",
+        "http://127.0.0.1:9000/v1",
+    ]
+
+
+def test_todays_single_endpoint_config_reads_as_a_one_entry_chain(tmp_path: Path) -> None:
+    """M1.1: there is no such thing as a config without a chain.
+
+    Every existing config names one endpoint at the top level, and every one of
+    them has to arrive at the chain code as a chain - otherwise resolution grows
+    a second path for "the old shape", and the one-entry case stops being
+    exercised by the same code the multi-entry case uses.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps({"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"})
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
+        ("qwen3-vl:32b", "http://127.0.0.1:9000/v1")
+    ]
+
+
+def test_a_config_naming_nothing_still_reads_as_a_one_entry_chain(tmp_path: Path) -> None:
+    """The defaults are an endpoint too, so an unconfigured run is a one-entry chain."""
+    config = load_local_vision_config(tmp_path)
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
+        (DEFAULT_MODEL, DEFAULT_LOCAL_VISION_BASE_URL)
+    ]
+
+
+def test_an_entry_omitting_a_field_takes_the_default_not_its_neighbours(
+    tmp_path: Path,
+) -> None:
+    """M1.1: an omitted field on an entry resolves to the default.
+
+    Two entries, each naming only one of the two fields, so neither can be
+    passing by accident on a value it inherited from the payload it sits in.
+
+    What this does *not* prove, stated so nobody reads it as more: it does not
+    catch an entry folded onto the surrounding config instead of onto a fresh
+    default (P3-D-010). Top-level endpoint fields alongside `endpoints` are
+    `E_BAD_OPTIONS`, so the surrounding config here holds the defaults too and
+    both spellings produce this same result. The credential and
+    `allow_remote_endpoint` are what make inheritance observable, and the test
+    that asserts the outgoing `Authorization` header is where that is proved.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b"},
+                    {"base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
+        ("qwen3-vl:8b", DEFAULT_LOCAL_VISION_BASE_URL),
+        (DEFAULT_MODEL, "http://127.0.0.1:9000/v1"),
+    ]
+
+
+def test_backend_timeout_and_caption_frames_are_chain_wide(tmp_path: Path) -> None:
+    """M1.1: some settings belong to the run, not to an endpoint.
+
+    `backend` names the wire protocol Distill speaks and is pinned to
+    `rapid-mlx` (ADR-0005: one client, no provider abstraction), and a timeout
+    and whether frames are captioned at all describe the run. An entry is free
+    to *say* `timeout_sec`, because JSON is; what it must not do is change the
+    run's. The fixture has entry 1 naming a different timeout for exactly that
+    reason.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "timeout_sec": 12,
+                "caption_frames": False,
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {
+                        "model": "qwen3-vl:32b",
+                        "base_url": "http://127.0.0.1:9000/v1",
+                        "timeout_sec": 999,
+                    },
+                ],
+            }
+        )
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert config.backend == "rapid-mlx"
+    assert config.timeout_sec == 12.0
+    assert config.caption_frames is False
+
+
+def test_an_empty_endpoints_array_is_refused(tmp_path: Path) -> None:
+    """M1.1: an empty chain is a configuration mistake, not a disabled run.
+
+    `--no-caption-frames` is how an operator says "no vision". An empty array
+    says "here are the endpoints I want you to try" and then names none, which
+    cannot be honored and must not be silently read as either the defaults or
+    as disabled - both would run something the operator did not ask for.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(json.dumps({"endpoints": []}))
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+
+
+def _chain_of(count: int) -> str:
+    """A config naming `count` distinct loopback entries."""
+    return json.dumps(
+        {
+            "endpoints": [
+                {"model": f"qwen3-vl:{index}b", "base_url": f"http://127.0.0.1:{8000 + index}/v1"}
+                for index in range(count)
+            ]
+        }
+    )
+
+
+def test_a_chain_of_four_is_allowed_and_a_fifth_entry_is_refused(tmp_path: Path) -> None:
+    """P3-D-005: the ceiling is four, and the boundary is asserted from both sides.
+
+    A ceiling only tested from above is a ceiling nobody knows the height of.
+    Each entry costs a probe on a cold run, so the bound is what keeps a
+    misconfigured chain from turning one run into a long walk through endpoints
+    that are not there.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(_chain_of(4))
+    assert len(load_local_vision_config(tmp_path).endpoints or ()) == 4
+
+    (tmp_path / "distill.local-vision.json").write_text(_chain_of(5))
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+
+
+def test_two_entries_sharing_model_and_remoteness_are_refused_naming_both(
+    tmp_path: Path,
+) -> None:
+    """P3-D-020: two entries that cannot be told apart by **bundle key**.
+
+    ADR-0004 keeps the address out of identity, so what names a reader is its
+    model and whether it is remote. Two entries agreeing on both derive the same
+    candidate key: whichever answered first would publish under it, and the
+    other would be served that generation while the manifest named its own
+    address. Refused at configuration time, because at resolution time there is
+    nothing left to tell them apart with.
+
+    Both indices are named. "Two of your endpoints collide" leaves the operator
+    to work out which two out of four.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:9100/v1"},
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.details["entries"] == [0, 2]
+
+
+def test_the_same_model_local_and_remote_is_not_a_collision(tmp_path: Path) -> None:
+    """The pair is `(model, remoteness)`, and remoteness is half of it.
+
+    The same model served locally and in the cloud is the case the **endpoint
+    chain** most obviously exists for. They derive different keys because
+    `local_vision_non_local` differs, so nothing collides and nothing is
+    refused.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "https://api.example.com/v1",
+                        "allow_remote_endpoint": True,
+                    },
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                ]
+            }
+        )
+    )
+
+    assert len(load_local_vision_config(tmp_path).endpoints or ()) == 2
+
+
+def test_a_top_level_endpoint_field_beside_endpoints_is_refused(tmp_path: Path) -> None:
+    """P3-D-013: naming an endpoint twice, two ways, means neither is settled.
+
+    Top-level `model`/`base_url`/credential fields *are* an endpoint - that is
+    what the one-entry chain is derived from. Naming them next to an
+    `endpoints` array asks for two chains at once, and any rule for picking a
+    winner would be Distill guessing at intent. Refused, so the operator says
+    which they meant.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "model": "qwen3-vl:8b",
+                "endpoints": [{"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"}],
+            }
+        )
+    )
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert "model" in refusal.value.details["fields"]
+
+
+def test_a_top_level_endpoint_field_in_another_layer_is_refused_too(tmp_path: Path) -> None:
+    """P3-D-013 says *any* layer, and across layers is the case that hides.
+
+    One file naming a chain and another naming a top-level model reads as
+    perfectly good configuration in each file on its own. The ambiguity only
+    exists once they are folded together, which is exactly why the check has to
+    run against the settled config rather than against a payload.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {"endpoints": [{"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"}]}
+        )
+    )
+    (tmp_path / "distill.json").write_text(
+        json.dumps({"local_vision": {"base_url": "http://127.0.0.1:8000/v1"}})
+    )
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert "base_url" in refusal.value.details["fields"]
+
+
+def test_every_entry_is_held_to_the_endpoint_rules_not_just_the_first(
+    tmp_path: Path,
+) -> None:
+    """R-43 and D-008 are per endpoint, so they are per entry.
+
+    A chain whose first entry is loopback would otherwise pass the only check
+    there was, and entry 1 - the one that actually leaves the machine - would
+    reach the network unexamined. Both refusals are asserted: an entry off
+    loopback without the opt-in, and an entry that has the opt-in but speaks
+    plain `http`, which D-008 refuses wherever it is.
+
+    The index is in the error, because "one of your endpoints is not allowed"
+    is not something an operator can act on.
+
+    Literal addresses, deliberately. A *hostname* is not settled here and must
+    not be: what it resolves to is a question with an answer that can change,
+    which is why the loopback rule is re-checked per request against the
+    resolved address (D-029) rather than guessed at from the URL. Only what is
+    decidable from the text is decided from the text.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "https://10.0.0.5/v1"},
+                ]
+            }
+        )
+    )
+    with pytest.raises(DistillError) as no_opt_in:
+        load_local_vision_config(tmp_path)
+    assert no_opt_in.value.code == "E_BAD_OPTIONS"
+    assert no_opt_in.value.details["entry"] == 1
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {
+                        "model": "qwen3-vl:32b",
+                        "base_url": "http://10.0.0.5/v1",
+                        "allow_remote_endpoint": True,
+                    },
+                ]
+            }
+        )
+    )
+    with pytest.raises(DistillError) as plain_http:
+        load_local_vision_config(tmp_path)
+    assert plain_http.value.code == "E_BAD_OPTIONS"
+    assert plain_http.value.details["entry"] == 1
+
+
+def test_an_entry_inherits_neither_credential_nor_remote_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3-D-010: the two things an entry must never pick up from a neighbour.
+
+    A credential and a remote opt-in are the two fields where inheritance is not
+    a tidiness problem but a disclosure: entry 1 would present entry 0's key to
+    a different operator's server, and an entry nobody authorized for remote use
+    would be allowed to leave the machine.
+
+    Asserted against the **outgoing header**, per P3-D-010, and not against the
+    config object. `public_dict` excludes credentials by design, so a leak is
+    invisible there - a public config looks correct whether or not entry 1 is
+    carrying entry 0's secret. `_request_headers` is where the difference
+    between "no credential" and "somebody else's credential" becomes a fact on
+    the wire.
+
+    (The socket-level version of this assertion wants the recording loopback
+    server that arrives with the § 0 PR. This asserts the same header at the
+    seam that builds it, which is what makes the leak observable.)
+    """
+    monkeypatch.setenv("ENTRY_ZERO_KEY", "sk-entry-zero-secret")
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "https://10.0.0.5/v1",
+                        "api_key_env": "ENTRY_ZERO_KEY",
+                        "allow_remote_endpoint": True,
+                    },
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+    endpoints = load_local_vision_config(tmp_path).endpoints
+    assert endpoints is not None
+    first, second = endpoints
+
+    assert _request_headers(first.credential)["Authorization"] == "Bearer sk-entry-zero-secret"
+    assert "Authorization" not in _request_headers(second.credential)
+    # The other half of the inheritance: entry 1 was never authorized to leave
+    # the machine, and entry 0 saying so does not speak for it.
+    assert first.allow_remote_endpoint is True
+    assert second.allow_remote_endpoint is False
+
+
+def test_a_later_layers_chain_replaces_an_earlier_one(tmp_path: Path) -> None:
+    """M1.1: layers replace the chain, they never concatenate it.
+
+    Concatenating would make a chain something no single file states, and an
+    operator adding a two-entry chain in one file would silently get four.
+    Order is preference, so a merged chain would also mean the layers were
+    arguing about preference order with no way to express who won.
+
+    The earlier layer names two entries and the later names one, so a
+    concatenation would be visible as a length of three.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "first-a", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "first-b", "base_url": "http://127.0.0.1:8001/v1"},
+                ]
+            }
+        )
+    )
+    (tmp_path / "distill.json").write_text(
+        json.dumps(
+            {
+                "local_vision": {
+                    "endpoints": [{"model": "second", "base_url": "http://127.0.0.1:9000/v1"}]
+                }
+            }
+        )
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert [entry.model for entry in config.endpoints or ()] == ["second"]
+
+
+def test_an_entry_resolves_its_own_credential_with_the_env_var_winning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-016 per entry: inline `api_key` still works, `api_key_env` still wins.
+
+    Entry 0 names both, so the precedence is observable rather than assumed;
+    entry 1 names neither, which is intentional no-auth and must leave the entry
+    in the chain rather than dropping it. An endpoint with no credential is an
+    ordinary thing to configure - a loopback server that asks for nothing.
+    """
+    monkeypatch.setenv("CHAIN_ENTRY_KEY", "sk-from-the-env-var")
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "api_key": "sk-inline-and-losing",
+                        "api_key_env": "CHAIN_ENTRY_KEY",
+                    },
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+    endpoints = load_local_vision_config(tmp_path).endpoints
+    assert endpoints is not None
+    first, second = endpoints
+
+    assert _request_headers(first.credential)["Authorization"] == "Bearer sk-from-the-env-var"
+    assert second.credential is None
+    # Kept and probed, not skipped: absence is a configuration, not an omission.
+    assert second.credential_configured is False
+
+
+def test_an_inline_key_alone_is_still_honored_per_entry(tmp_path: Path) -> None:
+    """The inline form has no env var to lose to, so it is what is carried."""
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "api_key": "sk-inline-only",
+                    }
+                ]
+            }
+        )
+    )
+
+    endpoints = load_local_vision_config(tmp_path).endpoints
+    assert endpoints is not None
+    (only,) = endpoints
+
+    assert _request_headers(only.credential)["Authorization"] == "Bearer sk-inline-only"
+
+
+def test_a_configured_credential_resolving_empty_is_fatal_per_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-016's typo guard is per endpoint, so a chain gets it per entry.
+
+    An operator who names `api_key_env` has said this endpoint needs a
+    credential. If it resolves to nothing and the endpoint is one that leaves
+    the machine, sending keyframes anyway would be doing the thing they tried to
+    authenticate, unauthenticated. Entry 0 is loopback and fine; the guard has
+    to reach entry 1 regardless.
+
+    Configuring no credential at all remains intentional no-auth, which the
+    entry-with-no-credential test above pins.
+    """
+    monkeypatch.delenv("MISSING_CHAIN_KEY", raising=False)
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {
+                        "model": "qwen3-vl:32b",
+                        "base_url": "https://10.0.0.5/v1",
+                        "api_key_env": "MISSING_CHAIN_KEY",
+                        "allow_remote_endpoint": True,
+                    },
+                ]
+            }
+        )
+    )
+
+    with pytest.raises(DistillError) as refusal:
+        load_local_vision_config(tmp_path)
+
+    assert refusal.value.code == "E_BAD_OPTIONS"
+    assert refusal.value.details["entry"] == 1
+    assert refusal.value.details["reason"] == "credential_configured_but_empty"
+
+
+def _two_entry_chain(tmp_path: Path) -> None:
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                ]
+            }
+        )
+    )
+
+
+def test_base_url_alone_moves_entry_zero_and_nothing_else(tmp_path: Path) -> None:
+    """P3-D-016: the address flag is key-neutral, so it may act on a chain.
+
+    ADR-0004 keeps the address out of identity, so pointing entry 0 somewhere
+    else changes no candidate key - the same reader is being reached at a
+    different address. That is what makes this override safe to honor against a
+    chain when `--local-vision-model` is not: it cannot make the run publish
+    under a key that describes a different reader.
+
+    Entry 0, because the flag names one address and the chain has an order.
+    """
+    _two_entry_chain(tmp_path)
+
+    config = local_vision_config_from_args(
+        {"local_vision_base_url": "http://127.0.0.1:8100/v1"}, tmp_path
+    )
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
+        ("qwen3-vl:8b", "http://127.0.0.1:8100/v1"),
+        ("qwen3-vl:32b", "http://127.0.0.1:9000/v1"),
+    ]
+
+
+def test_model_alone_against_a_chain_is_refused(tmp_path: Path) -> None:
+    """P3-D-016: the model flag is identity-bearing, so it cannot mean "entry 0".
+
+    The model is in the **options hash**. Applying it to one entry of a chain
+    would leave the other entries naming readers the operator did not ask for,
+    under keys that describe them - and picking entry 0 silently would be
+    Distill choosing which endpoint the flag meant. Against a one-entry chain
+    there is nothing to choose, so it behaves as it always did.
+    """
+    _two_entry_chain(tmp_path)
+
+    with pytest.raises(DistillError) as refusal:
+        local_vision_config_from_args({"local_vision_model": "qwen3-vl:4b"}, tmp_path)
+    assert refusal.value.code == "E_BAD_OPTIONS"
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {"endpoints": [{"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"}]}
+        )
+    )
+    one_entry = local_vision_config_from_args({"local_vision_model": "qwen3-vl:4b"}, tmp_path)
+    assert [entry.model for entry in one_entry.endpoints or ()] == ["qwen3-vl:4b"]
+
+
+def test_both_flags_together_replace_the_chain(tmp_path: Path) -> None:
+    """Naming a model *and* an address names one endpoint completely.
+
+    There is nothing ambiguous left: the operator has said which reader, at
+    which address. So the chain is replaced rather than edited - a run told to
+    use this endpoint should not still be carrying three others it may fall
+    through to.
+    """
+    _two_entry_chain(tmp_path)
+
+    config = local_vision_config_from_args(
+        {"local_vision_model": "qwen3-vl:4b", "local_vision_base_url": "http://127.0.0.1:8200/v1"},
+        tmp_path,
+    )
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
+        ("qwen3-vl:4b", "http://127.0.0.1:8200/v1")
+    ]
 
 
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
@@ -1200,6 +1809,34 @@ class TestSecretCredential:
         assert "sk-super-secret-value" not in repr(config)
         # asdict deep-copies field values and the carrier refuses deepcopy, so
         # generic dataclass serialization fails loudly instead of leaking.
+        with pytest.raises(TypeError):
+            asdict(config)
+
+    def test_a_chain_never_exposes_an_entrys_credential_either(self) -> None:
+        """Gate 1→2: the rule is about credentials, not about one field's home.
+
+        Entries are a second place a credential lives, so a chain is a second
+        way it could reach a **render**, a manifest, or a log. `public_dict`
+        recurses into entries rather than restating the exclusion, and this
+        asserts the outcome that recursion is for - including through
+        `cache_payload`, which is the serialization that becomes a **bundle
+        key** and therefore the one that must never carry a secret.
+        """
+        from dataclasses import asdict, replace
+
+        from distill.local_vision import SecretCredential
+
+        entry = replace(
+            LocalVisionConfig(base_url="https://10.0.0.5/v1", allow_remote_endpoint=True),
+            credential=SecretCredential("sk-entry-secret-value"),
+        )
+        config = replace(LocalVisionConfig(), endpoints=(entry,))
+
+        assert "sk-entry-secret-value" not in json.dumps(config.public_dict())
+        assert "sk-entry-secret-value" not in repr(config)
+        assert "sk-entry-secret-value" not in json.dumps(
+            DistillOptions.from_args({}).cache_payload("local")
+        )
         with pytest.raises(TypeError):
             asdict(config)
 

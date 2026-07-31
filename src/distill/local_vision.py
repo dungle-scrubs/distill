@@ -274,6 +274,43 @@ class LocalVisionConfig:
     """The run's vision-stage budget, attached by the interpreter to its
     per-run resolved config. Runtime state, not configuration: excluded from
     identity, `repr`, and `public_dict`."""
+    endpoints: tuple[LocalVisionConfig, ...] | None = None
+    """The configured **endpoint chain**, in preference order.
+
+    `None` and `()` are different facts and the distinction is load-bearing:
+    `None` is "no chain was configured", which the top-level fields answer for
+    and `_with_chain` turns into a one-entry chain; `()` is "a chain was
+    configured and it names no endpoints", which is a configuration mistake and
+    is refused. Collapsing them would read an empty array as the defaults and
+    run an endpoint the operator did not ask for.
+
+    After the config is settled this is always a tuple of at least one entry.
+
+    Entries are `LocalVisionConfig` values rather than a type of their own, so
+    this module keeps no knowledge of what a chain *means* - order, selection,
+    and candidate keys all belong to `vision_chain.py`. What lives here is what
+    already lived here: reading configuration layers into the fields an endpoint
+    is made of.
+
+    <!-- P3-D-010 --> Each entry is parsed from a fresh default rather than from
+    the surrounding config, so entry 2 cannot inherit entry 1's credential or
+    its remote authorization.
+    """
+    top_level_endpoint_fields: tuple[str, ...] = field(
+        default=(), repr=False, compare=False, metadata={"runtime": True}
+    )
+    """Which top-level endpoint fields the config *files* named, if any.
+
+    Parse bookkeeping in the same spirit as `credential_configured`: recorded
+    while layers are folded, consumed once by the settle-time check, and never
+    part of what a **bundle** records - it describes how the configuration was
+    written rather than what the endpoint is.
+
+    Carried rather than checked in place because P3-D-013 is about *any* layer:
+    one file naming a chain and another naming a top-level `base_url` reads as
+    good configuration in each file alone, and the conflict exists only once
+    they are folded together.
+    """
 
     def public_dict(self) -> dict[str, Any]:
         # Excluded by the `secret` metadata flag and by carrier type - a rule
@@ -287,6 +324,14 @@ class LocalVisionConfig:
                 or f.metadata.get("runtime")
                 or isinstance(value, SecretCredential)
             ):
+                continue
+            if f.name == "endpoints":
+                # Each entry answers for itself, by the same rules: an entry
+                # holds a credential exactly as the outer config does, and a
+                # tuple of dataclasses reaching a serializer would take those
+                # carriers with it. Recursing keeps the secret rule in one
+                # place rather than restating it per field spelling.
+                public[f.name] = None if value is None else [e.public_dict() for e in value]
                 continue
             public[f.name] = value
         return public
@@ -537,6 +582,81 @@ def _debug_enabled(value: bool | None = None) -> bool:
     return os.environ.get(DEBUG_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+ENDPOINT_FIELD_NAMES = ("model", "base_url", "api_key", "api_key_env", "allow_remote_endpoint")
+"""The config keys that describe *one* **vision endpoint**.
+
+Named as a set rather than checked inline because two rules need the same
+answer: these are what a chain entry is made of, and they are what a top-level
+config names when it configures the single endpoint the old way. `backend`,
+`timeout_sec` and `caption_frames` are deliberately absent - those are
+chain-wide and belong at the top level next to an `endpoints` array.
+"""
+
+MAX_ENDPOINTS = 4
+"""How many **vision endpoints** one **endpoint chain** may name.
+
+<!-- P3-D-005 --> A bound rather than a preference: each entry costs a probe on
+a cold run, and the chain is walked in order, so an unbounded chain turns one
+misconfigured run into a long walk through endpoints that are not there. Four is
+enough for the cases the chain exists for (a cloud reader with a local
+fallback, or a couple of each) and small enough that the walk stays short.
+"""
+
+
+def _validate_chain(endpoints: tuple[LocalVisionConfig, ...] | None) -> None:
+    """The chain's shape, checked once the config is settled.
+
+    Called from `_with_validated_endpoint` rather than while merging layers,
+    for the reason `_merged_local_vision_config` states: a per-call override is
+    allowed to rescue a file that names something unusable, and naming both
+    `--local-vision-model` and `--local-vision-base-url` replaces the chain
+    outright. Only the settled config is checked.
+
+    `None` is not a chain anybody configured and is nothing to check - the
+    top-level fields answer for it, and `_with_chain` derives the one entry.
+    """
+    if endpoints is None:
+        return
+    if not endpoints:
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            "'endpoints' was configured but names no endpoint. Remove it to use "
+            "the default endpoint, or pass --no-caption-frames to run without vision.",
+            {"endpoints": 0},
+        )
+    if len(endpoints) > MAX_ENDPOINTS:
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            f"'endpoints' names {len(endpoints)} endpoints; at most {MAX_ENDPOINTS} are allowed.",
+            {"endpoints": len(endpoints), "max": MAX_ENDPOINTS},
+        )
+    # <!-- P3-D-020 --> ADR-0004 keeps the address out of identity, so what
+    # names a reader is its model and whether it is remote. Two entries
+    # agreeing on both derive the same candidate key, and at resolution time
+    # there is nothing left to tell them apart with: whichever answered first
+    # would publish under that key and the other would be served its
+    # generation while the manifest named a different address.
+    seen: dict[tuple[str, bool], int] = {}
+    for index, entry in enumerate(endpoints):
+        identity = (entry.model, config_is_non_local(entry))
+        first = seen.get(identity)
+        if first is not None:
+            where = "remote" if identity[1] else "local"
+            raise DistillError(
+                "E_BAD_OPTIONS",
+                "local_vision",
+                f"endpoints {first} and {index} both name model '{entry.model}' "
+                f"{where}ly, so they cannot be told apart by bundle key. "
+                "Give them different models, or remove one.",
+                # Both indices, because "two of your endpoints collide" leaves
+                # the operator to work out which two out of four.
+                {"entries": [first, index], "model": entry.model, "remote": identity[1]},
+            )
+        seen[identity] = index
+
+
 def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     """The same config, once its `base_url` is one Distill will speak to.
 
@@ -545,6 +665,35 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
     address allowed, and silently degrading to OCR-only would hide that the
     operator's configuration was ignored.
     """
+    _validate_chain(config.endpoints)
+    if config.endpoints is not None and config.top_level_endpoint_fields:
+        named = ", ".join(f"'{name}'" for name in config.top_level_endpoint_fields)
+        raise DistillError(
+            "E_BAD_OPTIONS",
+            "local_vision",
+            f"{named} names an endpoint at the top level while 'endpoints' names a chain. "
+            "Move the top-level fields into an entry, or remove 'endpoints'.",
+            {"fields": list(config.top_level_endpoint_fields)},
+        )
+    for index, entry in enumerate(config.endpoints or ()):
+        # R-43's loopback rule and D-008's scheme rule are properties of one
+        # endpoint, so a chain has to be held to them once per entry. Checking
+        # only the top-level `base_url` would clear a chain whose first entry
+        # is loopback and let entry 1 - the one that actually leaves the
+        # machine - reach the network unexamined.
+        try:
+            _checked_endpoint_url(entry.base_url, allow_remote_endpoint=entry.allow_remote_endpoint)
+        except EndpointRejected as exc:
+            raise DistillError(
+                "E_BAD_OPTIONS",
+                "local_vision",
+                f"endpoint {index}: {exc.message}",
+                # The index, because "one of your endpoints is not allowed" is
+                # not something an operator can act on. The rejection's own
+                # detail still decides whether the URL itself can be named
+                # (D-007).
+                {"entry": index, **dict(exc.detail)},
+            ) from exc
     try:
         _checked_endpoint_url(config.base_url, allow_remote_endpoint=config.allow_remote_endpoint)
     except EndpointRejected as exc:
@@ -558,31 +707,56 @@ def _with_validated_endpoint(config: LocalVisionConfig) -> LocalVisionConfig:
             # (D-007). Re-adding the raw base_url here defeated exactly that.
             dict(exc.detail),
         ) from exc
-    if (
-        config.caption_frames
-        and config.credential_configured
-        and config.credential is None
-        and config_is_non_local(config)
-    ):
-        # D-016's typo guard: a credential the operator *configured* resolved
-        # to nothing, on a config that says remote is intended and whose host
-        # is not literally loopback. Without allow_remote_endpoint the
-        # per-request resolved-address check already proves the endpoint
-        # local (D-029), so a hostname like `localhost` is not punished.
-        # Configuring no credential at all remains intentional no-auth.
-        named = (
-            f" (env var '{config.credential_env}' is unset or empty)"
-            if config.credential_env
-            else ""
-        )
-        raise DistillError(
-            "E_BAD_OPTIONS",
-            "local_vision",
-            f"local_vision credential is configured but empty{named}; refusing "
-            "to send keyframes to a non-loopback endpoint without it.",
-            {"reason": "credential_configured_but_empty", "api_key_env": config.credential_env},
-        )
+    _check_credential_is_not_empty(config, captioning=config.caption_frames)
+    for index, entry in enumerate(config.endpoints or ()):
+        # The guard is a property of one endpoint, so a chain gets it per
+        # entry. `caption_frames` is the run's, not the entry's, which is why
+        # it is passed in rather than read off the entry - an entry's copy is
+        # whatever the default was.
+        _check_credential_is_not_empty(entry, captioning=config.caption_frames, index=index)
     return config
+
+
+def _check_credential_is_not_empty(
+    endpoint: LocalVisionConfig,
+    *,
+    captioning: bool,
+    index: int | None = None,
+) -> None:
+    """D-016's typo guard: a credential the operator *configured* resolved to
+    nothing, on an endpoint that says remote is intended and whose host is not
+    literally loopback.
+
+    Without `allow_remote_endpoint` the per-request resolved-address check
+    already proves the endpoint local (D-029), so a hostname like `localhost` is
+    not punished. Configuring no credential at all remains intentional no-auth.
+    """
+    if not (
+        captioning
+        and endpoint.credential_configured
+        and endpoint.credential is None
+        and config_is_non_local(endpoint)
+    ):
+        return
+    named = (
+        f" (env var '{endpoint.credential_env}' is unset or empty)"
+        if endpoint.credential_env
+        else ""
+    )
+    where = "" if index is None else f"endpoint {index}: "
+    details: dict[str, Any] = {
+        "reason": "credential_configured_but_empty",
+        "api_key_env": endpoint.credential_env,
+    }
+    if index is not None:
+        details["entry"] = index
+    raise DistillError(
+        "E_BAD_OPTIONS",
+        "local_vision",
+        f"{where}local_vision credential is configured but empty{named}; refusing "
+        "to send keyframes to a non-loopback endpoint without it.",
+        details,
+    )
 
 
 config_dir = general_config_dir
@@ -664,17 +838,49 @@ def _merged_local_vision_config(base_dir: Path | None = None) -> LocalVisionConf
     """
     root = (base_dir or config_dir()).expanduser()
     config = LocalVisionConfig()
+    named: list[str] = []
     for filename in CONFIG_FILENAMES:
         payload = _read_json(root / filename)
         if filename == "distill.json":
             nested = payload.get("local_vision")
             payload = nested if isinstance(nested, dict) else {}
+        # Recorded per layer and folded afterwards, because the conflict
+        # P3-D-013 names can span two files that are each fine alone.
+        named.extend(key for key in ENDPOINT_FIELD_NAMES if key in payload)
         config = _config_from_payload(payload, config)
-    return config
+    return replace(config, top_level_endpoint_fields=tuple(dict.fromkeys(named)))
+
+
+def _with_chain(config: LocalVisionConfig) -> LocalVisionConfig:
+    """Every settled config carries an **endpoint chain**, so there is one path.
+
+    A config that named no `endpoints` still names an endpoint - its top-level
+    fields are one - and deriving that entry here is what keeps resolution from
+    growing a second path for "the old shape". A one-entry chain that the
+    multi-entry code does not handle is a one-entry chain nobody tested.
+
+    Derived after validation, not before: the entry has to mirror the endpoint
+    the run will actually use, and validation is what settles that.
+    """
+    if config.endpoints is not None:
+        return config
+    return replace(
+        config,
+        endpoints=(
+            LocalVisionConfig(
+                model=config.model,
+                base_url=config.base_url,
+                credential=config.credential,
+                credential_configured=config.credential_configured,
+                credential_env=config.credential_env,
+                allow_remote_endpoint=config.allow_remote_endpoint,
+            ),
+        ),
+    )
 
 
 def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
-    return _with_validated_endpoint(_merged_local_vision_config(base_dir))
+    return _with_chain(_with_validated_endpoint(_merged_local_vision_config(base_dir)))
 
 
 def local_vision_config_from_args(
@@ -701,7 +907,52 @@ def local_vision_config_from_args(
         overrides["allow_remote_endpoint"] = _coerce_bool(
             args.get("local_vision_allow_remote_endpoint"), config.allow_remote_endpoint
         )
-    return _with_validated_endpoint(_config_from_payload(overrides, config))
+    config = _chain_after_overrides(config, overrides)
+    return _with_chain(_with_validated_endpoint(_config_from_payload(overrides, config)))
+
+
+def _chain_after_overrides(
+    config: LocalVisionConfig, overrides: dict[str, Any]
+) -> LocalVisionConfig:
+    """What `--local-vision-model` / `--local-vision-base-url` do to a chain.
+
+    <!-- P3-D-016 --> The two flags are not symmetric, because identity is not.
+    ADR-0004 keeps the address out of the **options hash**, so moving an
+    endpoint's address reaches the same reader at a different place and changes
+    no candidate key; the model *is* identity, and applying it to one entry
+    would leave the rest naming readers nobody asked for under keys that
+    describe them.
+
+    So: the address alone moves entry 0 and leaves the chain otherwise intact.
+    The model alone against a chain of more than one is refused, because
+    choosing which entry it meant is a decision Distill does not get to make
+    silently. Both together name one endpoint completely, and a run told to use
+    that endpoint should not still carry others it might fall through to - so
+    the chain is replaced.
+    """
+    chain = config.endpoints
+    if chain is None:
+        return config
+    names_model = "model" in overrides
+    names_address = "base_url" in overrides
+    if names_model and names_address:
+        return replace(config, endpoints=None)
+    if names_model:
+        if len(chain) > 1:
+            raise DistillError(
+                "E_BAD_OPTIONS",
+                "local_vision",
+                "--local-vision-model names one model but 'endpoints' names "
+                f"{len(chain)} endpoints, and the model decides which bundle a run "
+                "publishes under. Name --local-vision-base-url too to use a single "
+                "endpoint, or edit the chain.",
+                {"endpoints": len(chain)},
+            )
+        return replace(config, endpoints=None)
+    if names_address:
+        moved = replace(chain[0], base_url=str(overrides["base_url"]).rstrip("/"))
+        return replace(config, endpoints=(moved, *chain[1:]))
+    return config
 
 
 def _resolved_credential(
@@ -724,6 +975,32 @@ def _resolved_credential(
     return SecretCredential(value), True, env_name
 
 
+def _endpoints_from_payload(
+    payload: dict[str, Any],
+    inherited: tuple[LocalVisionConfig, ...] | None,
+) -> tuple[LocalVisionConfig, ...] | None:
+    """The **endpoint chain** this layer configured, or the one it inherited.
+
+    <!-- P3-D-010 --> Every entry is folded onto a fresh `LocalVisionConfig`,
+    never onto the surrounding config: inheriting would give entry 2 entry 1's
+    credential and its remote authorization, and the outgoing `Authorization`
+    header is where that would first be visible.
+
+    A layer that names no `endpoints` leaves the inherited chain alone. What a
+    layer that *does* name one should do to an earlier layer's - replace it
+    rather than concatenate - is asserted separately, and is why this returns
+    the new chain whole rather than extending.
+    """
+    configured = payload.get("endpoints")
+    if not isinstance(configured, list):
+        return inherited
+    return tuple(
+        _config_from_payload(entry, LocalVisionConfig())
+        for entry in configured
+        if isinstance(entry, dict)
+    )
+
+
 def _config_from_payload(
     payload: dict[str, Any],
     base: LocalVisionConfig,
@@ -733,6 +1010,7 @@ def _config_from_payload(
     credential, credential_configured, credential_env = _resolved_credential(payload, base)
     return replace(
         base,
+        endpoints=_endpoints_from_payload(payload, base.endpoints),
         credential=credential,
         credential_configured=credential_configured,
         credential_env=credential_env,

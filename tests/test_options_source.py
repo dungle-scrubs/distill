@@ -134,6 +134,50 @@ def test_local_opts_hash_includes_cache_mode_but_youtube_excludes_it() -> None:
     assert fingerprint.opts_hash("youtube") == content.opts_hash("youtube")
 
 
+def test_the_payload_names_a_vision_mode_rather_than_a_boolean() -> None:
+    """P3-D-017: `caption_frames` cannot say which of three outcomes happened.
+
+    A boolean has two states and a run now has three: vision was never asked
+    for, an endpoint was selected, or the whole **endpoint chain** was walked
+    and none answered. The last two both produced a bundle and they are not the
+    same bundle, so the key has to tell them apart.
+
+    Payload key names are themselves hashed, so this rename is a key change on
+    its own - which is why it lands in one step rather than alongside a
+    compatibility shim that would have to be hashed too.
+    """
+    disabled = DistillOptions(caption_frames=False).cache_payload("local")
+    selected = DistillOptions(caption_frames=True).cache_payload("local")
+
+    assert "caption_frames" not in disabled
+    assert disabled["vision_mode"] == "disabled"
+    assert selected["vision_mode"] == "selected"
+    # Nullable, and null exactly when no model produced the bundle: a disabled
+    # run names no reader, and naming one would put a model in the key of a
+    # bundle it had nothing to do with.
+    assert disabled["local_vision_model"] is None
+    assert selected["local_vision_model"] is not None
+
+
+def test_a_walked_out_chain_and_a_disabled_run_are_different_bundles() -> None:
+    """P3-D-012: degrading to OCR-only is not the same as asking for OCR-only.
+
+    Both produce a bundle with no **interpretations**, so without distinct keys
+    a run whose endpoints were all down would be served the deliberate
+    `--no-caption-frames` bundle forever after - and a deliberate one would be
+    served the degraded reading. The difference is not in the content, it is in
+    what the operator asked for, so it has to be in the key.
+    """
+    disabled = DistillOptions(caption_frames=False)
+    exhausted = DistillOptions(caption_frames=True, vision_mode="chain_exhausted")
+
+    assert disabled.cache_payload("local")["vision_mode"] == "disabled"
+    assert exhausted.cache_payload("local")["vision_mode"] == "chain_exhausted"
+    assert disabled.opts_hash("local") != exhausted.opts_hash("local")
+    # Neither names a reader, and that is exactly why the mode has to.
+    assert exhausted.cache_payload("local")["local_vision_model"] is None
+
+
 @pytest.mark.parametrize("source_type", ("local", "youtube"))
 def test_output_affecting_local_vision_settings_change_identity(source_type: str) -> None:
     no_caption = DistillOptions(caption_frames=False)
@@ -1148,7 +1192,11 @@ def test_valid_numbers_keep_their_json_types_in_the_current_identity_payload() -
         {"max_keyframes": 80, "min_interval_sec": 4, "max_duration_sec": 7200}
     )
     expected = {
-        "caption_frames": True,
+        # P3-D-017: `vision_mode` replaced `caption_frames` here. A boolean
+        # cannot say whether a bundle with no interpretations was asked for or
+        # arrived at, and payload key names are themselves hashed, so the
+        # rename is a key change in its own right.
+        "vision_mode": "selected",
         "local_vision_backend": DEFAULT_LOCAL_VISION_BACKEND,
         "local_vision_model": DEFAULT_LOCAL_VISION_MODEL,
         "local_vision_timeout_sec": DEFAULT_TIMEOUT_SEC,
