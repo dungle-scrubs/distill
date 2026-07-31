@@ -4,53 +4,74 @@ Distill's redaction rules removed any run of 40 or more alphanumeric characters
 under a rule named "generic base64 blob". Length and opacity are not evidence of
 a secret, and the rule matched far more than base64: a 40-character commit SHA, a
 64-character `sha256` digest, and a Docker image digest were all replaced with
-`[REDACTED]`. The rule now requires an actual base64 signal — padding, a `+` or
-`/`, or mixed case — so an **identifier-shaped value** survives into the bundle
-and only a **credential-shaped value** is removed.
+`[REDACTED]`. A **render** exists to be fed to an LLM agent, and a frame showing
+a commit SHA exists so the reader can look that commit up. Deleting it protects
+nothing and removes the only fact the frame carried.
 
-This is a deliberate reduction in coverage, and it is the point rather than a
-side effect. A bare, contextless run of 64 hex characters is genuinely ambiguous:
-it is a content digest and it is a plausible API secret, and no amount of
-shape-reading settles which. Distill now resolves that ambiguity toward the
-reader. The same secret written the way a secret is normally written on screen —
-`API_SECRET=<hex>`, `Authorization: Bearer <hex>`, inside a URL authority — is
-still caught, by the assignment and userinfo rules that read the *name* beside
-the value rather than the value alone. What is given up is the incidental catch
-of a hex secret sitting bare on a slide with nothing around it to identify it.
+The rule now exempts a matched run when — and only when — **both** hold: the run
+is pure hexadecimal, and an identifier cue sits adjacent to it (`commit`, `sha`,
+`sha1`, `sha256`, `sha384`, `sha512`, `digest`, `blob`, `tree`, `integrity`,
+`checksum`, `hash`, `rev`, `revision`, or a preceding `@` or `sha256:`).
+Everything else is redacted exactly as before.
 
-What is bought is the thing Distill exists to do. A **render** is written to be
-fed to an LLM agent, and a frame showing `commit f9a1a14a...` exists precisely so
-a reader can look that commit up. Redacting it protects nothing — the commit is
-in the repository either way — and removes the one fact the frame was carrying.
-Silently deleting every hash, digest, and build id on screen is a fidelity defect
-in a tool whose product is legibility, and it was invisible because the only
-digest fixture in the suite (`tests/test_redaction_patterns.py`) used a truncated
-`sha256:abcdef` that never reached the 40-character floor.
+## Why the exemption requires positive evidence
 
-## Considered options
+The obvious design — narrow the rule to things that look like base64, since
+that is what it is named for — was tried first and rejected after it was shown
+to fail in both directions:
 
-- **Exempt known identifier lengths** (pure hex of exactly 40 or 64 characters).
-  Rejected as arbitrary in both directions: it exempts a 64-character hex secret
-  just as readily, and still eats a 48-character hex identifier.
-- **Require a nearby cue word** (`commit`, `sha256`, `digest`). Rejected: the cue
-  list is a blocklist with the same open-ended failure as the one it replaces,
-  and OCR routinely drops or mangles the very word the rule would depend on.
-- **Keep redacting and name the shape in the mark** (`[REDACTED sha256-hex]`).
-  Rejected as the primary fix — it tells the reader what they lost without giving
-  it back — but adopted as a general improvement: see below.
+- **It leaks.** The pattern ends `={0,2}\b`, and `\b` cannot occur between `=`
+  and end-of-string. The regex backtracks, and the match excludes its own
+  padding: `QUFB…QQ==` matches as `QUFB…QQ`. That run is uppercase-and-digits
+  only, carries no base64 signal, and a rule keyed on such a signal would have
+  **preserved a real secret**. (The same boundary bug is why redaction currently
+  leaves `[REDACTED]==` behind — cosmetic today, load-bearing the moment a
+  predicate inspects the match.)
+- **It does not deliver fidelity anyway.** A 40-character lowercase-hex GitHub
+  `device_code` is a documented credential that no name-based rule covers; it is
+  caught today only by this rule and would have escaped. Meanwhile Subresource
+  Integrity digests and SSH public-key bodies are base64 by definition, entirely
+  public, and would have stayed redacted — so "identifier-shaped values survive"
+  would have been false for every base64-shaped identifier.
+
+Cue-gating inverts the failure mode, which is the whole reason it was chosen.
+The exemption fires only on positive evidence that a value names something
+public. A missing cue, a cue OCR mangled, an unusual identifier format — each
+degrades to exactly today's behavior. The rule can fail to *improve* fidelity;
+it cannot fail *open*.
+
+## What this deliberately does not fix
+
+- **Base64-shaped identifiers stay redacted.** SRI digests, SSH public keys, and
+  base64-encoded public data are unchanged from today. Distinguishing them from
+  an encoded secret needs context this rule does not have, and inventing a
+  syntactic test for it is the mistake documented above.
+- **Redaction remains a shape-matching blocklist.** It was defense-in-depth
+  before and still is. This decision narrows what it removes; it does not change
+  the technique, add entropy detection, or turn a **redaction mark** into a
+  guarantee. Anyone pointing Distill at sensitive recordings should test the
+  rules against their own secret formats first.
 
 ## Consequences
 
-- **Redaction is not a promise, and this makes that sharper.** It was already a
-  shape-matching blocklist, defense-in-depth rather than a guarantee. A hex
-  secret displayed bare, with no assignment and no header, is now outside its
-  reach. Anyone pointing Distill at genuinely sensitive recordings should test
-  the rules against their own secret formats first.
-- **A `[REDACTED]` mark now names a kind** — `[REDACTED api-key]`,
-  `[REDACTED base64-blob]` — so a reader can tell what stood in a place. The mark
+- **A hex credential displayed next to an identifier cue is now kept.** A frame
+  reading `digest a1b2…` where `a1b2…` is in fact a secret survives into the
+  bundle. This is the cost of the exemption and is accepted: the cue makes the
+  value look like a name for something public, which is the same evidence a
+  human reader would use.
+- **A redaction mark now names a kind** — `[REDACTED:api-key]`,
+  `[REDACTED:base64-blob]` — so a reader can tell what stood in a place. The mark
   discloses the kind and nothing further; length was considered and rejected,
-  being the disclosure a password can least afford.
-- **Bundle content changes, so the pipeline version rises.** Every bundle produced
-  before this change redacts text that this one keeps, and the **pipeline
-  signature** makes shipping the code change without the version bump a CI
-  failure rather than a silent cache collision.
+  being the disclosure a password can least afford. It carries no whitespace, and
+  every rule recognizes an existing mark and leaves it alone, because redaction
+  runs twice over the same text by design.
+- **The rule consumes its own padding**, so redaction stops leaving stray `=`
+  characters in the text.
+- **Bundle content changes, so the pipeline version rises.** Every bundle
+  produced before this change redacts text that this one keeps, and the
+  **pipeline signature** makes shipping the code change without the version bump
+  a CI failure rather than a silent cache collision.
+- **The test that hid this is replaced.** The suite's only digest fixture was
+  `image ghcr.io/org/app:1.2@sha256:abcdef` — a six-character abbreviation that
+  never reached the 40-character floor, so no test ever passed a full-length
+  digest through `redact_text`.
