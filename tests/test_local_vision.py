@@ -1806,6 +1806,34 @@ class TestSecretCredential:
         with pytest.raises(TypeError):
             asdict(config)
 
+    def test_a_chain_never_exposes_an_entrys_credential_either(self) -> None:
+        """Gate 1→2: the rule is about credentials, not about one field's home.
+
+        Entries are a second place a credential lives, so a chain is a second
+        way it could reach a **render**, a manifest, or a log. `public_dict`
+        recurses into entries rather than restating the exclusion, and this
+        asserts the outcome that recursion is for - including through
+        `cache_payload`, which is the serialization that becomes a **bundle
+        key** and therefore the one that must never carry a secret.
+        """
+        from dataclasses import asdict, replace
+
+        from distill.local_vision import SecretCredential
+
+        entry = replace(
+            LocalVisionConfig(base_url="https://10.0.0.5/v1", allow_remote_endpoint=True),
+            credential=SecretCredential("sk-entry-secret-value"),
+        )
+        config = replace(LocalVisionConfig(), endpoints=(entry,))
+
+        assert "sk-entry-secret-value" not in json.dumps(config.public_dict())
+        assert "sk-entry-secret-value" not in repr(config)
+        assert "sk-entry-secret-value" not in json.dumps(
+            DistillOptions.from_args({}).cache_payload("local")
+        )
+        with pytest.raises(TypeError):
+            asdict(config)
+
     @pytest.mark.parametrize(
         "url",
         [
