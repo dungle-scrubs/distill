@@ -130,6 +130,25 @@ where the memo is doing its job.
 """
 
 
+DEADLINE_SPENT = "deadline_spent"
+"""This endpoint was never reached: the walk's shared ceiling ran out first.
+
+Distinct from **skipped**, which means the memo already had an answer, and from
+**unavailable**, which means the endpoint was asked. This one says the run gave
+up before its turn - a fact about how long the chain took, not about this
+endpoint at all.
+"""
+
+PROBE_CEILING_SEC = 30.0
+"""The longest the whole probing walk may take, before `timeout_sec` narrows it.
+
+<!-- P3-D-020 --> Shared across every entry rather than allowed per entry. How
+many endpoints a chain names is the operator's choice; how long a run waits
+should not be that choice multiplied by a timeout. Four entries each given the
+full ceiling is four times the wait anyone asked for, and the vision stage's
+budget is charged between requests, so nothing else would cut it short.
+"""
+
 DEFAULT_MEMO_TTL_SEC = 300.0
 """How long an endpoint's unavailability is trusted before it is asked again.
 
@@ -229,6 +248,8 @@ def resolve_chain(
     cached: Callable[[str], int | None],
     probe: Callable[[LocalVisionConfig], bool],
     skip: Callable[[LocalVisionConfig], bool] = lambda _endpoint: False,
+    now: Callable[[], float] | None = None,
+    ceiling_sec: float = PROBE_CEILING_SEC,
 ) -> ResolvedRun:
     """The one endpoint - or the one cached bundle - this run will use.
 
@@ -283,7 +304,22 @@ def resolve_chain(
     # Phase 2: nothing on disk, so the endpoints are asked - in preference
     # order, and only now.
     evidence: list[EntryOutcome] = []
+    # <!-- P3-D-020 --> One deadline for the whole walk, armed at the first
+    # question rather than per entry. `None` means no clock was supplied and
+    # the ceiling is not enforced, which is what the tests that are about
+    # selection rather than time use.
+    started = None if now is None else now()
     for index, entry in enumerate(chain):
+        if started is not None and now is not None and now() - started >= ceiling_sec:
+            # Out of time. Every remaining entry is recorded as unreached
+            # rather than silently dropped: a chain that exhausted because it
+            # ran out of clock is a different diagnosis from one whose
+            # endpoints all answered no.
+            evidence.extend(
+                EntryOutcome(entry=later, outcome=DEADLINE_SPENT)
+                for later in range(index, len(chain))
+            )
+            break
         if skip(entry):
             # Passed over without a round trip. Recorded as its own outcome
             # rather than folded into `unavailable`, because "we already know"

@@ -18,6 +18,7 @@ from distill.options import (
     DistillOptions,
 )
 from distill.vision_chain import (
+    DEADLINE_SPENT,
     SELECTED,
     SKIPPED,
     UNAVAILABLE,
@@ -462,3 +463,44 @@ def test_a_clock_that_went_backwards_expires_the_memo_rather_than_trusting_it() 
     memo.record_unavailable(LOCAL_A, now=5000.0)
 
     assert memo.skips(LOCAL_A, now=1000.0) is False
+
+
+def test_the_whole_walk_shares_one_probing_deadline() -> None:
+    """<!-- P3-D-020 --> A chain of slow endpoints degrades; it does not hang.
+
+    How many entries there are is the operator's choice, but how long a run
+    waits should not be that choice multiplied by a timeout. Four entries each
+    given the full ceiling is four times the wait an operator asked for, and the
+    vision budget is charged between requests, so nothing else would cut it
+    short.
+
+    So the ceiling is shared: once it is spent the remaining entries are not
+    asked at all, and the chain exhausts. The clock is injected for the same
+    reason the memo's is.
+    """
+    chain = (LOCAL_A, LOCAL_B, REMOTE_A)
+    asked: list[str] = []
+    # Each probe consumes 20 seconds of a 30 second ceiling. The clock is read
+    # once to arm the deadline and once before each entry, so: armed at 0,
+    # entry 0 at 0 (probe), entry 1 at 20 (still inside, probe), entry 2 at 40
+    # (spent, never asked).
+    clock = iter([0.0, 0.0, 20.0, 40.0])
+
+    def probe(config: LocalVisionConfig) -> bool:
+        asked.append(config.model)
+        return False
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=probe,
+        now=lambda: next(clock),
+        ceiling_sec=30.0,
+    )
+
+    # Two entries fit inside the ceiling; the third is never asked.
+    assert asked == [LOCAL_A.model, LOCAL_B.model]
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert [o.outcome for o in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE, DEADLINE_SPENT]
