@@ -545,3 +545,57 @@ def test_a_hit_that_vanished_before_it_was_claimed_restarts_the_walk() -> None:
     assert resolved.evidence[0] == EntryOutcome(
         entry=0, outcome=CACHE_VANISHED, detail="claim failed after a Phase 1 hit"
     )
+
+
+def test_the_resolution_carries_the_options_that_describe_it() -> None:
+    """<!-- P3-D-015 --> The binding contract, asserted rather than assumed.
+
+    The partial implementation this exists to prevent sets a bundle key and
+    stops: `DistillOptions` goes on holding the *previous* entry's model, so the
+    pipeline calls entry 1 while the manifest records entry 0's options under
+    entry 1's key. Three artifacts, each internally consistent, agreeing on a
+    lie.
+
+    So the resolution carries the options as they are *for the endpoint it
+    selected*, and every consumer reads identity from there rather than
+    deriving its own. The check is that those options hash to the key the
+    resolution published under - if they did not, they would be describing a
+    different bundle than the one being written.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+
+    resolved = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: config is LOCAL_B,
+    )
+
+    assert resolved.entry == 1
+    assert resolved.options.local_vision_model == LOCAL_B.model
+    assert resolved.options.local_vision_base_url == LOCAL_B.base_url
+    assert resolved.options.vision_mode == VISION_MODE_SELECTED
+    # The key and the options are the same fact stated twice; if they can
+    # disagree, one of the three artifacts is wrong.
+    assert resolved.options.opts_hash("local") == resolved.opts_hash
+
+
+def test_an_exhausted_resolution_names_no_endpoint_in_its_options() -> None:
+    """A degraded run must not carry the last endpoint it tried.
+
+    Publishing under the exhausted key while the options still name entry 1's
+    model would record a reader that produced nothing as the reader of the
+    bundle.
+    """
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: False,
+    )
+
+    assert resolved.options.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert resolved.options.cache_payload("local")["local_vision_model"] is None
+    assert resolved.options.opts_hash("local") == resolved.opts_hash

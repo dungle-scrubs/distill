@@ -225,6 +225,18 @@ class ResolvedRun:
     opts_hash: str
     endpoint: LocalVisionConfig | None
     served_from_cache: bool
+    options: DistillOptions
+    """The options as they are *for the endpoint this resolution selected*.
+
+    The binding half of the contract. Without it a consumer reads identity off
+    the `DistillOptions` the run started with, which still names whichever
+    endpoint the chain happened to list first - so the pipeline calls entry 1
+    while the manifest records entry 0's options under entry 1's key.
+
+    `options.opts_hash(...)` equals `opts_hash` by construction. They are the
+    same fact stated twice, and a test says so: if they can drift, one of the
+    three artifacts a run writes is wrong.
+    """
     evidence: tuple[EntryOutcome, ...] = ()
 
 
@@ -294,6 +306,7 @@ def resolve_chain(
             opts_hash=disabled.opts_hash,
             endpoint=None,
             served_from_cache=False,
+            options=replace(options, vision_mode=disabled.vision_mode),
         )
     vanished: list[EntryOutcome] = []
     for key in keys if not options.force_reprocess else ():
@@ -322,6 +335,11 @@ def resolve_chain(
                 opts_hash=key.opts_hash,
                 endpoint=None if key.entry is None else chain[key.entry],
                 served_from_cache=True,
+                options=(
+                    replace(options, vision_mode=key.vision_mode)
+                    if key.entry is None
+                    else _as_entry(options, chain[key.entry])
+                ),
                 evidence=(
                     () if key.entry is None else (EntryOutcome(entry=key.entry, outcome=CACHE_HIT),)
                 ),
@@ -361,6 +379,7 @@ def resolve_chain(
                 opts_hash=selected.opts_hash,
                 endpoint=entry,
                 served_from_cache=False,
+                options=_as_entry(options, entry),
                 evidence=tuple(evidence),
             )
         evidence.append(EntryOutcome(entry=index, outcome=UNAVAILABLE))
@@ -375,6 +394,7 @@ def resolve_chain(
         opts_hash=exhausted.opts_hash,
         endpoint=None,
         served_from_cache=False,
+        options=replace(options, vision_mode=exhausted.vision_mode),
         evidence=tuple(evidence),
     )
 
