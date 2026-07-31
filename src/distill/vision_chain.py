@@ -166,7 +166,23 @@ def resolve_chain(
     talk to no endpoint itself.
     """
     keys = candidate_keys(options, chain, source_type)
-    for key in keys:
+    if not options.caption_frames:
+        # No reader was asked for, so none is asked. The single key is neither a
+        # selection nor an exhaustion, and probing here would be a network call
+        # made on behalf of an operator who said not to.
+        disabled = keys[0]
+        return ResolvedRun(
+            entry=None,
+            vision_mode=disabled.vision_mode,
+            opts_hash=disabled.opts_hash,
+            endpoint=None,
+            served_from_cache=False,
+        )
+    for key in keys if not options.force_reprocess else ():
+        # Phase 1 is skipped entirely under `--force-reprocess` rather than
+        # consulted and ignored: a run told to reprocess must reach the
+        # endpoints, and a scan whose result is discarded is one that can still
+        # pick the wrong answer if the skip is ever made conditional.
         if cached(key.opts_hash):
             return ResolvedRun(
                 entry=key.entry,

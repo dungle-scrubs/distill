@@ -223,3 +223,50 @@ def test_every_endpoint_unavailable_and_nothing_cached_exhausts_the_chain() -> N
     assert resolved.endpoint is None
     assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
     assert [outcome.outcome for outcome in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE]
+
+
+def test_force_reprocess_bypasses_the_cache_and_probes_from_the_top() -> None:
+    """`--force-reprocess` means do the work, not find a reason not to.
+
+    Phase 1 is skipped entirely rather than consulted and ignored: a run told to
+    reprocess must reach the endpoints, and a cache scan whose result is thrown
+    away is a scan that can still pick the wrong answer if the skip is ever
+    made conditional.
+    """
+    asked: list[str] = []
+
+    def probe(config: LocalVisionConfig) -> bool:
+        asked.append(config.model)
+        return True
+
+    resolved = resolve_chain(
+        DistillOptions(force_reprocess=True),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: True,
+        probe=probe,
+    )
+
+    assert resolved.served_from_cache is False
+    assert resolved.entry == 0
+    assert asked == [LOCAL_A.model]
+
+
+def test_a_disabled_run_is_settled_without_probing_anything() -> None:
+    """`--no-caption-frames` asks for no reader, so none is asked for.
+
+    Its one key is neither a selection nor an exhaustion, and a probe here would
+    be a network call made on behalf of an operator who said not to.
+    """
+    resolved = resolve_chain(
+        DistillOptions(caption_frames=False),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: False,
+        probe=never_probed,
+    )
+
+    assert resolved.entry is None
+    assert resolved.endpoint is None
+    assert resolved.vision_mode == VISION_MODE_DISABLED
+    assert resolved.evidence == ()
