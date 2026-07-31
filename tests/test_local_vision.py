@@ -194,6 +194,34 @@ def test_an_endpoints_array_parses_to_an_ordered_chain(tmp_path: Path) -> None:
     ]
 
 
+def test_todays_single_endpoint_config_reads_as_a_one_entry_chain(tmp_path: Path) -> None:
+    """M1.1: there is no such thing as a config without a chain.
+
+    Every existing config names one endpoint at the top level, and every one of
+    them has to arrive at the chain code as a chain - otherwise resolution grows
+    a second path for "the old shape", and the one-entry case stops being
+    exercised by the same code the multi-entry case uses.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps({"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"})
+    )
+
+    config = load_local_vision_config(tmp_path)
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints] == [
+        ("qwen3-vl:32b", "http://127.0.0.1:9000/v1")
+    ]
+
+
+def test_a_config_naming_nothing_still_reads_as_a_one_entry_chain(tmp_path: Path) -> None:
+    """The defaults are an endpoint too, so an unconfigured run is a one-entry chain."""
+    config = load_local_vision_config(tmp_path)
+
+    assert [(entry.model, entry.base_url) for entry in config.endpoints] == [
+        (DEFAULT_MODEL, DEFAULT_LOCAL_VISION_BASE_URL)
+    ]
+
+
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
     (tmp_path / "distill.local-vision.json").write_text(
         json.dumps({"model": "qwen3-vl:32b", "caption_frames": True})

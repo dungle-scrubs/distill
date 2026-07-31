@@ -302,6 +302,14 @@ class LocalVisionConfig:
                 or isinstance(value, SecretCredential)
             ):
                 continue
+            if f.name == "endpoints":
+                # Each entry answers for itself, by the same rules: an entry
+                # holds a credential exactly as the outer config does, and a
+                # tuple of dataclasses reaching a serializer would take those
+                # carriers with it. Recursing keeps the secret rule in one
+                # place rather than restating it per field spelling.
+                public[f.name] = [entry.public_dict() for entry in value]
+                continue
             public[f.name] = value
         return public
 
@@ -687,8 +695,36 @@ def _merged_local_vision_config(base_dir: Path | None = None) -> LocalVisionConf
     return config
 
 
+def _with_chain(config: LocalVisionConfig) -> LocalVisionConfig:
+    """Every settled config carries an **endpoint chain**, so there is one path.
+
+    A config that named no `endpoints` still names an endpoint - its top-level
+    fields are one - and deriving that entry here is what keeps resolution from
+    growing a second path for "the old shape". A one-entry chain that the
+    multi-entry code does not handle is a one-entry chain nobody tested.
+
+    Derived after validation, not before: the entry has to mirror the endpoint
+    the run will actually use, and validation is what settles that.
+    """
+    if config.endpoints:
+        return config
+    return replace(
+        config,
+        endpoints=(
+            LocalVisionConfig(
+                model=config.model,
+                base_url=config.base_url,
+                credential=config.credential,
+                credential_configured=config.credential_configured,
+                credential_env=config.credential_env,
+                allow_remote_endpoint=config.allow_remote_endpoint,
+            ),
+        ),
+    )
+
+
 def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
-    return _with_validated_endpoint(_merged_local_vision_config(base_dir))
+    return _with_chain(_with_validated_endpoint(_merged_local_vision_config(base_dir)))
 
 
 def local_vision_config_from_args(
@@ -715,7 +751,7 @@ def local_vision_config_from_args(
         overrides["allow_remote_endpoint"] = _coerce_bool(
             args.get("local_vision_allow_remote_endpoint"), config.allow_remote_endpoint
         )
-    return _with_validated_endpoint(_config_from_payload(overrides, config))
+    return _with_chain(_with_validated_endpoint(_config_from_payload(overrides, config)))
 
 
 def _resolved_credential(
