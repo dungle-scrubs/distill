@@ -16,6 +16,7 @@ and calls into this module; it does not reimplement any of what is here.
 
 from __future__ import annotations
 
+import functools
 import hmac
 import http.client
 import ipaddress
@@ -23,6 +24,7 @@ import json
 import logging
 import math
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -628,6 +630,114 @@ class _RedirectsAreRejected(urllib.request.HTTPRedirectHandler):
         )
 
 
+class _EndpointRequest(urllib.request.Request):
+    """A request carrying the addresses its host was *proved* to resolve to.
+
+    The pin travels on the request rather than in module state, so it cannot be
+    read by the wrong one: two threads posting **keyframes** to two endpoints
+    each connect to the addresses their own check approved.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        validated_addresses: tuple[str, ...] = (),
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.validated_addresses = validated_addresses
+
+
+def _connect_to_a_validated_address(
+    addresses: tuple[str, ...],
+    address: tuple[str, int],
+    *args: Any,
+    **kwargs: Any,
+) -> socket.socket:
+    """Dial the addresses the check approved, in order, never the name (D-021).
+
+    `socket.create_connection` would resolve the name a second time and connect
+    to whatever it answers with now, which is the whole defect: a name that is
+    loopback while the check runs and something else at connect time takes the
+    credential and the **keyframe** with it. Only the address is replaced; the
+    port is the request's.
+
+    Every approved address is tried rather than only the first, because a name
+    may answer with several and `localhost` routinely answers with both `::1`
+    and `127.0.0.1` while the server listens on one of them.
+    """
+    port = address[1]
+    last: OSError | None = None
+    for validated in addresses:
+        try:
+            return socket.create_connection((validated, port), *args, **kwargs)
+        except OSError as exc:
+            last = exc
+    if last is not None:
+        raise last
+    raise OSError(f"no validated address to connect to for port {port}")
+
+
+def _connection_pinned_to(
+    base: type[http.client.HTTPConnection], request: urllib.request.Request
+) -> Any:
+    """`base`, but dialling the request's validated addresses.
+
+    `_create_connection` is `http.client`'s own indirection for exactly this:
+    it is set per connection in `HTTPConnection.__init__` and is the only call
+    `connect()` makes to reach the network, so replacing it leaves `self.host`
+    intact - and with it the `Host` header and TLS's `server_hostname`. A
+    connection *dialled by address* but *named by hostname* is the point.
+    Pinning by rewriting the URL to the address would have been smaller and
+    would have broken certificate verification for an `https` endpoint named by
+    a hostname.
+    """
+    addresses = getattr(request, "validated_addresses", ())
+    if not addresses:
+        # Nothing was validated, so there is nothing to pin to: the remote
+        # `https` opt-in runs no resolved-address check at all (D-008), and its
+        # connection stays urllib's ordinary one.
+        return base
+
+    def build(host: str, **kwargs: Any) -> http.client.HTTPConnection:
+        # Typed `Any` deliberately: `_create_connection` is assigned per
+        # instance in `HTTPConnection.__init__`, so it is not declared on the
+        # class and no annotation describes it. The end-to-end test is what
+        # proves it is still the hook `connect()` reaches the network through.
+        connection: Any = base(host, **kwargs)
+        connection._create_connection = functools.partial(
+            _connect_to_a_validated_address, addresses
+        )
+        return connection
+
+    return build
+
+
+class _DialsOnlyTheValidatedAddress(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    """The transport, replacing urllib's, so the socket goes where the check said.
+
+    Ordered last rather than first (`handler_order`): a test that installs a
+    fake transport is still served by the fake, and this is what opens an
+    actual socket when nothing else answered.
+    """
+
+    handler_order = 900
+
+    # Declared, not assigned: `HTTPSHandler.__init__` sets it, and inheriting
+    # both handlers leaves it undeclared on this class.
+    _context: ssl.SSLContext
+
+    def http_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(_connection_pinned_to(http.client.HTTPConnection, req), req)
+
+    def https_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(
+            _connection_pinned_to(http.client.HTTPSConnection, req),
+            req,
+            context=self._context,
+        )
+
+
 def _build_opener(*handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
     """The vision client's opener: the default chain, minus two of its habits.
 
@@ -638,12 +748,18 @@ def _build_opener(*handlers: urllib.request.BaseHandler) -> urllib.request.Opene
     to a host no rule here ever saw. The endpoint is local by rule, so there is
     nothing for a proxy to do.
 
+    The transport is this module's too, so the connection goes to the address
+    the check approved rather than to a second lookup of the name (D-021).
+
     Built by a function so a test can put a fake transport under the *same*
     chain production uses, instead of asserting against a chain it assembled
     itself.
     """
     return urllib.request.build_opener(
-        _RedirectsAreRejected, urllib.request.ProxyHandler({}), *handlers
+        _RedirectsAreRejected,
+        urllib.request.ProxyHandler({}),
+        *handlers,
+        _DialsOnlyTheValidatedAddress,
     )
 
 
@@ -669,12 +785,13 @@ def _urlopen_json(
     by the time the **keyframe** is posted, and only the check standing between
     the resolution and the connection sees that.
 
-    What that does not close, stated so nobody reads it as more: the connection
-    resolves the name again, so a name that changes its answer between this
-    check and that connect is not caught. Closing it means connecting to the
-    address this function validated rather than to the name, which is a socket
-    Distill would have to open itself. The bound here is per request, which is
-    what D-029 asks for; it is not per packet.
+    The connection then goes to *that* answer and not to the name (D-021): the
+    addresses the check approved are pinned onto the request, and the transport
+    dials them instead of resolving the host a second time. Without that, a
+    name free to answer differently between the check and the connect sends the
+    credential and the **keyframe** to the second answer while every check here
+    passed. The bound is per request, which is what D-029 asks for; it is not
+    per packet, and a name is still trusted for the length of one request.
     """
     # The deadline is absolute from entry: policy resolution (which may hit
     # DNS), connect, send, and every chunk of the answer all charge it. One
@@ -683,7 +800,7 @@ def _urlopen_json(
     # one socket operation (D-008).
     deadline = _monotonic() + timeout_sec
     scheme, host, port = _checked_endpoint_url(url, allow_remote_endpoint=allow_remote_endpoint)
-    _check_resolved_address(
+    validated_addresses = _check_resolved_address(
         host,
         port,
         allow_remote_endpoint=allow_remote_endpoint,
@@ -691,11 +808,12 @@ def _urlopen_json(
         resolver=resolver,
     )
     data = None if body is None else json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(
+    request = _EndpointRequest(
         url,
         data=data,
         method=method,
         headers=_request_headers(credential),
+        validated_addresses=tuple(validated_addresses),
     )
     # The deadline is absolute and covers the whole request - connect, send,
     # and every chunk of the answer. urllib's timeout is per socket operation,

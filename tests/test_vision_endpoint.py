@@ -13,11 +13,14 @@ every test drives a fake resolver rather than asking the machine's.
 from __future__ import annotations
 
 import http.client
+import http.server
 import json
 import logging
+import socket
+import threading
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -27,8 +30,10 @@ from distill.local_vision import (
     MAX_RESPONSE_BYTES,
     LocalVisionConfig,
     LocalVisionFailure,
+    SecretCredential,
     _build_opener,
     _urlopen_json,
+    config_is_non_local,
     local_vision_config_from_args,
     probe_local_vision,
     try_interpret_image,
@@ -140,6 +145,83 @@ def _json_response(url: str, payload: Any) -> _CannedResponse:
 
 def _redirect_response(url: str, location: str) -> _CannedResponse:
     return _CannedResponse(url, status=302, headers={"Location": location})
+
+
+class _Received(NamedTuple):
+    """One request as the server on the other end saw it."""
+
+    path: str
+    headers: dict[str, str]
+    body: bytes
+
+
+class _RecordingHTTPServer(http.server.ThreadingHTTPServer):
+    """A loopback server that keeps what reached it."""
+
+    def __init__(self, handler: type[http.server.BaseHTTPRequestHandler]) -> None:
+        super().__init__(("127.0.0.1", 0), handler)
+        self.received: list[_Received] = []
+
+
+class _RecordingHandler(http.server.BaseHTTPRequestHandler):
+    def _record_and_answer(self, payload: Any) -> None:
+        server = self.server
+        assert isinstance(server, _RecordingHTTPServer)
+        length = int(self.headers.get("Content-Length") or 0)
+        server.received.append(
+            _Received(self.path, dict(self.headers), self.rfile.read(length) if length else b"")
+        )
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's name
+        self._record_and_answer({"data": []})
+
+    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's name
+        self._record_and_answer({"choices": [{"message": {"content": "{}"}}]})
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib's name
+        return None
+
+
+class _RealEndpoint:
+    """One real HTTP endpoint on loopback, for the tests about the socket.
+
+    `_FakeTransport` replaces urllib's HTTP handlers outright, so the socket -
+    which is the entire subject of the pinning tests - is never opened under
+    it. These tests need the production chain all the way down, so they need a
+    server actually listening.
+    """
+
+    def __init__(self) -> None:
+        self._httpd = _RecordingHTTPServer(_RecordingHandler)
+        self.port: int = self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def received(self) -> list[_Received]:
+        return self._httpd.received
+
+    def close(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+@pytest.fixture
+def real_endpoints() -> Any:
+    """Two live loopback endpoints, torn down whatever the test does."""
+    endpoints: list[_RealEndpoint] = [_RealEndpoint(), _RealEndpoint()]
+    try:
+        yield endpoints
+    finally:
+        for endpoint in endpoints:
+            endpoint.close()
 
 
 def test_a_non_loopback_host_is_rejected_without_the_opt_out(tmp_path: Path) -> None:
@@ -339,6 +421,164 @@ def test_the_resolved_address_is_checked_on_every_request(
     assert caught.value.detail["address"] == "169.254.169.254"
     assert asked == [("vision.test", 8000), ("vision.test", 8000)]
     assert transport.requested == [named_url]
+
+
+def test_the_request_goes_to_the_address_that_was_validated(
+    monkeypatch: pytest.MonkeyPatch,
+    real_endpoints: list[_RealEndpoint],
+) -> None:
+    """D-021: the name is resolved once, and *that* answer is what is dialled.
+
+    Checking a resolved address and then handing the *name* to the connection
+    validates nothing: the name is free to answer differently the second time,
+    and the second answer is the one the socket goes to. A name that is
+    loopback while the check runs and something else when the connection is
+    made sends the credential and the **keyframe** to the something else, while
+    every check this module made passed and the bundle records local-only.
+
+    Reproduced with two real servers and a resolver that answers with the first
+    and then the second: both are loopback, so nothing here depends on being
+    able to bind an address the machine may not have, and the port is what
+    makes the swap observable. The second endpoint must receive nothing at all
+    - not a request without the credential, nothing - because a request that
+    arrives has already told an unvalidated host that this machine is running
+    Distill against a vision endpoint.
+    """
+    validated, swapped = real_endpoints
+    real_getaddrinfo = socket.getaddrinfo
+    answers = [validated.port, swapped.port]
+
+    def rebinding_getaddrinfo(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
+        if host != "vision.test":
+            return real_getaddrinfo(host, port, *args, **kwargs)
+        answered = answers.pop(0) if answers else swapped.port
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", answered))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
+    url = f"http://vision.test:{validated.port}/v1/models"
+
+    assert _urlopen_json(
+        "GET", url, None, 5.0, credential=SecretCredential("s3cr3t")
+    ) == {"data": []}
+
+    assert [request.path for request in validated.received] == ["/v1/models"]
+    assert swapped.received == []
+
+
+def test_an_unreachable_validated_address_fails_rather_than_falling_back(
+    monkeypatch: pytest.MonkeyPatch,
+    real_endpoints: list[_RealEndpoint],
+) -> None:
+    """D-021: the pin is load-bearing, not an optimisation with a safety net.
+
+    A pin that quietly falls back to resolving the name when the validated
+    address refuses the connection closes nothing - the swap just needs the
+    first address to be down, which whoever is steering DNS controls anyway.
+    So the validated address failing is the end of the request, and the name is
+    never dialled, even though something is listening on it.
+
+    Asserted through the probe, where an operator meets it: an endpoint that
+    cannot be reached at the address it was approved at is *unavailable*, which
+    ADR-0002 degrades on, and not a rejection - nothing about the endpoint's
+    policy was wrong.
+    """
+    live, _ = real_endpoints
+    with socket.socket() as spare:
+        spare.bind(("127.0.0.1", 0))
+        closed_port = spare.getsockname()[1]
+    real_getaddrinfo = socket.getaddrinfo
+
+    def resolves_to_the_live_endpoint(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
+        if host != "vision.test":
+            return real_getaddrinfo(host, port, *args, **kwargs)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", live.port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolves_to_the_live_endpoint)
+    monkeypatch.setattr("distill.rapid_mlx._resolve_addresses", lambda host, port: ["127.0.0.1"])
+
+    probe = probe_local_vision(LocalVisionConfig(base_url=f"http://vision.test:{closed_port}/v1"))
+
+    assert probe.available is False
+    assert probe.code == "local_vision_rapid_mlx_unavailable"
+    assert live.received == []
+
+
+def test_a_local_only_claim_is_backed_by_where_the_keyframe_actually_went(
+    monkeypatch: pytest.MonkeyPatch,
+    real_endpoints: list[_RealEndpoint],
+) -> None:
+    """D-021: the disclosure and the socket now agree.
+
+    `local_vision_non_local` is false for a hostname endpoint without the
+    remote opt-in, on the grounds that the transport proves every resolved
+    address loopback on every request. The race made that a claim the transport
+    did not keep: the **keyframe** and the credential could go to the second
+    answer while the **bundle** recorded local-only, and nothing anywhere
+    recorded otherwise. So the claim is asserted against the body that actually
+    arrived, not against the config that predicted it.
+    """
+    validated, swapped = real_endpoints
+    config = LocalVisionConfig(base_url=f"http://vision.test:{validated.port}/v1")
+    assert config_is_non_local(config) is False
+    payload = DistillOptions.from_args(
+        {"local_vision_base_url": f"http://vision.test:{validated.port}/v1"}
+    ).cache_payload("local")
+    assert payload["local_vision_non_local"] is False
+
+    real_getaddrinfo = socket.getaddrinfo
+    answers = [validated.port, swapped.port]
+
+    def rebinding_getaddrinfo(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
+        if host != "vision.test":
+            return real_getaddrinfo(host, port, *args, **kwargs)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", answers.pop(0)))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
+
+    _urlopen_json(
+        "POST",
+        f"http://vision.test:{validated.port}/v1/chat/completions",
+        {"model": "a-model", "messages": [{"role": "user", "content": "a keyframe"}]},
+        5.0,
+        credential=SecretCredential("s3cr3t"),
+    )
+
+    (request,) = validated.received
+    assert b"a keyframe" in request.body
+    assert request.headers["Authorization"] == "Bearer s3cr3t"
+    # And the address the second lookup named learned nothing: not the
+    # keyframe, not the credential, not that this machine asked at all.
+    assert swapped.received == []
+
+
+def test_the_connection_is_dialled_by_address_but_named_by_hostname(
+    monkeypatch: pytest.MonkeyPatch,
+    real_endpoints: list[_RealEndpoint],
+) -> None:
+    """D-021: pinning replaces the address, and nothing else.
+
+    Rewriting the URL to the validated address would pin just as well and would
+    break two things at once: the `Host` header stops naming what the operator
+    configured, and TLS would verify a certificate against an address instead
+    of the hostname - so an `https` endpoint named by a hostname, with an
+    ordinary certificate, would stop working. The address is the only thing
+    the connection is allowed to lose.
+    """
+    endpoint, _ = real_endpoints
+    real_getaddrinfo = socket.getaddrinfo
+
+    def resolver(host: str, port: int, *args: Any, **kwargs: Any) -> Any:
+        if host != "vision.test":
+            return real_getaddrinfo(host, port, *args, **kwargs)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", endpoint.port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolver)
+    url = f"http://vision.test:{endpoint.port}/v1/models"
+
+    assert _urlopen_json("GET", url, None, 5.0) == {"data": []}
+
+    (request,) = endpoint.received
+    assert request.headers["Host"] == f"vision.test:{endpoint.port}"
 
 
 def test_a_redirect_urllib_will_not_act_on_still_tells_the_operator_it_was_one(
