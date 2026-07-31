@@ -638,3 +638,86 @@ def test_the_walk_itself_opens_nothing_so_it_can_hold_no_lock(
     )
 
     assert resolved.entry == 1
+
+
+def test_two_runs_seeing_different_availability_settle_on_different_keys() -> None:
+    """Gate 2→3: concurrent runs must not publish conflicting generations.
+
+    Two runs of one source, one reaching the cloud endpoint and one not - a
+    laptop that moved networks mid-batch, or a token that expired for one
+    process. They select different endpoints, so they must publish under
+    *different* keys rather than two different readings under one.
+
+    That is what makes the concurrency safe without coordination: the bundle
+    key already separates them, so neither has to wait for the other and
+    neither can overwrite the other's generation. Two runs that agree on
+    availability agree on a key and contend for the same lock, which is the
+    case the store's run lock already handles.
+    """
+    chain = (REMOTE_A, LOCAL_B)
+
+    reaches_cloud = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: True,
+    )
+    offline = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: config is LOCAL_B,
+    )
+
+    assert reaches_cloud.entry == 0
+    assert offline.entry == 1
+    assert reaches_cloud.opts_hash != offline.opts_hash
+    # And each key describes the reader that produced it, so neither
+    # generation claims the other's endpoint.
+    assert reaches_cloud.options.local_vision_model == REMOTE_A.model
+    assert offline.options.local_vision_model == LOCAL_B.model
+
+
+def test_an_endpoint_whose_probe_raises_is_passed_over_not_propagated() -> None:
+    """ADR-0002: an endpoint that cannot be reached is degradation.
+
+    A chain exists so that one endpoint being wrong does not stop a run. If a
+    probe raising propagates, a single misconfigured entry - a rejected
+    endpoint, a DNS failure, a transport error - takes the whole run with it,
+    and the later entries that would have answered are never asked. That is the
+    opposite of what a chain is for.
+
+    The reason is kept, on the entry's own outcome, because "entry 0 was
+    unavailable" without saying why is not something an operator can act on.
+    """
+    chain = (LOCAL_A, LOCAL_B)
+
+    def probe(config: LocalVisionConfig) -> bool:
+        if config is LOCAL_A:
+            raise OSError("connection refused")
+        return True
+
+    resolved = resolve_chain(
+        DistillOptions(), chain, "local", cached=lambda key: None, probe=probe
+    )
+
+    assert resolved.entry == 1
+    assert resolved.evidence[0].entry == 0
+    assert resolved.evidence[0].outcome == UNAVAILABLE
+    assert "connection refused" in resolved.evidence[0].detail
+
+
+def test_a_chain_whose_every_probe_raises_degrades_rather_than_failing() -> None:
+    """The same rule at the end of the chain: exhaustion, not an exception."""
+    resolved = resolve_chain(
+        DistillOptions(),
+        (LOCAL_A, LOCAL_B),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: (_ for _ in ()).throw(OSError("nothing here")),
+    )
+
+    assert resolved.vision_mode == VISION_MODE_CHAIN_EXHAUSTED
+    assert [o.outcome for o in resolved.evidence] == [UNAVAILABLE, UNAVAILABLE]

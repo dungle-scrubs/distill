@@ -370,7 +370,18 @@ def resolve_chain(
             # why a chain behaved the way it did.
             evidence.append(EntryOutcome(entry=index, outcome=SKIPPED))
             continue
-        if probe(entry):
+        # ADR-0002: an endpoint that cannot be reached is **degradation**, and
+        # a chain exists so one wrong entry does not stop a run. A probe that
+        # raised used to take the whole run with it, and the later entries that
+        # would have answered were never asked - the opposite of what a chain
+        # is for. The reason is kept, because "entry 0 was unavailable" without
+        # saying why is not something an operator can act on.
+        try:
+            answered = probe(entry)
+            detail = ""
+        except Exception as exc:  # noqa: BLE001 - any failure is unavailability
+            answered, detail = False, f"{type(exc).__name__}: {exc}"
+        if answered:
             evidence.append(EntryOutcome(entry=index, outcome=SELECTED))
             selected = keys[index]
             return ResolvedRun(
@@ -382,7 +393,7 @@ def resolve_chain(
                 options=_as_entry(options, entry),
                 evidence=tuple(evidence),
             )
-        evidence.append(EntryOutcome(entry=index, outcome=UNAVAILABLE))
+        evidence.append(EntryOutcome(entry=index, outcome=UNAVAILABLE, detail=detail))
     # Every endpoint was asked and none could serve. That is **degradation**,
     # and it publishes under the exhausted key rather than the disabled one:
     # the operator asked for vision and did not get it, which is a different
