@@ -34,7 +34,7 @@ import re
 from pathlib import Path
 
 from .bundle_store import atomic_write_text
-from .redact_secrets import redact_text
+from .redact_secrets import MARK_RE, redact_text
 
 ARTIFACT_DIR_ENV = "DISTILL_ARTIFACT_DIR"
 XDG_DATA_HOME_ENV = "XDG_DATA_HOME"
@@ -214,8 +214,16 @@ def _git_work_tree_root(cwd: Path) -> Path | None:
 
 
 def _safe_name(value: str) -> str:
-    """`value` reduced to a filename this module is willing to write."""
-    return _UNSAFE_NAME_CHARACTERS.sub("-", value).strip("-. ")
+    """`value` reduced to a filename this module is willing to write.
+
+    A **redaction mark** collapses to a bare `REDACTED` first. The kind a mark
+    names is for a reader of the text, where knowing an API key stood in a place
+    tells them whether the frame still holds what they came for. A filename
+    wants to be terse and stable, and `REDACTED-github-token-abc123` is neither
+    more useful nor more honest than `REDACTED-abc123` - it is the same fact,
+    spelled longer, in the one place a name is read at a glance.
+    """
+    return _UNSAFE_NAME_CHARACTERS.sub("-", MARK_RE.sub("REDACTED", value)).strip("-. ")
 
 
 def _capped(value: str) -> str:

@@ -334,9 +334,7 @@ def test_a_resumed_run_rebuilds_its_carriers_from_the_stage_result(tmp_path: Pat
     second.release()
     assert payload is not None
 
-    resumed = FrameArtifact.from_document(
-        payload["frames"][0], redaction=RedactionState.DISABLED
-    )
+    resumed = FrameArtifact.from_document(payload["frames"][0], redaction=RedactionState.DISABLED)
     assert resumed.redaction is RedactionState.DISABLED
     assert resumed.extracted_text == secret
     assert resumed.relative_path == "frames/frame_0001.png"

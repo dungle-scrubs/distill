@@ -452,9 +452,12 @@ def test_the_mark_names_the_kind_of_value_it_replaced() -> None:
     from the value, so it discloses a category and nothing narrower.
     """
     assert "[REDACTED:api-key]" in redact_text("sk-abcdefghijklmnopqrstuvwx").text
-    assert "[REDACTED:jwt]" in redact_text(
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
-    ).text
+    assert (
+        "[REDACTED:jwt]"
+        in redact_text(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+        ).text
+    )
     assert "[REDACTED:aws-key]" in redact_text("AKIAIOSFODNN7EXAMPLE").text
 
 

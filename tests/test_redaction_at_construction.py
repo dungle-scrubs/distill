@@ -588,9 +588,7 @@ def test_a_cache_hit_reads_its_related_links_back_as_carriers(tmp_path: Path) ->
     assert isinstance(run, BundleRun)
     run.write_render("# Video\n")
     run.write_self_contained_render("# Video\n")
-    run.commit(
-        manifest_document(fresh, options, transcript_present=False, frames=[], warnings=[])
-    )
+    run.commit(manifest_document(fresh, options, transcript_present=False, frames=[], warnings=[]))
 
     served = YouTubeSourceProvider().cached(
         SourceRequest(value=f"https://youtu.be/{video_id}", options=options, output_root=root),
@@ -721,9 +719,7 @@ def test_the_link_policy_is_the_users_option_and_not_a_default(
     for, so it is asserted from the surface the user's option enters.
     """
     redacted = resolve_youtube_source(monkeypatch, tmp_path, DistillOptions())
-    opted_out = resolve_youtube_source(
-        monkeypatch, tmp_path, DistillOptions(redact_secrets=False)
-    )
+    opted_out = resolve_youtube_source(monkeypatch, tmp_path, DistillOptions(redact_secrets=False))
 
     # Asserted on the documents the sinks produce rather than on the carriers,
     # because that is the form the user's option has to survive all the way to.
