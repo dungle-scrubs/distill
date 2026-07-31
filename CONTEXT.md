@@ -42,6 +42,22 @@ _Avoid_: output folder, cache entry
 One immutable, finished rendering of a **bundle**.
 _Avoid_: version, revision, run output
 
+**Artifact**:
+The one self-contained document a caller consumes, copied out of the **active
+generation** into the project being worked in. It is the deliverable, not
+derived state: a **bundle** may be reclaimed by a cache cleaner at any time,
+and an artifact may not.
+_Avoid_: output, final render, frame artifact (a **frame artifact** is the
+record derived from one **keyframe** and lives inside a **generation**; an
+artifact is the whole reading and lives outside the cache)
+
+**Artifact directory**:
+Where **artifacts** are written — normally `.distill/` at the root of the work
+tree the run was invoked from. Distinct from the **output root**, which is
+where **bundles** live, and resolved separately: one answers "where does the
+deliverable go", the other "where does derived state live".
+_Avoid_: output directory, output dir (that is the cache root)
+
 **Active generation**:
 The one **generation** a **manifest** names as authoritative; the only one a
 reader is entitled to.
@@ -370,6 +386,17 @@ Staging directory ─────────> Generation   (indivisible: the ge
   but only holds for some — resolved: the promise applies to **optional
   capabilities**; a missing **required capability** is a **fatal error**, and
   which is which must be stated rather than implied.
+- **"artifact"** was already taken by **frame artifact** when the deliverable
+  needed a name, and "output" was already taken by `--output-dir`, which moves
+  the cache rather than the deliverable — resolved: an **artifact** is the
+  document a caller consumes and lives outside the cache; a **frame artifact**
+  is a record inside a **generation**. The qualifier is load-bearing, and
+  neither term may be shortened to the other.
+- **"output"** named both the cache root and the thing a caller came for, which
+  is why `--output-dir` moved the bundle store and nobody could find their
+  reading — resolved: the **output root** holds **bundles**, the **artifact
+  directory** holds **artifacts**, and a caller asking where the output went is
+  asking about the second.
 - **"signed module"** was treated as a maintained list rather than a property —
   resolved: signed-ness is definitional (editing it can change bundle content),
   so an unsigned output-affecting module is a defect, not an omission.
