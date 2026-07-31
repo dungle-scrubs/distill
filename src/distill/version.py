@@ -66,6 +66,11 @@ SIGNED_MODULES = (
     "run_command.py",
     "source.py",
     "transcript.py",
+    # Derives the candidate keys a run may publish under, so editing it can
+    # change which bundle a run serves and therefore what a caller reads. It
+    # asks no endpoint and opens no file, but purity is not what makes a module
+    # unsigned - not affecting output is, and this decides output.
+    "vision_chain.py",
     "vision_prompts.py",
     "youtube.py",
 )
