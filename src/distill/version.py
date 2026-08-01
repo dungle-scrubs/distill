@@ -25,7 +25,7 @@ the cryptographic sense, and nothing verifies who produced it.
 
 from __future__ import annotations
 
-PIPELINE_VERSION = 60
+PIPELINE_VERSION = 61
 
 # Output-affecting source files covered by PIPELINE_SIGNATURE, named by their
 # path relative to `src/distill/` in posix form so that modules in subpackages
@@ -103,6 +103,18 @@ EXEMPT_MODULES: dict[str, str] = {
         "no bundle write path at all. Read-only is what this exemption rests "
         "on; a repair mode added here would make the module signed."
     ),
+    "filtered_view.py": (
+        "Turns a published bundle into the non-authoritative filtered view of "
+        "its active generation and hands that markdown back to the caller. It "
+        "reads a manifest and a generation through the store's read-only "
+        "surface, writes nothing, and the view it produces exists under no "
+        "bundle key and enters no manifest, so nothing it renders is ever read "
+        "back as pipeline input. It cannot make a served bundle differ from "
+        "what the current code would produce, because it produces no bundle "
+        "content at all. Never written back is what this exemption rests on; a "
+        "mode that stored the view beside the generation would make the module "
+        "signed."
+    ),
     "job_store.py": (
         "Owns job records and their identifier domain, written under the cache "
         "root's _jobs/ directory. Those records live outside every bundle "
@@ -130,4 +142,4 @@ EXEMPT_MODULES: dict[str, str] = {
 }
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "c84571ab1368342d434a66774801febd4bbb584dff3c1173fb86102f21645c60"
+PIPELINE_SIGNATURE = "2ea139403fc462addbc125cd04b09b44d90d1a33d59e57375731bab86af02b78"

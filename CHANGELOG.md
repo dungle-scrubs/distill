@@ -14,7 +14,7 @@ stay readable where the format allows and are otherwise reprocessed.
 ### Breaking
 
 - **Every cache written by 0.2.0 reprocesses on first run.** The pipeline
-  version moves 54 → 60. Six changes to what the pipeline produces earned a
+  version moves 54 → 61. Six changes to what the pipeline produces earned a
   bump each: the vision client connects to the address the endpoint check
   approved instead of resolving the hostname a second time; an `endpoints`
   array is read as an ordered chain, and the vision mode a run settled on
@@ -25,8 +25,13 @@ stay readable where the format allows and are otherwise reprocessed.
   manifest names the reader that produced the interpretations, or states that
   none did; and a run that spent long enough waiting for a contended bundle
   that its availability answer had aged re-asks the chain before reading, so it
-  may publish under a different bundle key than the one it started toward. The pipeline version participates
-  in every **bundle key**, so existing bundles are not overwritten and not
+  may publish under a different bundle key than the one it started toward. The
+  seventh bump is owed by a change that produces nothing: a read-side command
+  renders an already-published bundle without the frames the vision model
+  judged redundant, writing that view back nowhere. What a run produces is
+  untouched - the version moves because the command registers on a CLI surface
+  that is itself a signed module. The pipeline version participates in every
+  **bundle key**, so existing bundles are not overwritten and not
   served — the first run after upgrading rebuilds them. The note above covers
   caches written by 0.1.0; this one is separate and applies to 0.2.0 as well.
 - **Distill installs nothing.** A missing `tesseract` used to make Distill run

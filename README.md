@@ -322,11 +322,42 @@ stdout's contents survives a descriptor the caller broke.
 | `cleanup-cache` | Prune old cache bundles. Flags: `--output-dir`, `--max-age-days`, `--keep-generations`, `--dry-run/--no-dry-run`. |
 | `cache-doctor` | Report what is under an output root - bundles, active generations, orphan generations, locks, a prune preview - and change nothing. Flags: `--output-dir`, `--max-age-days`, `--keep-generations`. |
 | `get-job-status JOB_ID` | Read a Distill job status record. Flags: `--output-dir`. |
+| `filtered-view BUNDLE_KEY` | Print the filtered view of an already-published bundle - the render with the frames the vision model judged redundant left out - as JSON with the document under `markdown`. Changes nothing under the output root. Flags: `--output-dir`. |
 | `list-tools` | Print the registered tool names as JSON. |
 | `timeout-diagnostics` | Show the configured vs. effective timeout (assumption A-004). |
 | `timeout-probe PROBE_MS` | Sleep for a bounded timeout probe; long probes require `DISTILL_ENABLE_LONG_TIMEOUT_PROBE=1`. |
 | `local-vision-diagnostics` | Probe the local Rapid-MLX vision server and print the resolved config. Flags: `--caption-frames/--no-caption-frames`, `--local-vision-backend`, `--local-vision-model`, `--local-vision-base-url`, `--local-vision-timeout-sec`, `--local-vision-allow-remote-endpoint/--no-local-vision-allow-remote-endpoint`. |
 | `call-tool TOOL [--args JSON]` | Call any registered tool by its MCP-style name with a JSON arguments object. Prints the MCP envelope, so the tool's own JSON is the string at `.result.content[0].text` rather than the printed document itself. |
+
+**`filtered-view` is a reading of a bundle, not a second render of it.** It
+takes a bundle key - the directory name under the output root - and prints the
+generation active there with the frames the vision model judged redundant
+against the surrounding speech left out, under a banner saying exactly that. The
+view is non-authoritative: the stored generation render still contains every
+frame, this one is produced on demand, is never written back, and does not exist
+under the bundle key. Nothing under the output root changes, so it is safe to
+run against a cache another process is writing into, and the only copy of a view
+is the one you keep:
+
+```bash
+distill filtered-view <bundle-key> | jq -r .markdown > view.md
+```
+
+**It redacts what the bundle it reads may not have.** The view runs secret
+redaction over everything it reads back, whatever policy the run was published
+under, and takes nothing from what the manifest claims about itself. For a
+bundle published with `--redact-secrets` - the default - that changes nothing,
+because the text was capped and redacted at write time. For one published with
+`--no-redact-secrets` the view is redacted where the stored render is not, and
+carries redaction warnings the generation never recorded: for those bundles it
+is deliberately not a faithful projection of the render sitting beside it.
+
+**One thing it cannot show you.** A manifest records what the vision model read
+from each keyframe but not Distill's assessment of whether the on-screen-text
+reader confirmed that reading, so the view omits the corroboration note that
+sits above a reading in the stored render. The readings themselves are all
+there; what is missing is the line saying whether anything backed them up. When
+that line is what you are after, read the generation's own `video.md`.
 
 The processing commands (`process-local-video`, `process-youtube-video`,
 `process-video-directory`, `process-youtube-playlist`) share these options: `--whisper-model`,

@@ -468,6 +468,7 @@ INTERNAL_FAULT_ARGV: dict[str, list[str]] = {
     "cleanup-cache": ["cleanup-cache"],
     "cache-doctor": ["cache-doctor"],
     "get-job-status": ["get-job-status", "some-job"],
+    "filtered-view": ["filtered-view", "some-bundle"],
     "list-tools": ["list-tools"],
     "timeout-diagnostics": ["timeout-diagnostics"],
     "timeout-probe": ["timeout-probe", "1"],
@@ -478,6 +479,7 @@ INTERNAL_FAULT_ARGV: dict[str, list[str]] = {
 
 CLI_WORK_SEAMS = (
     "call_registered_tool",
+    "filtered_view",
     "list_tools",
     "local_vision_diagnostics",
     "run_timeout_probe",
