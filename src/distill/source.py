@@ -123,7 +123,7 @@ from .run_command import (
     run_json,
     stream,
 )
-from .vision_chain import ResolvedRun, resolve_chain
+from .vision_chain import CandidateKey, ResolvedRun, candidate_keys, resolve_chain
 from .youtube import (  # noqa: F401  re-exported: the YouTube client
     NO_PLAYLIST_ARG as NO_PLAYLIST_ARG,
 )
@@ -523,6 +523,47 @@ def _probe_endpoint(endpoint: LocalVisionConfig) -> bool:
     return probe_local_vision(endpoint).available
 
 
+def _chain_for(options: DistillOptions) -> tuple[LocalVisionConfig, ...]:
+    """The **endpoint chain** these options name, however they were built.
+
+    A config that names no chain still names an endpoint. `DistillOptions`
+    reached through `from_args` carries the one-entry chain `_with_chain`
+    derived, but one constructed directly does not - and treating an empty chain
+    as the whole answer would exhaust immediately, re-keying a run that has a
+    perfectly good endpoint configured the old way.
+
+    Named once because two questions need it: which endpoint to walk, and which
+    **candidate key** a run already holding an answer is on. Those must see the
+    same chain or the second would describe a run that never existed.
+    """
+    return options.local_vision_endpoints or (options.local_vision_config(),)
+
+
+def candidate_in_hand(options: DistillOptions, source_type: str) -> CandidateKey | None:
+    """Which **candidate key** a run carrying these options is already on.
+
+    A `ResolvedRun` is produced by a walk and then discarded: what survives into
+    a run is the options the walk settled, which carry the **vision mode** and
+    the endpoint but not the *position* in the chain. An operator comparing
+    where a run started with where it ended needs that position on both sides,
+    so it is recovered here rather than carried - by re-deriving the candidates
+    and finding the one whose **options hash** this run's options produce.
+
+    Re-derived rather than matched on the endpoint's address, because address is
+    not identity (ADR-0004) and `candidate_keys` is the one place that knows how
+    a candidate is built. Matching on the hash asks that one place.
+
+    `None` when no candidate matches, which is not a run this module produced -
+    options assembled by hand, or a chain edited since the walk. The caller is
+    told rather than given a position that would be a guess.
+    """
+    opts_hash = options.opts_hash(source_type)
+    for candidate in candidate_keys(options, _chain_for(options), source_type):
+        if candidate.opts_hash == opts_hash:
+            return candidate
+    return None
+
+
 def _resolved_for(
     options: DistillOptions,
     fingerprint: str,
@@ -541,15 +582,9 @@ def _resolved_for(
     A caller that named no **output root** has no store to ask, so every
     candidate reads as absent and the walk goes straight to probing.
     """
-    # A config that names no chain still names an endpoint. `DistillOptions`
-    # reached through `from_args` carries the one-entry chain `_with_chain`
-    # derived, but one constructed directly does not - and resolving an empty
-    # chain would exhaust immediately, re-keying a run that has a perfectly good
-    # endpoint configured the old way.
-    chain = options.local_vision_endpoints or (options.local_vision_config(),)
     return resolve_chain(
         options,
-        chain,
+        _chain_for(options),
         source_type,
         cached=lambda opts_hash: (
             None
@@ -557,6 +592,65 @@ def _resolved_for(
             else servable_interpretation_count(output_root, source_hash(fingerprint, opts_hash))
         ),
         probe=_probe_endpoint,
+        # The clock that arms `PROBE_CEILING_SEC`. `resolve_chain` enforces its
+        # shared ceiling only when a caller supplies one, which is what lets
+        # tests about *selection* ignore time - and left production walking with
+        # no ceiling at all, so a four-entry chain of unreachable endpoints cost
+        # four connect timeouts end to end, which is the multiplication
+        # P3-D-020 exists to refuse. Monotonic, because what is being bounded is
+        # an elapsed duration and a wall clock corrected mid-walk would either
+        # cut it short or never end it.
+        now=time.monotonic,
+    )
+
+
+@dataclass(frozen=True)
+class ChainRevalidation:
+    """A second walk of the **endpoint chain**, and the **bundle key** it names.
+
+    The key travels with the resolution because the two are one answer: an
+    `opts_hash` is what the walk settled on and `source_hash(fingerprint,
+    opts_hash)` is the bundle it describes, and a caller that derived the second
+    half itself would be a second place that knows how a bundle key is built.
+    """
+
+    resolution: ResolvedRun
+    bundle_key: str
+
+
+def revalidate_chain(
+    options: DistillOptions,
+    fingerprint: str,
+    source_type: str,
+    output_root: Path | None,
+) -> ChainRevalidation:
+    """Walk the chain again, for a run whose answer has aged under a lock.
+
+    <!-- D-004 --> The walk that settled a run's **bundle key** happens during
+    source resolution, before the run has queued for that key. A run that then
+    waits out a contended lock arrives at its own work holding an availability
+    answer older than the wait, and the memo that answer came from has a life
+    measured in the same minutes - so the worst case is an expired answer rather
+    than a slightly stale one.
+
+    The whole walk rather than a cheaper re-check, and deliberately so: what is
+    being re-asked is which endpoint this run should read with, and that question
+    has one answer-shaped procedure. What the re-ask costs is bounded by that
+    procedure - Phase 1 scans the candidate keys against the cache before
+    anything is asked of the network, and Phase 2 stops at the first endpoint
+    that answers - so the ordinary second walk is one probe of the endpoint that
+    answered the first time.
+
+    Here rather than in `pipeline.py` because this module owns the walk
+    <!-- D-033 -->: the pipeline decides *whether* a run owes one, which is a
+    fact about the wait it measured, and asking is still source resolution's to
+    perform. A second implementation of the walk would be a second place for the
+    key and the options to disagree.
+    """
+    resolution = _resolved_for(options, fingerprint, source_type, output_root)
+    return ChainRevalidation(
+        resolution=resolution,
+        bundle_key=source_hash(fingerprint, resolution.opts_hash),
     )
 
 

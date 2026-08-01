@@ -185,6 +185,8 @@ def run_response(
     progress: dict[str, Any] | None = None,
     job_id: str | None = None,
     artifact_path: str | None = None,
+    waited_sec: float = 0.0,
+    rekeyed_from: str | None = None,
 ) -> dict[str, Any]:
     """What a caller receives, whether the run produced the bundle or read it.
 
@@ -195,6 +197,18 @@ def run_response(
     a fresh run got from `response_frames` and a cache hit read out of the
     **manifest** the previous run wrote, then re-addressed to the active
     **generation**.
+
+    Two of the fields below are about how the run *got here* rather than about
+    what it produced, and they are here because the alternative is DEBUG logs. A
+    run that waited out a contended **bundle key** and one that walked straight
+    in hand back the same bundle, and `waited_sec` is the only thing that tells
+    them apart. It is the run's whole wait rather than one acquisition's,
+    because a run that re-keyed queued twice and the second queue is the shorter
+    one - reporting it alone would say a run that waited five minutes waited
+    none. `rekeyed_from` is the sharper case: a run whose second chain walk
+    moved it publishes under a key its caller never named (D-005), so without it
+    the caller is handed a `source_hash` it cannot account for and nothing to
+    account for it with.
     """
     # Counted on what a reading says, not on a key being present (R-39): a
     # **manifest** written before an empty response was rejected, or by a server
@@ -221,8 +235,14 @@ def run_response(
         "duration_sec": source.duration_sec,
         "frame_count": len(frames),
         "source_hash": source.source_hash,
+        # The key this run queued for and gave up, or `None` for the ordinary
+        # run that kept the one it resolved to. Always present, because "did
+        # this run move" is a question every response answers - answered by
+        # absence, it would read as a field this build does not have.
+        "rekeyed_from": rekeyed_from,
         "source_resolved_path": str(source.resolved_path),
         "cached": cached,
+        "waited_sec": waited_sec,
         "pipeline_version": PIPELINE_VERSION,
         "distill_version": DISTILL_VERSION,
         "job_id": job_id,

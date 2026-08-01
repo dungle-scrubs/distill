@@ -13,7 +13,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -61,12 +61,16 @@ from .progress import (
 from .render import render_markdown
 from .response import manifest_document, response_frames, run_response
 from .source import (
+    ChainRevalidation,
+    candidate_in_hand,
     normalize_youtube_url,
     release_acquisition_lease,
     resolve_source_for_processing,
+    revalidate_chain,
     source_path_kind,
     validate_output_root,
 )
+from .vision_chain import REVALIDATE_AFTER_WAIT_SEC
 from .youtube import ensure_youtube_host, youtube_playlist_urls
 
 TOOLS = {
@@ -79,6 +83,35 @@ TOOLS = {
     "get_job_status": "Read a Distill job status record by job id",
 }
 LOGGER = logging.getLogger(__name__)
+
+PIPELINE_EVENT_TYPE = "distill.pipeline"
+
+
+def _pipeline_log(event: str, **detail: Any) -> None:
+    """Emit one run-orchestration event: a decision `execute` took about a run.
+
+    Metadata only, in the shape `bundle_store` and `source` use, so one log
+    stream answers "what happened to this **bundle key**" across the three
+    modules that act on one. `bundle_key` is the correlation field for that
+    reason: an event here sits between the store's `lock_acquired` and its
+    `generation_committed` for the same key, and an operator reading why a run
+    behaved as it did needs the three in one order.
+
+    Nothing a stage produced is recorded here. No **extracted text** has passed
+    a **redaction sink** by the time these fire, and none of these decisions is
+    about content anyway.
+    """
+    LOGGER.debug(
+        json.dumps(
+            {
+                "type": PIPELINE_EVENT_TYPE,
+                "event": event,
+                "detail": {"pid": os.getpid(), **detail},
+            },
+            sort_keys=True,
+        )
+    )
+
 
 DEFAULT_CONFIGURED_TIMEOUT_MS = 5_400_000
 
@@ -281,6 +314,35 @@ def _abandon_reason(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+REKEY_BOUND_REASON = "one_rekey_per_run"
+"""Why a run that diverges a second time proceeds anyway. <!-- D-005 -->
+
+Named rather than written into the event as a sentence, because it is the only
+reason there is: the bound is one re-key per run, and an operator reading this
+is being told the run *could* have moved and chose not to. A chain that
+disagrees twice in one run is a chain that is flapping, and following it costs a
+lock release and another wait per lap - so the second answer is recorded and the
+run finishes under the key it already took.
+"""
+
+
+def revalidation_is_owed(waited_sec: float) -> bool:
+    """Whether a run that waited this long owes its **endpoint chain** a second walk.
+
+    One named predicate rather than a comparison inside `execute`, because the
+    two halves of this decision live apart: the wait is the store's measurement
+    and the threshold is a statement about the vision memo (D-016). Read here
+    together, the rule is one line an operator can check against the constant;
+    read inline, it is a bare number in the middle of a run.
+
+    Inclusive at the threshold. It is not a deadline the answer survives up to,
+    it is the point past which the answer has aged appreciably - so a wait that
+    lands exactly on it has aged exactly that much, and the tie is broken toward
+    asking, which costs one probe.
+    """
+    return waited_sec >= REVALIDATE_AFTER_WAIT_SEC
+
+
 @dataclass
 class ProcessingRun:
     source: Any
@@ -299,6 +361,25 @@ class ProcessingRun:
     fails, the batch proceeds, and re-running picks it up as a cache hit.
     """
 
+    waited_sec: float = field(default=0.0, init=False)
+    """How long this run has spent queueing for a **bundle key**, in total.
+
+    Summed rather than taken from the hold it is working under, because a run
+    that re-keyed queued twice: the second queue gets what is left of the budget
+    (D-044) and is usually the shorter one, so reporting it alone would tell a
+    caller that a run which waited out five minutes waited none.
+    """
+
+    rekeyed_from: str | None = field(default=None, init=False)
+    """The **bundle key** this run queued for and gave up, once it has.
+
+    State the run acquires rather than an input, which is why it is not
+    constructible: it is set at the one point a run can move (D-005), and a
+    caller that could hand one in could tell a response a run moved when it did
+    not. It reaches that response because a re-keyed run answers under a key
+    nobody asked for, and the caller is owed the key it did ask for.
+    """
+
     def execute(self) -> dict[str, Any]:
         """Produce this run's **generation**, or hand back the one already published.
 
@@ -308,14 +389,22 @@ class ProcessingRun:
         exclusion rather than only the staging that opens it. `begin` answers
         the cache question from *under* that lock, which is what makes a waiter
         coalesce onto the winner's result instead of redoing its work.
+
+        A waiter also arrives holding a stale answer, which is the other half of
+        that coalescing. The **endpoint chain** was walked before this run
+        queued, so the wait `begin` measured is time the availability answer
+        aged with nothing watching it - and this is where that number first
+        exists beside the inputs a second walk would need (D-004).
+
+        Which key this run publishes under is therefore not settled until the
+        wait has been accounted for, and that happens before the heartbeat
+        starts and before any stage runs. A re-key after a stage would have to
+        move what that stage staged; a re-key before one moves nothing.
         """
         store = BundleStore.open(self.output_root)
-        began = store.begin(
-            self.source.source_hash,
-            wait_sec=self.lock_wait_sec,
-            resume=self.options.resume_partial,
-            reuse_active=not self.options.force_reprocess,
-        )
+        began = self._begin(store, self.source.source_hash, self.lock_wait_sec)
+        if isinstance(began, BundleRun):
+            began = self._settled_after_wait(store, began)
         if isinstance(began, BundleSnapshot):
             return self._cached_response(store, began)
 
@@ -333,6 +422,223 @@ class ProcessingRun:
                     raise
         finally:
             heartbeat.stop()
+
+    def _begin(
+        self, store: BundleStore, bundle_key: str, wait_sec: float
+    ) -> BundleRun | BundleSnapshot:
+        """Queue for `bundle_key` on this run's terms. The only place that does.
+
+        Two callers ask for a run lock - the run starting, and the run moving to
+        the key a second walk named - and every argument but the key and the
+        budget is the same fact about this run either way. Stated twice, a later
+        change to what `resume` or `reuse_active` mean here would reach one of
+        them, and the re-key path is the one nobody exercises by hand.
+
+        Being the only place, it is also where the run is charged for what
+        queueing cost. `begin` reports its wait on both arms - the hold and the
+        cache hit a waiter coalesced onto - so the sum is total by construction
+        rather than by every caller remembering to add its own.
+        """
+        began = store.begin(
+            bundle_key,
+            wait_sec=wait_sec,
+            resume=self.options.resume_partial,
+            reuse_active=not self.options.force_reprocess,
+        )
+        self.waited_sec += began.waited_sec
+        return began
+
+    def _settled_after_wait(
+        self, store: BundleStore, run: BundleRun
+    ) -> BundleRun | BundleSnapshot:
+        """The hold this run will actually work under, once its wait is accounted for.
+
+        The wait is `begin`'s: `_take_lock` measured it and `BundleRun` carries
+        it, which is what puts the number and the resolution inputs
+        (`source_fingerprint`, `source_type`, the output root) in one scope for
+        the first time. Nothing else in the run knows both, which is why the
+        decision is here (D-004) and the walk is still `source.py`'s.
+
+        Under the lock, not before it: a run that re-asked while queueing would
+        be asking on behalf of an answer it might never get to use, and the
+        point of asking is that the *wait* is what aged the answer.
+
+        A second walk that names the key the lock was taken on ends here, having
+        cost one probe. That is the ordinary outcome - the endpoint that answered
+        before the wait usually answers after it - and it must cost nothing
+        beyond the asking, because the alternative is charging every contended
+        run a re-key for an answer that did not change.
+
+        <!-- D-005 --> Divergence is answered once, and the shape of this method
+        is where "once" lives: ask, re-key, ask again, and the second answer can
+        only be recorded. Written as a loop or as a recursive call it would read
+        as "keep going until the chain settles", which is a run that can spend a
+        full wait budget per iteration against a chain that never settles.
+
+        Every step of it runs outside `execute`'s `with`, which is what makes
+        the failure arm necessary rather than defensive: a run lock is live from
+        the moment `begin` returns, and re-asking the chain reads the store, so
+        a failure here is a failure while holding a **bundle key** that no
+        `__exit__` is waiting to give up.
+        """
+        held: BundleRun | None = run
+        try:
+            if not revalidation_is_owed(run.waited_sec):
+                return run
+            _pipeline_log(
+                "chain_revalidated",
+                bundle_key=run.bundle_key,
+                waited_sec=run.waited_sec,
+                revalidate_after_sec=REVALIDATE_AFTER_WAIT_SEC,
+            )
+            diverged = self._divergence(run)
+            if diverged is None:
+                return run
+            # What is left of the budget, not a fresh one. `lock_wait_sec` is a
+            # promise about how long *this run* waits before it gives up
+            # (D-044), and a second queue that re-armed it would quietly make
+            # that promise mean twice as long - worst exactly where a re-key
+            # happens at all, since discovering a divergence takes a wait long
+            # enough to have aged the answer. Read before the hold is given up,
+            # because it is a fact about the wait that produced this hold.
+            remaining = max(0.0, self.lock_wait_sec - run.waited_sec)
+            self._leave_key_for(run, diverged)
+            held = None
+            begun = self._begin(store, diverged.bundle_key, remaining)
+            if isinstance(begun, BundleSnapshot):
+                # The key the second walk named already holds an **active
+                # generation**. There is nothing left to produce, so there is
+                # nothing left to ask the chain about either.
+                return begun
+            held = begun
+            # The confirming walk. Ungated, unlike the first one, because it is
+            # not a question about the wait: this run has just been told the
+            # chain moved under it, and what it asks is whether the key it is
+            # about to publish under is still the one the chain names. Gating it
+            # on the second wait would also be near-dead code - what is left of
+            # a budget the first wait already spent past the threshold rarely
+            # reaches the threshold again - so the answer would go unasked
+            # exactly where the chain has proved it moves. It costs one probe,
+            # on a path a run reaches only after waiting minutes, and it cannot
+            # re-key: what it produces is a record.
+            declined = self._divergence(begun)
+            if declined is not None:
+                self._log_divergence(
+                    "chain_divergence_declined", begun, declined, reason=REKEY_BOUND_REASON
+                )
+            return begun
+        except BaseException as exc:
+            # `held` is whichever hold is live at the point of failure, and
+            # `None` in the window between giving the old key up and taking the
+            # new one - the one stretch of this where a failure strands nothing.
+            if held is not None:
+                held.abandon(_abandon_reason(exc), during=exc)
+            raise
+
+    def _divergence(self, run: BundleRun) -> ChainRevalidation | None:
+        """Ask the chain about this run's key again; `None` when it says the same.
+
+        The comparison and not the walk is what this owns: `revalidate_chain`
+        returns the key its resolution names, and a caller that compared some
+        other derivation of it against `run.bundle_key` would be asking whether
+        two ways of building a key agree rather than whether the chain moved.
+        """
+        revalidated = revalidate_chain(
+            self.options,
+            self.source.source_fingerprint,
+            self.source.source_type,
+            self.output_root,
+        )
+        if revalidated.bundle_key == run.bundle_key:
+            return None
+        return revalidated
+
+    def _leave_key_for(self, run: BundleRun, revalidated: ChainRevalidation) -> None:
+        """Give up the key the wait aged, and become the run the new key describes.
+
+        <!-- D-005 --> Re-resolution *is* re-keying. `CandidateKey.opts_hash` is
+        derived from the reader and the outcome, and a **bundle key** is
+        `source_hash(fingerprint, opts_hash)`, so a walk that lands on a
+        different endpoint has named a different bundle - and the lock in hand
+        was taken on the old one. There is no revalidation that leaves the key
+        alone, which is why this releases rather than continues.
+
+        `abandon` rather than a bare release, because a bundle that did not
+        change is otherwise indistinguishable from a run that never happened:
+        the old key is left with an **ownership marker**, an empty **staging
+        directory** and a recorded reason naming the key the run moved to.
+        Nothing was staged under it - this runs before the first stage - so
+        there is no partial **generation** to strand.
+
+        What the run *is* moves with the key, and that is the second half of
+        what this does. The **manifest** records `source.source_hash` as
+        identity and is built from `self.options`, so a run that took the new
+        key while still describing itself by the old walk would publish entry
+        0's options under entry 1's key: the three-artifact disagreement
+        P3-D-015 exists to prevent. The move happens here rather than after the
+        re-begin, so a re-begin that fails `E_LOCKED` fails as the run it had
+        already become.
+
+        `replace` rather than assignment, because a `SourceInfo` is frozen - a
+        resolved source is a settled description, and the way to describe a
+        different bundle is to hold a different one rather than to edit the
+        record of what resolution decided.
+
+        Returns nothing, and the caller takes the new key. Leaving and arriving
+        are two acts with a gap between them where this run holds no lock at
+        all, and a method that did both would hide that gap - which is the one
+        stretch of the re-key where a failure strands nothing.
+        """
+        self._log_divergence("chain_diverged", run, revalidated)
+        run.abandon(f"chain_rekeyed: {revalidated.bundle_key}")
+        # Recorded before the run stops being the run that held it: from here
+        # on `self.source.source_hash` is the new key, and the only account of
+        # the old one outside the log is this.
+        self.rekeyed_from = run.bundle_key
+        self.options = revalidated.resolution.options
+        self.source = replace(
+            self.source,
+            source_hash=revalidated.bundle_key,
+            resolved_options=revalidated.resolution.options,
+        )
+
+    def _log_divergence(
+        self,
+        event: str,
+        run: BundleRun,
+        revalidated: ChainRevalidation,
+        **detail: Any,
+    ) -> None:
+        """Record a second walk naming a different key, from both sides at once.
+
+        A divergence is the one thing revalidation does that is visible from
+        outside the process - a bundle appears under a key nobody queued for,
+        and the key the run *did* queue for is left holding nothing. Neither
+        side explains that alone: the old key is what correlates with the
+        `lock_acquired` this run already logged, the new key is what the
+        **generation** will be published under, and the pair is the whole event.
+
+        The entry and the **vision mode** travel together for the same reason.
+        An entry index says which position in the **endpoint chain** answered;
+        the mode says whether one answered at all - so `None -> 0` alone cannot
+        tell a run that had given the chain up from one that never wanted a
+        reader. The address is deliberately absent: it is a machine-local claim
+        and not reader identity (ADR-0004).
+
+        Called before the re-key moves the run, so `self.options` still
+        describes the side the run is leaving.
+        """
+        held = candidate_in_hand(self.options, self.source.source_type)
+        _pipeline_log(
+            event,
+            bundle_key=run.bundle_key,
+            entry=None if held is None else held.entry,
+            vision_mode=self.options.vision_mode,
+            new_bundle_key=revalidated.bundle_key,
+            new_entry=revalidated.resolution.entry,
+            new_vision_mode=revalidated.resolution.vision_mode,
+            **detail,
+        )
 
     def _cached_response(self, store: BundleStore, snapshot: BundleSnapshot) -> dict[str, Any]:
         snapshot, progress_summary = cache_hit_progress_summary(store, snapshot)
@@ -359,6 +665,8 @@ class ProcessingRun:
             artifact_path=self._emit_artifact(snapshot),
             progress=progress_summary,
             job_id=self.options.job_id,
+            waited_sec=self.waited_sec,
+            rekeyed_from=self.rekeyed_from,
         )
 
     def _run_stage[StageValue](
@@ -740,6 +1048,8 @@ class ProcessingRun:
             artifact_path=self._emit_artifact(snapshot),
             progress=progress_summary,
             job_id=self.options.job_id,
+            waited_sec=self.waited_sec,
+            rekeyed_from=self.rekeyed_from,
         )
 
 

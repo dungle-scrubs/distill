@@ -167,6 +167,37 @@ bound on how stale an answer may be, not a verdict: an endpoint is unavailable
 because something got fixed later, not because it stopped existing.
 """
 
+REVALIDATE_AFTER_WAIT_SEC = DEFAULT_MEMO_TTL_SEC / 2
+"""How long a run may wait for a lock before its availability answer is re-asked.
+
+The chain is walked during source resolution, which is before the run takes the
+lock on the **bundle key** that walk named. A run that then waits out a contended
+key arrives at its own work holding an answer gathered before the wait started
+(D-004).
+
+`DEFAULT_MEMO_TTL_SEC` is this project's recorded answer to how long an
+availability answer is worth trusting, and half of it is where one has aged
+appreciably. It is worth anchoring to *as that statement*, and only as that:
+<!-- D-021 --> no run wires an `AvailabilityMemo` today, so nothing enforces
+that life at runtime and a pre-wait answer is stale without any bound. The
+threshold is a judgement about staleness that happens to share the memo's
+premise, not a consequence of the memo's mechanics.
+
+So the derivation is NOT what holds the relation
+`BATCH_ITEM_LOCK_WAIT_SEC` needs. <!-- D-022 --> The test asserting that
+relation is: a derivation cannot fail loudly and a test can. A half was chosen
+over a tighter fraction because both bounds want room - a batch item's 5 s
+budget falls thirty times short of the threshold, and a single-source run that
+spends its full 300 s budget is twice past it - so neither side turns on a
+rounding <!-- D-006 -->.
+
+`bundle_store.py` owns both wait budgets and looks like the tidy home for this,
+but the store must not learn what a vision endpoint is <!-- D-016 -->: importing
+the memo TTL there would make the lock depend on the chain. The relation is
+asserted from a test instead, which may reach across a boundary production code
+may not.
+"""
+
 
 @dataclass
 class AvailabilityMemo:
