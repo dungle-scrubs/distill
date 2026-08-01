@@ -134,6 +134,26 @@ def test_synthetic_truth_matches_the_generator_text() -> None:
         assert score.truth_text(case_id) == expected
 
 
+def test_the_identifiers_frame_is_registered_and_scored() -> None:
+    """The identifiers frame is in the corpus, not merely on disk.
+
+    Its PNG and ground truth shipped with the redaction work that needed the
+    frame's *content*; registering it is what makes the corpus assert that
+    recovering a commit sha, a sha256 digest and a lockfile integrity hash is
+    the correct reading rather than something redaction may delete. The
+    generator-truth test above passes on an unregistered case, because it reads
+    the fixture and never the corpus - so it cannot notice the registration
+    going missing, and this can.
+    """
+    cases = {case.id: case for case in score.load_labelled_cases()}
+
+    case = cases["30_synth_identifiers_f01"]
+    assert case.verified, "an unverified case is skipped by the scorer"
+    assert case.has_text
+    assert case.category == "clean_text"
+    assert score.truth_text(case.id)
+
+
 def test_labelled_corpus_rejects_unknown_category(tmp_path, monkeypatch) -> None:
     (tmp_path / "cases.toml").write_text(
         '[[case]]\nid = "bad-category"\ncategory = "unknown"\nlegibility = "clean"\n'
@@ -552,3 +572,19 @@ def test_the_gate_evidence_file_is_internally_consistent() -> None:
     )
     assert recomputed.passed is evidence["verdict"]["passed"]
     assert evidence["superseded_run"]["verdict"]["passed"] is False
+
+    # The cloud file is not digest-pinned the way the baseline is, so without
+    # this it can describe a corpus nobody scored: register a case, re-record
+    # the baseline because line 438 forces it, leave this file alone, and the
+    # suite stays green while the two evidence files disagree about what was
+    # measured. README says drift between them and the corpus fails the suite;
+    # this is what makes that true.
+    baseline_digest = baseline["corpus_sha256"]
+    assert evidence["corpus_sha256"] == baseline_digest
+    scored_ids = [
+        case.id
+        for case in score.load_labelled_cases()
+        if case.verified and score.truth_text(case.id) is not None
+    ]
+    assert evidence["summary"]["cases_scored"] == len(scored_ids)
+    assert [case["id"] for case in evidence["cases"]] == scored_ids

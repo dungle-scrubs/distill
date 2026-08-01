@@ -95,18 +95,26 @@ across other PNG encoders.
 
 ## Coverage
 
-26 cases: 16 real frames from 7 recordings plus 10 deterministic synthetic
+30 cases: 16 real frames from 7 recordings plus 14 deterministic synthetic
 frames, spread across:
 
 - **kind**: 16 slides, 2 real UIs (an agent trace viewer, a phone app
-  mockup), 1 diagram, 7 photo/negative.
-- **legibility**: 16 clean, 3 partial, 7 unreadable/empty-content.
-- **category**: 12 `clean_text`, 6 `textless`, 1 `chrome_only`, 2 `injection`,
+  mockup), 1 diagram, 1 terminal, 10 photo/negative.
+- **legibility**: 17 clean, 3 partial, 10 unreadable/empty-content.
+- **category**: 13 `clean_text`, 8 `textless`, 2 `chrome_only`, 2 `injection`,
   2 `safety_blocked`, and 3 `ocr_vision_disagreement`.
 - **background**: dark and light slides both represented.
 - Includes the original hallucination case (`04_..._f16`, "We're closer than you
-  think"), six true invention probes, one chrome-only convention case, and ten
-  labelled synthetic edge cases.
+  think"), the true invention probes, the chrome-only convention cases, and the
+  labelled synthetic edge cases - among them `30_synth_identifiers_f01`, a
+  terminal of commit shas and digests, which is the corpus saying that
+  recovering an identifier is the correct reading rather than something
+  redaction may delete.
+
+`kind` is documentation only: `load_labelled_cases` validates `id`, `category`,
+`legibility`, `has_text` and `verified`, and ignores `kind`. These counts are
+not pinned by a test either; the corpus digest is what fails loudly when
+`cases.toml` changes.
 
 To refresh or extend the pool: `uv run python tests/evals/triage.py`.
 
