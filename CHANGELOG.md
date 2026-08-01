@@ -23,9 +23,9 @@ stay readable where the format allows and are otherwise reprocessed.
   `sha256` digest - which a rule named for base64 had been matching; chain
   resolution decides which of a run's candidate keys it publishes under; a
   manifest names the reader that produced the interpretations, or states that
-  none did; and a run that waited long enough for its availability answer to
-  expire re-asks the chain before reading, so it may publish under a different
-  bundle key than the one it started toward. The pipeline version participates
+  none did; and a run that spent long enough waiting for a contended bundle
+  that its availability answer had aged re-asks the chain before reading, so it
+  may publish under a different bundle key than the one it started toward. The pipeline version participates
   in every **bundle key**, so existing bundles are not overwritten and not
   served — the first run after upgrading rebuilds them. The note above covers
   caches written by 0.1.0; this one is separate and applies to 0.2.0 as well.
