@@ -560,6 +560,56 @@ def _resolved_for(
     )
 
 
+@dataclass(frozen=True)
+class ChainRevalidation:
+    """A second walk of the **endpoint chain**, and the **bundle key** it names.
+
+    The key travels with the resolution because the two are one answer: an
+    `opts_hash` is what the walk settled on and `source_hash(fingerprint,
+    opts_hash)` is the bundle it describes, and a caller that derived the second
+    half itself would be a second place that knows how a bundle key is built.
+    """
+
+    resolution: ResolvedRun
+    bundle_key: str
+
+
+def revalidate_chain(
+    options: DistillOptions,
+    fingerprint: str,
+    source_type: str,
+    output_root: Path | None,
+) -> ChainRevalidation:
+    """Walk the chain again, for a run whose answer has aged under a lock.
+
+    <!-- D-004 --> The walk that settled a run's **bundle key** happens during
+    source resolution, before the run has queued for that key. A run that then
+    waits out a contended lock arrives at its own work holding an availability
+    answer older than the wait, and the memo that answer came from has a life
+    measured in the same minutes - so the worst case is an expired answer rather
+    than a slightly stale one.
+
+    The whole walk rather than a cheaper re-check, and deliberately so: what is
+    being re-asked is which endpoint this run should read with, and that question
+    has one answer-shaped procedure. What the re-ask costs is bounded by that
+    procedure - Phase 1 scans the candidate keys against the cache before
+    anything is asked of the network, and Phase 2 stops at the first endpoint
+    that answers - so the ordinary second walk is one probe of the endpoint that
+    answered the first time.
+
+    Here rather than in `pipeline.py` because this module owns the walk
+    <!-- D-033 -->: the pipeline decides *whether* a run owes one, which is a
+    fact about the wait it measured, and asking is still source resolution's to
+    perform. A second implementation of the walk would be a second place for the
+    key and the options to disagree.
+    """
+    resolution = _resolved_for(options, fingerprint, source_type, output_root)
+    return ChainRevalidation(
+        resolution=resolution,
+        bundle_key=source_hash(fingerprint, resolution.opts_hash),
+    )
+
+
 def servable_interpretation_count(output_root: Path, bundle_key: str) -> int | None:
     """How many frames of the servable **generation** carry a reading.
 

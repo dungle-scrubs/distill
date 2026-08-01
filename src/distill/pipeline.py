@@ -64,9 +64,11 @@ from .source import (
     normalize_youtube_url,
     release_acquisition_lease,
     resolve_source_for_processing,
+    revalidate_chain,
     source_path_kind,
     validate_output_root,
 )
+from .vision_chain import REVALIDATE_AFTER_WAIT_SEC
 from .youtube import ensure_youtube_host, youtube_playlist_urls
 
 TOOLS = {
@@ -79,6 +81,35 @@ TOOLS = {
     "get_job_status": "Read a Distill job status record by job id",
 }
 LOGGER = logging.getLogger(__name__)
+
+PIPELINE_EVENT_TYPE = "distill.pipeline"
+
+
+def _pipeline_log(event: str, **detail: Any) -> None:
+    """Emit one run-orchestration event: a decision `execute` took about a run.
+
+    Metadata only, in the shape `bundle_store` and `source` use, so one log
+    stream answers "what happened to this **bundle key**" across the three
+    modules that act on one. `bundle_key` is the correlation field for that
+    reason: an event here sits between the store's `lock_acquired` and its
+    `generation_committed` for the same key, and an operator reading why a run
+    behaved as it did needs the three in one order.
+
+    Nothing a stage produced is recorded here. No **extracted text** has passed
+    a **redaction sink** by the time these fire, and none of these decisions is
+    about content anyway.
+    """
+    LOGGER.debug(
+        json.dumps(
+            {
+                "type": PIPELINE_EVENT_TYPE,
+                "event": event,
+                "detail": {"pid": os.getpid(), **detail},
+            },
+            sort_keys=True,
+        )
+    )
+
 
 DEFAULT_CONFIGURED_TIMEOUT_MS = 5_400_000
 
@@ -281,6 +312,23 @@ def _abandon_reason(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def revalidation_is_owed(waited_sec: float) -> bool:
+    """Whether a run that waited this long owes its **endpoint chain** a second walk.
+
+    One named predicate rather than a comparison inside `execute`, because the
+    two halves of this decision live apart: the wait is the store's measurement
+    and the threshold is a statement about the vision memo (D-016). Read here
+    together, the rule is one line an operator can check against the constant;
+    read inline, it is a bare number in the middle of a run.
+
+    Inclusive at the threshold. It is not a deadline the answer survives up to,
+    it is the point past which the answer has aged appreciably - so a wait that
+    lands exactly on it has aged exactly that much, and the tie is broken toward
+    asking, which costs one probe.
+    """
+    return waited_sec >= REVALIDATE_AFTER_WAIT_SEC
+
+
 @dataclass
 class ProcessingRun:
     source: Any
@@ -308,6 +356,12 @@ class ProcessingRun:
         exclusion rather than only the staging that opens it. `begin` answers
         the cache question from *under* that lock, which is what makes a waiter
         coalesce onto the winner's result instead of redoing its work.
+
+        A waiter also arrives holding a stale answer, which is the other half of
+        that coalescing. The **endpoint chain** was walked before this run
+        queued, so the wait `begin` measured is time the availability answer
+        aged with nothing watching it - and this is where that number first
+        exists beside the inputs a second walk would need (D-004).
         """
         store = BundleStore.open(self.output_root)
         began = store.begin(
@@ -323,6 +377,7 @@ class ProcessingRun:
         try:
             with began as run:
                 try:
+                    self._revalidate_after_wait(run)
                     return self._produce_generation(run, heartbeat)
                 except BaseException as exc:
                     # A bundle that did not change is otherwise indistinguishable
@@ -333,6 +388,51 @@ class ProcessingRun:
                     raise
         finally:
             heartbeat.stop()
+
+    def _revalidate_after_wait(self, run: BundleRun) -> None:
+        """Re-ask the chain if the wait for this key outlived the answer in hand.
+
+        The wait is `begin`'s: `_take_lock` measured it and `BundleRun` carries
+        it, which is what puts the number and the resolution inputs
+        (`source_fingerprint`, `source_type`, the output root) in one scope for
+        the first time. Nothing else in the run knows both, which is why the
+        decision is here (D-004) and the walk is still `source.py`'s.
+
+        Under the lock, not before it: a run that re-asked while queueing would
+        be asking on behalf of an answer it might never get to use, and the
+        point of asking is that the *wait* is what aged the answer.
+
+        A second walk that names the key the lock was taken on ends here, having
+        cost one probe. That is the ordinary outcome - the endpoint that answered
+        before the wait usually answers after it - and it must cost nothing
+        beyond the asking, because the alternative is charging every contended
+        run a re-key for an answer that did not change.
+        """
+        if not revalidation_is_owed(run.waited_sec):
+            return
+        _pipeline_log(
+            "chain_revalidated",
+            bundle_key=run.bundle_key,
+            waited_sec=run.waited_sec,
+            revalidate_after_sec=REVALIDATE_AFTER_WAIT_SEC,
+        )
+        revalidated = revalidate_chain(
+            self.options,
+            self.source.source_fingerprint,
+            self.source.source_type,
+            self.output_root,
+        )
+        # <!-- D-005 --> Agreement is the outcome this step acts on, and acting
+        # on it means doing nothing: the key the second walk named is the key
+        # the lock was taken on. A divergent walk names a bundle key this run
+        # does not hold, and re-resolution implies re-keying - the lock in hand
+        # was taken on the old key, so honouring the new one means releasing it
+        # and beginning again under the new key, exactly once. Until that
+        # bounded re-key exists a divergent run goes on under the key it holds,
+        # producing the reading it would have produced had it never asked: a
+        # walk spent, rather than a bundle published under the wrong key.
+        if revalidated.bundle_key != run.bundle_key:
+            return
 
     def _cached_response(self, store: BundleStore, snapshot: BundleSnapshot) -> dict[str, Any]:
         snapshot, progress_summary = cache_hit_progress_summary(store, snapshot)
