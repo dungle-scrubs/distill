@@ -388,6 +388,33 @@ SALIENCE_WINDOW_RADIUS_SEC = 30.0
 _WINDOW_CHAR_BOUND = 4800
 
 
+def segment_bounds(segment: Any) -> tuple[float, float] | None:
+    """Where one **transcript** segment sits on the recording's clock, or `None`.
+
+    `None` is "this segment cannot be placed", and it covers every way that
+    happens: not a mapping, either bound missing, a bound that is not a number,
+    and a bound that is `nan` or infinite. Missing is included deliberately -
+    a segment read as starting at zero because it said nothing has been moved
+    to the beginning of the recording, which is a claim about when somebody
+    spoke.
+
+    One reading of the question, because two readers ask it and they must not
+    answer differently: this module skips what it cannot place when it builds
+    a salience window, and a read-side render refuses a document that holds
+    one rather than rendering around it. Segments come back off disk on both
+    routes (R-23), so neither reader may assume the shape this module wrote.
+    """
+    if not isinstance(segment, Mapping) or "start" not in segment or "end" not in segment:
+        return None
+    try:
+        start, end = float(segment["start"]), float(segment["end"])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (math.isfinite(start) and math.isfinite(end)):
+        return None
+    return start, end
+
+
 def select_transcript_window(
     segments: Iterable[Any],
     timestamp_sec: float,
@@ -416,14 +443,10 @@ def select_transcript_window(
             # past several multiples of it is work with no reader (the same
             # bounded-work discipline as the redaction patterns).
             break
-        if not isinstance(segment, Mapping) or "start" not in segment or "end" not in segment:
+        bounds = segment_bounds(segment)
+        if bounds is None:
             continue
-        try:
-            start, end = float(segment["start"]), float(segment["end"])
-        except (TypeError, ValueError):
-            continue
-        if not (math.isfinite(start) and math.isfinite(end)):
-            continue
+        start, end = bounds
         if end >= low and start <= high:
             text = str(segment.get("text", "")).strip()
             if text:

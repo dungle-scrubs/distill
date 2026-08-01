@@ -19,6 +19,7 @@ so editing it changes bundle content at an unchanged **bundle key**.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from .artifacts import FrameArtifact, document_carries_a_reading, serialize
@@ -142,6 +143,8 @@ def response_frames(frames: list[FrameArtifact]) -> list[dict[str, Any]]:
     `run_response`. The names overlap with the carrier's without being the
     carrier's: what a stage passes along and what a reader is served are two
     schemas, and the second one is this module's to change (D-015).
+    `frame_carrier_document` is the way back, for a reader that has only the
+    manifest and needs carriers again.
 
     A carrier in and a document out, never a document in, and the way out is
     `serialize`. A **manifest** is durable and a response is what a caller
@@ -173,6 +176,35 @@ def response_frames(frames: list[FrameArtifact]) -> list[dict[str, Any]]:
             item["salience"] = document["salience"]
         response.append(item)
     return response
+
+
+def frame_carrier_document(document: Mapping[str, Any]) -> dict[str, Any]:
+    """The **frame artifact** document one of these frames projects back to.
+
+    The inverse of `response_frames`, and here for the reason the forward
+    direction is: two schemas share names without being the same schema, and
+    the translation between them is this module's whether it is read left to
+    right or right to left. A reader rebuilding carriers out of a **manifest**
+    that spelled `ocr_text` itself would be a third module holding an opinion
+    about what a frame is called, which is exactly what M4.4 removed.
+
+    A document in and a document out, never a carrier: `FrameArtifact.from_document`
+    is what turns the result into one, and it is the only thing that may - it
+    is where R-23 puts the **redaction** policy the caller is running under.
+
+    `path` is absent from the result because it is absent from the manifest, on
+    purpose: it addresses the producing machine, and what replaces it is a
+    reader's own **generation** directory - which this module does not have and
+    would be producing a path to have. The caller supplies it.
+    """
+    return {
+        "index": document.get("index"),
+        "timestamp_sec": document.get("timestamp_sec"),
+        "relative_path": document.get("relative_path"),
+        "extracted_text": document.get("ocr_text", ""),
+        "interpretation": document.get("visual_interpretation"),
+        "salience": document.get("salience"),
+    }
 
 
 def run_response(

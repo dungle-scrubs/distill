@@ -31,6 +31,7 @@ stages hand to the writers, so it must not depend on either side.
 from __future__ import annotations
 
 import dataclasses
+import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -309,6 +310,15 @@ def _fits_declaration(value: Any, declared: Any) -> bool:
     `validated_stage_payload` refuses it in a schema version: `True` is an
     instance of `int` and equals 1, so a document whose `index` is a boolean
     would otherwise be a frame numbered 1.
+
+    A `float` that is not finite is refused for a reason of the same kind, and
+    it took a read-side render to reach: `inf` and `nan` are not JSON (`errors`
+    says so where it coerces a **fatal error**'s details), so a carrier holding
+    one serializes to a **manifest** no strict reader can parse - and the
+    render turns a timestamp into a clock face, which is where `nan` ends a
+    command on `cannot convert float NaN to integer` rather than on a diagnosis.
+    An `int` is finite by construction and is passed here without asking, so a
+    value too large for a float is not converted merely to be checked.
     """
     origin = get_origin(declared)
     if origin is UnionType or origin is Union:
@@ -327,7 +337,9 @@ def _fits_declaration(value: Any, declared: Any) -> bool:
             return not arms or all(_fits_declaration(item, arms[0]) for item in value)
         return isinstance(value, origin)
     if declared is float:
-        return isinstance(value, int | float) and not isinstance(value, bool)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return False
+        return isinstance(value, int) or math.isfinite(value)
     if declared is int:
         return isinstance(value, int) and not isinstance(value, bool)
     if isinstance(declared, type):
@@ -873,21 +885,29 @@ class FrameArtifact(Carrier):
 
         A **resume** reads its scratch back off disk as plain JSON, so the
         carriers a stage produced have to be reconstituted before the next stage
-        can add to them.
+        can add to them. `filtered_view` is the other caller: it rebuilds a
+        frame out of a **manifest** to render a bundle it did not produce.
 
-        `redaction` is the *resuming run's* policy and is required, never the
+        `redaction` is the *reading caller's* policy and is required, never the
         state the document claims. The document is something another process
         wrote, so its claims are input (R-23's premise): a forged stage result
         recording `disabled` would otherwise downgrade a run that asked for
-        redaction, and the text it carries would be published raw. Taking the
-        run's policy instead cannot be wrong, because `redact_secrets`
-        participates in the **options hash** and so in the **bundle key** - a
-        document under this bundle key was written by a run under this policy.
+        redaction, and the text it carries would be published raw.
 
-        Warnings recorded on the document come back with it, and this
-        reconstruction adds none of its own in any reachable case: the text was
-        already capped and redacted before it was written, so the policy running
-        again over it changes nothing and has nothing to report.
+        Warnings recorded on the document come back with it, and what this
+        reconstruction adds to them depends on which caller is asking. On the
+        resume route it adds nothing: `redact_secrets` participates in the
+        **options hash** and so in the **bundle key**, so a document under this
+        bundle key was written by a run under this policy, and re-running the
+        policy over text already capped and redacted changes nothing and has
+        nothing to report. The read-side route is where that stops holding.
+        `filtered_view` passes `APPLIED` for every bundle including one
+        published under `--no-redact-secrets` (A-001/D-019), so over that
+        bundle the policy has work to do and something to say: the rebuilt
+        frame's text is redacted where the stored **render**'s is not, and it
+        carries redaction warnings the **generation** never raised. That
+        divergence is accepted rather than incidental - a view is a reader, and
+        no reader is owed less redaction than the generation it reads.
 
         Unknown keys are dropped rather than refused - the document is scratch,
         and a field this Distill does not know about is one an older one wrote.
@@ -955,9 +975,11 @@ class Transcript(Carrier):
     def from_document(cls, document: Mapping[str, Any], *, redaction: RedactionState) -> Transcript:
         """Rebuild a transcript from a document a **stage result** recorded.
 
-        The resume route, on the same terms as `FrameArtifact.from_document`,
-        including that `redaction` is the resuming run's policy rather than the
-        one the document claims for itself.
+        The resume route and the read-side one, on the same terms as
+        `FrameArtifact.from_document`, including that `redaction` is the
+        reading caller's policy rather than the one the document claims for
+        itself - and including what that costs when the caller is a view over
+        a bundle published under `--no-redact-secrets`.
 
         What a segment holds is not this carrier's - `transcript.py` decides
         that - so segments are passed through as the documents they are and
