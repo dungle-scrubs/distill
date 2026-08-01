@@ -123,7 +123,7 @@ from .run_command import (
     run_json,
     stream,
 )
-from .vision_chain import ResolvedRun, resolve_chain
+from .vision_chain import CandidateKey, ResolvedRun, candidate_keys, resolve_chain
 from .youtube import (  # noqa: F401  re-exported: the YouTube client
     NO_PLAYLIST_ARG as NO_PLAYLIST_ARG,
 )
@@ -523,6 +523,47 @@ def _probe_endpoint(endpoint: LocalVisionConfig) -> bool:
     return probe_local_vision(endpoint).available
 
 
+def _chain_for(options: DistillOptions) -> tuple[LocalVisionConfig, ...]:
+    """The **endpoint chain** these options name, however they were built.
+
+    A config that names no chain still names an endpoint. `DistillOptions`
+    reached through `from_args` carries the one-entry chain `_with_chain`
+    derived, but one constructed directly does not - and treating an empty chain
+    as the whole answer would exhaust immediately, re-keying a run that has a
+    perfectly good endpoint configured the old way.
+
+    Named once because two questions need it: which endpoint to walk, and which
+    **candidate key** a run already holding an answer is on. Those must see the
+    same chain or the second would describe a run that never existed.
+    """
+    return options.local_vision_endpoints or (options.local_vision_config(),)
+
+
+def candidate_in_hand(options: DistillOptions, source_type: str) -> CandidateKey | None:
+    """Which **candidate key** a run carrying these options is already on.
+
+    A `ResolvedRun` is produced by a walk and then discarded: what survives into
+    a run is the options the walk settled, which carry the **vision mode** and
+    the endpoint but not the *position* in the chain. An operator comparing
+    where a run started with where it ended needs that position on both sides,
+    so it is recovered here rather than carried - by re-deriving the candidates
+    and finding the one whose **options hash** this run's options produce.
+
+    Re-derived rather than matched on the endpoint's address, because address is
+    not identity (ADR-0004) and `candidate_keys` is the one place that knows how
+    a candidate is built. Matching on the hash asks that one place.
+
+    `None` when no candidate matches, which is not a run this module produced -
+    options assembled by hand, or a chain edited since the walk. The caller is
+    told rather than given a position that would be a guess.
+    """
+    opts_hash = options.opts_hash(source_type)
+    for candidate in candidate_keys(options, _chain_for(options), source_type):
+        if candidate.opts_hash == opts_hash:
+            return candidate
+    return None
+
+
 def _resolved_for(
     options: DistillOptions,
     fingerprint: str,
@@ -541,15 +582,9 @@ def _resolved_for(
     A caller that named no **output root** has no store to ask, so every
     candidate reads as absent and the walk goes straight to probing.
     """
-    # A config that names no chain still names an endpoint. `DistillOptions`
-    # reached through `from_args` carries the one-entry chain `_with_chain`
-    # derived, but one constructed directly does not - and resolving an empty
-    # chain would exhaust immediately, re-keying a run that has a perfectly good
-    # endpoint configured the old way.
-    chain = options.local_vision_endpoints or (options.local_vision_config(),)
     return resolve_chain(
         options,
-        chain,
+        _chain_for(options),
         source_type,
         cached=lambda opts_hash: (
             None
