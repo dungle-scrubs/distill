@@ -35,6 +35,7 @@ from .bundle_store import (
 from .cache_doctor import inspect_cache
 from .config import resolve_options
 from .errors import DistillError, WarningRecord, aggregate_warnings
+from .filtered_view import filtered_view_markdown
 from .frame_selection import select_keyframes
 from .job_store import JobOutcome, JobStore
 from .local_vision import (
@@ -1445,6 +1446,32 @@ def cache_doctor(args: dict[str, Any]) -> dict[str, Any]:
         keep_generations=policy.keep_generations,
         max_age_days=policy.max_age_days,
     )
+
+
+def filtered_view(args: dict[str, Any]) -> dict[str, Any]:
+    """The non-authoritative filtered view of a published **bundle** (D-006).
+
+    The root is resolved here rather than in `filtered_view.py` for the reason
+    `cache_doctor` is: the read-only module is handed a root the option layers
+    already settled, so `distill filtered-view` reads the root a run would have
+    published into rather than the default one while runs go elsewhere. Not
+    created, either - a command that only reads has to be safe to point at a
+    path the operator mistyped, and creating a directory to report that no
+    bundle is under it is a mutation.
+
+    JSON, and the document under `markdown`, because R-46's contract is one
+    shape on stdout: a command that printed a bare document would be the one an
+    operator's parser has to special-case. The root and key travel beside it so
+    a redirected view says which bundle it is a view of - the banner says what
+    the document omits and nothing about where it came from.
+    """
+    root = validate_output_root(configured_args(args).get("output_dir"), create=False)
+    bundle_key = str(args.get("bundle_key", ""))
+    return {
+        "root": str(root),
+        "bundle_key": bundle_key,
+        "markdown": filtered_view_markdown(root, bundle_key),
+    }
 
 
 def get_job_status(args: dict[str, Any]) -> dict[str, Any]:

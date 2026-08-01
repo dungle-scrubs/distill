@@ -41,6 +41,7 @@ from .options import OPTION_SPECS, PROCESSING_OPTION_NAMES
 from .pipeline import (
     DistillSession,
     call_registered_tool,
+    filtered_view,
     list_tools,
     local_vision_diagnostics,
     run_timeout_probe,
@@ -358,6 +359,19 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("job_id")
     status.add_argument("--output-dir")
 
+    # Read-only like `cache-doctor`, and deliberately without a --dry-run flag
+    # for the same reason: there is no other mode. A preview exists to stand in
+    # for a run that would change something, and this one produces a view on
+    # demand that is never written back (D-006), so a `--dry-run` would preview
+    # itself. The pair of arguments is `get-job-status`'s - one identifier the
+    # record is under, and the root to look for it in - because the question is
+    # the same question asked of a bundle instead of a job.
+    view = subcommands.add_parser(
+        "filtered-view", help="Render the non-authoritative filtered view of a published bundle"
+    )
+    view.add_argument("bundle_key")
+    view.add_argument("--output-dir")
+
     subcommands.add_parser("list-tools", help="List tool names")
     subcommands.add_parser("timeout-diagnostics", help="Show configured timeout diagnostics")
 
@@ -439,6 +453,8 @@ def _dispatch(argv: list[str] | None) -> None:
         _print_json(
             call_registered_tool("get_job_status", _args_payload(args, ("job_id", "output_dir")))
         )
+    elif args.command == "filtered-view":
+        _print_json(filtered_view(_args_payload(args, ("bundle_key", "output_dir"))))
     elif args.command == "list-tools":
         _print_json(list_tools())
     elif args.command == "timeout-diagnostics":
