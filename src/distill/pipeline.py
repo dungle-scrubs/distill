@@ -13,7 +13,7 @@ import re
 import sys
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -361,6 +361,25 @@ class ProcessingRun:
     fails, the batch proceeds, and re-running picks it up as a cache hit.
     """
 
+    waited_sec: float = field(default=0.0, init=False)
+    """How long this run has spent queueing for a **bundle key**, in total.
+
+    Summed rather than taken from the hold it is working under, because a run
+    that re-keyed queued twice: the second queue gets what is left of the budget
+    (D-044) and is usually the shorter one, so reporting it alone would tell a
+    caller that a run which waited out five minutes waited none.
+    """
+
+    rekeyed_from: str | None = field(default=None, init=False)
+    """The **bundle key** this run queued for and gave up, once it has.
+
+    State the run acquires rather than an input, which is why it is not
+    constructible: it is set at the one point a run can move (D-005), and a
+    caller that could hand one in could tell a response a run moved when it did
+    not. It reaches that response because a re-keyed run answers under a key
+    nobody asked for, and the caller is owed the key it did ask for.
+    """
+
     def execute(self) -> dict[str, Any]:
         """Produce this run's **generation**, or hand back the one already published.
 
@@ -414,13 +433,20 @@ class ProcessingRun:
         budget is the same fact about this run either way. Stated twice, a later
         change to what `resume` or `reuse_active` mean here would reach one of
         them, and the re-key path is the one nobody exercises by hand.
+
+        Being the only place, it is also where the run is charged for what
+        queueing cost. `begin` reports its wait on both arms - the hold and the
+        cache hit a waiter coalesced onto - so the sum is total by construction
+        rather than by every caller remembering to add its own.
         """
-        return store.begin(
+        began = store.begin(
             bundle_key,
             wait_sec=wait_sec,
             resume=self.options.resume_partial,
             reuse_active=not self.options.force_reprocess,
         )
+        self.waited_sec += began.waited_sec
+        return began
 
     def _settled_after_wait(
         self, store: BundleStore, run: BundleRun
@@ -565,6 +591,10 @@ class ProcessingRun:
         """
         self._log_divergence("chain_diverged", run, revalidated)
         run.abandon(f"chain_rekeyed: {revalidated.bundle_key}")
+        # Recorded before the run stops being the run that held it: from here
+        # on `self.source.source_hash` is the new key, and the only account of
+        # the old one outside the log is this.
+        self.rekeyed_from = run.bundle_key
         self.options = revalidated.resolution.options
         self.source = replace(
             self.source,
@@ -635,6 +665,8 @@ class ProcessingRun:
             artifact_path=self._emit_artifact(snapshot),
             progress=progress_summary,
             job_id=self.options.job_id,
+            waited_sec=self.waited_sec,
+            rekeyed_from=self.rekeyed_from,
         )
 
     def _run_stage[StageValue](
@@ -1016,6 +1048,8 @@ class ProcessingRun:
             artifact_path=self._emit_artifact(snapshot),
             progress=progress_summary,
             job_id=self.options.job_id,
+            waited_sec=self.waited_sec,
+            rekeyed_from=self.rekeyed_from,
         )
 
 

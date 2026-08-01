@@ -592,6 +592,15 @@ def _resolved_for(
             else servable_interpretation_count(output_root, source_hash(fingerprint, opts_hash))
         ),
         probe=_probe_endpoint,
+        # The clock that arms `PROBE_CEILING_SEC`. `resolve_chain` enforces its
+        # shared ceiling only when a caller supplies one, which is what lets
+        # tests about *selection* ignore time - and left production walking with
+        # no ceiling at all, so a four-entry chain of unreachable endpoints cost
+        # four connect timeouts end to end, which is the multiplication
+        # P3-D-020 exists to refuse. Monotonic, because what is being bounded is
+        # an elapsed duration and a wall clock corrected mid-walk would either
+        # cut it short or never end it.
+        now=time.monotonic,
     )
 
 

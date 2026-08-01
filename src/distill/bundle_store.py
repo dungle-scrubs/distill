@@ -125,7 +125,7 @@ import shutil
 import stat
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -442,6 +442,19 @@ class BundleSnapshot:
     bundle_key: str
     generation: Path
     manifest: dict[str, Any]
+    waited_sec: float = 0.0
+    """How long the acquisition that handed this back waited for the run lock.
+
+    Not a property of the generation - a property of *getting to it*, and it
+    travels here because `begin` hands a caller either this or a `BundleRun` and
+    the wait is the same fact on both arms. A run that coalesced onto another
+    run's publish is otherwise indistinguishable, from the outside, from one
+    that found the bundle already there: both are cache hits, and only one of
+    them cost five minutes.
+
+    Zero for a snapshot `load_active` read on its own, which is honest rather
+    than a placeholder: a read that takes no lock queues for nothing.
+    """
 
     @property
     def markdown(self) -> Path:
@@ -1052,9 +1065,12 @@ class BundleStore:
             snapshot = self.load_active(bundle_key) if reuse_active else None
             if snapshot is not None:
                 # A cache hit holds nothing: the question the lock was taken to
-                # answer has been answered, so the next run may have it.
+                # answer has been answered, so the next run may have it. The
+                # wait travels with the hand-back rather than being dropped
+                # here: this is the coalescing waiter, the one caller for whom
+                # the wait is the most of what happened to it.
                 lock.release()
-                return snapshot
+                return replace(snapshot, waited_sec=waited_sec)
             directory = self.bundle_root(bundle_key)
             ensure_safe_directory(directory, self.root)
             write_ownership_marker(directory, bundle_key)
@@ -1234,6 +1250,11 @@ class BundleStore:
             bundle_key=current.bundle_key,
             generation=current.generation,
             manifest=manifest,
+            # An amendment re-reads the generation; it does not re-acquire it.
+            # The wait belongs to the caller's hand-back, and re-reading under a
+            # short-lived amendment lock would report the amendment's wait as
+            # the run's.
+            waited_sec=snapshot.waited_sec,
         )
 
     def plan_prune(self, policy: PrunePolicy) -> PrunePlan:
@@ -1865,6 +1886,11 @@ class BundleRun:
             bundle_key=self.bundle_key,
             generation=final_paths.generation,
             manifest=published_manifest(manifest, final_paths),
+            # The wait this run spent to get the hold it just published under.
+            # A fresh publish and a cache hit are described from the same
+            # snapshot, so the wait has to survive the publish or it would reach
+            # a caller on one arm and not the other.
+            waited_sec=self.waited_sec,
         )
 
     def abandon(self, reason: str, *, during: BaseException | None = None) -> None:

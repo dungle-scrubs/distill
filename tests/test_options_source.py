@@ -1344,6 +1344,76 @@ def test_key_derivation_uses_the_endpoint_the_walk_selected(
     assert resolved.options.opts_hash("local") == resolved.opts_hash
 
 
+def test_the_walk_source_resolution_performs_is_bounded_by_the_probing_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """<!-- P3-D-020 --> A chain of dead endpoints costs one ceiling, not one each.
+
+    `resolve_chain` enforces its shared ceiling only for a caller that hands it
+    a clock - the seam that lets tests about *selection* ignore time entirely -
+    so a production walk supplying none was a walk with no ceiling at all, and a
+    four-entry chain of unreachable endpoints cost four connect timeouts end to
+    end. That is the multiplication the ceiling exists to refuse, and a
+    revalidation walk pays it on a run that has already waited minutes.
+
+    Asserted here rather than beside the ceiling's own tests because what can
+    regress is the *call*: the walk has always known how to stop.
+    """
+    from distill import source
+    from distill.local_vision import LocalVisionConfig
+    from distill.source import _resolved_for
+    from distill.vision_chain import DEADLINE_SPENT, UNAVAILABLE
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "first-dead-reader", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "second-dead-reader", "base_url": "http://127.0.0.1:9000/v1"},
+                    {"model": "never-reached-reader", "base_url": "http://127.0.0.1:9100/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    options = DistillOptions.from_args({})
+
+    class Elapsing:
+        """`time` as `source` reads it, with a monotonic this test moves.
+
+        A stand-in for the module rather than a patch of the real one, because
+        the clock under test is the one `_resolved_for` reaches for by name and
+        nothing else in this process should start seeing a fabricated time.
+        """
+
+        elapsed = 0.0
+
+        def monotonic(self) -> float:
+            return self.elapsed
+
+    clock = Elapsing()
+    asked: list[str] = []
+
+    def probe(config: LocalVisionConfig) -> bool:
+        # Each dead endpoint costs two thirds of the ceiling, as a connect
+        # timeout does: two of them fit and the third is never reached.
+        asked.append(config.model)
+        clock.elapsed += 20.0
+        return False
+
+    monkeypatch.setattr(source, "time", clock)
+    monkeypatch.setattr(source, "_probe_endpoint", probe)
+
+    resolved = _resolved_for(options, "a-fingerprint", "local", None)
+
+    assert asked == ["first-dead-reader", "second-dead-reader"]
+    assert [outcome.outcome for outcome in resolved.evidence] == [
+        UNAVAILABLE,
+        UNAVAILABLE,
+        DEADLINE_SPENT,
+    ]
+
+
 def test_a_resolution_selecting_entry_one_leaves_no_entry_zero_field_behind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

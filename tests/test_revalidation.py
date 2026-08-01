@@ -49,6 +49,7 @@ from distill.bundle_store import (
     BATCH_ITEM_LOCK_WAIT_SEC,
     MANIFEST_NAME,
     SINGLE_SOURCE_LOCK_WAIT_SEC,
+    BundleRun,
     BundleStore,
 )
 from distill.errors import DistillError
@@ -61,7 +62,9 @@ from distill.options import (
 )
 from distill.pipeline import REKEY_BOUND_REASON, ProcessingRun
 from distill.progress import ProgressReporter
+from distill.release import DISTILL_VERSION
 from distill.source import SourceInfo, _resolved_for
+from distill.version import PIPELINE_VERSION
 from distill.vision_chain import (
     DEFAULT_MEMO_TTL_SEC,
     REVALIDATE_AFTER_WAIT_SEC,
@@ -165,6 +168,63 @@ def _fake_interpret(
     return frames, []
 
 
+ANOTHER_RUNS_READING = "a reading the waiting run never did"
+"""What the **interpretation** in a rival run's generation says.
+
+Text the waiting run's own stages cannot produce - they interpret nothing - so a
+response carrying it is proof the bundle was served rather than produced again,
+which is the whole question when a re-key lands on a key that already holds
+work.
+"""
+
+
+def _publish_a_generation(root: Path, bundle_key: str) -> None:
+    """Publish a servable **generation** under `bundle_key`, as another run would.
+
+    Through `begin` and `commit` rather than by writing files, because what is
+    being staged is the exact thing a re-key can collide with: an **active
+    generation** a rival run published while this one waited. A directory
+    assembled by hand would prove only that the test can write a manifest.
+
+    The frame carries a reading because a `selected` **candidate key** promises
+    one (P3-D-019). Without it the second walk reads the key as a miss, probes,
+    and reaches the same place for the wrong reason - so the branch under test
+    would be entered by luck rather than by the cache scan that ordinarily
+    enters it.
+    """
+    run = BundleStore.open(root).begin(bundle_key)
+    assert isinstance(run, BundleRun)
+    image = run.frames_dir / "frame_0001.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    run.paths.markdown.write_text("# Another run got here first\n")
+    run.paths.self_contained_markdown.write_text("# Another run got here first\n")
+    run.commit(
+        {
+            "pipeline_version": PIPELINE_VERSION,
+            "distill_version": DISTILL_VERSION,
+            "source_type": "local",
+            "source_hash": bundle_key,
+            "source_resolved_path": "another-run's-source",
+            "duration_sec": 1.0,
+            "options": {},
+            "frame_count": 1,
+            "transcript_present": False,
+            "warning_count": 0,
+            "frames": [
+                {
+                    "index": 1,
+                    "timestamp_sec": 0.0,
+                    "path": str(image),
+                    "relative_path": "frames/frame_0001.png",
+                    "ocr_text": "",
+                    "visual_interpretation": {"visual_summary": ANOTHER_RUNS_READING},
+                }
+            ],
+            "warnings": [],
+        }
+    )
+
+
 @dataclass
 class Contended:
     """One `execute()` that came out of a wait, and what the wait cost.
@@ -238,6 +298,7 @@ def _run_that_waited(
     answers: Callable[[LocalVisionConfig, int], bool] = lambda _endpoint, _walk: True,
     skipped_at_resolution: tuple[LocalVisionConfig, ...] = (),
     held_throughout: tuple[str, ...] = (),
+    published_during_wait: tuple[str, ...] = (),
 ) -> Contended:
     """A whole run of one source, held out of its own **bundle key** for `seconds`.
 
@@ -257,6 +318,8 @@ def _run_that_waited(
 
     `held_throughout` names bundle keys some other run never gives up, for the
     case where the key a re-key moves *to* is itself contended.
+    `published_during_wait` names keys another run finishes under while this one
+    is still queueing - the ordinary way a second walk finds work already done.
     """
     root = tmp_path / "output"
     root.mkdir()
@@ -274,18 +337,19 @@ def _run_that_waited(
     walk: dict[str, int] = {"index": -1}
 
     def resolving(*args: Any, **kwargs: Any) -> Any:
-        """`resolve_chain` with the memo and the clock this test drives.
+        """`resolve_chain` with the memo this test drives.
 
-        Production wires neither yet, so the seams `resolve_chain` already
-        accepts are filled in here rather than reached around: the walk stays
-        the real one, and what changes between two walks is only what an
-        endpoint answered and how much of the memo's life had run.
+        Production wires no memo, so the `skip` seam `resolve_chain` already
+        accepts is filled in here rather than reached around: the walk stays the
+        real one, and what changes between two walks is only what an endpoint
+        answered and how much of the memo's life had run. The memo reads this
+        test's clock directly, so the walk's own `now` - which production
+        supplies, to arm the probing ceiling - passes through untouched.
         """
         walk["index"] += 1
         return resolve_chain(
             *args,
             skip=lambda endpoint: memo.skips(endpoint, now=clock.now),
-            now=clock.monotonic,
             **kwargs,
         )
 
@@ -306,9 +370,17 @@ def _run_that_waited(
     holder: dict[str, int | None] = {"fd": hold_the_lock(root, bundle_key)}
     others = [hold_the_lock(root, key) for key in held_throughout]
 
+    unpublished = list(published_during_wait)
+
     def sleep(interval: float) -> None:
         before = clock.now
         clock.sleep(interval)
+        while unpublished:
+            # A rival run finishing while this one is still in the poll loop,
+            # which is what makes the generation appear *during* the wait: one
+            # published before the run started would be found by the first walk
+            # and there would be no divergence to test.
+            _publish_a_generation(root, unpublished.pop())
         if clock.now == before:
             # A poll loop asked for a delay this clock cannot represent: the
             # interval has fallen below the float's resolution at the time it
@@ -551,6 +623,132 @@ def test_the_divergence_names_both_keys_both_entries_and_both_readers(
         if event["event"] == "lock_acquired"
     ]
     assert acquired == [detail["bundle_key"], detail["new_bundle_key"]]
+
+
+def test_the_response_reports_the_whole_wait_and_the_key_the_run_left(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A re-keyed run answers under a key nobody asked it about.
+
+    Everything revalidation does is a DEBUG event, and DEBUG is off: an MCP
+    caller that asked about one **bundle key** and was handed a response naming
+    another has, without these two fields, no way to find out why short of
+    turning logging up and reproducing a contention window that has closed.
+    `rekeyed_from` is the key it asked about, and `waited_sec` is why the run
+    moved at all.
+
+    The wait is the run's, not the hold's, and the difference is the assertion:
+    this run spent its whole budget on the first key and queued for the second
+    one with the second that was left, so a `waited_sec` read off the hold it
+    finished under would report a five-minute run as an instant one.
+    """
+    contended = _run_that_waited(
+        WAIT_THAT_OUTLIVES_THE_MEMO,
+        tmp_path,
+        monkeypatch,
+        caplog,
+        chain=CHAIN,
+        skipped_at_resolution=(PREFERRED,),
+    )
+
+    assert contended.response["source_hash"] == _key_of(CHAIN, 0)
+    assert contended.response["rekeyed_from"] == contended.bundle_key
+    assert contended.response["waited_sec"] == pytest.approx(
+        WAIT_THAT_OUTLIVES_THE_MEMO, abs=0.05
+    )
+
+
+def test_a_run_that_kept_its_key_says_it_kept_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`rekeyed_from` is a fact every response states, including the boring one.
+
+    A field only a re-keyed run carries would make its absence ambiguous - a run
+    that did not move and a build that does not report moving would read the
+    same. `None` is the answer, stated, and the wait beside it is what says this
+    run was contended at all: it spent a whole batch-item budget queueing and
+    still published under the key it resolved to.
+    """
+    contended = _run_that_waited(BATCH_ITEM_LOCK_WAIT_SEC, tmp_path, monkeypatch, caplog)
+
+    assert contended.response["source_hash"] == contended.bundle_key
+    assert contended.response["rekeyed_from"] is None
+    assert contended.response["waited_sec"] == pytest.approx(BATCH_ITEM_LOCK_WAIT_SEC, abs=0.05)
+
+
+def test_a_re_key_onto_a_key_another_run_published_serves_it_and_stops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The likeliest divergence of all: the new key already holds the answer.
+
+    A second walk scans every **candidate key** against the store before it asks
+    anything of the network, so the ordinary way it diverges is not that an
+    endpoint came back - it is that some other run published under a sibling key
+    while this one queued. That resolution is a cache hit, the run re-keys onto
+    it, and the `begin` that follows finds an **active generation** under the
+    lock rather than a hold.
+
+    There is nothing left to do at that point, and the assertion is that the run
+    agrees: it serves what it found. A run that fell through instead would redo
+    the whole vision pass and publish *over* another run's generation while
+    reporting the key it had already left - the three-artifact disagreement
+    P3-D-015 exists to prevent, on the one path where the wrong answer is also
+    the plausible-looking one.
+
+    The reading is the proof, because this run's own stages interpret nothing:
+    a response carrying one is a response describing somebody else's generation.
+    `rekeyed_from` is the other half - the caller asked about a key this
+    response does not name, and this is the only place outside a DEBUG log where
+    those two keys are stated together.
+    """
+    rekeyed = _key_of(CHAIN, 0)
+
+    contended = _run_that_waited(
+        WAIT_THAT_OUTLIVES_THE_MEMO,
+        tmp_path,
+        monkeypatch,
+        caplog,
+        chain=CHAIN,
+        skipped_at_resolution=(PREFERRED,),
+        published_during_wait=(rekeyed,),
+    )
+
+    assert contended.bundle_key == _key_of(CHAIN, 1)
+    assert contended.response["source_hash"] == rekeyed
+    assert contended.response["rekeyed_from"] == contended.bundle_key
+    assert contended.response["cached"] is True
+    # A coalescing waiter is a cache hit that cost five minutes, and the wait
+    # travels on the hand-back rather than being dropped with the lock - so the
+    # one caller for whom the wait was most of what happened still hears it.
+    assert contended.response["waited_sec"] == pytest.approx(
+        WAIT_THAT_OUTLIVES_THE_MEMO, abs=0.05
+    )
+    served = contended.response["frames"][0]["visual_interpretation"]
+    assert served["visual_summary"] == ANOTHER_RUNS_READING
+    # The cache scan answered, so no endpoint was asked on the way here - and
+    # the confirming walk the re-key would otherwise make never runs, because
+    # there is no run left to confirm a key for.
+    assert contended.probes == []
+    assert _counted(contended.pipeline_events, "chain_diverged") == 1
+    assert _counted(contended.pipeline_events, "chain_divergence_declined") == 0
+    # Three acquisitions, and the order is the whole sequence: the rival run
+    # publishing, this run's wait ending on the key it queued for, and its
+    # re-key onto the rival's. The last is `begin`'s own and is given straight
+    # back, because a hand-back holds nothing.
+    acquired = [
+        event["detail"]["bundle_key"]
+        for event in contended.lock_events
+        if event["event"] == "lock_acquired"
+    ]
+    assert acquired == [rekeyed, contended.bundle_key, rekeyed]
+    assert lock_is_held(lock_path(contended.root, rekeyed)) is False
+    assert lock_is_held(lock_path(contended.root, contended.bundle_key)) is False
 
 
 def test_a_second_divergence_is_recorded_rather_than_acted_on(
