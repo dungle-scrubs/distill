@@ -352,6 +352,13 @@ because the text was capped and redacted at write time. For one published with
 carries redaction warnings the generation never recorded: for those bundles it
 is deliberately not a faithful projection of the render sitting beside it.
 
+**One thing it cannot show you.** A manifest records what the vision model read
+from each keyframe but not Distill's assessment of whether the on-screen-text
+reader confirmed that reading, so the view omits the corroboration note that
+sits above a reading in the stored render. The readings themselves are all
+there; what is missing is the line saying whether anything backed them up. When
+that line is what you are after, read the generation's own `video.md`.
+
 The processing commands (`process-local-video`, `process-youtube-video`,
 `process-video-directory`, `process-youtube-playlist`) share these options: `--whisper-model`,
 `--whisper-language`, `--ocr`/`--no-ocr`, `--ocr-language`, `--ocr-preprocess`,

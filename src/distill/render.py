@@ -431,6 +431,35 @@ FILTERED_VIEW_BANNER = (
     "is never written back, and does not exist under the bundle key (D-006)."
 )
 
+EVERY_FRAME_REDUNDANT_NOTE = (
+    "Every frame in this generation was judged redundant against the "
+    "surrounding speech. The stored render contains them all."
+)
+"""Said when the filter took every frame, above whatever else survived it.
+
+A note rather than the whole document, because the frames are the only thing
+this view filters: a generation whose speech fills a render still has that
+render to show, and returning the note alone would drop the transcript, the
+source, the warnings and the related links over a judgment that was never
+about them.
+"""
+
+NOTHING_LEFT_NOTE = (
+    "Nothing in this generation survives this reading: it records no transcript "
+    "text, and no frame left standing carries on-screen text or a model reading. "
+    "The stored render is the complete account."
+)
+"""Said when the filtered set has nothing a reader could read.
+
+The other half of `EVERY_FRAME_REDUNDANT_NOTE`'s case, and the reason the
+filtered path never calls `ensure_content`: `E_NO_CONTENT` is a **fatal error**
+a *run* raises about a generation it is producing, and this path is reading one
+that already passed that check with its full frame set. Telling an operator
+their intact, servable bundle produced no content - on the strength of a model's
+salience opinion about its frames - is a verdict a read-side view has no
+standing to reach.
+"""
+
 
 def render_filtered_markdown(
     source_label: str,
@@ -449,6 +478,14 @@ def render_filtered_markdown(
     dropped: absent salience is absence of a judgment, not redundancy, so an
     unjudged frame always stays. The banner says what this is and where the
     complete account lives.
+
+    Frames are the only thing filtered, and the document says so end to end:
+    what survives the filter is rendered in full, so a generation whose every
+    frame was judged redundant still shows its transcript, its source, its
+    warnings and its related links under the banner and a note naming what was
+    taken. Only a filtered set with nothing left to read stops short of a
+    render - and it stops with a note, never with `ensure_content`'s
+    `E_NO_CONTENT`, which is a verdict about a run and not about a reading.
     """
 
     def judged_redundant(frame: FrameArtifact) -> bool:
@@ -456,15 +493,14 @@ def render_filtered_markdown(
         return salience is not None and not salience.adds_information
 
     kept = [frame for frame in frames if not judged_redundant(frame)]
-    if not kept and frames:
-        # A view, not a verdict: everything being judged redundant is a
-        # statement the banner can carry, never the pipeline's no-content
-        # error - this path is read-time and non-authoritative.
-        return (
-            FILTERED_VIEW_BANNER
-            + "\n\nEvery frame in this generation was judged redundant against "
-            "the surrounding speech. The stored render contains them all."
-        )
+    lead = [FILTERED_VIEW_BANNER]
+    if frames and not kept:
+        lead.append(EVERY_FRAME_REDUNDANT_NOTE)
+    if transcript_is_empty(transcript) and frames_are_useless(kept):
+        # A view, not a verdict. The run that published this generation already
+        # passed `ensure_content` against its full frame set, so an empty
+        # reading is what the filter did and not what the bundle is.
+        return "\n\n".join(lead if len(lead) > 1 else [*lead, NOTHING_LEFT_NOTE])
     rendered = render_markdown(
         source_label,
         duration_sec,
@@ -475,7 +511,7 @@ def render_filtered_markdown(
         provenance=provenance,
         include_frame_links=include_frame_links,
     )
-    return f"{FILTERED_VIEW_BANNER}\n\n{rendered}"
+    return "\n\n".join([*lead, rendered])
 
 
 def _corroboration_lines(assessment: GroundingAssessment | None) -> list[str]:

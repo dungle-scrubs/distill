@@ -22,7 +22,13 @@ from distill.bundle_store import MANIFEST_NAME, BundleRun, BundleStore
 from distill.errors import DistillError
 from distill.filtered_view import filtered_view_markdown
 from distill.options import DistillOptions
-from distill.render import FILTERED_VIEW_BANNER, render_markdown
+from distill.render import (
+    EVERY_FRAME_REDUNDANT_NOTE,
+    FILTERED_VIEW_BANNER,
+    NOTHING_LEFT_NOTE,
+    UNCORROBORATED_NOTE,
+    render_markdown,
+)
 from distill.response import manifest_document, response_frames
 from distill.source import SourceInfo
 
@@ -84,6 +90,8 @@ def frame(
     *,
     text: str = "",
     salience: dict[str, Any] | None = None,
+    interpretation: dict[str, Any] | None = None,
+    grounding: dict[str, Any] | None = None,
     redaction: RedactionState = RedactionState.NOT_APPLIED,
 ) -> FrameArtifact:
     """A **frame artifact** addressed into the staging directory of `g1`."""
@@ -94,6 +102,8 @@ def frame(
         path=str(root / BUNDLE_KEY / ".tmp.g1" / relative),
         relative_path=relative,
         extracted_text=text,
+        interpretation=interpretation,
+        grounding=grounding,
         salience=salience,
         redaction=redaction,
     )
@@ -160,7 +170,7 @@ def test_manifest_without_frames_is_a_typed_error(tmp_path: Path) -> None:
     ("malformed", "why"),
     [
         (["frame_0001.png"], "an entry that is not a document at all"),
-        ([{"index": "one", "timestamp_sec": 1.0, "relative_path": "frames/f.png"}], "a text index"),
+        ([{"index": "one", "timestamp_sec": 1.0, "relative_path": "frames/frame_0001.png"}], "a text index"),
         ([{"index": 1, "timestamp_sec": 1.0}], "no relative_path to address the image by"),
         (
             [{"index": 1, "timestamp_sec": 1.0, "relative_path": "../../escape.png"}],
@@ -171,7 +181,7 @@ def test_manifest_without_frames_is_a_typed_error(tmp_path: Path) -> None:
                 {
                     "index": 1,
                     "timestamp_sec": float("inf"),
-                    "relative_path": "frames/f.png",
+                    "relative_path": "frames/frame_0001.png",
                     "ocr_text": "visible",
                 }
             ],
@@ -182,7 +192,7 @@ def test_manifest_without_frames_is_a_typed_error(tmp_path: Path) -> None:
                 {
                     "index": 1,
                     "timestamp_sec": float("nan"),
-                    "relative_path": "frames/f.png",
+                    "relative_path": "frames/frame_0001.png",
                     "ocr_text": "visible",
                 }
             ],
@@ -291,9 +301,132 @@ def test_a_wholly_redundant_generation_is_a_view_and_not_an_error(tmp_path: Path
     view = filtered_view_markdown(root, BUNDLE_KEY)
 
     assert view.startswith(FILTERED_VIEW_BANNER)
-    assert "Every frame in this generation was judged redundant" in view
+    assert EVERY_FRAME_REDUNDANT_NOTE in view
     assert "restated once" not in view
     assert "restated twice" not in view
+
+
+def test_a_generation_that_loses_its_last_readable_frame_is_a_view(tmp_path: Path) -> None:
+    """The same property one step in: *some* frames survive, and none of them read.
+
+    `E_NO_CONTENT` is reached by `ensure_content`, which asks whether there is a
+    transcript or a usable frame - not whether every frame was filtered. So a
+    generation whose one text-carrying frame is judged redundant, leaving a
+    frame with neither on-screen text nor a reading, published perfectly well
+    (its own `ensure_content` saw the frame that had text) and would then fail
+    its own view. A **fatal error** over an intact, servable bundle is the
+    verdict a read-side view has no standing to reach, whether the filter took
+    every frame or merely every readable one.
+    """
+    root = tmp_path / "output"
+    publish(
+        root,
+        [
+            frame(root, 1, text="the only text here", salience={"adds_information": False}),
+            frame(root, 2, salience={"adds_information": True}),
+        ],
+    )
+
+    view = filtered_view_markdown(root, BUNDLE_KEY)
+
+    assert view.startswith(FILTERED_VIEW_BANNER)
+    assert NOTHING_LEFT_NOTE in view
+    assert "the only text here" not in view
+
+
+def test_a_wholly_redundant_generation_keeps_the_speech_it_did_not_filter(
+    tmp_path: Path,
+) -> None:
+    """Frames are what this view filters, so a filtered frame costs frames only.
+
+    The banner says redundant *frames* are omitted. A generation whose every
+    frame was judged redundant still has its speech, its source label, its
+    **warnings** and its **related links**, and returning the banner alone
+    would discard all of it over a judgment that was never about any of it -
+    handing a reader a nearly empty document under a banner claiming the stored
+    render merely has more frames.
+    """
+    root = tmp_path / "output"
+    publish(
+        root,
+        [frame(root, 1, text="restated", salience={"adds_information": False})],
+        transcript=Transcript(
+            language="en",
+            segments=({"start": 0.0, "end": 2.0, "text": "a substantial spoken account"},),
+        ),
+    )
+
+    view = filtered_view_markdown(root, BUNDLE_KEY)
+
+    assert view.startswith(FILTERED_VIEW_BANNER)
+    assert EVERY_FRAME_REDUNDANT_NOTE in view
+    assert "a substantial spoken account" in view
+    assert "- Transcript: yes" in view
+    assert "restated" not in view
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "why"),
+    [
+        ("https://tracker.example/pixel.png", "a URL the reader's viewer would fetch"),
+        ("file:///etc/passwd", "a local-file URL the reader's viewer would dereference"),
+        ("frames/../../escape.png", "a traversal spelled inside the frames directory"),
+        ("frames\\frame_0001.png", "a separator this layout does not use"),
+        ("frames/frame_0001.png/x", "a name with something appended to it"),
+        ("frames/notes.txt", "a file in the right place that is not a keyframe"),
+    ],
+)
+def test_a_frame_addressed_by_something_other_than_a_keyframe_is_refused(
+    tmp_path: Path, relative_path: str, why: str
+) -> None:
+    """`relative_path` is what the view *links to*, so it is checked as a path.
+
+    Confinement is not enough on its own and the URLs are why: joined to the
+    generation, `https://tracker.example/pixel.png` is an ordinary relative name
+    that stays inside the bundle root, so `confined_path` accepts it - and the
+    render then prints it verbatim as the image destination, where a reader's
+    markdown viewer fetches it on open. The value has to match the one shape a
+    **keyframe** of this generation has.
+    """
+    root = tmp_path / "output"
+    store = publish(root, [frame(root, 1, text="visible", salience={"adds_information": True})])
+    published = json.loads((store.bundle_root(BUNDLE_KEY) / MANIFEST_NAME).read_text())["frames"]
+    published[0]["relative_path"] = relative_path
+    rewrite_manifest(store, {"frames": published})
+
+    with pytest.raises(DistillError) as raised:
+        filtered_view_markdown(root, BUNDLE_KEY)
+
+    assert raised.value.code == "E_BAD_MANIFEST", why
+
+
+def test_a_manifest_that_miscounts_its_own_frames_is_refused(tmp_path: Path) -> None:
+    """A manifest disagreeing with itself about how many frames it holds.
+
+    `frame_count` is written as `len(frames)` and validated only as an `int`, so
+    a document where the two disagree is one this view has no reading of: the
+    frames it renders are fewer than the frames the manifest says exist, and the
+    absence is indistinguishable - to a reader holding the view - from the
+    judgment of redundancy the banner claims. The same rule as an unreadable
+    frame document, for the same reason.
+    """
+    root = tmp_path / "output"
+    store = publish(
+        root,
+        [
+            frame(root, 1, text="one", salience={"adds_information": True}),
+            frame(root, 2, text="two", salience={"adds_information": True}),
+        ],
+    )
+    published = json.loads((store.bundle_root(BUNDLE_KEY) / MANIFEST_NAME).read_text())["frames"]
+    rewrite_manifest(store, {"frames": published[:1]})
+
+    with pytest.raises(DistillError) as raised:
+        filtered_view_markdown(root, BUNDLE_KEY)
+
+    assert raised.value.code == "E_BAD_MANIFEST"
+    assert raised.value.details["frame_count"] == 2
+    assert raised.value.details["frames"] == 1
 
 
 # `AKIA…` with a fullwidth `Ｉ` in it: no secret rule matches the raw run, and
@@ -445,6 +578,162 @@ def test_an_unplaceable_transcript_segment_is_a_typed_error(
         filtered_view_markdown(root, BUNDLE_KEY)
 
     assert raised.value.code == "E_BAD_MANIFEST", why
+
+
+@pytest.mark.parametrize(
+    ("words", "why"),
+    [
+        ([{"word": "hi"}], "a word entry with no end to place it at"),
+        ([{"word": "hi", "end": None}], "an end that is not a number"),
+        ([{"word": "hi", "end": "later"}], "an end that is not a number either"),
+        ([{"word": "hi", "end": float("inf")}], "an end no clock produced"),
+        (["hi"], "a word entry that is not a document"),
+        ("hi", "a word grid that is not a list"),
+    ],
+)
+def test_a_word_grid_the_view_cannot_walk_is_a_typed_error(
+    tmp_path: Path, words: Any, why: str
+) -> None:
+    """A segment's `words` is walked by the render, so it is checked like its bounds.
+
+    The render interleaves speech with keyframes by advancing through `words`
+    and comparing each `end` against a frame timestamp. An entry with no `end`,
+    an unparseable one, or an entry that is not a document at all does not
+    render badly - it ends a read-only command on a `KeyError`, a `ValueError`
+    or an `AttributeError`, which reaches an operator as an internal failure
+    naming Distill's own machinery over a document another process wrote (R-23).
+    A **transcript** that will not read back is a refusal this view already has
+    a code for.
+    """
+    root = tmp_path / "output"
+    store = publish(
+        root,
+        [frame(root, 1, text="kept", salience={"adds_information": True})],
+        transcript=Transcript(language="en", segments=({"start": 0.0, "end": 2.0, "text": "hi"},)),
+    )
+    snapshot = store.load_active(BUNDLE_KEY)
+    assert snapshot is not None
+    segment = {"start": 0.0, "end": 2.0, "text": "hi", "words": words}
+    snapshot.transcript.write_text(json.dumps({"language": "en", "segments": [segment]}))
+
+    with pytest.raises(DistillError) as raised:
+        filtered_view_markdown(root, BUNDLE_KEY)
+
+    assert raised.value.code == "E_BAD_MANIFEST", why
+
+
+def test_a_word_grid_a_run_wrote_is_walked_rather_than_refused(tmp_path: Path) -> None:
+    """The check above admits the shape a real run publishes, timings and all."""
+    root = tmp_path / "output"
+    store = publish(
+        root,
+        [frame(root, 1, text="kept", salience={"adds_information": True})],
+        transcript=Transcript(language="en", segments=({"start": 0.0, "end": 2.0, "text": "hi"},)),
+    )
+    snapshot = store.load_active(BUNDLE_KEY)
+    assert snapshot is not None
+    snapshot.transcript.write_text(
+        json.dumps(
+            {
+                "language": "en",
+                "segments": [
+                    {
+                        "start": 0.0,
+                        "end": 2.0,
+                        "text": "spoken words",
+                        "words": [
+                            {"word": " spoken", "start": 0.0, "end": 0.5, "probability": 0.9},
+                            {"word": " words", "start": 0.5, "end": 2.0, "probability": 0.9},
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    view = filtered_view_markdown(root, BUNDLE_KEY)
+
+    assert "spoken" in view
+    assert "words" in view
+
+
+def test_manifest_text_no_carrier_covers_is_redacted_too(tmp_path: Path) -> None:
+    """A-001's policy has no per-field exception, so neither does this view.
+
+    Two strings reach this document without belonging to a carrier's
+    extracted-text region: a **warning** record's message, and a **related
+    link**'s `reason`, which its carrier declares to be Distill's own words -
+    true of a link `extract_relevant_links` built and not of one a **manifest**
+    supplied. Both are printed by the render, so both go through this command's
+    own policy; a view that redacted the fields a carrier happens to declare
+    and passed the rest through would be running a policy with a hole in it.
+    """
+    root = tmp_path / "output"
+    store = publish(
+        root,
+        [frame(root, 1, text="kept", salience={"adds_information": True})],
+        warnings=[
+            {
+                "stage": "transcript",
+                "code": "tool_failed",
+                "message": f"the tool exited saying {CONFUSABLE_SECRET}",
+            }
+        ],
+    )
+    rewrite_manifest(
+        store,
+        {
+            "related_links": [
+                {
+                    "url": "https://github.com/a/b",
+                    "label": "the repo",
+                    "source": "metadata",
+                    "reason": f"kept because {CONFUSABLE_SECRET}",
+                }
+            ]
+        },
+    )
+
+    view = filtered_view_markdown(root, BUNDLE_KEY)
+
+    assert CONFUSABLE_SECRET not in view
+    assert "code: tool_failed" in view
+    assert "the repo" in view
+    assert "possible_confusable_secret" in view
+
+
+def test_the_view_drops_the_corroboration_note_the_stored_render_carries(
+    tmp_path: Path,
+) -> None:
+    """The one thing this thaw cannot recover, pinned rather than left to be found.
+
+    `response_frames` never projected **grounding** into the **manifest**, so a
+    frame rebuilt from one has none, and the neutral note that sits above a
+    reading in the stored render is absent here. That is a documented loss
+    (Escape Hatch 3) rather than a silent one: the reading itself survives, and
+    closing the gap means putting grounding in the manifest, which is bundle
+    content and owes a **pipeline version** bump. This test is what makes the
+    loss break loudly if the manifest ever does carry it.
+    """
+    root = tmp_path / "output"
+    read = frame(
+        root,
+        1,
+        salience={"adds_information": True},
+        interpretation={"visual_summary": "a slide about caching", "verbatim_text": "CACHE"},
+        grounding={"level": "ungrounded", "is_corroborated": False},
+    )
+    store = publish(root, [read], render=render_markdown("video.mp4", 2.0, None, [read], []))
+    snapshot = store.load_active(BUNDLE_KEY)
+    assert snapshot is not None
+    stored = snapshot.markdown.read_text()
+
+    view = filtered_view_markdown(root, BUNDLE_KEY)
+
+    assert "a slide about caching" in stored
+    assert UNCORROBORATED_NOTE in stored
+    assert "a slide about caching" in view
+    assert UNCORROBORATED_NOTE not in view
 
 
 @pytest.mark.parametrize(

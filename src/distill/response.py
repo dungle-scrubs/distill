@@ -196,6 +196,15 @@ def frame_carrier_document(document: Mapping[str, Any]) -> dict[str, Any]:
     purpose: it addresses the producing machine, and what replaces it is a
     reader's own **generation** directory - which this module does not have and
     would be producing a path to have. The caller supplies it.
+
+    **Grounding** is absent for a different reason, and it is a loss rather than
+    a decision restated: `response_frames` never projected it, so there is
+    nothing here to map it from and a frame rebuilt from a manifest carries
+    none. A **render** built from these frames therefore prints a reading
+    without the corroboration note that sits above it in the generation's own
+    render. Recovering it means adding `grounding` to the projection above,
+    which is **manifest** content and owes a **pipeline version** bump;
+    `filtered_view` documents the gap for its readers until that is taken.
     """
     return {
         "index": document.get("index"),

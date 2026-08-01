@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -413,6 +413,45 @@ def segment_bounds(segment: Any) -> tuple[float, float] | None:
     if not (math.isfinite(start) and math.isfinite(end)):
         return None
     return start, end
+
+
+def segment_words_are_placeable(segment: Any) -> bool:
+    """Whether a segment's word grid is one a render can place frames inside.
+
+    `segment_bounds` answers where a segment sits; this answers whether the
+    *words* under it can be walked, and the two are separate questions because
+    a render asks both. Interleaving speech with keyframes advances through
+    `words` comparing each `end` against a frame's timestamp, so a word entry
+    that is not a mapping, or one whose `end` is missing, unparseable or not
+    finite, is not slow or wrong - it ends the walk on a `KeyError`, an
+    `AttributeError` or a `TypeError` out of whatever command asked for the
+    render. `words` absent entirely is placeable: the render then places the
+    segment's frames against the segment's own bounds, which `segment_bounds`
+    already answered for.
+
+    Here rather than in either reader for the reason `segment_bounds` is here:
+    segments come back off disk on the resume route and on the read-side one
+    (R-23), and two readers asking whether a segment can be walked must not
+    answer differently. What a word *says* is not this question - the render
+    stringifies it, so any type survives - and only what places it is checked.
+    """
+    if not isinstance(segment, Mapping):
+        return False
+    words = segment.get("words")
+    if words is None:
+        return True
+    if isinstance(words, str | bytes | bytearray) or not isinstance(words, Sequence):
+        return False
+    for word in words:
+        if not isinstance(word, Mapping):
+            return False
+        try:
+            end = float(word["end"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(end):
+            return False
+    return True
 
 
 def select_transcript_window(
