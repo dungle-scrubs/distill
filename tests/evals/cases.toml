@@ -274,3 +274,15 @@ has_text = false   # terminal SHAPE - panel, title strip, code-line rhythm - no 
 verified = true
 category = "textless"
 tags = ["synthetic", "no-text", "terminal-shaped", "hard-negative"]
+
+# The identifiers frame. Every hex run here is a shape redaction used to delete
+# wholesale; the case exists so the corpus can say that recovering them is the
+# correct reading. Synthetic, so the truth is exact by construction.
+[[case]]
+id = "30_synth_identifiers_f01"
+kind = "terminal"
+legibility = "clean"
+has_text = true
+category = "clean_text"
+verified = true
+tags = ["synthetic", "terminal", "identifiers", "hex", "dark-bg"]

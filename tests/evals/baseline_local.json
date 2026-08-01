@@ -1,20 +1,20 @@
 {
   "_reproduce": "Start Rapid-MLX serving run.vision_config.model on a loopback port, then: uv run python tests/evals/score.py --with-vision --json --base-url <url>. Thresholds here are pinned from the MEAN of `trials` full-corpus runs, not a single draw.",
   "_acceptance_rule": "Pins Gate 2->3 (plan 02). Three bounds. accuracy_floor and f1_floor are the measured local means minus noise_band. hallucination_ceiling is 0.0 and measures INVENTION ONLY: the denominator is the category=textless frames, which carry no text pixels at all - including two built to LOOK like a slide and a terminal, because a frame that seems to carry text is what actually tempts a reader to supply some. Frames whose only text is chrome (a browser bar, a branding logo) are category=chrome_only and excluded: text that is genuinely on screen cannot be invented. That is not a free pass - the prompt explicitly instructs the reader to ignore chrome, so transcribing it is an instruction-following failure, reported as chrome_transcription_rate beside the verdict. f1_floor exists because accuracy is recall-only and invention looks only at textless frames: without it a reader could transcribe every banner on every real slide and still pass.",
-  "recorded": "2026-07-30",
+  "recorded": "2026-08-01",
   "trials": 3,
-  "corpus_sha256": "e0b29fc72535ad9de4e5b8b8fab90a13eee252eacbfd6f686ee3054e29610e28",
+  "corpus_sha256": "2a7b1a3b23e26749f11fc6b356611ac1d38456dbf184fb6d39ab9d5812d77484",
   "acceptance_rule": {
-    "accuracy_floor": 0.8371902191256061,
+    "accuracy_floor": 0.843830708169326,
     "hallucination_ceiling": 0.0,
-    "f1_floor": 0.8588045934258722,
+    "f1_floor": 0.8643643637545785,
     "noise_band": 0.03
   },
   "spread": {
     "text_recovery_accuracy": {
-      "mean": 0.8671902191256061,
-      "min": 0.8671902191256062,
-      "max": 0.8671902191256062,
+      "mean": 0.8738307081693261,
+      "min": 0.873830708169326,
+      "max": 0.873830708169326,
       "trials": 3
     },
     "hallucination_rate": {
@@ -30,15 +30,15 @@
       "trials": 3
     },
     "vision_token_f1_mean": {
-      "mean": 0.8888045934258723,
-      "min": 0.8888045934258723,
-      "max": 0.8888045934258723,
+      "mean": 0.8943643637545785,
+      "min": 0.8943643637545786,
+      "max": 0.8943643637545786,
       "trials": 3
     },
     "vision_wer_mean": {
-      "mean": 0.15069611160806026,
-      "min": 0.15069611160806026,
-      "max": 0.15069611160806026,
+      "mean": 0.14316130602765725,
+      "min": 0.14316130602765725,
+      "max": 0.14316130602765725,
       "trials": 3
     },
     "unusable_readings": {
@@ -53,26 +53,39 @@
     "vision_config": {
       "backend": "rapid-mlx",
       "model": "mlx-community/Qwen3-VL-8B-Instruct-8bit",
-      "base_url": "http://127.0.0.1:17439/v1",
+      "base_url": "http://127.0.0.1:17448/v1",
       "timeout_sec": 30.0,
       "caption_frames": true,
       "allow_remote_endpoint": false,
       "credential_configured": false,
-      "credential_env": ""
+      "credential_env": "",
+      "endpoints": [
+        {
+          "backend": "rapid-mlx",
+          "model": "mlx-community/Qwen3-VL-8B-Instruct-8bit",
+          "base_url": "http://127.0.0.1:17448/v1",
+          "timeout_sec": 30.0,
+          "caption_frames": true,
+          "allow_remote_endpoint": false,
+          "credential_configured": false,
+          "credential_env": "",
+          "endpoints": null
+        }
+      ]
     },
     "tesseract": "tesseract 5.5.2",
     "rapid_mlx": "rapid-mlx 0.6.70"
   },
   "summary": {
-    "cases_scored": 29,
-    "ocr_wer_mean": 0.5113310182004613,
-    "vision_wer_mean": 0.15069611160806026,
-    "vision_token_recall_mean": 0.8671902191256062,
-    "text_recovery_accuracy": 0.8671902191256062,
+    "cases_scored": 30,
+    "ocr_wer_mean": 0.4913200228459938,
+    "vision_wer_mean": 0.14316130602765725,
+    "vision_token_recall_mean": 0.873830708169326,
+    "text_recovery_accuracy": 0.873830708169326,
     "hallucination_rate": 0.0,
     "chrome_transcription_rate": 0.0,
     "unusable_readings": 0,
-    "vision_token_f1_mean": 0.8888045934258723,
+    "vision_token_f1_mean": 0.8943643637545786,
     "grounding_precision": 0.8,
     "grounding_recall": 0.9230769230769231
   },
@@ -482,6 +495,48 @@
       "should_flag": true,
       "claimed_text": false,
       "unusable": false
+    },
+    {
+      "id": "30_synth_identifiers_f01",
+      "category": "clean_text",
+      "legibility": "clean",
+      "has_text": true,
+      "ocr_wer": 0.1111111111111111,
+      "vision_wer": 0.0,
+      "vision_recall": 1.0,
+      "vision_f1": 1.0,
+      "flagged": false,
+      "should_flag": false,
+      "claimed_text": null,
+      "unusable": false
     }
-  ]
+  ],
+  "superseded_corpus_run": {
+    "_what": "The same reader on the 29-case corpus, before 30_synth_identifiers_f01 was registered. Kept so the corpus change is auditable as numbers rather than as a claim: delta_to_current is this run subtracted from the current one, and corroboration_delta_is_zero records that registering a text-bearing terminal frame moved neither grounding_precision nor grounding_recall.",
+    "corpus_sha256": "e0b29fc72535ad9de4e5b8b8fab90a13eee252eacbfd6f686ee3054e29610e28",
+    "cases_scored": 29,
+    "summary": {
+      "text_recovery_accuracy": 0.8671902191256062,
+      "vision_token_f1_mean": 0.8888045934258723,
+      "hallucination_rate": 0.0,
+      "chrome_transcription_rate": 0.0,
+      "grounding_precision": 0.8,
+      "grounding_recall": 0.9230769230769231,
+      "ocr_wer_mean": 0.5113310182004613,
+      "vision_wer_mean": 0.15069611160806026,
+      "unusable_readings": 0
+    },
+    "delta_to_current": {
+      "text_recovery_accuracy": 0.006640489043719722,
+      "vision_token_f1_mean": 0.005559770328706359,
+      "hallucination_rate": 0.0,
+      "chrome_transcription_rate": 0.0,
+      "grounding_precision": 0.0,
+      "grounding_recall": 0.0,
+      "ocr_wer_mean": -0.020010995354467542,
+      "vision_wer_mean": -0.007534805580403009
+    },
+    "corroboration_delta_is_zero": true,
+    "_composition_note": "The reader recovers the new frame exactly (vision WER 0.0, recall and F1 1.0), so registering it raises the corpus mean and therefore the floors. The +0.0066 accuracy rise is a composition effect of an easier corpus, NOT evidence the reader improved; the 29 pre-existing per-case results are unchanged. Read the floors as re-derived for a different corpus, not as a bar that was raised."
+  }
 }

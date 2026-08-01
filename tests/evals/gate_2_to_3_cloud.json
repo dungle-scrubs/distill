@@ -1,7 +1,7 @@
 {
   "_what": "Gate 2->3 evidence (plan 02, A-001): the cloud-vs-local comparison ADR-0001's reversal requires. The candidate was reached through Distill's own remote endpoint path - bearer auth, https-for-remote, run-wide budget - not a bypass.",
-  "_how_measured": "Both readers run the full corpus `trials` times. The verdict is judged on the MEAN accuracy and F1 but the WORST-trial invention rate: a safety ceiling that a lucky draw can satisfy is not a ceiling. The local reader was deterministic across trials; this one is not, which is the whole reason for the repetition - see chrome_transcription_rate below.",
-  "recorded": "2026-07-30",
+  "_how_measured": "Both readers run the full corpus `trials` times. The verdict is judged on the MEAN accuracy and F1 but the WORST-trial invention rate: a safety ceiling that a lucky draw can satisfy is not a ceiling. The local reader was deterministic across trials; this one has not been, which is the whole reason for the repetition - see chrome_transcription_rate below.",
+  "recorded": "2026-08-01",
   "trials": 3,
   "verdict": {
     "passed": true,
@@ -16,9 +16,9 @@
   },
   "spread": {
     "text_recovery_accuracy": {
-      "mean": 0.9925039363101572,
-      "min": 0.9917127166384029,
-      "max": 0.9934366030740689,
+      "mean": 0.9930131142321988,
+      "min": 0.9927443647571002,
+      "max": 0.9931474889697481,
       "trials": 3
     },
     "hallucination_rate": {
@@ -28,21 +28,21 @@
       "trials": 3
     },
     "chrome_transcription_rate": {
-      "mean": 0.16666666666666666,
+      "mean": 0.0,
       "min": 0.0,
-      "max": 0.5,
+      "max": 0.0,
       "trials": 3
     },
     "vision_token_f1_mean": {
-      "mean": 0.9917588795243337,
-      "min": 0.991135727387733,
-      "max": 0.9923472890606931,
+      "mean": 0.9905039431497831,
+      "min": 0.9872029638233446,
+      "max": 0.9922039410183464,
       "trials": 3
     },
     "vision_wer_mean": {
-      "mean": 0.046822447009810635,
-      "min": 0.04588978024589909,
-      "max": 0.04761366668156498,
+      "mean": 0.03762531074136097,
+      "min": 0.013178092425600732,
+      "max": 0.055082140401612724,
       "trials": 3
     },
     "unusable_readings": {
@@ -53,19 +53,20 @@
     }
   },
   "chrome_transcription": {
-    "_what": "Not invention and not part of the bar - the text is genuinely on screen - but the prompt names logos, banners, watermarks, speaker insets and page numbers as things to ignore, so a non-zero rate is a measured instruction-following weakness of this candidate. It varied across trials, which is precisely why a single run must not be the record.",
-    "per_trial_max": 0.5,
+    "_what": "Not invention and not part of the bar - the text is genuinely on screen - but the prompt names logos, banners, watermarks, speaker insets and page numbers as things to ignore, so a non-zero rate is a measured instruction-following weakness. On the 30-case corpus this candidate transcribed no chrome in any of the three trials. The 0.5 worst-trial rate recorded on the 29-case corpus is kept under superseded_corpus_run, where it says which run it belongs to.",
+    "per_trial_max": 0.0,
     "per_trial_min": 0.0,
-    "mean": 0.16666666666666666
+    "mean": 0.0,
+    "trials": 3
   },
   "comparison": {
-    "corpus": "29 frames, six categories, eight true negatives (two shaped to look text-bearing)",
+    "corpus": "30 frames, six categories, eight true negatives (two shaped to look text-bearing)",
     "local_model": "mlx-community/Qwen3-VL-8B-Instruct-8bit",
     "local_spread": {
       "text_recovery_accuracy": {
-        "mean": 0.8671902191256061,
-        "min": 0.8671902191256062,
-        "max": 0.8671902191256062,
+        "mean": 0.8738307081693261,
+        "min": 0.873830708169326,
+        "max": 0.873830708169326,
         "trials": 3
       },
       "hallucination_rate": {
@@ -81,15 +82,15 @@
         "trials": 3
       },
       "vision_token_f1_mean": {
-        "mean": 0.8888045934258723,
-        "min": 0.8888045934258723,
-        "max": 0.8888045934258723,
+        "mean": 0.8943643637545785,
+        "min": 0.8943643637545786,
+        "max": 0.8943643637545786,
         "trials": 3
       },
       "vision_wer_mean": {
-        "mean": 0.15069611160806026,
-        "min": 0.15069611160806026,
-        "max": 0.15069611160806026,
+        "mean": 0.14316130602765725,
+        "min": 0.14316130602765725,
+        "max": 0.14316130602765725,
         "trials": 3
       },
       "unusable_readings": {
@@ -145,15 +146,15 @@
     }
   },
   "summary": {
-    "cases_scored": 29,
-    "ocr_wer_mean": 0.5113310182004613,
-    "vision_wer_mean": 0.046963894101967836,
-    "vision_token_recall_mean": 0.9923624892180002,
-    "text_recovery_accuracy": 0.9923624892180002,
+    "cases_scored": 30,
+    "ocr_wer_mean": 0.4913200228459938,
+    "vision_wer_mean": 0.013178092425600732,
+    "vision_token_recall_mean": 0.9931474889697481,
+    "text_recovery_accuracy": 0.9931474889697481,
     "hallucination_rate": 0.0,
-    "chrome_transcription_rate": 0.5,
+    "chrome_transcription_rate": 0.0,
     "unusable_readings": 0,
-    "vision_token_f1_mean": 0.9917936221245751,
+    "vision_token_f1_mean": 0.9921049246076583,
     "grounding_precision": 0.7647058823529411,
     "grounding_recall": 1.0
   },
@@ -178,9 +179,9 @@
       "legibility": "partial",
       "has_text": true,
       "ocr_wer": 0.8775510204081632,
-      "vision_wer": 0.04081632653061224,
-      "vision_recall": 0.9591836734693877,
-      "vision_f1": 0.9690721649484536,
+      "vision_wer": 0.02040816326530612,
+      "vision_recall": 0.9795918367346939,
+      "vision_f1": 0.9795918367346939,
       "flagged": true,
       "should_flag": true,
       "claimed_text": null,
@@ -192,7 +193,7 @@
       "legibility": "partial",
       "has_text": true,
       "ocr_wer": 0.8620689655172413,
-      "vision_wer": 0.6206896551724138,
+      "vision_wer": 0.0,
       "vision_recall": 1.0,
       "vision_f1": 1.0,
       "flagged": true,
@@ -206,9 +207,9 @@
       "legibility": "partial",
       "has_text": true,
       "ocr_wer": 1.0,
-      "vision_wer": 0.024691358024691357,
-      "vision_recall": 0.9753086419753086,
-      "vision_f1": 0.9875,
+      "vision_wer": 0.037037037037037035,
+      "vision_recall": 0.9629629629629629,
+      "vision_f1": 0.975,
       "flagged": true,
       "should_flag": true,
       "claimed_text": null,
@@ -365,7 +366,7 @@
       "vision_f1": null,
       "flagged": true,
       "should_flag": true,
-      "claimed_text": true,
+      "claimed_text": false,
       "unusable": false
     },
     {
@@ -563,6 +564,20 @@
       "should_flag": true,
       "claimed_text": false,
       "unusable": false
+    },
+    {
+      "id": "30_synth_identifiers_f01",
+      "category": "clean_text",
+      "legibility": "clean",
+      "has_text": true,
+      "ocr_wer": 0.1111111111111111,
+      "vision_wer": 0.0,
+      "vision_recall": 1.0,
+      "vision_f1": 1.0,
+      "flagged": false,
+      "should_flag": false,
+      "claimed_text": null,
+      "unusable": false
     }
   ],
   "superseded_run": {
@@ -585,5 +600,33 @@
       "grounding_precision": 0.6,
       "grounding_recall": 1.0
     }
+  },
+  "corpus_sha256": "2a7b1a3b23e26749f11fc6b356611ac1d38456dbf184fb6d39ab9d5812d77484",
+  "superseded_corpus_run": {
+    "_what": "The same reader on the 29-case corpus, before 30_synth_identifiers_f01 was registered. Kept so the corpus change is auditable as numbers rather than as a claim: delta_to_current is this run subtracted from the current one, and corroboration_delta_is_zero records that registering a text-bearing terminal frame moved neither grounding_precision nor grounding_recall.",
+    "corpus_sha256": "e0b29fc72535ad9de4e5b8b8fab90a13eee252eacbfd6f686ee3054e29610e28",
+    "cases_scored": 29,
+    "summary": {
+      "text_recovery_accuracy": 0.9923624892180002,
+      "vision_token_f1_mean": 0.9917936221245751,
+      "hallucination_rate": 0.0,
+      "chrome_transcription_rate": 0.5,
+      "grounding_precision": 0.7647058823529411,
+      "grounding_recall": 1.0,
+      "ocr_wer_mean": 0.5113310182004613,
+      "vision_wer_mean": 0.046963894101967836,
+      "unusable_readings": 0
+    },
+    "delta_to_current": {
+      "text_recovery_accuracy": 0.0007849997517479501,
+      "vision_token_f1_mean": 0.00031130248308319786,
+      "hallucination_rate": 0.0,
+      "chrome_transcription_rate": -0.5,
+      "grounding_precision": 0.0,
+      "grounding_recall": 0.0,
+      "ocr_wer_mean": -0.020010995354467542,
+      "vision_wer_mean": -0.033785801676367105
+    },
+    "corroboration_delta_is_zero": true
   }
 }
