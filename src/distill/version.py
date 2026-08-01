@@ -130,4 +130,4 @@ EXEMPT_MODULES: dict[str, str] = {
 }
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "55f830f50173a01ff69665b96f73feaf790258cc5c749f4040aa6f8aad2fab58"
+PIPELINE_SIGNATURE = "c84571ab1368342d434a66774801febd4bbb584dff3c1173fb86102f21645c60"
