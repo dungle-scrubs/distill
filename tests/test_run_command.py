@@ -1352,13 +1352,20 @@ def declared_timeouts() -> dict[str, CommandTimeouts]:
 
 
 def test_the_package_has_call_sites_to_check() -> None:
-    """Guards the two tests below against silently checking an empty set."""
+    """Guards the two tests below against silently checking an empty set.
+
+    ``source.py`` previously owned the YouTube download call site; that
+    responsibility now lives in the deep ``acquisition`` module (Candidate 03),
+    which is the one place that invokes the download helper. The seam is
+    ``acquisition.acquire`` — narrow and testable — rather than a second copy
+    of the call in ``source``.
+    """
     assert {module for module, _line, _kwargs in call_sites()} == {
+        "acquisition.py",
         "frame_selection.py",
         "measure.py",
         "media_inspect.py",
         "ocr.py",
-        "source.py",
         "transcript.py",
         "youtube.py",
     }

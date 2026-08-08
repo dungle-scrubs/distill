@@ -253,9 +253,15 @@ def general_config(base_dir: Path | None = None) -> dict[str, Any]:
     section belonging to another owner, and a file that says
     `{"local_vision": {...}}` is not asking to set an option called
     `local_vision`.
+
+    Delegates to ``configuration.general_config`` so layering for ALL options
+    lives in one place, but remains importable here for existing callers.
     """
-    payload = _read_json((base_dir or config_dir()) / GENERAL_CONFIG_FILENAME)
-    return {key: value for key, value in payload.items() if key != LOCAL_VISION_SECTION}
+    from .configuration import (
+        general_config as _cfg_general,  # lazy to keep config_dir single-sourced
+    )
+
+    return _cfg_general(base_dir)
 
 
 def environment_options() -> dict[str, Any]:
@@ -264,13 +270,13 @@ def environment_options() -> dict[str, Any]:
     An empty value is not a setting: `DISTILL_OUTPUT_DIR=` exports a variable
     with nothing in it, and treating that as an output root of `""` would
     silently mean the default while looking like a choice.
+
+    Delegates to ``configuration.environment_options`` so the single resolver
+    owns the precedence.
     """
-    values: dict[str, Any] = {}
-    for option, variable in OPTION_ENV_VARIABLES.items():
-        value = os.environ.get(variable)
-        if value:
-            values[option] = value
-    return values
+    from .configuration import environment_options as _cfg_env
+
+    return _cfg_env()
 
 
 def resolve_options(
@@ -294,36 +300,12 @@ def resolve_options(
     A key present in `args` with the value `None` is a caller that named
     nothing, not a caller asking for the default: that is how the CLI spells an
     unused flag, and a configured value has to survive it.
+
+    Delegates to ``configuration.resolve_general_options`` - the single place
+    that enforces CLI > env > file > default for ALL options.
     """
-    known = frozenset(general_keys)
-    root = base_dir or config_dir()
-    file_options = general_config(root)
-    unknown = sorted(set(file_options) - known)
-    if unknown:
-        raise _bad_config_file(
-            root / GENERAL_CONFIG_FILENAME,
-            "config file names unknown options",
-            unknown_options=unknown,
-        )
-    file_options = {
-        key: value
-        for key, value in file_options.items()
-        if not (key == "output_dir" and value == "")
-    }
-    resolved = ResolvedOptions(
-        {key: value for key, value in file_options.items() if key in known},
-        configured_from={
-            key: root / GENERAL_CONFIG_FILENAME for key in file_options if key in known
-        },
-    )
-    for key, value in environment_options().items():
-        if key not in known:
-            continue
-        resolved[key] = value
-        resolved.configured_from.pop(key, None)
-    for key, value in args.items():
-        if value is None and key in resolved:
-            continue
-        resolved[key] = value
-        resolved.configured_from.pop(key, None)
-    return resolved
+    from .configuration import resolve_general_options as _cfg_resolve
+
+    legacy = _cfg_resolve(args, general_keys=general_keys, base_dir=base_dir)
+    # Preserve ResolvedOptions type expected by callers (has .configured_from)
+    return ResolvedOptions(dict(legacy), configured_from=dict(legacy.configured_from))

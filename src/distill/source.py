@@ -1,5 +1,18 @@
 """Source acquisition and fingerprinting for Distill.
 
+Thin **SourceResolver** façade that composes pure identity
+(**source fingerprint**, **lock key**, **bundle key**, fast-path) from
+``source_identity`` with effectful acquisition (**acquisition lease**,
+staging, validation, promotion) from ``acquisition`` and the cache check
+against the **bundle store**. It owns no hashing or ``flock`` logic itself;
+it imports and re-exports them so ``from distill.source import ...`` keeps
+working.
+
+Vocabulary per ``CONTEXT.md``: **source**, **source fingerprint**,
+**options hash**, **bundle key**, **lock key**, **acquisition lease**,
+**bundle**, **generation**, **staging directory**.
+
+
 This module owns local path resolution, duration probing, safe output root
 validation, YouTube id lookup, the acquisition of a remote **source**, disk
 checks, and **source fingerprints**.
@@ -54,30 +67,81 @@ what a **generation** contains, or install anything.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import math
 import os
-import re
-import shutil
 import stat
 import sys
 import tempfile
 import time
-import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
+# Façade composition: pure identity and effectful acquisition own the
+# implementations; this module delegates and re-exports for compatibility.
+from .acquisition import (  # noqa: F401  re-exported: acquisition lease + helpers
+    ACQUISITION_EVENT_TYPE as ACQUISITION_EVENT_TYPE,
+)
+from .acquisition import (
+    BYTE_UNITS as BYTE_UNITS,
+)
+from .acquisition import (
+    LOCK_DIR_NAME as LOCK_DIR_NAME,
+)
+from .acquisition import (
+    MEDIA_CONTAINER_PREFERENCE as MEDIA_CONTAINER_PREFERENCE,
+)
+from .acquisition import (
+    MEDIA_DIR_NAME as MEDIA_DIR_NAME,
+)
+from .acquisition import (
+    PROMOTED_MEDIA_STEM as PROMOTED_MEDIA_STEM,
+)
+from .acquisition import (
+    STAGING_DIR_NAME as STAGING_DIR_NAME,
+)
+from .acquisition import (
+    YOUTUBE_DISK_FLOOR_BYTES as YOUTUBE_DISK_FLOOR_BYTES,
+)
+from .acquisition import (
+    AcquiredSource as AcquiredSource,
+)
+from .acquisition import (
+    AcquisitionLease as AcquisitionLease,
+)
+from .acquisition import (
+    YoutubeDownloader as YoutubeDownloader,
+)
+from .acquisition import (
+    YouTubeDownloaderProtocol as YouTubeDownloaderProtocol,
+)
+from .acquisition import (
+    check_disk_floor as check_disk_floor,
+)
+from .acquisition import (
+    parse_byte_amount as parse_byte_amount,
+)
+from .acquisition import (
+    parse_ytdlp_progress as parse_ytdlp_progress,
+)
+from .acquisition import (
+    promote_media as promote_media,
+)
+from .acquisition import (
+    release_acquisition_lease as release_acquisition_lease,
+)
+from .acquisition import (
+    select_downloaded_media as select_downloaded_media,
+)
+from .acquisition import (
+    validate_media_file as validate_media_file,
+)
 from .artifacts import Provenance, RedactionState, document_carries_a_reading
 from .bundle_store import (
     SINGLE_SOURCE_LOCK_WAIT_SEC,
     BundleStore,
-    ExclusiveLock,
-    confined_path,
-    ensure_safe_directory,
 )
 from .errors import DistillError, WarningRecord, errno_name, warning
 from .links import RelatedLink, extract_relevant_links
@@ -118,10 +182,44 @@ from .media_inspect import (
 from .options import DistillOptions
 from .progress import ProgressReporter
 from .redact_secrets import redact_text
-from .run_command import (
-    CommandResult,
-    run_json,
-    stream,
+from .source_identity import (  # noqa: F401  re-exported: pure identity
+    SourceIdentity as SourceIdentity,
+)
+from .source_identity import (
+    bundle_key as bundle_key,
+)
+from .source_identity import (
+    bundle_key_for as bundle_key_for,
+)
+from .source_identity import (
+    derive_local_identity as derive_local_identity,
+)
+from .source_identity import (
+    derive_source_identity as derive_source_identity,
+)
+from .source_identity import (
+    derive_youtube_identity as derive_youtube_identity,
+)
+from .source_identity import (
+    fingerprint_for_youtube as fingerprint_for_youtube,
+)
+from .source_identity import (
+    is_youtube_fast_path as is_youtube_fast_path,
+)
+from .source_identity import (
+    lock_key_for_video_id as lock_key_for_video_id,
+)
+from .source_identity import (
+    lock_key_for_youtube as lock_key_for_youtube,
+)
+from .source_identity import (
+    source_fingerprint_for_youtube as source_fingerprint_for_youtube,
+)
+from .source_identity import (
+    youtube_fingerprint as youtube_fingerprint,
+)
+from .source_identity import (
+    youtube_lock_key as youtube_lock_key,
 )
 from .vision_chain import CandidateKey, ResolvedRun, candidate_keys, resolve_chain
 from .youtube import (  # noqa: F401  re-exported: the YouTube client
@@ -202,7 +300,7 @@ thing a path can be. There is deliberately no "unreadable" member: a path that
 could not be asked about is not a kind of answer, it is the absence of one.
 """
 
-YOUTUBE_DISK_FLOOR_BYTES = 1024 * 1024 * 1024
+# YOUTUBE_DISK_FLOOR_BYTES re-exported from .acquisition (façade)
 # Wall-clock ceilings so a wedged tool or a stalled network call cannot hang the
 # whole run. yt-dlp additionally gets `--socket-timeout` so it aborts a stalled
 # connection on its own rather than blocking until the outer timeout fires.
@@ -219,18 +317,18 @@ YOUTUBE_DISK_FLOOR_BYTES = 1024 * 1024 * 1024
 # are siblings under one output root so promotion is a rename on one filesystem
 # rather than a copy across two, and so the promoted directory holds nothing but
 # promoted media.
-STAGING_DIR_NAME = "_youtube_staging"
-MEDIA_DIR_NAME = "_youtube_sources"
-LOCK_DIR_NAME = "_youtube_locks"
+# STAGING_DIR_NAME re-exported from .acquisition (façade)
+# MEDIA_DIR_NAME re-exported from .acquisition (façade)
+# LOCK_DIR_NAME re-exported from .acquisition (façade)
 # The stem yt-dlp is told to write, and so the only stem a completed download
 # has. A format fragment is `source.f140.m4a`, whose stem is `source.f140`, and
 # an in-flight file is `source.mp4.part`, whose stem is `source.mp4`: matching
 # the stem exactly is what separates the merged container from both (R-37).
-PROMOTED_MEDIA_STEM = "source"
+# PROMOTED_MEDIA_STEM re-exported from .acquisition (façade)
 # Preference order when a staging directory somehow holds more than one complete
 # container. Order is fixed rather than alphabetical so the choice is a stated
 # preference; anything unlisted sorts after everything listed, by suffix.
-MEDIA_CONTAINER_PREFERENCE = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+# MEDIA_CONTAINER_PREFERENCE re-exported from .acquisition (façade)
 SENSITIVE_COMPONENTS = {
     ".ssh",
     ".gnupg",
@@ -239,140 +337,15 @@ SENSITIVE_COMPONENTS = {
     "library/keychains",
 }
 
-BYTE_UNITS = {
-    "B": 1,
-    "KB": 1000,
-    "MB": 1000**2,
-    "GB": 1000**3,
-    "TB": 1000**4,
-    "KiB": 1024,
-    "MiB": 1024**2,
-    "GiB": 1024**3,
-    "TiB": 1024**4,
-}
+# BYTE_UNITS re-exported from .acquisition (façade)
 
 
-ACQUISITION_EVENT_TYPE = "distill.source"
+# ACQUISITION_EVENT_TYPE re-exported from .acquisition (façade)
 
 
-def _acquisition_log(event: str, **detail: Any) -> None:
-    """Emit one acquisition event: lease taken or released, verdict, promotion.
-
-    Metadata only, in the shape `run_command` uses for its boundary event, so
-    one log stream answers both "which tool ran" and "what did acquisition do
-    with what it produced". Paths are Distill's own; no **extracted text** is
-    recorded here, because none of it has passed a **redaction sink**.
-    """
-    LOGGER.debug(
-        json.dumps(
-            {
-                "type": ACQUISITION_EVENT_TYPE,
-                "event": event,
-                "detail": {"pid": os.getpid(), **detail},
-            },
-            sort_keys=True,
-        )
-    )
-
-
-@dataclass
-class AcquisitionLease:
-    """The exclusive right to acquire and read one **source**'s media.
-
-    Keyed by **lock key**, so it identifies the source and not the combination
-    of source and options: two runs with different options contend for the same
-    lease, which is exactly what stops the second from replacing media the first
-    is still reading (R-36).
-
-    The exclusion itself is `bundle_store.ExclusiveLock` - one `flock` primitive
-    for the whole package. The lease and the bundle lock stay two locks, because
-    they answer different questions on different keys ("is another run fetching
-    this source?" against "is another run producing this bundle?"), but they are
-    not two mechanisms: the argument for why an open descriptor is exclusive and
-    a lock file's *contents* are not is the argument finding 11 came from
-    getting wrong, and a second copy of it is a second chance to get it wrong
-    again.
-
-    Held until `release`, which the reader calls when it is finished with the
-    media - not when the download ends. `release` is idempotent, because the
-    failure paths that release a lease early overlap with the caller's own
-    cleanup.
-
-    Does not own: the media it protects, the staging directory, or bundle-level
-    locking, which is keyed by **bundle key** and belongs to the bundle store.
-    """
-
-    lock_key: str
-    lock_path: Path
-    lock: ExclusiveLock
-    warnings: list[WarningRecord] = field(default_factory=list)
-
-    @property
-    def released(self) -> bool:
-        return self.lock.released
-
-    @classmethod
-    def take(cls, lock_key: str, lock_path: Path) -> AcquisitionLease | None:
-        """Take the lease, or report `None` if another run holds it.
-
-        A filesystem that cannot take the lock (`flock` reporting anything other
-        than "held") is fatal: `E_LOCK_UNSUPPORTED` rather than a fallback that
-        would let two runs read one source without either of them knowing. The
-        stage and message name *this* question, so a user downloading a video
-        is told which lock could not be taken.
-        """
-        lock = ExclusiveLock.take(
-            lock_key,
-            lock_path,
-            stage="youtube",
-            message="filesystem cannot lock the YouTube source directory",
-        )
-        if lock is None:
-            return None
-        return cls(lock_key=lock_key, lock_path=lock_path, lock=lock)
-
-    def release(self) -> None:
-        """Give the lease up by closing the descriptor the kernel locked.
-
-        The lock file itself stays on disk, deliberately. Unlinking it is a
-        second way to lose exclusivity: a waiter that has already opened the
-        path holds a descriptor on an inode that now has no name, so it can lock
-        that inode while the next run creates a fresh file at the same path and
-        locks that - two runs, again, one lock key. Leaving the file costs one
-        empty inode per **lock key** and keeps the path itself the identity of
-        the lease.
-
-        Nothing ever removes it, **prune** included: `_youtube_locks` is a
-        reserved name the walk skips, so no rule proposes what is inside it
-        (finding 7-opus). That is the intended end state - a lock file deleted
-        while any run might be about to open its path is the same lost
-        exclusivity - and the cost is bounded by the number of distinct sources
-        this root has ever acquired.
-        """
-        if self.lock.released:
-            return
-        self.lock.release()
-        _acquisition_log(
-            "lease_released",
-            lock_key=self.lock_key,
-            lock_path=str(self.lock_path),
-        )
-
-
-@dataclass(frozen=True)
-class AcquiredSource:
-    """A promoted media file and the lease that keeps it readable.
-
-    The lease travels with the path because the two have the same lifetime: a
-    caller holding this holds the right to read `path`, and the moment it
-    releases the lease another run may promote a replacement.
-    """
-
-    path: Path
-    lease: AcquisitionLease
-    warnings: list[WarningRecord] = field(default_factory=list)
-
-
+# _acquisition_log re-exported from .acquisition
+# AcquisitionLease re-exported from .acquisition
+# AcquiredSource re-exported from .acquisition
 @dataclass(frozen=True)
 class SourceInfo:
     source_type: str
@@ -410,44 +383,7 @@ class SourceInfo:
     acquisition_lease: AcquisitionLease | None = None
 
 
-def release_acquisition_lease(source: Any, *, during: BaseException | None = None) -> None:
-    """Release the lease a source carries, if it carries one.
-
-    Takes anything with the attribute rather than a `SourceInfo`, because the
-    reader that calls this handles local sources, cache hits and test doubles
-    through the same path, and none of those hold a lease.
-
-    `during` is the failure this release is cleaning up after, when there is
-    one. Cleanup that raises while an exception travels *substitutes* that
-    exception, so a lease that could not be given up turned an operator's
-    `Ctrl-C` into an `E_INTERNAL` record about a descriptor - the wrong
-    diagnosis, and the true one thrown away. With a failure named, the release
-    failure is logged instead of raised; with none, it is raised, because a
-    lease this process believes it released and did not is a **lock key** the
-    next run of the same source will wait out.
-
-    An `Exception` from the release, not a `BaseException`: a second `Ctrl-C`
-    landing inside cleanup still propagates, because swallowing an interrupt to
-    preserve an earlier one is not an improvement on losing the earlier one.
-    """
-    lease = getattr(source, "acquisition_lease", None)
-    if not isinstance(lease, AcquisitionLease):
-        return
-    if during is None:
-        lease.release()
-        return
-    try:
-        lease.release()
-    except Exception as release_failure:
-        _acquisition_log(
-            "lease_release_failed",
-            lock_key=lease.lock_key,
-            lock_path=str(lease.lock_path),
-            error=repr(release_failure),
-            during=type(during).__name__,
-        )
-
-
+# release_acquisition_lease re-exported from .acquisition
 def _processed_at_utc() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -478,15 +414,7 @@ class SourceResolution:
     progress: ProgressReporter | None = None
 
 
-class YouTubeDownloaderProtocol(Protocol):
-    def acquire(
-        self,
-        url: str,
-        lock_key: str,
-        progress: ProgressReporter | None = None,
-    ) -> AcquiredSource: ...
-
-
+# YouTubeDownloaderProtocol re-exported from .acquisition
 def servable_duration(output_root: Path, bundle_key: str) -> float | None:
     """The duration of the **bundle** `bundle_key` names, if it is servable.
 
@@ -977,451 +905,19 @@ def sensitive_path_match(
     return None
 
 
-def youtube_lock_key(video_id: str) -> str:
-    return hashlib.sha256(video_id.encode()).hexdigest()
+# youtube_lock_key re-exported from .source_identity
 
 
-def check_disk_floor(path: Path) -> None:
-    usage = shutil.disk_usage(path)
-    if usage.free < YOUTUBE_DISK_FLOOR_BYTES:
-        raise DistillError(
-            "E_DISK_SPACE",
-            "youtube",
-            "at least 1 GB free disk space is required",
-            {"free_bytes": usage.free},
-        )
+# check_disk_floor re-exported from .acquisition
 
 
-def parse_byte_amount(value: str, unit: str) -> int:
-    multiplier = BYTE_UNITS.get(unit)
-    if multiplier is None:
-        raise ValueError(f"unknown byte unit: {unit}")
-    return int(float(value) * multiplier)
+# _probed_codec_types re-exported from .acquisition
+# _probed_duration_sec re-exported from .acquisition
+# validate_media_file re-exported from .acquisition
 
 
-def parse_ytdlp_progress(line: str) -> dict[str, float | int] | None:
-    if "[download]" not in line:
-        return None
-    result: dict[str, float | int] = {}
-    percent = re.search(r"(?P<percent>\d+(?:\.\d+)?)%", line)
-    if percent:
-        result["percent"] = float(percent.group("percent"))
-
-    downloaded = re.search(
-        r"(?P<downloaded>\d+(?:\.\d+)?)\s*(?P<downloaded_unit>[KMGT]?i?B)\s+of\s+"
-        r"(?P<total>\d+(?:\.\d+)?)\s*(?P<total_unit>[KMGT]?i?B)",
-        line,
-    )
-    if downloaded:
-        result["downloaded_bytes"] = parse_byte_amount(
-            downloaded.group("downloaded"),
-            downloaded.group("downloaded_unit"),
-        )
-        result["total_bytes"] = parse_byte_amount(
-            downloaded.group("total"),
-            downloaded.group("total_unit"),
-        )
-        if "percent" not in result and result["total_bytes"]:
-            result["percent"] = (
-                float(result["downloaded_bytes"]) / float(result["total_bytes"])
-            ) * 100
-    return result or {"indeterminate": 1}
-
-
-def _container_rank(path: Path) -> tuple[int, str]:
-    suffix = path.suffix.lower()
-    if suffix in MEDIA_CONTAINER_PREFERENCE:
-        return (MEDIA_CONTAINER_PREFERENCE.index(suffix), suffix)
-    return (len(MEDIA_CONTAINER_PREFERENCE), suffix)
-
-
-def select_downloaded_media(staging_dir: Path) -> Path:
-    """Pick the completed container a download produced, deterministically (R-37).
-
-    An interrupted merge leaves the per-format fragments (`source.f140.m4a`,
-    `source.f299.mp4`) and an in-flight `source.mp4.part` beside the container
-    yt-dlp was asked for. Taking the first entry of a glob picks whichever of
-    those sorts first, which is how a run ends up transcribing an audio fragment
-    of a previous download - finding 16.
-
-    The rule instead: a completed container is a regular file whose stem is
-    exactly `source`, which every fragment and part-file fails by construction.
-    Among those, the fixed container preference decides, and the suffix breaks
-    any remaining tie, so the same staging directory always yields the same
-    choice. Selecting is not trusting: the winner is still validated before it
-    is promoted.
-    """
-    entries = sorted(staging_dir.iterdir()) if staging_dir.is_dir() else []
-    candidates = [
-        entry
-        for entry in entries
-        if entry.is_file() and not entry.is_symlink() and entry.stem == PROMOTED_MEDIA_STEM
-    ]
-    if not candidates:
-        raise DistillError(
-            "E_YTDLP",
-            "youtube",
-            "yt-dlp did not produce a source file",
-            {"staging_dir": str(staging_dir), "produced": [entry.name for entry in entries]},
-        )
-    return min(candidates, key=_container_rank)
-
-
-def _reject_media(path: Path, reason: str, message: str, **detail: Any) -> DistillError:
-    """Record a rejection verdict and build the error that carries it."""
-    _acquisition_log("media_validated", path=str(path), verdict="rejected", reason=reason, **detail)
-    return DistillError("E_BAD_MEDIA", "youtube", message, {"path": str(path), **detail})
-
-
-def _probed_codec_types(probe: Any) -> list[str]:
-    streams = probe.get("streams") if isinstance(probe, dict) else None
-    if not isinstance(streams, list):
-        return []
-    return [
-        str(entry.get("codec_type"))
-        for entry in streams
-        if isinstance(entry, dict) and entry.get("codec_type")
-    ]
-
-
-def _probed_duration_sec(probe: Any) -> float:
-    container = probe.get("format") if isinstance(probe, dict) else None
-    value = container.get("duration") if isinstance(container, dict) else None
-    if not isinstance(value, (str, int, float)):
-        return 0.0
-    try:
-        duration = float(value)
-    except ValueError:
-        return 0.0
-    # A header claiming NaN or inf is a container without a playable duration,
-    # and reporting it as one is how it passed `duration_sec <= 0` (R-47).
-    return duration if math.isfinite(duration) else 0.0
-
-
-def validate_media_file(path: Path) -> list[WarningRecord]:
-    """Confirm a staged file is the media Distill asked for, before promoting it.
-
-    A **fatal error**, not a **degradation** (ADR-0002): the media file is the
-    input every later stage reads, so a file that is not playable video leaves
-    no reduced-but-useful **bundle** to produce - there is no **transcript** and
-    no **keyframe** without it. That makes usable media a **required
-    capability** of the run rather than an optional one, and R-34 admits no
-    third answer. Nothing here degrades; it promotes or it raises.
-
-    Three questions, all answered by one ffprobe: does the file have content,
-    does it carry a video stream, and does it have a playable duration. An
-    audio-only format fragment fails the second and a truncated container fails
-    the third, so neither can be promoted over media that answered all three.
-    This is a separate probe from `probe_duration`, which reads the *promoted*
-    path: the point of asking here is to ask before promotion.
-
-    It returns the probe's own **warnings** - truncated capture (R-33) - because
-    a verdict of "accepted" is not the same as "nothing was lost", and this is
-    the only place those warnings exist.
-    """
-    size = path.stat().st_size if path.is_file() else 0
-    if size == 0:
-        raise _reject_media(path, "empty_file", "downloaded source file is empty")
-    try:
-        probe, probe_warnings = run_json(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "stream=codec_type:format=duration",
-                "-of",
-                "json",
-                str(path),
-            ],
-            stage="youtube",
-            total_timeout_sec=FFPROBE_TIMEOUTS.total_sec,
-            idle_timeout_sec=FFPROBE_TIMEOUTS.idle_sec,
-        )
-    except DistillError:
-        # ffprobe could not read it at all, which is its own answer. The error it
-        # raised already names the tool and the failure, so it travels as-is.
-        _acquisition_log("media_validated", path=str(path), verdict="rejected", reason="unreadable")
-        raise
-    codec_types = _probed_codec_types(probe)
-    if "video" not in codec_types:
-        raise _reject_media(
-            path,
-            "no_video_stream",
-            "downloaded source file carries no video stream",
-            codec_types=codec_types,
-        )
-    duration_sec = _probed_duration_sec(probe)
-    if duration_sec <= 0:
-        raise _reject_media(
-            path,
-            "no_duration",
-            "downloaded source file reports no playable duration",
-            duration_sec=duration_sec,
-        )
-    _acquisition_log(
-        "media_validated",
-        path=str(path),
-        verdict="accepted",
-        size_bytes=size,
-        codec_types=codec_types,
-        duration_sec=duration_sec,
-    )
-    return list(probe_warnings)
-
-
-def promote_media(produced: Path, media_dir: Path, *, root: Path) -> Path:
-    """Move a validated file onto its immutable path in one indivisible step.
-
-    `os.replace` on one filesystem is the whole promotion: a reader either sees
-    the previous media or this one, never a half-written file, and the previous
-    media is not removed before its replacement exists. Copying, truncating or
-    clearing the directory first would each reintroduce the window RV-3
-    describes, in which the only good copy is already gone when the replacement
-    turns out not to arrive.
-
-    Both ends of the rename are checked against `root` (R-16). A rename has two
-    of them: a symlink at the media directory sends the destination outside the
-    output root and replaces whatever it names, and a substituted staging
-    directory makes the *source* a file of the user's that promotion then moves
-    away from where they left it.
-    """
-    ensure_safe_directory(media_dir, root)
-    produced = confined_path(produced, root)
-    promoted = confined_path(media_dir / produced.name, root)
-    os.replace(produced, promoted)
-    _acquisition_log(
-        "media_promoted",
-        source=str(produced),
-        path=str(promoted),
-        size_bytes=promoted.stat().st_size,
-    )
-    return promoted
-
-
-class YoutubeDownloader:
-    def __init__(
-        self,
-        output_root: Path,
-        *,
-        lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
-        lock_poll_sec: float = 0.25,
-        lock_warn_after_sec: float = 5.0,
-    ) -> None:
-        """Acquire one remote **source** under an **acquisition lease**.
-
-        `lock_wait_sec` defaults to the budget of the run a user is watching
-        rather than to zero (D-044). A zero default was one production call site
-        away from making the wait unreachable, and it was that call site: every
-        second run of a video was denied on its first attempt, which is the case
-        the budget exists for (finding 4-opus). A caller that means "do not
-        wait" now says so.
-        """
-        self.output_root = output_root
-        self.lock_wait_sec = lock_wait_sec
-        self.lock_poll_sec = lock_poll_sec
-        self.lock_warn_after_sec = lock_warn_after_sec
-
-    def acquire(
-        self,
-        url: str,
-        lock_key: str,
-        progress: ProgressReporter | None = None,
-    ) -> AcquiredSource:
-        """Stage a download, validate what it produced, and promote it (R-35).
-
-        The lease is returned rather than released: the caller reads the media
-        under it and releases it when finished (R-36). Every path out of here
-        that does not return an `AcquiredSource` releases the lease itself, so
-        a failure never strands one.
-        """
-        lease = self._take_lease(lock_key, progress)
-        try:
-            staging_dir = self._new_staging_dir(lock_key)
-            try:
-                result = self._download(url, staging_dir, progress)
-                produced = select_downloaded_media(staging_dir)
-                validation_warnings = validate_media_file(produced)
-                promoted = promote_media(produced, self._media_dir(lock_key), root=self.output_root)
-            finally:
-                # The staging directory is scratch: whatever survived the run -
-                # a rejected file, an unmerged fragment, a `.part` - is
-                # discarded with it. Nothing under the promoted path is touched.
-                self._discard(staging_dir)
-            if progress:
-                progress.complete("youtube_download", detail={"path": str(promoted)})
-        except BaseException:
-            lease.release()
-            raise
-        return AcquiredSource(
-            path=promoted,
-            lease=lease,
-            warnings=[*lease.warnings, *result.warnings, *validation_warnings],
-        )
-
-    def _media_dir(self, lock_key: str) -> Path:
-        return self.output_root / MEDIA_DIR_NAME / lock_key
-
-    def _discard(self, staging_dir: Path) -> None:
-        """Remove a staging directory, having first proved it is one (R-16).
-
-        The check is re-run here rather than trusted from creation, and it
-        raises rather than skipping. A path that was inside the output root when
-        it was made and is not when it is deleted is a substitution in progress,
-        which is a sharper thing to report than whatever the download was doing
-        when it happened - so this is allowed to replace an in-flight error.
-        """
-        confined_path(staging_dir, self.output_root)
-        shutil.rmtree(staging_dir, ignore_errors=True)
-
-    def _new_staging_dir(self, lock_key: str) -> Path:
-        """A staging directory no other run can be writing into.
-
-        Named by pid and a random token, so two runs of one source - which the
-        lease already serializes - and two runs of different sources alike get
-        directories that cannot collide. Created under the lease, which is also
-        what makes discarding any staging directory left by an earlier run of
-        this source safe: no live run can own one.
-
-        The lease proves who is running, not what the path is, so every entry
-        this walks is checked against the output root immediately before it is
-        removed (R-16). Both halves matter: a symlink at `<lock key>` makes
-        `iterdir` enumerate somebody else's directory, and a link planted among
-        real entries names a directory this run never staged into. Each is a
-        `rmtree` of the user's files, and neither is anything the lease can see.
-        """
-        parent = ensure_safe_directory(
-            self.output_root / STAGING_DIR_NAME / lock_key, self.output_root
-        )
-        for stale in sorted(parent.iterdir()):
-            confined_path(stale, self.output_root)
-            if stale.is_dir():
-                shutil.rmtree(stale, ignore_errors=True)
-        staging_dir = confined_path(parent / f"{os.getpid()}-{uuid.uuid4().hex}", self.output_root)
-        staging_dir.mkdir()
-        return staging_dir
-
-    def _take_lease(
-        self,
-        lock_key: str,
-        progress: ProgressReporter | None,
-    ) -> AcquisitionLease:
-        locks = ensure_safe_directory(self.output_root / LOCK_DIR_NAME, self.output_root)
-        # The lock path itself is checked by `_acquire`, once per attempt, rather
-        # than here: it is created by the attempt that takes it, and a wait that
-        # can run for minutes is exactly the gap a check placed here would leave.
-        lock = locks / f"{lock_key}.lock"
-        if progress:
-            progress.update("youtube_download", status="running", detail={"step": "lock"})
-        lease, lock_warnings = self._acquire(lock_key, lock)
-        if lease is None:
-            _acquisition_log("lease_denied", lock_key=lock_key, lock_path=str(lock), reason="held")
-            raise DistillError("E_LOCKED", "youtube", "YouTube source is locked by another process")
-        lease.warnings.extend(lock_warnings)
-        _acquisition_log("lease_acquired", lock_key=lock_key, lock_path=str(lock))
-        return lease
-
-    def _download(
-        self,
-        url: str,
-        staging_dir: Path,
-        progress: ProgressReporter | None,
-    ) -> CommandResult:
-        """Run yt-dlp with its output template pointed at the staging directory.
-
-        The template names the staging directory and never the promoted path, so
-        yt-dlp's habit of opening its destination before the transfer succeeds
-        cannot truncate media a previous run proved good (RV-3).
-        """
-        out_template = str(staging_dir / f"{PROMOTED_MEDIA_STEM}.%(ext)s")
-        command = [
-            "yt-dlp",
-            # The URL names one video, whatever `list` parameter it carries.
-            NO_PLAYLIST_ARG,
-            "-f",
-            "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best/bv*+ba/b",
-            "--newline",
-            # The idle timeout is what bounds this download (R-30), and its
-            # heartbeat is yt-dlp's progress output. `--progress` keeps that
-            # output coming even under a user config that set `--quiet`,
-            # which would otherwise starve the idle clock and have a healthy
-            # download killed for saying nothing.
-            "--progress",
-            "--socket-timeout",
-            str(YTDLP_SOCKET_TIMEOUT_SEC),
-            "--retries",
-            "3",
-            "--fragment-retries",
-            "3",
-            "--concurrent-fragments",
-            "8",
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            out_template,
-            "--",
-            url,
-        ]
-
-        def report(line: str) -> None:
-            parsed = parse_ytdlp_progress(line)
-            if not parsed or progress is None:
-                return
-            progress.update(
-                "youtube_download",
-                percent=(float(parsed["percent"]) if "percent" in parsed else None),
-                detail=parsed,
-            )
-
-        # R-32: yt-dlp writes `--newline` download progress to stdout. It is
-        # the only stream parsed here; stderr carries its diagnostics, which
-        # run_command captures for the failure payload.
-        return stream(
-            command,
-            stage="youtube",
-            total_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.total_sec,
-            idle_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.idle_sec,
-            on_stdout_line=report,
-            error_code="E_YTDLP",
-        )
-
-    def _acquire(
-        self,
-        lock_key: str,
-        lock: Path,
-    ) -> tuple[AcquisitionLease | None, list[WarningRecord]]:
-        """Poll for the lease within this run's wait budget.
-
-        The budget is the only thing that ends the wait: a lock is held until
-        its holder gives it up or dies, and neither is something to time out on
-        a holder's behalf.
-
-        Each attempt creates the lock file if it is not there, so each attempt
-        re-checks the path (R-16). A wait that can run for minutes and validates
-        once at the top is a check separated from its use by the whole wait,
-        which is the window the check exists to close.
-        """
-        started = time.monotonic()
-        warnings: list[WarningRecord] = []
-        while True:
-            confined_path(lock, self.output_root)
-            lease = AcquisitionLease.take(lock_key, lock)
-            if lease is not None:
-                waited = time.monotonic() - started
-                if waited >= self.lock_warn_after_sec:
-                    warnings.append(
-                        warning(
-                            "youtube",
-                            "long_lock_wait",
-                            f"waited {waited:.1f}s for YouTube source lock",
-                        )
-                    )
-                return lease, warnings
-            if time.monotonic() - started >= self.lock_wait_sec:
-                return None, warnings
-            time.sleep(self.lock_poll_sec)
-
-
+# promote_media re-exported from .acquisition
+# YoutubeDownloader re-exported from .acquisition
 def _manifest_related_links(
     manifest: Mapping[str, Any], options: DistillOptions
 ) -> list[RelatedLink] | None:

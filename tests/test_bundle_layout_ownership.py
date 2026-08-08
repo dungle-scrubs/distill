@@ -21,8 +21,15 @@ from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src" / "distill"
 
-OWNER = "bundle_store.py"
-"""The one module allowed to name the layout it owns."""
+OWNERS = frozenset({"bundle_store.py", "bundle_layout.py"})
+"""Modules allowed to name the layout they own (deep split, Candidate 02).
+
+``bundle_store.py`` remains the façade and the bundle identity owner;
+``bundle_layout.py`` owns the filesystem layout names (``BundlePaths``,
+``MarkerVerdict``) as the deep module behind that façade. Both may name the
+layout literally; no other module may.
+"""
+OWNER = "bundle_store.py"  # legacy alias for prose
 
 LAYOUT_NAMES = {
     "_manifest.json": "the bundle marker's filename",
@@ -54,7 +61,7 @@ def _sources() -> dict[str, str]:
         path.relative_to(PACKAGE_DIR).as_posix(): path.read_text()
         for path in sorted(PACKAGE_DIR.rglob("*.py"))
         if "__pycache__" not in path.relative_to(PACKAGE_DIR).parts
-        and path.name != OWNER
+        and path.name not in OWNERS
     }
 
 
