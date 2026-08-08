@@ -880,35 +880,58 @@ def _with_chain(config: LocalVisionConfig) -> LocalVisionConfig:
 
 
 def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
-    return _with_chain(_with_validated_endpoint(_merged_local_vision_config(base_dir)))
+    """Thin wrapper so config file location and forgiving coercions live once.
+
+    Delegates to ``configuration.load_local_vision_config`` - the single
+    resolver owns the layering, while this keeps the import path existing
+    callers use. Vision remains forgivingly coerced, but the reader is not
+    duplicated.
+    """
+    try:
+        from .configuration import load_local_vision_config as _cfg_load
+
+        return _cfg_load(base_dir)
+    except ImportError:
+        return _with_chain(_with_validated_endpoint(_merged_local_vision_config(base_dir)))
 
 
 def local_vision_config_from_args(
     args: dict[str, Any],
     base_dir: Path | None = None,
 ) -> LocalVisionConfig:
-    config = _merged_local_vision_config(base_dir)
-    overrides: dict[str, Any] = {}
-    if "caption_frames" in args:
-        overrides["caption_frames"] = _coerce_bool(
-            args.get("caption_frames"), config.caption_frames
-        )
-    if "local_vision_backend" in args:
-        overrides["backend"] = str(args["local_vision_backend"])
-    if "local_vision_model" in args:
-        overrides["model"] = str(args["local_vision_model"])
-    if "local_vision_base_url" in args:
-        overrides["base_url"] = str(args["local_vision_base_url"])
-    if "local_vision_timeout_sec" in args:
-        overrides["timeout_sec"] = _coerce_float(
-            args.get("local_vision_timeout_sec"), config.timeout_sec
-        )
-    if "local_vision_allow_remote_endpoint" in args:
-        overrides["allow_remote_endpoint"] = _coerce_bool(
-            args.get("local_vision_allow_remote_endpoint"), config.allow_remote_endpoint
-        )
-    config = _chain_after_overrides(config, overrides)
-    return _with_chain(_with_validated_endpoint(_config_from_payload(overrides, config)))
+    """Vision config as a view over the resolved config, not a second reader.
+
+    Delegates to ``configuration.local_vision_config_from_args`` which folds
+    file + CLI via the single resolver with forgiving coercions. Kept here so
+    ``from distill.local_vision import ...`` still works.
+    """
+    try:
+        from .configuration import local_vision_config_from_args as _cfg_vision
+
+        return _cfg_vision(args, base_dir=base_dir)
+    except ImportError:
+        config = _merged_local_vision_config(base_dir)
+        overrides: dict[str, Any] = {}
+        if "caption_frames" in args:
+            overrides["caption_frames"] = _coerce_bool(
+                args.get("caption_frames"), config.caption_frames
+            )
+        if "local_vision_backend" in args:
+            overrides["backend"] = str(args["local_vision_backend"])
+        if "local_vision_model" in args:
+            overrides["model"] = str(args["local_vision_model"])
+        if "local_vision_base_url" in args:
+            overrides["base_url"] = str(args["local_vision_base_url"])
+        if "local_vision_timeout_sec" in args:
+            overrides["timeout_sec"] = _coerce_float(
+                args.get("local_vision_timeout_sec"), config.timeout_sec
+            )
+        if "local_vision_allow_remote_endpoint" in args:
+            overrides["allow_remote_endpoint"] = _coerce_bool(
+                args.get("local_vision_allow_remote_endpoint"), config.allow_remote_endpoint
+            )
+        config = _chain_after_overrides(config, overrides)
+        return _with_chain(_with_validated_endpoint(_config_from_payload(overrides, config)))
 
 
 def _chain_after_overrides(
