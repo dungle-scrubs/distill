@@ -439,12 +439,25 @@ class DistillOptions:
 
     @classmethod
     def from_args(cls, args: dict[str, Any]) -> DistillOptions:
-        # The configured layers first, so a value from `distill.json` or from
-        # `DISTILL_OUTPUT_DIR` is read, cast and validated below by the code
-        # that reads a typed value. A second door for configured values is how
-        # a config file comes to accept a number the command line refuses.
-        args = resolve_options(args, general_keys=GENERAL_OPTION_NAMES)
-        local_vision = local_vision_config_from_args(args)
+        """Typed entry point that now delegates to the single resolver.
+
+        The ``dict[str, Any]`` seam is kept for existing callers and tests,
+        but the precedence (CLI > env > file > default) for ALL options
+        lives in ``configuration.resolve_run_config`` behind the typed
+        ``ResolvedRunConfig``. This wrapper preserves the untyped call shape
+        while the typed dataclass is the internal source of truth.
+        """
+        # Delegated so CLI > env > file > default is enforced once, for both
+        # general and vision, and vision is a view over the same layers.
+        try:
+            from .configuration import resolve_run_config as _resolve_run
+
+            return _resolve_run(dict(args)).options
+        except ImportError:
+            # Fallback to legacy path if configuration is not yet importable
+            # (kept for isolated import ordering; normally never taken).
+            args = resolve_options(args, general_keys=GENERAL_OPTION_NAMES)
+            local_vision = local_vision_config_from_args(args)
         values: dict[str, Any] = {}
         for spec in OPTION_SPECS:
             default = OPTION_DEFAULTS[spec.name]
