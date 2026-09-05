@@ -170,7 +170,10 @@ def test_manifest_without_frames_is_a_typed_error(tmp_path: Path) -> None:
     ("malformed", "why"),
     [
         (["frame_0001.png"], "an entry that is not a document at all"),
-        ([{"index": "one", "timestamp_sec": 1.0, "relative_path": "frames/frame_0001.png"}], "a text index"),
+        (
+            [{"index": "one", "timestamp_sec": 1.0, "relative_path": "frames/frame_0001.png"}],
+            "a text index",
+        ),
         ([{"index": 1, "timestamp_sec": 1.0}], "no relative_path to address the image by"),
         (
             [{"index": 1, "timestamp_sec": 1.0, "relative_path": "../../escape.png"}],

@@ -141,7 +141,7 @@ def test_cleanup_cache_refuses_keep_generations_below_one(tmp_path: Path) -> Non
 
 
 def test_cleanup_cache_reports_what_it_considered(tmp_path: Path) -> None:
-    """"Considered nothing" and "deleted nothing" are different answers (R-57)."""
+    """ "Considered nothing" and "deleted nothing" are different answers (R-57)."""
     root = tmp_path / "cache"
     (root / "notes").mkdir(parents=True)
 

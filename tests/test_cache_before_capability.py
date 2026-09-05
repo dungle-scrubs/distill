@@ -39,8 +39,8 @@ from test_local_integration import fake_transcribe
 
 from distill import frame_selection
 from distill import pipeline as distill_session
+from distill.configuration import resolve_run_config
 from distill.errors import DistillError
-from distill.options import DistillOptions
 from distill.source import local_fingerprint, source_hash
 
 VIDEO_ID = "cachedvideo"
@@ -214,7 +214,7 @@ def test_a_youtube_bundle_keyed_by_the_resolved_video_id_is_still_found(
     pipeline version is *how* stale output stops being served, and a test that
     froze it would be pinning a mechanism against its own purpose.
     """
-    options = DistillOptions.from_args(youtube_args(tmp_path, cache_mode="fingerprint"))
+    options = resolve_run_config(youtube_args(tmp_path, cache_mode="fingerprint")).options
     fingerprint = hashlib.sha256(VIDEO_ID.encode()).hexdigest()
     bundle_key = source_hash(fingerprint, options.opts_hash("youtube"))
     write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")
@@ -247,7 +247,7 @@ def test_a_bundle_keyed_by_a_resolved_id_the_url_does_not_carry_is_still_found(
             'argv[-1].rsplit("=", 1)[-1].rsplit("/", 1)[-1]', repr(resolved_id)
         ),
     )
-    options = DistillOptions.from_args(youtube_args(tmp_path, cache_mode="fingerprint"))
+    options = resolve_run_config(youtube_args(tmp_path, cache_mode="fingerprint")).options
     bundle_key = source_hash(
         hashlib.sha256(resolved_id.encode()).hexdigest(), options.opts_hash("youtube")
     )
@@ -279,7 +279,7 @@ def test_a_playlist_attached_url_is_not_served_from_the_video_ids_bundle(
     """
     playlist_url = f"{URL}&list=PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH"
     args = youtube_args(tmp_path, url=playlist_url, cache_mode="fingerprint")
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     bundle_key = source_hash(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
@@ -305,7 +305,7 @@ def test_a_youtube_manifest_duration_over_the_cap_is_refused_rather_than_served(
     decided by which kind of **source** the bundle happened to be for.
     """
     args = youtube_args(tmp_path, max_duration_sec=5.0)
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     bundle_key = source_hash(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
@@ -336,7 +336,7 @@ def test_a_local_manifest_duration_over_the_cap_is_refused_rather_than_served(
     """
     video = a_local_video(tmp_path)
     args = local_args(video, tmp_path, max_duration_sec=5.0)
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     bundle_key = source_hash(
         local_fingerprint(video.resolve(), options.cache_mode), options.opts_hash("local")
     )
@@ -369,7 +369,7 @@ def test_a_url_naming_two_video_ids_is_not_served_from_the_first_ones_bundle(
     """
     two_ids = f"{URL}&v=otherid1234"
     args = youtube_args(tmp_path, url=two_ids)
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     bundle_key = source_hash(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
@@ -415,7 +415,7 @@ def test_a_video_id_the_url_padded_is_not_a_bundle_key_of_its_own(
     )
     padded = f"https://www.youtube.com/watch?v={VIDEO_ID}x"
     args = youtube_args(tmp_path, url=padded)
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     bundle_key = source_hash(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
@@ -443,7 +443,7 @@ def test_a_manifest_recording_a_boolean_duration_is_a_miss_not_a_one_second_hit(
     hit is a served **bundle** and a miss is `E_MISSING_TOOL`.
     """
     args = youtube_args(tmp_path)
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     bundle_key = source_hash(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
@@ -541,7 +541,7 @@ def test_neither_local_cache_mode_needs_a_probe_to_find_its_bundle(
     tmp_path: Path,
     cache_mode: str,
 ) -> None:
-    """"Where possible" is every option combination: the enumeration is empty.
+    """ "Where possible" is every option combination: the enumeration is empty.
 
     `local_fingerprint` reads the file and nothing else in both modes -
     `fingerprint` hashes size, mtime and sampled anchors, `content` hashes every
@@ -596,9 +596,7 @@ def test_force_reprocess_still_probes_the_local_source(
     ffprobe.unlink()
 
     with pytest.raises(DistillError) as failure:
-        distill_session.process_local_video(
-            local_args(video, tmp_path, force_reprocess=True)
-        )
+        distill_session.process_local_video(local_args(video, tmp_path, force_reprocess=True))
 
     assert failure.value.code == "E_MISSING_TOOL"
     assert failure.value.details["tool"] == "ffprobe"

@@ -35,9 +35,7 @@ policy is the thing that was avoided, not the file they share.
 from __future__ import annotations
 
 import base64
-import json
 import logging
-import math
 import os
 import threading
 import time
@@ -51,7 +49,6 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import FrameArtifact, Interpretation
-from .config import config_dir as general_config_dir
 from .errors import DistillError, WarningRecord, aggregate_warnings, occurrences_of, warning
 from .grounding import UNGROUNDED, GroundingAssessment, assess_grounding
 from .progress import ProgressReporter
@@ -167,7 +164,6 @@ DEFAULT_TIMEOUT_SEC = 30.0
 # Small vision models intermittently emit non-JSON; one retry recovers most of
 # them. Transport errors (timeout, unreachable) are not retried.
 DEFAULT_MAX_ATTEMPTS = 2
-CONFIG_FILENAMES = ("distill.local-vision.json", "distill.json")
 DEBUG_ENV = "DISTILL_LOCAL_VISION_DEBUG"
 # Cap on in-flight vision requests. Rapid-MLX batches internally, so Distill
 # keeps a small fixed pool rather than fanning out unbounded. 1 == serial.
@@ -759,36 +755,6 @@ def _check_credential_is_not_empty(
     )
 
 
-config_dir = general_config_dir
-"""Where local-vision configuration lives: the general config directory.
-
-Re-exported rather than resolved again here, because two answers to "where does
-config live" is a machine where `distill.json` is read from one directory and
-`distill.local-vision.json` from another. `config.py` owns the resolution; this
-module owns only its own forgiving reader and coercions.
-"""
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _coerce_bool(value: Any, default: bool) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "off"}:
-            return False
-    return default
-
-
 MAX_SOCKET_TIMEOUT_SEC = 2**63 / 1e9
 """The largest timeout `socket.settimeout` can hold, in seconds (~292 years).
 
@@ -799,257 +765,6 @@ a policy about how long a probe may wait: `inf` is not the only number a socket
 cannot take, and a door that coerces has to land inside the range or it has not
 coerced anything.
 """
-
-
-def _coerce_float(value: Any, default: float) -> float:
-    """A configured number, or the default when what arrived is not one.
-
-    Coercion rather than refusal is this layer's contract - a config file that
-    names an unusable timeout should not stop a run - but what it coerces *to*
-    has to be a number the thing downstream can take. `inf` cleared the `> 0`
-    test and reached `socket.settimeout`, which answered with an uncaught
-    `OverflowError` from the stdlib; so does any finite value past
-    `MAX_SOCKET_TIMEOUT_SEC`, which is why the bound is the socket's and not
-    just `math.isfinite`. `nan` clears nothing and would have disabled the
-    timeout by always comparing false. All of them are unusable in the way a
-    string is, so all of them get the default.
-
-    `bool` is refused for the reason `manifest_duration` refuses it: `True` is
-    an `int` in Python, and a config file saying `"timeout_sec": true` is not a
-    one-second timeout.
-    """
-    if isinstance(value, bool):
-        return default
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-    if not math.isfinite(parsed) or parsed <= 0 or parsed >= MAX_SOCKET_TIMEOUT_SEC:
-        return default
-    return parsed
-
-
-def _merged_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
-    """The configuration files, folded together, not yet validated.
-
-    Unvalidated on purpose: the endpoint that matters is the one the run will
-    use, and a per-call override is allowed to rescue a file that names a
-    forbidden one. Only the settled config is checked.
-    """
-    root = (base_dir or config_dir()).expanduser()
-    config = LocalVisionConfig()
-    named: list[str] = []
-    for filename in CONFIG_FILENAMES:
-        payload = _read_json(root / filename)
-        if filename == "distill.json":
-            nested = payload.get("local_vision")
-            payload = nested if isinstance(nested, dict) else {}
-        # Recorded per layer and folded afterwards, because the conflict
-        # P3-D-013 names can span two files that are each fine alone.
-        named.extend(key for key in ENDPOINT_FIELD_NAMES if key in payload)
-        config = _config_from_payload(payload, config)
-    return replace(config, top_level_endpoint_fields=tuple(dict.fromkeys(named)))
-
-
-def _with_chain(config: LocalVisionConfig) -> LocalVisionConfig:
-    """Every settled config carries an **endpoint chain**, so there is one path.
-
-    A config that named no `endpoints` still names an endpoint - its top-level
-    fields are one - and deriving that entry here is what keeps resolution from
-    growing a second path for "the old shape". A one-entry chain that the
-    multi-entry code does not handle is a one-entry chain nobody tested.
-
-    Derived after validation, not before: the entry has to mirror the endpoint
-    the run will actually use, and validation is what settles that.
-    """
-    if config.endpoints is not None:
-        return config
-    return replace(
-        config,
-        endpoints=(
-            LocalVisionConfig(
-                model=config.model,
-                base_url=config.base_url,
-                credential=config.credential,
-                credential_configured=config.credential_configured,
-                credential_env=config.credential_env,
-                allow_remote_endpoint=config.allow_remote_endpoint,
-            ),
-        ),
-    )
-
-
-def load_local_vision_config(base_dir: Path | None = None) -> LocalVisionConfig:
-    """Thin wrapper so config file location and forgiving coercions live once.
-
-    Delegates to ``configuration.load_local_vision_config`` - the single
-    resolver owns the layering, while this keeps the import path existing
-    callers use. Vision remains forgivingly coerced, but the reader is not
-    duplicated.
-    """
-    try:
-        from .configuration import load_local_vision_config as _cfg_load
-
-        return _cfg_load(base_dir)
-    except ImportError:
-        return _with_chain(_with_validated_endpoint(_merged_local_vision_config(base_dir)))
-
-
-def local_vision_config_from_args(
-    args: dict[str, Any],
-    base_dir: Path | None = None,
-) -> LocalVisionConfig:
-    """Vision config as a view over the resolved config, not a second reader.
-
-    Delegates to ``configuration.local_vision_config_from_args`` which folds
-    file + CLI via the single resolver with forgiving coercions. Kept here so
-    ``from distill.local_vision import ...`` still works.
-    """
-    try:
-        from .configuration import local_vision_config_from_args as _cfg_vision
-
-        return _cfg_vision(args, base_dir=base_dir)
-    except ImportError:
-        config = _merged_local_vision_config(base_dir)
-        overrides: dict[str, Any] = {}
-        if "caption_frames" in args:
-            overrides["caption_frames"] = _coerce_bool(
-                args.get("caption_frames"), config.caption_frames
-            )
-        if "local_vision_backend" in args:
-            overrides["backend"] = str(args["local_vision_backend"])
-        if "local_vision_model" in args:
-            overrides["model"] = str(args["local_vision_model"])
-        if "local_vision_base_url" in args:
-            overrides["base_url"] = str(args["local_vision_base_url"])
-        if "local_vision_timeout_sec" in args:
-            overrides["timeout_sec"] = _coerce_float(
-                args.get("local_vision_timeout_sec"), config.timeout_sec
-            )
-        if "local_vision_allow_remote_endpoint" in args:
-            overrides["allow_remote_endpoint"] = _coerce_bool(
-                args.get("local_vision_allow_remote_endpoint"), config.allow_remote_endpoint
-            )
-        config = _chain_after_overrides(config, overrides)
-        return _with_chain(_with_validated_endpoint(_config_from_payload(overrides, config)))
-
-
-def _chain_after_overrides(
-    config: LocalVisionConfig, overrides: dict[str, Any]
-) -> LocalVisionConfig:
-    """What `--local-vision-model` / `--local-vision-base-url` do to a chain.
-
-    <!-- P3-D-016 --> The two flags are not symmetric, because identity is not.
-    ADR-0004 keeps the address out of the **options hash**, so moving an
-    endpoint's address reaches the same reader at a different place and changes
-    no candidate key; the model *is* identity, and applying it to one entry
-    would leave the rest naming readers nobody asked for under keys that
-    describe them.
-
-    So: the address alone moves entry 0 and leaves the chain otherwise intact.
-    The model alone against a chain of more than one is refused, because
-    choosing which entry it meant is a decision Distill does not get to make
-    silently. Both together name one endpoint completely, and a run told to use
-    that endpoint should not still carry others it might fall through to - so
-    the chain is replaced.
-    """
-    chain = config.endpoints
-    if chain is None:
-        return config
-    names_model = "model" in overrides
-    names_address = "base_url" in overrides
-    if names_model and names_address:
-        return replace(config, endpoints=None)
-    if names_model:
-        if len(chain) > 1:
-            raise DistillError(
-                "E_BAD_OPTIONS",
-                "local_vision",
-                "--local-vision-model names one model but 'endpoints' names "
-                f"{len(chain)} endpoints, and the model decides which bundle a run "
-                "publishes under. Name --local-vision-base-url too to use a single "
-                "endpoint, or edit the chain.",
-                {"endpoints": len(chain)},
-            )
-        return replace(config, endpoints=None)
-    if names_address:
-        moved = replace(chain[0], base_url=str(overrides["base_url"]).rstrip("/"))
-        return replace(config, endpoints=(moved, *chain[1:]))
-    return config
-
-
-def _resolved_credential(
-    payload: dict[str, Any], base: LocalVisionConfig
-) -> tuple[SecretCredential | None, bool, str]:
-    """D-016: `api_key_env` names an env var and wins over inline `api_key`.
-
-    Returns (credential, configured, env_name). `configured` is True whenever
-    either key appeared, even if the resolved value is empty - validation
-    needs that distinction to fail closed on a remote endpoint.
-    """
-    if "api_key" not in payload and "api_key_env" not in payload:
-        return base.credential, base.credential_configured, base.credential_env
-    value = str(payload.get("api_key") or "")
-    env_name = str(payload.get("api_key_env") or "")
-    if env_name:
-        value = os.environ.get(env_name, "")
-    if not value:
-        return None, True, env_name
-    return SecretCredential(value), True, env_name
-
-
-def _endpoints_from_payload(
-    payload: dict[str, Any],
-    inherited: tuple[LocalVisionConfig, ...] | None,
-) -> tuple[LocalVisionConfig, ...] | None:
-    """The **endpoint chain** this layer configured, or the one it inherited.
-
-    <!-- P3-D-010 --> Every entry is folded onto a fresh `LocalVisionConfig`,
-    never onto the surrounding config: inheriting would give entry 2 entry 1's
-    credential and its remote authorization, and the outgoing `Authorization`
-    header is where that would first be visible.
-
-    A layer that names no `endpoints` leaves the inherited chain alone. What a
-    layer that *does* name one should do to an earlier layer's - replace it
-    rather than concatenate - is asserted separately, and is why this returns
-    the new chain whole rather than extending.
-    """
-    configured = payload.get("endpoints")
-    if not isinstance(configured, list):
-        return inherited
-    return tuple(
-        _config_from_payload(entry, LocalVisionConfig())
-        for entry in configured
-        if isinstance(entry, dict)
-    )
-
-
-def _config_from_payload(
-    payload: dict[str, Any],
-    base: LocalVisionConfig,
-) -> LocalVisionConfig:
-    if not payload:
-        return base
-    credential, credential_configured, credential_env = _resolved_credential(payload, base)
-    return replace(
-        base,
-        endpoints=_endpoints_from_payload(payload, base.endpoints),
-        credential=credential,
-        credential_configured=credential_configured,
-        credential_env=credential_env,
-        backend=str(payload.get("backend", base.backend)),
-        model=str(payload.get("model", base.model)),
-        base_url=str(payload.get("base_url", base.base_url)).rstrip("/"),
-        timeout_sec=_coerce_float(payload.get("timeout_sec"), base.timeout_sec),
-        caption_frames=_coerce_bool(
-            payload.get("caption_frames", base.caption_frames),
-            base.caption_frames,
-        ),
-        allow_remote_endpoint=_coerce_bool(
-            payload.get("allow_remote_endpoint", base.allow_remote_endpoint),
-            base.allow_remote_endpoint,
-        ),
-    )
 
 
 def probe_local_vision(config: LocalVisionConfig) -> LocalVisionProbe:

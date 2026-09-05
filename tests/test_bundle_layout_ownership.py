@@ -54,8 +54,7 @@ def _sources() -> dict[str, str]:
     return {
         path.relative_to(PACKAGE_DIR).as_posix(): path.read_text()
         for path in sorted(PACKAGE_DIR.rglob("*.py"))
-        if "__pycache__" not in path.relative_to(PACKAGE_DIR).parts
-        and path.name not in OWNERS
+        if "__pycache__" not in path.relative_to(PACKAGE_DIR).parts and path.name not in OWNERS
     }
 
 

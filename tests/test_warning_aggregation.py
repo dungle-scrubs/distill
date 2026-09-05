@@ -18,6 +18,7 @@ from test_local_integration import fake_transcribe, make_short_screencast
 from distill import pipeline as distill_session
 from distill.artifacts import FrameArtifact, Interpretation, Provenance, RedactionState
 from distill.bundle_store import BundleRun, BundleStore
+from distill.configuration import resolve_run_config
 from distill.errors import aggregate_warnings, warning
 from distill.local_vision import (
     FrameInterpreter,
@@ -495,14 +496,16 @@ def test_the_runs_own_fold_reaches_the_manifest_without_a_video(
 
     response = distill_session.process_resolved_source(
         source,
-        DistillOptions.from_args(
+        resolve_run_config(
             {"output_dir": str(tmp_path / "cache"), "ocr": False, "caption_frames": True}
-        ),
+        ).options,
         tmp_path / "cache",
     )
 
     manifest = json.loads(Path(response["manifest_path"]).read_text())
-    assert [(item["stage"], item["code"], item["occurrences"]) for item in manifest["warnings"]] == [
+    assert [
+        (item["stage"], item["code"], item["occurrences"]) for item in manifest["warnings"]
+    ] == [
         ("source", "source_metadata_missing", 1),
         ("transcript", "no_speech_detected", 1),
         ("local_vision", "local_vision_timeout", 80),

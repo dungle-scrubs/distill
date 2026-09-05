@@ -26,6 +26,7 @@ from typing import Any, NamedTuple
 
 import pytest
 
+from distill.configuration import local_vision_config_from_args, resolve_run_config
 from distill.errors import DistillError
 from distill.local_vision import (
     ERROR_BODY_PREVIEW_BYTES,
@@ -36,11 +37,9 @@ from distill.local_vision import (
     _build_opener,
     _urlopen_json,
     config_is_non_local,
-    local_vision_config_from_args,
     probe_local_vision,
     try_interpret_image,
 )
-from distill.options import DistillOptions
 
 # Direct, not through `local_vision`'s re-exports: the pinning transport is an
 # internal of the client module, and the facade should not widen to name it.
@@ -352,7 +351,7 @@ def test_a_non_loopback_host_is_rejected_without_the_opt_out(tmp_path: Path) -> 
         local_vision_config_from_args({}, tmp_path)
 
     with pytest.raises(DistillError, match="loopback"):
-        DistillOptions.from_args({"local_vision_base_url": PRIVATE_URL})
+        resolve_run_config({"local_vision_base_url": PRIVATE_URL})
 
 
 def test_the_endpoint_scheme_is_restricted_to_http_and_https(tmp_path: Path) -> None:
@@ -429,9 +428,9 @@ def test_the_opt_out_permits_a_non_loopback_host(
     assert failure is None
     assert transport.requested == [models_url, completions_url]
 
-    options = DistillOptions.from_args(
+    options = resolve_run_config(
         {"local_vision_base_url": PRIVATE_URL, "local_vision_allow_remote_endpoint": True}
-    )
+    ).options
 
     assert options.local_vision_base_url == PRIVATE_URL
     rebuilt = options.local_vision_config()
@@ -456,9 +455,9 @@ def test_the_opt_out_permits_a_non_loopback_host(
         ),
     )
     # Same loopback endpoint on both sides, so only the policy flag differs.
-    permitted = DistillOptions.from_args({"local_vision_allow_remote_endpoint": True})
-    assert permitted.local_vision_base_url == DistillOptions.from_args({}).local_vision_base_url
-    assert permitted.opts_hash(source_type) == DistillOptions.from_args({}).opts_hash(source_type)
+    permitted = resolve_run_config({"local_vision_allow_remote_endpoint": True}).options
+    assert permitted.local_vision_base_url == resolve_run_config({}).options.local_vision_base_url
+    assert permitted.opts_hash(source_type) == resolve_run_config({}).options.opts_hash(source_type)
 
 
 def test_a_redirect_to_a_link_local_address_is_not_followed(
@@ -753,9 +752,9 @@ def test_a_local_only_claim_is_backed_by_where_the_keyframe_actually_went(
     validated, swapped = real_endpoint(), real_endpoint()
     config = LocalVisionConfig(base_url=f"http://vision.test:{validated.port}/v1")
     assert config_is_non_local(config) is False
-    payload = DistillOptions.from_args(
+    payload = resolve_run_config(
         {"local_vision_base_url": f"http://vision.test:{validated.port}/v1"}
-    ).cache_payload("local")
+    ).options.cache_payload("local")
     assert payload["local_vision_non_local"] is False
 
     _answers_with_ports(monkeypatch, validated.port, swapped.port)

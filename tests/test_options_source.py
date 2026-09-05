@@ -20,6 +20,7 @@ from fake_tools import (
 )
 
 from distill.artifacts import RedactionState
+from distill.configuration import resolve_run_config
 from distill.errors import DistillError
 from distill.options import OPTION_DEFAULTS, DistillOptions
 from distill.progress import ProgressReporter
@@ -113,7 +114,7 @@ def test_playlist_listing_uses_guarded_ytdlp_command(
 def test_non_positive_max_static_window_is_rejected() -> None:
     for bad in (0.0, -5.0):
         with pytest.raises(DistillError) as exc:
-            DistillOptions.from_args({"max_static_window_sec": bad})
+            resolve_run_config({"max_static_window_sec": bad})
         assert exc.value.code == "E_BAD_OPTIONS"
         assert "max_static_window_sec" in exc.value.message
 
@@ -193,8 +194,8 @@ def test_local_vision_server_address_does_not_change_the_bundle_key(
     source_type: str,
 ) -> None:
     """FAILS FIRST: the address of an equal-output reader entered identity."""
-    first = DistillOptions.from_args({"local_vision_base_url": "http://127.0.0.1:8000/v1"})
-    second = DistillOptions.from_args({"local_vision_base_url": "http://127.0.0.1:9000/v1"})
+    first = resolve_run_config({"local_vision_base_url": "http://127.0.0.1:8000/v1"}).options
+    second = resolve_run_config({"local_vision_base_url": "http://127.0.0.1:9000/v1"}).options
 
     fingerprint = "same-source"
     assert source_hash(fingerprint, first.opts_hash(source_type)) == source_hash(
@@ -952,7 +953,7 @@ def test_a_nan_max_duration_is_refused_rather_than_silencing_the_cap() -> None:
     assert not (duration_sec > cap), "a NaN cap silently answers 'not over the limit'"
 
     with pytest.raises(DistillError) as exc:
-        DistillOptions.from_args({"max_duration_sec": float("nan")})
+        resolve_run_config({"max_duration_sec": float("nan")})
 
     assert exc.value.code == "E_BAD_OPTIONS"
     assert "max_duration_sec" in exc.value.message
@@ -1010,7 +1011,7 @@ def test_an_infinite_numeric_option_is_refused() -> None:
     for name in ("max_duration_sec", "max_static_window_sec", "local_vision_timeout_sec"):
         for bad in (float("inf"), float("-inf")):
             with pytest.raises(DistillError) as exc:
-                DistillOptions.from_args({name: bad})
+                resolve_run_config({name: bad})
             assert exc.value.code == "E_BAD_OPTIONS"
             assert name in exc.value.message
 
@@ -1025,7 +1026,7 @@ def test_a_zero_or_negative_duration_option_is_refused() -> None:
     for name in ("max_duration_sec", "local_vision_timeout_sec"):
         for bad in (0.0, -1.0):
             with pytest.raises(DistillError) as exc:
-                DistillOptions.from_args({name: bad})
+                resolve_run_config({name: bad})
             assert exc.value.code == "E_BAD_OPTIONS"
             assert name in exc.value.message
 
@@ -1048,7 +1049,7 @@ def test_every_numeric_option_declares_a_domain_and_refuses_a_non_finite_value()
         assert name in NUMERIC_OPTION_DOMAINS, f"{name} declares no numeric domain"
         for bad in (float("nan"), float("inf")):
             with pytest.raises(DistillError) as exc:
-                DistillOptions.from_args({name: bad})
+                resolve_run_config({name: bad})
             assert exc.value.code == "E_BAD_OPTIONS", name
             assert name in exc.value.message
 
@@ -1063,7 +1064,7 @@ def test_a_numeric_option_refuses_a_value_that_is_not_a_number() -> None:
     """
     for bad in ("lots", None, True):
         with pytest.raises(DistillError) as exc:
-            DistillOptions.from_args({"max_keyframes": bad})
+            resolve_run_config({"max_keyframes": bad})
         assert exc.value.code == "E_BAD_OPTIONS"
         assert "max_keyframes" in exc.value.message
 
@@ -1076,12 +1077,12 @@ def test_max_keyframes_must_be_a_whole_number_of_frames() -> None:
     already whole - `80`, or `80.0` from JSON - still passes.
     """
     with pytest.raises(DistillError) as exc:
-        DistillOptions.from_args({"max_keyframes": 2.7})
+        resolve_run_config({"max_keyframes": 2.7})
     assert exc.value.code == "E_BAD_OPTIONS"
     assert "max_keyframes" in exc.value.message
 
-    assert DistillOptions.from_args({"max_keyframes": 80.0}).max_keyframes == 80
-    assert DistillOptions.from_args({"max_keyframes": "80"}).max_keyframes == 80
+    assert resolve_run_config({"max_keyframes": 80.0}).options.max_keyframes == 80
+    assert resolve_run_config({"max_keyframes": "80"}).options.max_keyframes == 80
 
 
 def test_a_counted_option_is_validated_without_being_rewritten() -> None:
@@ -1102,19 +1103,20 @@ def test_a_counted_option_is_validated_without_being_rewritten() -> None:
     """
     beyond_float = 9007199254740993
 
-    assert DistillOptions.from_args({"max_keyframes": beyond_float}).max_keyframes == beyond_float
+    assert resolve_run_config({"max_keyframes": beyond_float}).options.max_keyframes == beyond_float
     assert (
-        DistillOptions.from_args({"max_keyframes": str(beyond_float)}).max_keyframes == beyond_float
+        resolve_run_config({"max_keyframes": str(beyond_float)}).options.max_keyframes
+        == beyond_float
     )
     assert json.dumps(
-        DistillOptions.from_args({"max_keyframes": beyond_float}).cache_payload("local")[
+        resolve_run_config({"max_keyframes": beyond_float}).options.cache_payload("local")[
             "max_keyframes"
         ]
     ) == str(beyond_float)
 
     for ambiguous in (1e300, float(2**53), float(beyond_float)):
         with pytest.raises(DistillError) as beyond_precision:
-            DistillOptions.from_args({"max_keyframes": ambiguous})
+            resolve_run_config({"max_keyframes": ambiguous})
         assert beyond_precision.value.code == "E_BAD_OPTIONS", ambiguous
         assert "max_keyframes" in beyond_precision.value.message, ambiguous
 
@@ -1129,13 +1131,13 @@ def test_a_numeric_option_too_large_for_a_float_is_an_option_error() -> None:
     """
     for name in ("max_duration_sec", "min_interval_sec", "max_static_window_sec"):
         with pytest.raises(DistillError) as exc:
-            DistillOptions.from_args({name: 10**400})
+            resolve_run_config({name: 10**400})
         assert exc.value.code == "E_BAD_OPTIONS", name
         assert exc.value.stage == "options", name
         assert name in exc.value.message, name
 
     with pytest.raises(DistillError) as as_text:
-        DistillOptions.from_args({"max_duration_sec": "1" + "0" * 400})
+        resolve_run_config({"max_duration_sec": "1" + "0" * 400})
     assert as_text.value.code == "E_BAD_OPTIONS"
 
 
@@ -1148,8 +1150,8 @@ def test_a_negative_zero_spacing_hashes_as_the_zero_it_is() -> None:
     `-0.0`, so the **options hash** was over different text and the run
     published a second **bundle** for a run already on disk.
     """
-    negative = DistillOptions.from_args({"min_interval_sec": -0.0})
-    positive = DistillOptions.from_args({"min_interval_sec": 0.0})
+    negative = resolve_run_config({"min_interval_sec": -0.0}).options
+    positive = resolve_run_config({"min_interval_sec": 0.0}).options
 
     assert json.dumps(negative.cache_payload("local")["min_interval_sec"]) == "0.0"
     assert negative.opts_hash("local") == positive.opts_hash("local")
@@ -1165,9 +1167,9 @@ def test_the_spacing_floor_is_the_one_numeric_option_zero_still_means_something_
     """
     from distill.options import NUMERIC_OPTION_DOMAINS
 
-    assert DistillOptions.from_args({"min_interval_sec": 0.0}).min_interval_sec == 0.0
+    assert resolve_run_config({"min_interval_sec": 0.0}).options.min_interval_sec == 0.0
     with pytest.raises(DistillError) as exc:
-        DistillOptions.from_args({"min_interval_sec": -0.5})
+        resolve_run_config({"min_interval_sec": -0.5})
     assert exc.value.code == "E_BAD_OPTIONS"
 
     zero_admitted = [name for name, domain in NUMERIC_OPTION_DOMAINS.items() if domain.admits_zero]
@@ -1188,9 +1190,9 @@ def test_valid_numbers_keep_their_json_types_in_the_current_identity_payload() -
     )
     from distill.version import PIPELINE_VERSION
 
-    options = DistillOptions.from_args(
+    options = resolve_run_config(
         {"max_keyframes": 80, "min_interval_sec": 4, "max_duration_sec": 7200}
-    )
+    ).options
     expected = {
         # P3-D-017: `vision_mode` replaced `caption_frames` here. A boolean
         # cannot say whether a bundle with no interpretations was asked for or
@@ -1240,7 +1242,7 @@ def test_a_duration_cap_and_narrow_window_that_would_build_an_unbounded_schedule
     from distill.frame_selection import MAX_CANDIDATE_SCHEDULE
 
     with pytest.raises(DistillError) as excinfo:
-        DistillOptions.from_args(
+        resolve_run_config(
             {"max_duration_sec": 1_000_000_000.0, "max_static_window_sec": 0.001}
         )
     error = excinfo.value
@@ -1253,7 +1255,7 @@ def test_a_duration_cap_and_narrow_window_that_would_build_an_unbounded_schedule
     # also refused, because the floor is a per-window rule and the pair is what
     # is unphysical.
     with pytest.raises(DistillError):
-        DistillOptions.from_args({"max_static_window_sec": 0.001})
+        resolve_run_config({"max_static_window_sec": 0.001})
 
 
 def test_a_dense_but_bounded_schedule_is_accepted() -> None:
@@ -1262,7 +1264,9 @@ def test_a_dense_but_bounded_schedule_is_accepted() -> None:
     from distill.frame_selection import MAX_CANDIDATE_SCHEDULE
 
     # 3600 / 0.01 = 360_000 candidates, under the 500_000 ceiling.
-    options = DistillOptions.from_args({"max_duration_sec": 3600.0, "max_static_window_sec": 0.01})
+    options = resolve_run_config(
+        {"max_duration_sec": 3600.0, "max_static_window_sec": 0.01}
+    ).options
     assert options.max_duration_sec / options.max_static_window_sec < MAX_CANDIDATE_SCHEDULE
 
 
@@ -1289,7 +1293,7 @@ def test_a_configured_chain_survives_into_the_config_the_pipeline_uses(
     )
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
 
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
     config = options.local_vision_config()
 
     assert [entry.model for entry in config.endpoints or ()] == [
@@ -1326,7 +1330,7 @@ def test_key_derivation_uses_the_endpoint_the_walk_selected(
         )
     )
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
 
     # Only the second endpoint answers, and nothing is cached.
     monkeypatch.setattr(
@@ -1376,7 +1380,7 @@ def test_the_walk_source_resolution_performs_is_bounded_by_the_probing_ceiling(
         )
     )
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
 
     class Elapsing:
         """`time` as `source` reads it, with a monotonic this test moves.
@@ -1441,7 +1445,7 @@ def test_a_resolution_selecting_entry_one_leaves_no_entry_zero_field_behind(
         )
     )
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
 
     monkeypatch.setattr(
         "distill.source._probe_endpoint",
@@ -1487,7 +1491,7 @@ def test_the_source_carries_the_options_its_key_was_derived_from(
 
     video = tmp_path / "demo.mp4"
     video.write_bytes(b"\x00" * 4096)
-    info = resolve_local_source(str(video), DistillOptions.from_args({}), output_root=tmp_path)
+    info = resolve_local_source(str(video), resolve_run_config({}).options, output_root=tmp_path)
 
     assert info.resolved_options is not None
     assert info.resolved_options.local_vision_model == "entry-one-model"

@@ -655,9 +655,7 @@ def test_the_response_reports_the_whole_wait_and_the_key_the_run_left(
 
     assert contended.response["source_hash"] == _key_of(CHAIN, 0)
     assert contended.response["rekeyed_from"] == contended.bundle_key
-    assert contended.response["waited_sec"] == pytest.approx(
-        WAIT_THAT_OUTLIVES_THE_MEMO, abs=0.05
-    )
+    assert contended.response["waited_sec"] == pytest.approx(WAIT_THAT_OUTLIVES_THE_MEMO, abs=0.05)
 
 
 def test_a_run_that_kept_its_key_says_it_kept_it(
@@ -726,9 +724,7 @@ def test_a_re_key_onto_a_key_another_run_published_serves_it_and_stops(
     # A coalescing waiter is a cache hit that cost five minutes, and the wait
     # travels on the hand-back rather than being dropped with the lock - so the
     # one caller for whom the wait was most of what happened still hears it.
-    assert contended.response["waited_sec"] == pytest.approx(
-        WAIT_THAT_OUTLIVES_THE_MEMO, abs=0.05
-    )
+    assert contended.response["waited_sec"] == pytest.approx(WAIT_THAT_OUTLIVES_THE_MEMO, abs=0.05)
     served = contended.response["frames"][0]["visual_interpretation"]
     assert served["visual_summary"] == ANOTHER_RUNS_READING
     # The cache scan answered, so no endpoint was asked on the way here - and

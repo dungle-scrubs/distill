@@ -169,9 +169,9 @@ def test_details_that_refer_to_themselves_serialize_once_and_stop() -> None:
 
 def test_a_detail_too_long_to_publish_is_capped_rather_than_dropped() -> None:
     """A record is a diagnosis, not a transcript: it is bounded, and says so."""
-    details = json.loads(
-        DistillError("E_X", "s", "m", {"blob": "x" * 10_000}).to_json_text()
-    )["details"]
+    details = json.loads(DistillError("E_X", "s", "m", {"blob": "x" * 10_000}).to_json_text())[
+        "details"
+    ]
 
     assert len(details["blob"]) < 10_000
     assert details["blob"].endswith(DETAIL_TRUNCATION_SUFFIX)

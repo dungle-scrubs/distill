@@ -22,8 +22,8 @@ from typing import Any
 
 import pytest
 
-from distill import cli, config, local_vision, pipeline
-from distill.config import OPTION_ENV_VARIABLES, resolve_options
+from distill import cli, config, configuration, pipeline
+from distill.configuration import OPTION_ENV_VARIABLES, resolve_options, resolve_run_config
 from distill.errors import DistillError
 from distill.local_vision import DEFAULT_TIMEOUT_SEC
 from distill.options import GENERAL_OPTION_NAMES, DistillOptions
@@ -74,7 +74,7 @@ def test_a_general_key_in_distill_json_reaches_the_options(
     write_config(tmp_path, {"max_keyframes": 5})
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
 
-    assert DistillOptions.from_args({}).max_keyframes == 5
+    assert resolve_run_config({}).options.max_keyframes == 5
 
 
 def test_output_dir_in_distill_json_sets_the_output_root(
@@ -85,7 +85,7 @@ def test_output_dir_in_distill_json_sets_the_output_root(
     write_config(tmp_path, {"output_dir": str(configured)})
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
 
-    assert output_root(DistillOptions.from_args({})) == configured.resolve()
+    assert output_root(resolve_run_config({}).options) == configured.resolve()
 
 
 def test_distill_output_dir_sets_the_output_root(
@@ -95,7 +95,7 @@ def test_distill_output_dir_sets_the_output_root(
     configured = home() / "environment-root"
     monkeypatch.setenv("DISTILL_OUTPUT_DIR", str(configured))
 
-    assert output_root(DistillOptions.from_args({})) == configured.resolve()
+    assert output_root(resolve_run_config({}).options) == configured.resolve()
 
 
 def test_each_layer_overrides_the_one_below_it(
@@ -113,15 +113,15 @@ def test_each_layer_overrides_the_one_below_it(
     from_command_line = home() / "command-line-root"
 
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
-    assert output_root(DistillOptions.from_args({})) == default_root.resolve()
+    assert output_root(resolve_run_config({}).options) == default_root.resolve()
 
     write_config(tmp_path, {"output_dir": str(from_file)})
-    assert output_root(DistillOptions.from_args({})) == from_file.resolve()
+    assert output_root(resolve_run_config({}).options) == from_file.resolve()
 
     monkeypatch.setenv("DISTILL_OUTPUT_DIR", str(from_environment))
-    assert output_root(DistillOptions.from_args({})) == from_environment.resolve()
+    assert output_root(resolve_run_config({}).options) == from_environment.resolve()
 
-    command_line = DistillOptions.from_args({"output_dir": str(from_command_line)})
+    command_line = resolve_run_config({"output_dir": str(from_command_line)}).options
     assert output_root(command_line) == from_command_line.resolve()
 
 
@@ -134,12 +134,12 @@ def test_a_diagnostic_variable_changes_no_option(
     dump, the timeout resolution - and adopting one into the resolution order
     would make a debugging switch change what a run produces.
     """
-    unconfigured = DistillOptions.from_args({"job_id": "fixed"})
+    unconfigured = resolve_run_config({"job_id": "fixed"}).options
 
     for name in DIAGNOSTIC_VARIABLES:
         monkeypatch.setenv(name, "1")
 
-    assert DistillOptions.from_args({"job_id": "fixed"}) == unconfigured
+    assert resolve_run_config({"job_id": "fixed"}).options == unconfigured
 
 
 def test_a_config_under_xdg_config_home_is_read(
@@ -150,7 +150,7 @@ def test_a_config_under_xdg_config_home_is_read(
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     write_config(tmp_path / "distill", {"max_keyframes": 11})
 
-    assert DistillOptions.from_args({}).max_keyframes == 11
+    assert resolve_run_config({}).options.max_keyframes == 11
 
 
 def test_a_config_under_home_config_distill_is_read(
@@ -160,7 +160,7 @@ def test_a_config_under_home_config_distill_is_read(
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     write_config(home() / ".config" / "distill", {"max_keyframes": 12})
 
-    assert DistillOptions.from_args({}).max_keyframes == 12
+    assert resolve_run_config({}).options.max_keyframes == 12
 
 
 def test_a_config_under_the_dot_distill_directory_is_read(
@@ -171,7 +171,7 @@ def test_a_config_under_the_dot_distill_directory_is_read(
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     write_config(home() / ".distill", {"max_keyframes": 13})
 
-    assert DistillOptions.from_args({}).max_keyframes == 13
+    assert resolve_run_config({}).options.max_keyframes == 13
 
 
 def test_the_config_directories_do_not_merge_with_each_other(
@@ -190,7 +190,7 @@ def test_the_config_directories_do_not_merge_with_each_other(
     write_config(home() / ".config" / "distill", {"max_keyframes": 22, "whisper_model": "medium"})
     write_config(home() / ".distill", {"max_keyframes": 23, "whisper_language": "de"})
 
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
 
     assert options.max_keyframes == 21
     assert options.whisper_model == "small"
@@ -208,7 +208,7 @@ def test_distill_config_dir_wins_over_every_other_location(
     write_config(home() / ".config" / "distill", {"max_keyframes": 33})
     write_config(home() / ".distill", {"max_keyframes": 34})
 
-    assert DistillOptions.from_args({}).max_keyframes == 31
+    assert resolve_run_config({}).options.max_keyframes == 31
 
 
 def test_an_absent_explicit_config_directory_is_authoritative_and_empty(
@@ -221,7 +221,7 @@ def test_an_absent_explicit_config_directory_is_authoritative_and_empty(
     write_config(home() / ".config" / "distill", {"max_keyframes": 33})
 
     assert config.config_dir() == explicit
-    assert DistillOptions.from_args({}).max_keyframes == 80
+    assert resolve_run_config({}).options.max_keyframes == 80
 
 
 def test_an_explicit_config_path_that_is_not_a_directory_is_refused(
@@ -233,7 +233,7 @@ def test_an_explicit_config_path_that_is_not_a_directory_is_refused(
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(explicit))
 
     with pytest.raises(DistillError) as refusal:
-        DistillOptions.from_args({})
+        resolve_run_config({})
 
     assert refusal.value.code == "E_BAD_OPTIONS"
     assert refusal.value.stage == "options"
@@ -264,7 +264,7 @@ def test_a_relative_config_environment_path_is_skipped(
     write_config(tmp_path / relative_directory, {"max_keyframes": 7})
     write_config(home() / ".config" / "distill", {"max_keyframes": 9})
 
-    assert DistillOptions.from_args({}).max_keyframes == 9
+    assert resolve_run_config({}).options.max_keyframes == 9
 
 
 def test_an_unreadable_explicit_config_parent_is_a_typed_process_refusal(
@@ -478,8 +478,8 @@ def test_the_local_vision_section_is_not_a_general_option(tmp_path: Path) -> Non
     """
     write_config(tmp_path, {"local_vision": {"model": "qwen3-vl:32b"}, "max_keyframes": 4})
 
-    assert config.general_config(tmp_path) == {"max_keyframes": 4}
-    assert local_vision.load_local_vision_config(tmp_path).model == "qwen3-vl:32b"
+    assert configuration.general_config(tmp_path) == {"max_keyframes": 4}
+    assert configuration.load_local_vision_config(tmp_path).model == "qwen3-vl:32b"
 
 
 def test_an_unused_flag_does_not_overrule_a_configured_value(
@@ -530,7 +530,7 @@ def test_local_vision_reads_the_same_config_directory() -> None:
     directory or an operator has two config directories and no way to tell
     which file is being read from which.
     """
-    assert local_vision.config_dir is config.config_dir
+    assert configuration.config_dir is config.config_dir
 
 
 # --- What a configured value is refused by, and what a bad file is worth. -----
@@ -597,9 +597,9 @@ def test_general_json_values_must_have_the_option_type(
     write_config(tmp_path, {option: value})
 
     with pytest.raises(DistillError) as configured:
-        DistillOptions.from_args({})
+        resolve_run_config({})
     with pytest.raises(DistillError) as typed:
-        DistillOptions.from_args({option: value})
+        resolve_run_config({option: value})
 
     assert configured.value.code == typed.value.code == "E_BAD_OPTIONS"
     assert configured.value.stage == typed.value.stage == "options"
@@ -627,9 +627,9 @@ def test_a_configured_number_is_refused_where_a_typed_one_is(
     path = write_config(tmp_path, {"max_keyframes": value})
 
     with pytest.raises(DistillError) as configured:
-        DistillOptions.from_args({})
+        resolve_run_config({})
     with pytest.raises(DistillError) as typed:
-        DistillOptions.from_args({"max_keyframes": value})
+        resolve_run_config({"max_keyframes": value})
 
     assert configured.value.code == "E_BAD_OPTIONS"
     assert configured.value.stage == "options"
@@ -657,7 +657,7 @@ def test_a_malformed_general_config_file_is_refused_rather_than_read_as_empty(
     write_text_config(tmp_path, MALFORMED_JSON)
 
     with pytest.raises(DistillError) as refusal:
-        DistillOptions.from_args({})
+        resolve_run_config({})
 
     assert refusal.value.code == "E_BAD_OPTIONS"
     assert refusal.value.stage == "options"
@@ -674,7 +674,7 @@ def test_a_malformed_general_config_file_names_the_file_and_the_parse_failure(
     path = write_text_config(tmp_path, MALFORMED_JSON)
 
     with pytest.raises(DistillError) as refusal:
-        config.general_config(tmp_path)
+        configuration.general_config(tmp_path)
 
     details = refusal.value.details
     assert details["path"] == str(path)
@@ -688,7 +688,7 @@ def test_a_non_utf8_general_config_file_is_refused_and_names_the_file(
     path.write_bytes(b'{"max_keyframes": "\xff"}')
 
     with pytest.raises(DistillError) as refusal:
-        config.general_config(tmp_path)
+        configuration.general_config(tmp_path)
 
     assert refusal.value.code == "E_BAD_OPTIONS"
     assert refusal.value.stage == "options"
@@ -706,7 +706,7 @@ def test_a_general_config_file_that_is_not_an_object_is_refused(tmp_path: Path) 
     write_text_config(tmp_path, '["max_keyframes"]')
 
     with pytest.raises(DistillError) as refusal:
-        config.general_config(tmp_path)
+        configuration.general_config(tmp_path)
 
     assert refusal.value.code == "E_BAD_OPTIONS"
     assert refusal.value.details["received"] == "list"
@@ -728,7 +728,7 @@ def test_an_unreadable_general_config_file_is_refused_rather_than_treated_as_abs
         pytest.skip("this process can read a mode 000 file")
 
     with pytest.raises(DistillError) as refusal:
-        config.general_config(tmp_path)
+        configuration.general_config(tmp_path)
 
     assert refusal.value.code == "E_BAD_OPTIONS"
     assert refusal.value.stage == "options"
@@ -741,7 +741,7 @@ def test_an_absent_general_config_file_is_not_a_refusal(tmp_path: Path) -> None:
     Stated as its own test because the refusals above are one over-eager `except`
     away from making a machine with no config file unable to run at all.
     """
-    assert config.general_config(tmp_path) == {}
+    assert configuration.general_config(tmp_path) == {}
 
 
 def test_a_broken_general_config_symlink_is_refused_as_present(
@@ -751,7 +751,7 @@ def test_a_broken_general_config_symlink_is_refused_as_present(
     path.symlink_to(tmp_path / "missing-target.json")
 
     with pytest.raises(DistillError) as refusal:
-        config.general_config(tmp_path)
+        configuration.general_config(tmp_path)
 
     assert refusal.value.code == "E_BAD_OPTIONS"
     assert refusal.value.stage == "options"
@@ -773,16 +773,16 @@ def test_a_local_vision_value_is_coerced_where_a_general_value_is_refused(
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
     write_config(tmp_path, {"local_vision": {"timeout_sec": "soon"}, "max_keyframes": 5})
 
-    assert local_vision.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
-    assert DistillOptions.from_args({}).max_keyframes == 5
+    assert configuration.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
+    assert resolve_run_config({}).options.max_keyframes == 5
 
     write_config(tmp_path, {"local_vision": {"timeout_sec": "soon"}, "max_keyframes": "many"})
 
     with pytest.raises(DistillError) as refusal:
-        DistillOptions.from_args({})
+        resolve_run_config({})
 
     assert refusal.value.code == "E_BAD_OPTIONS"
-    assert local_vision.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
+    assert configuration.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
 
 
 def test_a_malformed_local_vision_file_is_still_read_forgivingly(tmp_path: Path) -> None:
@@ -795,7 +795,7 @@ def test_a_malformed_local_vision_file_is_still_read_forgivingly(tmp_path: Path)
     """
     (tmp_path / "distill.local-vision.json").write_text(MALFORMED_JSON)
 
-    assert local_vision.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
+    assert configuration.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
 
 
 def test_a_non_utf8_local_vision_file_still_degrades_to_defaults(
@@ -803,7 +803,7 @@ def test_a_non_utf8_local_vision_file_still_degrades_to_defaults(
 ) -> None:
     (tmp_path / "distill.local-vision.json").write_bytes(b'{"timeout_sec": "\xff"}')
 
-    assert local_vision.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
+    assert configuration.load_local_vision_config(tmp_path).timeout_sec == DEFAULT_TIMEOUT_SEC
 
 
 def test_a_configured_option_changes_the_options_hash(
@@ -817,11 +817,11 @@ def test_a_configured_option_changes_the_options_hash(
     publishes - the property ADR-0003 makes a module signed for.
     """
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
-    default_hash = DistillOptions.from_args({}).opts_hash("local")
+    default_hash = resolve_run_config({}).options.opts_hash("local")
 
     write_config(tmp_path, {"max_keyframes": 5})
 
-    assert DistillOptions.from_args({}).opts_hash("local") != default_hash
+    assert resolve_run_config({}).options.opts_hash("local") != default_hash
     assert "config.py" in SIGNED_MODULES
 
 
@@ -832,8 +832,8 @@ def test_file_and_cli_values_produce_the_same_options_hash(
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
     write_config(tmp_path, {"max_keyframes": 17})
 
-    from_file = DistillOptions.from_args({}).opts_hash("local")
-    from_cli = DistillOptions.from_args({"max_keyframes": 17}).opts_hash("local")
+    from_file = resolve_run_config({}).options.opts_hash("local")
+    from_cli = resolve_run_config({"max_keyframes": 17}).options.opts_hash("local")
 
     assert from_file == from_cli
 
@@ -844,10 +844,10 @@ def test_file_output_roots_do_not_change_the_options_hash(
 ) -> None:
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
     write_config(tmp_path, {"output_dir": str(home() / "first")})
-    first = DistillOptions.from_args({}).opts_hash("local")
+    first = resolve_run_config({}).options.opts_hash("local")
 
     write_config(tmp_path, {"output_dir": str(home() / "second")})
-    second = DistillOptions.from_args({}).opts_hash("local")
+    second = resolve_run_config({}).options.opts_hash("local")
 
     assert first == second
 
@@ -892,14 +892,14 @@ def test_the_module_comment_states_what_it_owns() -> None:
     this module starts reading without saying so fails, which is the drift a
     hand-written comment about ownership actually suffers.
     """
-    comment = config.__doc__ or ""
+    comment = (config.__doc__ or "") + (configuration.__doc__ or "")
 
     for name in (
         config.CONFIG_DIR_ENV,
         config.XDG_CONFIG_HOME_ENV,
-        config.GENERAL_CONFIG_FILENAME,
-        config.LOCAL_VISION_SECTION,
-        *config.OPTION_ENV_VARIABLES.values(),
+        configuration.GENERAL_CONFIG_FILENAME,
+        configuration.LOCAL_VISION_SECTION,
+        *configuration.OPTION_ENV_VARIABLES.values(),
         *DIAGNOSTIC_VARIABLES,
     ):
         assert name in comment, f"the module comment does not mention {name}"

@@ -29,7 +29,7 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .cache_doctor import inspect_cache
-from .config import resolve_options
+from .configuration import local_vision_config_from_args, resolve_options, resolve_run_config
 from .errors import DistillError, WarningRecord
 from .filtered_view import filtered_view_markdown
 from .frame_selection import select_keyframes
@@ -37,7 +37,6 @@ from .job_store import JobOutcome, JobStore
 from .local_vision import (
     MAX_SOCKET_TIMEOUT_SEC,
     FrameInterpreter,
-    local_vision_config_from_args,
     probe_local_vision,
     try_interpret_image_after_probe,
 )
@@ -215,7 +214,7 @@ def acquire_and_process(
 def process_local_video(
     args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
 ) -> dict[str, Any]:
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     root = validate_output_root(options.output_dir)
 
     def work() -> dict[str, Any]:
@@ -235,7 +234,7 @@ def process_local_video(
 def process_youtube_video(
     args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
 ) -> dict[str, Any]:
-    options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
+    options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
     root = validate_output_root(options.output_dir)
     progress = ProgressReporter(emitter=progress_emitter(options.job_id))
 
@@ -408,7 +407,7 @@ class BatchRunner:
 
 
 def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     root = validate_output_root(options.output_dir)
     max_items = validated_count("max_items", args.get("max_items", 50))
     recursive = bool(args.get("recursive", False))
@@ -467,7 +466,7 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
         raise DistillError("E_BAD_URL", "youtube", "url is required")
     # Reject non-YouTube hosts / option-injection values before any yt-dlp call.
     ensure_youtube_host(url)
-    options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
+    options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
     root = validate_output_root(options.output_dir)
     playlist_root = root / "playlists" / playlist_folder_name(url)
     max_items = validated_count("max_items", args.get("max_items", 25))

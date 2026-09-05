@@ -16,6 +16,12 @@ from untrusted_blocks import SENTINEL, assert_delimited, attack
 
 from distill import pipeline as distill_session
 from distill.artifacts import FrameArtifact, Interpretation
+from distill.config import config_dir
+from distill.configuration import (
+    load_local_vision_config,
+    local_vision_config_from_args,
+    resolve_run_config,
+)
 from distill.errors import DistillError
 from distill.grounding import UNGROUNDED
 from distill.local_vision import (
@@ -28,15 +34,11 @@ from distill.local_vision import (
     LocalVisionFailure,
     LocalVisionProbe,
     _interpret_with_rapid_mlx,
-    config_dir,
-    load_local_vision_config,
-    local_vision_config_from_args,
     parse_interpretation_json,
     probe_local_vision,
     probe_rapid_mlx_availability,
     try_interpret_image,
 )
-from distill.options import DistillOptions
 from distill.pipeline import local_vision_diagnostics
 
 # Direct, not through `local_vision`'s re-exports: the header builder is an
@@ -142,7 +144,7 @@ def test_local_vision_config_loads_from_config_dir(
     )
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
 
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
 
     assert options.caption_frames is True
     assert options.local_vision_backend == "rapid-mlx"
@@ -153,7 +155,7 @@ def test_local_vision_config_loads_from_config_dir(
     monkeypatch.delenv("DISTILL_CONFIG_DIR")
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
 
-    options_with_generic_config_dir = DistillOptions.from_args({})
+    options_with_generic_config_dir = resolve_run_config({}).options
 
     assert options_with_generic_config_dir.local_vision_model == DEFAULT_MODEL
     assert options_with_generic_config_dir.local_vision_base_url == DEFAULT_LOCAL_VISION_BASE_URL
@@ -895,14 +897,14 @@ def test_unsupported_backend_is_rejected() -> None:
 
 
 def test_rapid_mlx_backend_is_accepted_by_options() -> None:
-    options = DistillOptions.from_args({"local_vision_backend": "rapid-mlx"})
+    options = resolve_run_config({"local_vision_backend": "rapid-mlx"}).options
 
     assert options.local_vision_backend == "rapid-mlx"
 
 
 def test_non_rapid_mlx_backend_is_rejected_by_options() -> None:
     with pytest.raises(DistillError, match="must be 'rapid-mlx'"):
-        DistillOptions.from_args({"local_vision_backend": "ollama"})
+        resolve_run_config({"local_vision_backend": "ollama"})
 
 
 def test_config_dir_env_overrides_a_config_planted_under_home(
@@ -926,7 +928,7 @@ def test_config_dir_env_overrides_a_config_planted_under_home(
 
     assert hermetic_config_dir != home_config_dir
     assert config_dir() == hermetic_config_dir
-    assert DistillOptions.from_args({}).local_vision_model == DEFAULT_MODEL
+    assert resolve_run_config({}).options.local_vision_model == DEFAULT_MODEL
 
 
 def test_config_dir_falls_back_to_home_when_env_var_is_unset(
@@ -950,7 +952,7 @@ def test_config_dir_falls_back_to_home_when_env_var_is_unset(
     monkeypatch.setenv("HOME", str(tmp_path))
 
     assert config_dir() == home_config_dir
-    assert DistillOptions.from_args({}).local_vision_model == configured_model
+    assert resolve_run_config({}).options.local_vision_model == configured_model
 
 
 def test_local_vision_diagnostics_describe_rapid_mlx(
@@ -970,7 +972,7 @@ def test_local_vision_diagnostics_describe_rapid_mlx(
     monkeypatch.setattr("distill.pipeline.probe_local_vision", fake_probe)
 
     diagnostics = local_vision_diagnostics({})
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
 
     assert diagnostics["setup_command"] == f"rapid-mlx serve {DEFAULT_MODEL}"
     assert options.local_vision_model == DEFAULT_MODEL
@@ -1837,7 +1839,7 @@ class TestSecretCredential:
         assert "sk-entry-secret-value" not in json.dumps(config.public_dict())
         assert "sk-entry-secret-value" not in repr(config)
         assert "sk-entry-secret-value" not in json.dumps(
-            DistillOptions.from_args({}).cache_payload("local")
+            resolve_run_config({}).options.cache_payload("local")
         )
         with pytest.raises(TypeError):
             asdict(config)
@@ -1940,7 +1942,7 @@ class TestCredentialResolution:
         )
         monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
 
-        options = DistillOptions.from_args({})
+        options = resolve_run_config({}).options
         config = options.local_vision_config()
 
         assert config.credential is not None
@@ -2868,19 +2870,19 @@ class TestNonLocalProvenance:
     def test_was_remote_folds_into_bundle_identity_but_the_address_does_not(
         self,
     ) -> None:
-        local = DistillOptions.from_args({})
-        remote = DistillOptions.from_args(
+        local = resolve_run_config({}).options
+        remote = resolve_run_config(
             {
                 "local_vision_base_url": "https://10.0.0.5:8000/v1",
                 "local_vision_allow_remote_endpoint": True,
             }
-        )
-        another_remote = DistillOptions.from_args(
+        ).options
+        another_remote = resolve_run_config(
             {
                 "local_vision_base_url": "https://198.51.100.7:9000/v1",
                 "local_vision_allow_remote_endpoint": True,
             }
-        )
+        ).options
 
         # Remote- and local-produced bundles never share a key (D-012)...
         assert local.opts_hash("local") != remote.opts_hash("local")
@@ -2995,7 +2997,7 @@ def test_end_to_end_credential_budget_and_provenance_compose(
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path / "config"))
     (tmp_path / "frame0.png").write_bytes(b"png")
 
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
     config = options.local_vision_config()
 
     auth_headers: list[str | None] = []
@@ -3198,8 +3200,8 @@ class TestFrameSalienceToggle:
     cache_key=True - on and off yield different bundle keys."""
 
     def test_defaults_on_and_is_disableable_and_keys_the_cache(self) -> None:
-        default = DistillOptions.from_args({})
-        disabled = DistillOptions.from_args({"frame_salience": False})
+        default = resolve_run_config({}).options
+        disabled = resolve_run_config({"frame_salience": False}).options
 
         assert default.frame_salience is True
         assert disabled.frame_salience is False
@@ -3430,7 +3432,7 @@ class TestFilteredRenderView:
 
         frames, _warnings = interpret_frames_with_local_vision(
             [_frame(1, tmp_path / "frame0.png")],
-            DistillOptions.from_args({}),
+            resolve_run_config({}).options,
             None,
             transcript=transcript,
         )

@@ -239,8 +239,7 @@ def test_extract_audio_reports_media_time_progress(
     # duration_sec, so an inexact assertion here would not notice the
     # duration failing to reach extract_audio at all.
     assert any(
-        event.mechanism == "audio_extraction" and event.percent == 50.0
-        for event in progress.events
+        event.mechanism == "audio_extraction" and event.percent == 50.0 for event in progress.events
     )
     # The 50% event is emitted inside the stderr loop, before the returncode is
     # ever checked, so the mid-run percent alone cannot tell a successful
@@ -435,9 +434,7 @@ def test_transcribe_video_returns_audio_warning_without_transcribing(
 
     monkeypatch.setattr(transcript, "transcribe_audio", _should_not_run)
 
-    result, warnings = transcribe_video(
-        tmp_path / "video.mp4", tmp_path, "small", "en", True
-    )
+    result, warnings = transcribe_video(tmp_path / "video.mp4", tmp_path, "small", "en", True)
 
     assert result is None
     assert warnings == [audio_warning]
@@ -465,13 +462,9 @@ def test_a_truncated_extraction_still_transcribes_and_keeps_its_warning(
     **bundle** with no record that ffmpeg's own output was cut short.
     """
     fake_tool("ffmpeg", FAKE_FFMPEG_FLOODS_STDERR)
-    monkeypatch.setattr(
-        transcript, "transcribe_audio", lambda *_a, **_k: ({"segments": []}, [])
-    )
+    monkeypatch.setattr(transcript, "transcribe_audio", lambda *_a, **_k: ({"segments": []}, []))
 
-    result, warnings = transcribe_video(
-        tmp_path / "video.mp4", tmp_path, "small", "en", True
-    )
+    result, warnings = transcribe_video(tmp_path / "video.mp4", tmp_path, "small", "en", True)
 
     assert result == {"segments": []}
     assert [item["code"] for item in warnings] == [TRUNCATION_WARNING_CODE]
@@ -560,6 +553,4 @@ class TestTranscriptWindow:
             {"start": 5.0, "end": 15.0, "text": "the one real segment"},
         )
 
-        assert select_transcript_window(segments, 10.0, radius_sec=30.0) == (
-            "the one real segment"
-        )
+        assert select_transcript_window(segments, 10.0, radius_sec=30.0) == ("the one real segment")

@@ -191,9 +191,7 @@ def test_a_plan_deletes_nothing_on_its_own(tmp_path: Path) -> None:
 
 def test_a_plan_over_an_absent_root_considers_nothing(tmp_path: Path) -> None:
     """The control for the refusal below: an absent root is a knowable answer."""
-    plan = BundleStore.open(tmp_path / "never-created").plan_prune(
-        PrunePolicy(keep_generations=1)
-    )
+    plan = BundleStore.open(tmp_path / "never-created").plan_prune(PrunePolicy(keep_generations=1))
 
     assert plan.targets == ()
     assert plan.considered == 0
@@ -459,9 +457,7 @@ def test_apply_prune_skips_every_target_of_a_bundle_a_live_run_holds(tmp_path: P
         lock.release()
 
     assert outcome.deleted == ()
-    assert {result.reason for result in outcome.retained} == {
-        "another run holds this bundle key"
-    }
+    assert {result.reason for result in outcome.retained} == {"another run holds this bundle key"}
     assert (bundle / "g1").is_dir()
     assert (bundle / "g2").is_dir()
 
@@ -698,9 +694,7 @@ def test_considering_nothing_is_distinguishable_from_deleting_nothing(
     empty = BundleStore.open(empty_root).apply_prune(
         BundleStore.open(empty_root).plan_prune(policy)
     )
-    busy = BundleStore.open(busy_root).apply_prune(
-        BundleStore.open(busy_root).plan_prune(policy)
-    )
+    busy = BundleStore.open(busy_root).apply_prune(BundleStore.open(busy_root).plan_prune(policy))
 
     assert empty.deleted == () and busy.deleted == ()
     assert empty.considered == 0

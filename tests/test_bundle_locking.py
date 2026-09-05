@@ -40,6 +40,7 @@ from distill.bundle_store import (
     BundleSnapshot,
     BundleStore,
 )
+from distill.configuration import resolve_run_config
 from distill.errors import DistillError
 
 BUNDLE_KEY = "b0a1c2d3"
@@ -469,9 +470,7 @@ def test_lock_events_report_acquired_waited_denied_and_unsupported(
     by_event = {event["event"]: event for event in events}
     assert set(by_event) >= {"lock_acquired", "lock_waited", "lock_denied", "lock_unsupported"}
     assert by_event["lock_denied"]["detail"]["waited_sec"] == pytest.approx(5.0)
-    assert by_event["lock_waited"]["detail"]["waited_sec"] == pytest.approx(
-        clock.now - released_at
-    )
+    assert by_event["lock_waited"]["detail"]["waited_sec"] == pytest.approx(clock.now - released_at)
     assert by_event["lock_unsupported"]["detail"]["errno"] == "ENOLCK"
     assert by_event["lock_acquired"]["detail"]["bundle_key"] == BUNDLE_KEY
 
@@ -683,7 +682,6 @@ def test_a_run_takes_the_bundle_lock_for_the_budget_its_caller_named(
     seconds and lets the batch move on.
     """
     from distill import pipeline
-    from distill.options import DistillOptions
     from distill.progress import ProgressReporter
 
     budgets: list[float] = []
@@ -700,7 +698,7 @@ def test_a_run_takes_the_bundle_lock_for_the_budget_its_caller_named(
 
     root = tmp_path / "output"
     root.mkdir()
-    options = DistillOptions.from_args({"output_dir": str(root), "job_id": "j"})
+    options = resolve_run_config({"output_dir": str(root), "job_id": "j"}).options
     progress = ProgressReporter(emitter=lambda _event: None)
 
     # The default is the single-source budget, so a caller that says nothing
@@ -730,7 +728,6 @@ def test_a_run_that_fails_mid_stage_abandons_its_hold_and_says_why(
     directory** stays for the next run to **resume** from; only the lock goes.
     """
     from distill import pipeline
-    from distill.options import DistillOptions
     from distill.progress import ProgressReporter
 
     def explode(_self: object, _run: object, _heartbeat: object) -> dict[str, Any]:
@@ -749,7 +746,7 @@ def test_a_run_that_fails_mid_stage_abandons_its_hold_and_says_why(
     with pytest.raises(DistillError):
         pipeline.process_resolved_source(
             StubSource(),
-            DistillOptions.from_args({"output_dir": str(root), "job_id": "j"}),
+            resolve_run_config({"output_dir": str(root), "job_id": "j"}).options,
             root,
             progress=ProgressReporter(emitter=lambda _event: None),
         )
@@ -775,7 +772,6 @@ def test_the_same_budget_reaches_the_lock_a_run_takes_first(
     denied at acquisition before `begin` was called at all.
     """
     from distill import pipeline
-    from distill.options import DistillOptions
     from distill.progress import ProgressReporter
 
     budgets: list[float] = []
@@ -796,7 +792,7 @@ def test_the_same_budget_reaches_the_lock_a_run_takes_first(
 
     root = tmp_path / "output"
     root.mkdir()
-    options = DistillOptions.from_args({"output_dir": str(root), "job_id": "j"})
+    options = resolve_run_config({"output_dir": str(root), "job_id": "j"}).options
     progress = ProgressReporter(emitter=lambda _event: None)
     for budget in (SINGLE_SOURCE_LOCK_WAIT_SEC, BATCH_ITEM_LOCK_WAIT_SEC):
         with pytest.raises(DistillError):

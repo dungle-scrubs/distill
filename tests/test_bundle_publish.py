@@ -298,9 +298,7 @@ def test_the_generation_left_by_such_a_crash_is_a_prunable_orphan(
         publish_staging(second, manifest_for())
 
     assert (bundle_root / "g2").is_dir()
-    assert orphan_generations(bundle_root, read_marker(bundle_root)) == [
-        bundle_root / "g2"
-    ]
+    assert orphan_generations(bundle_root, read_marker(bundle_root)) == [bundle_root / "g2"]
 
 
 def test_the_manifest_is_written_by_atomic_replace(

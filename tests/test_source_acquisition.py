@@ -34,6 +34,7 @@ from fake_tools import (
 from distill import bundle_store as distill_bundle_store
 from distill import source as distill_source
 from distill.bundle_store import ExclusiveLock
+from distill.configuration import resolve_run_config
 from distill.errors import DistillError
 from distill.progress import ProgressReporter
 from distill.run_command import OUTPUT_CAP_BYTES, TRUNCATION_WARNING_CODE
@@ -751,9 +752,7 @@ def test_acquisition_emits_lease_validation_and_promotion_events(
         acquired.lease.release()
 
     events = [
-        json.loads(record.message)
-        for record in caplog.records
-        if record.name == "distill.source"
+        json.loads(record.message) for record in caplog.records if record.name == "distill.source"
     ]
     assert [event["event"] for event in events] == [
         "lease_acquired",
@@ -784,9 +783,7 @@ def test_a_rejected_media_file_is_reported_with_its_verdict(
         YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     events = [
-        json.loads(record.message)
-        for record in caplog.records
-        if record.name == "distill.source"
+        json.loads(record.message) for record in caplog.records if record.name == "distill.source"
     ]
     assert [event["event"] for event in events] == [
         "lease_acquired",
@@ -835,9 +832,7 @@ def test_a_truncated_validation_probe_travels_with_the_acquired_source(
     try:
         assert acquired.path.exists()
         assert [
-            item["code"]
-            for item in acquired.warnings
-            if item["code"] == TRUNCATION_WARNING_CODE
+            item["code"] for item in acquired.warnings if item["code"] == TRUNCATION_WARNING_CODE
         ] == [TRUNCATION_WARNING_CODE]
     finally:
         acquired.lease.release()
@@ -933,9 +928,7 @@ def test_a_symlink_planted_inside_staging_is_refused_rather_than_walked(
     output_root.mkdir()
     victim = user_data_outside(tmp_path)
     staging_root(output_root).mkdir(parents=True)
-    (staging_root(output_root) / "abandoned-run").symlink_to(
-        victim, target_is_directory=True
-    )
+    (staging_root(output_root) / "abandoned-run").symlink_to(victim, target_is_directory=True)
 
     with pytest.raises(DistillError) as exc:
         YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
@@ -1170,9 +1163,8 @@ class BudgetClock:
 
 
 def youtube_options(root: Path) -> Any:
-    from distill.options import DistillOptions
 
-    return DistillOptions.from_args(
+    return resolve_run_config(
         {
             "url": URL,
             "output_dir": str(root),
@@ -1181,7 +1173,7 @@ def youtube_options(root: Path) -> Any:
             "caption_frames": False,
             "cache_mode": "fingerprint",
         }
-    )
+    ).options
 
 
 def hold_the_lease(root: Path, lock_key: str) -> AcquisitionLease:

@@ -23,6 +23,7 @@ from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import frame_selection
 from distill import pipeline as distill_session
+from distill.configuration import resolve_run_config
 from distill.errors import DistillError
 from distill.frame_selection import (
     CANDIDATE_TIMESTAMP_QUANTUM_SEC as QUANTUM,
@@ -31,7 +32,6 @@ from distill.frame_selection import (
     filtered_candidates,
     select_keyframes,
 )
-from distill.options import DistillOptions
 
 SWEEP_SEED = 20260728
 """Fixed, so a failing tuple is reproducible from the report alone."""
@@ -48,7 +48,7 @@ def test_a_sub_millisecond_static_window_is_refused_rather_than_spun_on() -> Non
     the schedule itself, which is the code that cannot honour it.
     """
     with pytest.raises(DistillError) as at_the_boundary:
-        DistillOptions.from_args({"max_static_window_sec": 0.0001})
+        resolve_run_config({"max_static_window_sec": 0.0001})
 
     assert at_the_boundary.value.code == "E_BAD_OPTIONS"
     assert at_the_boundary.value.stage == "options"
@@ -84,9 +84,12 @@ def test_the_smallest_expressible_window_is_admitted_and_still_advances() -> Non
     # under the candidate-count ceiling (M7.1): the floor is admitted, and it is
     # the combination with an uncapped duration that is unphysical, not the
     # window value itself.
-    assert DistillOptions.from_args(
-        {"max_static_window_sec": QUANTUM, "max_duration_sec": 100.0}
-    ).max_static_window_sec == QUANTUM
+    assert (
+        resolve_run_config(
+            {"max_static_window_sec": QUANTUM, "max_duration_sec": 100.0}
+        ).options.max_static_window_sec
+        == QUANTUM
+    )
 
     schedule = filtered_candidates([0.0], 0.01, 0.0, QUANTUM)
 
@@ -193,8 +196,7 @@ def _fails_rather_than_hangs(report: str) -> Iterator[None]:
 
     def stalled(_signum: int, _frame: FrameType | None) -> None:
         raise AssertionError(
-            f"candidate generation did not terminate within "
-            f"{SWEEP_TUPLE_DEADLINE_SEC}s: {report}"
+            f"candidate generation did not terminate within {SWEEP_TUPLE_DEADLINE_SEC}s: {report}"
         )
 
     previous = signal.signal(signal.SIGALRM, stalled)

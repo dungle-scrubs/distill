@@ -49,19 +49,17 @@ from .pipeline import (
 )
 
 
-def _add_common_processing_options(parser: argparse.ArgumentParser) -> None:
+def _add_common_processing_options(
+    parser: argparse.ArgumentParser, keys: tuple[str, ...] | None = None
+) -> None:
     specs = {spec.name: spec for spec in OPTION_SPECS}
-    for key in PROCESSING_KEYS:
+    for key in PROCESSING_KEYS if keys is None else keys:
         flag = f"--{key.replace('_', '-')}"
         spec = specs.get(key)
         if spec and spec.boolean:
             parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=None)
         elif spec and spec.caster in {int, float}:
             parser.add_argument(flag, type=spec.caster)
-        elif key == "local_vision_timeout_sec":
-            parser.add_argument(flag, type=float)
-        elif key in {"caption_frames", "local_vision_allow_remote_endpoint"}:
-            parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=None)
         else:
             parser.add_argument(flag)
 
@@ -277,23 +275,10 @@ def _tool_args(raw: str) -> dict[str, Any]:
     return parsed
 
 
-PROCESSING_KEYS = (
-    *PROCESSING_OPTION_NAMES,
-    "caption_frames",
-    "local_vision_backend",
-    "local_vision_model",
-    "local_vision_base_url",
-    "local_vision_timeout_sec",
-    "local_vision_allow_remote_endpoint",
-)
+PROCESSING_KEYS = PROCESSING_OPTION_NAMES
 
-LOCAL_VISION_DIAGNOSTIC_KEYS = (
-    "caption_frames",
-    "local_vision_backend",
-    "local_vision_model",
-    "local_vision_base_url",
-    "local_vision_timeout_sec",
-    "local_vision_allow_remote_endpoint",
+LOCAL_VISION_DIAGNOSTIC_KEYS = tuple(
+    spec.name for spec in OPTION_SPECS if spec.vision_field is not None
 )
 """What `local-vision-diagnostics` forwards, named once so the parser can be checked.
 
@@ -381,16 +366,7 @@ def build_parser() -> argparse.ArgumentParser:
     timeout_probe.add_argument("probe_ms", type=int)
 
     vision = subcommands.add_parser("local-vision-diagnostics", help="Probe local vision settings")
-    vision.add_argument("--caption-frames", action=argparse.BooleanOptionalAction, default=None)
-    vision.add_argument("--local-vision-backend")
-    vision.add_argument("--local-vision-model")
-    vision.add_argument("--local-vision-base-url")
-    vision.add_argument("--local-vision-timeout-sec", type=float)
-    vision.add_argument(
-        "--local-vision-allow-remote-endpoint",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
+    _add_common_processing_options(vision, LOCAL_VISION_DIAGNOSTIC_KEYS)
 
     raw = subcommands.add_parser(
         "call-tool", help="Call a package tool by MCP-style name and JSON args"
