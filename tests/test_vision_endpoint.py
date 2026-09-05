@@ -29,13 +29,7 @@ import pytest
 from distill.configuration import local_vision_config_from_args, resolve_run_config
 from distill.errors import DistillError
 from distill.local_vision import (
-    ERROR_BODY_PREVIEW_BYTES,
-    MAX_RESPONSE_BYTES,
     LocalVisionConfig,
-    LocalVisionFailure,
-    SecretCredential,
-    _build_opener,
-    _urlopen_json,
     config_is_non_local,
     probe_local_vision,
     try_interpret_image,
@@ -44,10 +38,16 @@ from distill.local_vision import (
 # Direct, not through `local_vision`'s re-exports: the pinning transport is an
 # internal of the client module, and the facade should not widen to name it.
 from distill.rapid_mlx import (
+    ERROR_BODY_PREVIEW_BYTES,
+    MAX_RESPONSE_BYTES,
+    LocalVisionFailure,
+    SecretCredential,
+    _build_opener,
     _connect_to_a_validated_address,
     _connection_pinned_to,
     _DialsOnlyTheValidatedAddress,
     _EndpointRequest,
+    _urlopen_json,
 )
 
 LOOPBACK_URL = "http://127.0.0.1:8000/v1"

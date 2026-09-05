@@ -18,9 +18,9 @@ from .local_vision import (
     DEFAULT_TIMEOUT_SEC,
     MAX_SOCKET_TIMEOUT_SEC,
     LocalVisionConfig,
-    SecretCredential,
     config_is_non_local,
 )
+from .rapid_mlx import SecretCredential
 from .version import PIPELINE_VERSION
 
 DEFAULT_MAX_DURATION_SEC = 7200.0

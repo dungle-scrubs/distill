@@ -348,12 +348,8 @@ class TextEmitter:
         destination = url.strip().replace("&", AMPERSAND_REFERENCE)
         if _PLAIN_DESTINATION_RE.fullmatch(destination):
             return destination
-        escaped = (
-            destination.replace("\\", "\\\\").replace("<", "\\<").replace(">", "\\>")
-        )
-        encoded = _DESTINATION_ENCODED_RE.sub(
-            lambda match: f"%{ord(match.group()):02X}", escaped
-        )
+        escaped = destination.replace("\\", "\\\\").replace("<", "\\<").replace(">", "\\>")
+        encoded = _DESTINATION_ENCODED_RE.sub(lambda match: f"%{ord(match.group()):02X}", escaped)
         return f"<{encoded}>"
 
     def temporary_for(self, path: Path) -> Path:
@@ -399,4 +395,3 @@ def _fsync_directory(directory: Path) -> None:
         LOGGER.debug("directory fsync refused: %s", errno_name(exc))
     finally:
         os.close(fd)
-

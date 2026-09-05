@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from fake_tools import FAKE_FFPROBE
 
+from distill.acquisition import AcquiredSource, AcquisitionLease, YouTubeDownloaderProtocol
 from distill.artifacts import (
     Carrier,
     Provenance,
@@ -21,23 +22,18 @@ from distill.artifacts import (
 )
 from distill.bundle_store import BundleRun, BundleStore, validate_manifest_schema
 from distill.errors import DistillError
+from distill.media_inspect import source_hash
 from distill.options import DistillOptions
 from distill.progress import ProgressReporter
 from distill.response import manifest_document
 from distill.source import (
-    AcquiredSource,
-    AcquisitionLease,
     LocalSourceProvider,
     SourceInfo,
     SourceRequest,
     SourceResolver,
-    YouTubeDownloaderProtocol,
-    YouTubeMetadata,
     YouTubeSourceProvider,
-    _first_description_paragraph,
-    source_hash,
-    youtube_metadata,
 )
+from distill.youtube import YouTubeMetadata, _first_description_paragraph, youtube_metadata
 
 FAKE_YTDLP_WITH_PROVENANCE = """
 import json
@@ -231,8 +227,8 @@ def test_youtube_source_combines_metadata_with_measured_provenance(
             _ = (url, lock_key, progress)
             return AcquiredSource(path=video, lease=lease)
 
-    monkeypatch.setattr("distill.source.check_disk_floor", lambda _path: None)
-    monkeypatch.setattr("distill.source.probe_duration", lambda _path: (12.5, []))
+    monkeypatch.setattr("distill.acquisition.check_disk_floor", lambda _path: None)
+    monkeypatch.setattr("distill.media_inspect.probe_duration", lambda _path: (12.5, []))
     fixed = "2026-07-29T14:20:00Z"
 
     source = YouTubeSourceProvider().resolve(
@@ -300,8 +296,8 @@ print(json.dumps({{
             _ = (url, lock_key, progress)
             return AcquiredSource(path=video, lease=lease)
 
-    monkeypatch.setattr("distill.source.check_disk_floor", lambda _path: None)
-    monkeypatch.setattr("distill.source.probe_duration", lambda _path: (12.5, []))
+    monkeypatch.setattr("distill.acquisition.check_disk_floor", lambda _path: None)
+    monkeypatch.setattr("distill.media_inspect.probe_duration", lambda _path: (12.5, []))
 
     source = YouTubeSourceProvider().resolve(
         SourceRequest(
@@ -359,8 +355,8 @@ def test_youtube_metadata_exception_warns_and_keeps_processing(
     # silently ineffective and the assertion below would pass off a real yt-dlp
     # run as the injected failure.
     monkeypatch.setattr("distill.youtube._run_ytdlp", fail_metadata)
-    monkeypatch.setattr("distill.source.check_disk_floor", lambda _path: None)
-    monkeypatch.setattr("distill.source.probe_duration", lambda _path: (12.5, []))
+    monkeypatch.setattr("distill.acquisition.check_disk_floor", lambda _path: None)
+    monkeypatch.setattr("distill.media_inspect.probe_duration", lambda _path: (12.5, []))
     fixed = "2026-07-29T14:20:00Z"
 
     source = YouTubeSourceProvider().resolve(
@@ -459,7 +455,7 @@ def test_youtube_resolution_reuses_one_request_for_cache_and_acquisition(
             )
 
     monkeypatch.setattr(
-        "distill.source.youtube_metadata",
+        "distill.youtube.youtube_metadata",
         lambda _url: YouTubeMetadata("abcdefghijk", "", []),
     )
     resolver = SourceResolver(youtube=RecordingProvider())

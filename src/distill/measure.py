@@ -38,10 +38,10 @@ try:
         phash,
         scene_midpoint_candidates,
     )
+    from .media_inspect import probe_duration
     from .pipeline import run_timeout_probe, timeout_diagnostics
     from .redact_secrets import redact_text
     from .run_command import CommandTimeouts, run
-    from .source import probe_duration
     from .transcript import FasterWhisperAdapter, extract_audio
 except ImportError:
     from distill.frame_selection import (  # type: ignore[no-redef]
@@ -51,6 +51,7 @@ except ImportError:
         phash,
         scene_midpoint_candidates,
     )
+    from distill.media_inspect import probe_duration  # type: ignore[no-redef]
     from distill.pipeline import (  # type: ignore[no-redef]
         run_timeout_probe,
         timeout_diagnostics,
@@ -60,7 +61,6 @@ except ImportError:
         CommandTimeouts,
         run,
     )
-    from distill.source import probe_duration  # type: ignore[no-redef]
     from distill.transcript import (  # type: ignore[no-redef]
         FasterWhisperAdapter,
         extract_audio,

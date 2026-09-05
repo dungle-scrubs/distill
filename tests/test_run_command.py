@@ -1482,6 +1482,6 @@ def test_a_silent_tool_call_site_cannot_tighten_its_idle_value_alone() -> None:
 
 def test_the_silent_by_design_call_sites_declare_a_single_deadline() -> None:
     """tesseract and `ffprobe -v error` both answer only when they are done."""
-    for name in ("ocr.TESSERACT_TIMEOUTS", "source.FFPROBE_TIMEOUTS"):
+    for name in ("ocr.TESSERACT_TIMEOUTS", "media_inspect.FFPROBE_TIMEOUTS"):
         timeouts = declared_timeouts()[name]
         assert timeouts.idle_sec == timeouts.total_sec, name

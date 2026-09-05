@@ -30,7 +30,6 @@ from .local_vision import (
     ENDPOINT_FIELD_NAMES,
     MAX_SOCKET_TIMEOUT_SEC,
     LocalVisionConfig,
-    SecretCredential,
     _with_validated_endpoint,
 )
 from .options import (
@@ -43,6 +42,7 @@ from .options import (
     validated_number,
     validated_option_type,
 )
+from .rapid_mlx import SecretCredential
 
 GENERAL_CONFIG_FILENAME = "distill.json"
 LOCAL_VISION_SECTION = "local_vision"

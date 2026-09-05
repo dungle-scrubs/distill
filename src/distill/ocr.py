@@ -198,9 +198,7 @@ def _ocr_processed_image(
         try:
             processed.save(temp_path)
         except (OSError, ValueError) as exc:
-            return None, [
-                warning("ocr", "ocr_failed", f"OCR failed for {source.name}: {exc}")
-            ]
+            return None, [warning("ocr", "ocr_failed", f"OCR failed for {source.name}: {exc}")]
         return _read_text(command, temp_path, language, source=source)
     finally:
         temp_path.unlink(missing_ok=True)

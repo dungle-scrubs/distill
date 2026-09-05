@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar
 
 import pytest
+from runtime_fakes import configure_run
 from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import pipeline as distill_session
@@ -269,7 +270,7 @@ def test_no_redact_secrets_still_produces_a_bundle(
     """
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     response = distill_session.process_local_video(
         {

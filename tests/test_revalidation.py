@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from runtime_fakes import configure_run
 from test_bundle_locking import FakeClock, hold_the_lock, lock_is_held, lock_path
 
 from distill import bundle_store, pipeline, source
@@ -60,9 +61,9 @@ from distill.options import (
     VISION_MODE_SELECTED,
     DistillOptions,
 )
-from distill.pipeline import REKEY_BOUND_REASON, ProcessingRun
 from distill.progress import ProgressReporter
 from distill.release import DISTILL_VERSION
+from distill.run_orchestrator import REKEY_BOUND_REASON
 from distill.source import SourceInfo, _resolved_for
 from distill.version import PIPELINE_VERSION
 from distill.vision_chain import (
@@ -299,6 +300,7 @@ def _run_that_waited(
     skipped_at_resolution: tuple[LocalVisionConfig, ...] = (),
     held_throughout: tuple[str, ...] = (),
     published_during_wait: tuple[str, ...] = (),
+    media_starts: list[str] | None = None,
 ) -> Contended:
     """A whole run of one source, held out of its own **bundle key** for `seconds`.
 
@@ -401,13 +403,19 @@ def _run_that_waited(
         "open",
         classmethod(lambda cls, root, **_kwargs: cls(Path(root).resolve(), clock.monotonic, sleep)),
     )
-    monkeypatch.setattr(pipeline, "transcribe_with_imports", _fake_transcribe)
-    monkeypatch.setattr(pipeline, "select_keyframes", _fake_select_keyframes)
-    monkeypatch.setattr(pipeline, "ocr_frames", _fake_ocr_frames)
-    monkeypatch.setattr(pipeline, "interpret_frames_with_local_vision", _fake_interpret)
+
+    def transcribe(*args: Any, **kwargs: Any) -> tuple[None, list[dict[str, str]]]:
+        if media_starts is not None:
+            media_starts.append("transcribe")
+        return _fake_transcribe(*args, **kwargs)
+
+    configure_run(monkeypatch, transcribe=transcribe)
+    configure_run(monkeypatch, select_keyframes=_fake_select_keyframes)
+    configure_run(monkeypatch, ocr_frames=_fake_ocr_frames)
+    configure_run(monkeypatch, interpret_frames=_fake_interpret)
     caplog.set_level(logging.DEBUG)
 
-    run = ProcessingRun(
+    run = pipeline.ProcessingRun(
         source=SourceInfo(
             source_type="local",
             resolved_path=video,
@@ -865,10 +873,13 @@ def test_a_second_walk_that_fails_gives_the_key_back(
     that the key came back.
     """
 
-    def refuse(*_args: Any, **_kwargs: Any) -> Any:
-        raise DistillError("E_INTERNAL", "bundle", "the store could not be read", {})
+    failure = DistillError("E_INTERNAL", "bundle", "the store could not be read", {})
+    media_starts: list[str] = []
 
-    monkeypatch.setattr(pipeline, "revalidate_chain", refuse)
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        raise failure
+
+    configure_run(monkeypatch, revalidate=refuse)
 
     with pytest.raises(DistillError) as raised:
         _run_that_waited(
@@ -878,8 +889,10 @@ def test_a_second_walk_that_fails_gives_the_key_back(
             caplog,
             chain=CHAIN,
             skipped_at_resolution=(PREFERRED,),
+            media_starts=media_starts,
         )
 
-    assert raised.value.code == "E_INTERNAL"
+    assert raised.value is failure
+    assert media_starts == []
     root = tmp_path / "output"
     assert lock_is_held(lock_path(root, _key_of(CHAIN, 1))) is False

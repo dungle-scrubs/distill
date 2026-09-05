@@ -131,6 +131,7 @@ def errno_name(exc: OSError) -> str:
     """
     return (errno.errorcode.get(exc.errno, "") if exc.errno is not None else "") or str(exc.errno)
 
+
 WarningRecord = dict[str, Any]
 """One **warning** as it travels: a stage, a code, a message, and a count.
 

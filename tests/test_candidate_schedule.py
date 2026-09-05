@@ -19,6 +19,7 @@ from pathlib import Path
 from types import FrameType
 
 import pytest
+from runtime_fakes import configure_run
 from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import frame_selection
@@ -420,7 +421,7 @@ def test_the_truncation_warning_reaches_the_published_manifest(
     """
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     monkeypatch.setattr(
         frame_selection,
         "scene_midpoint_candidates",

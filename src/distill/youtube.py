@@ -51,11 +51,7 @@ def normalize_youtube_url(url: str) -> str:
     if parsed.netloc.lower() not in YOUTUBE_HOSTS:
         return url
     pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    kept = [
-        (k, v)
-        for k, v in pairs
-        if k not in YOUTUBE_STRIP_QUERY_KEYS
-    ]
+    kept = [(k, v) for k, v in pairs if k not in YOUTUBE_STRIP_QUERY_KEYS]
     if len(kept) == len(pairs):
         return url
     new_query = urlencode(kept)
@@ -352,9 +348,7 @@ def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
     # maps a missing/hung yt-dlp onto clean errors. `names_one_video=False` is
     # the one call in Distill whose subject really is a playlist: the default
     # would have this enumerate a single video.
-    proc = _run_ytdlp(
-        ["--flat-playlist", "--print", "webpage_url"], url, names_one_video=False
-    )
+    proc = _run_ytdlp(["--flat-playlist", "--print", "webpage_url"], url, names_one_video=False)
     if proc.returncode != 0:
         raise DistillError(
             "E_YTDLP",

@@ -39,17 +39,23 @@ from .bundle_store import (
     confined_path,
 )
 from .errors import DistillError, WarningRecord, aggregate_warnings
-from .local_vision import MAX_SOCKET_TIMEOUT_SEC
+from .frame_selection import select_keyframes
+from .local_vision import FrameInterpreter
+from .ocr import ocr_frames
 from .options import DistillOptions
 from .progress import (
     TERMINAL_PROGRESS_STATUSES,
     OverallProgressAggregator,
+    ProgressCounter,
     ProgressHeartbeat,
     ProgressReporter,
 )
+from .render import render_markdown
 from .response import manifest_document, response_frames, run_response
-from .source import ChainRevalidation, candidate_in_hand, revalidate_chain
+from .source import ChainRevalidation, SourceInfo, candidate_in_hand, revalidate_chain
 from .vision_chain import REVALIDATE_AFTER_WAIT_SEC
+
+type Revalidator = Callable[[DistillOptions, str, str, Path], ChainRevalidation]
 
 LOGGER = logging.getLogger("distill.pipeline")
 
@@ -70,46 +76,57 @@ def _pipeline_log(event: str, **detail: Any) -> None:
     )
 
 
-def _transcribe(video_path, work_dir, options, progress, duration_sec):
-    """Indirect through pipeline so tests patching pipeline.transcribe_with_imports take effect."""
-    from . import pipeline as _pipeline
+def transcribe_source(
+    video_path: Path,
+    work_dir: Path,
+    options: DistillOptions,
+    progress: ProgressCounter | ProgressReporter,
+    duration_sec: float,
+) -> tuple[dict[str, Any] | None, list[WarningRecord]]:
+    # No default: SourceInfo.duration_sec is always present, and omitting it here
+    # would silently disable ffmpeg -progress instead of failing loudly.
+    from .transcript import transcribe_video
 
-    return _pipeline.transcribe_with_imports(
-        video_path, work_dir, options, progress, duration_sec=duration_sec
+    return transcribe_video(
+        video_path,
+        work_dir,
+        options.whisper_model,
+        options.whisper_language,
+        options.vad_filter,
+        progress,
+        duration_sec,
     )
 
 
-def _interpret_frames(frames, options, progress, transcript):
-    from . import pipeline as _pipeline
+def interpret_frames(
+    frames: list[FrameArtifact],
+    options: DistillOptions,
+    progress: ProgressReporter | None = None,
+    *,
+    transcript: Transcript | None = None,
+    interpreter_factory: Callable[..., FrameInterpreter] = FrameInterpreter,
+) -> tuple[list[FrameArtifact], list[WarningRecord]]:
+    """Interpret every frame, under the **redaction** policy the frames carry.
 
-    return _pipeline.interpret_frames_with_local_vision(
-        frames, options, progress, transcript=transcript
+    The interpreter is told nothing about redaction. `--no-redact-secrets` is
+    recorded on each **frame artifact** by `select_keyframes` and travels with
+    it, so the model's words are redacted where they enter the carrier (R-19)
+    rather than by a helper the vision pass had to remember to call.
+
+    The transcript is the salience context (D-003): each frame is judged
+    against the speech around its timestamp when `frame_salience` is on. A
+    missing transcript means absent salience, never a judgment against
+    nothing.
+    """
+    interpreter = interpreter_factory(
+        config=options.local_vision_config(),
+        progress=progress,
+        frame_salience=options.frame_salience,
     )
-
-
-def _select_keyframes(*args, **kwargs):
-    from . import pipeline as _pipeline
-
-    return _pipeline.select_keyframes(*args, **kwargs)
-
-
-def _ocr_frames(*args, **kwargs):
-    from . import pipeline as _pipeline
-
-    return _pipeline.ocr_frames(*args, **kwargs)
-
-
-def _render_markdown(*args, **kwargs):
-    from . import pipeline as _pipeline
-
-    return _pipeline.render_markdown(*args, **kwargs)
-
-
-DEFAULT_CONFIGURED_TIMEOUT_MS = 5_400_000
-TIMEOUT_ENV = "DISTILL_EFFECTIVE_TIMEOUT_MS"
-LONG_TIMEOUT_PROBE_ENV = "DISTILL_ENABLE_LONG_TIMEOUT_PROBE"
-TIMEOUT_PROBE_LIMIT_MS = 1_000
-TIMEOUT_PROBE_CEILING_MS = int(MAX_SOCKET_TIMEOUT_SEC * 1000)
+    return interpreter.interpret(
+        frames,
+        transcript_segments=None if transcript is None else transcript.segments,
+    )
 
 
 def cache_hit_progress_summary(
@@ -239,21 +256,21 @@ class KeySettlement:
     def __init__(
         self,
         options: DistillOptions,
-        source: Any,
+        source: SourceInfo,
         output_root: Path,
         lock_wait_sec: float,
         waited_sec_ref: list[float],
+        revalidate: Revalidator = revalidate_chain,
     ) -> None:
         self.options = options
         self.source = source
         self.output_root = output_root
         self.lock_wait_sec = lock_wait_sec
         self._waited = waited_sec_ref
+        self.revalidate = revalidate
         self.rekeyed_from: str | None = None
 
-    def settle(
-        self, store: BundleStore, run: BundleRun
-    ) -> BundleRun | BundleSnapshot:
+    def settle(self, store: BundleStore, run: BundleRun) -> BundleRun | BundleSnapshot:
         held: BundleRun | None = run
         try:
             if not revalidation_is_owed(run.waited_sec):
@@ -298,32 +315,9 @@ class KeySettlement:
         return began
 
     def _divergence(self, run: BundleRun) -> ChainRevalidation | None:
-        # Test seam: ``tests/test_revalidation.py`` monkeypatches
-        # ``pipeline.revalidate_chain``; honor it via lazy lookup so a
-        # patched ``refuse`` that raises is not swallowed by the fallback.
-        _revalidate = None
-        try:
-            from . import pipeline as _pipeline  # noqa: PLC0415
-
-            _revalidate = getattr(_pipeline, "revalidate_chain", None)
-        except ImportError:
-            _revalidate = None
-        # Use pipeline's version only when it is a different object than the
-        # source's (i.e. monkeypatched); otherwise use the direct import.
-        if callable(_revalidate) and _revalidate is not revalidate_chain:
-            revalidated = _revalidate(
-                self.options,
-                self.source.source_fingerprint,
-                self.source.source_type,
-                self.output_root,
-            )
-        else:
-            revalidated = revalidate_chain(
-                self.options,
-                self.source.source_fingerprint,
-                self.source.source_type,
-                self.output_root,
-            )
+        revalidated = self.revalidate(
+            self.options, self.source.source_fingerprint, self.source.source_type, self.output_root
+        )
         if revalidated.bundle_key == run.bundle_key:
             return None
         return revalidated
@@ -363,12 +357,23 @@ class KeySettlement:
 class ProcessingRun:
     """One run's attempt to produce (or serve) its **generation**."""
 
-    source: Any
+    source: SourceInfo
     options: DistillOptions
     output_root: Path
     progress: ProgressReporter
     tool: str
     lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+
+    transcribe: Callable[..., tuple[dict[str, Any] | None, list[WarningRecord]]] = transcribe_source
+    select_keyframes: Callable[..., tuple[list[FrameArtifact], list[WarningRecord]]] = (
+        select_keyframes
+    )
+    ocr_frames: Callable[..., tuple[list[FrameArtifact], list[WarningRecord]]] = ocr_frames
+    interpret_frames: Callable[..., tuple[list[FrameArtifact], list[WarningRecord]]] = (
+        interpret_frames
+    )
+    render: Callable[..., str] = render_markdown
+    revalidate: Revalidator = revalidate_chain
 
     waited_sec: float = field(default=0.0, init=False)
     rekeyed_from: str | None = field(default=None, init=False)
@@ -403,12 +408,15 @@ class ProcessingRun:
         self.waited_sec += began.waited_sec
         return began
 
-    def _settled_after_wait(
-        self, store: BundleStore, run: BundleRun
-    ) -> BundleRun | BundleSnapshot:
+    def _settled_after_wait(self, store: BundleStore, run: BundleRun) -> BundleRun | BundleSnapshot:
         waited_ref = [self.waited_sec]
         settlement = KeySettlement(
-            self.options, self.source, self.output_root, self.lock_wait_sec, waited_ref
+            self.options,
+            self.source,
+            self.output_root,
+            self.lock_wait_sec,
+            waited_ref,
+            self.revalidate,
         )
         result = settlement.settle(store, run)
         # propagate mutations back
@@ -495,7 +503,7 @@ class ProcessingRun:
 
     def _produce_ocr(self, frames: list[FrameArtifact]) -> dict[str, Any]:
         ocr = self.options.ocr_config()
-        read, ocr_warnings = _ocr_frames(
+        read, ocr_warnings = self.ocr_frames(
             frames,
             ocr.language,
             ocr.enabled,
@@ -548,7 +556,7 @@ class ProcessingRun:
     def _produce_local_vision(
         self, frames: list[FrameArtifact], transcript: Transcript | None
     ) -> dict[str, Any]:
-        vision_frames, vision_warnings = _interpret_frames(
+        vision_frames, vision_warnings = self.interpret_frames(
             frames,
             self.options,
             self.progress,
@@ -564,7 +572,7 @@ class ProcessingRun:
         warnings = list(self.source.warnings)
 
         def produce_transcript() -> dict[str, Any]:
-            transcript, transcript_warnings = _transcribe(
+            transcript, transcript_warnings = self.transcribe(
                 self.source.resolved_path,
                 run.scratch_dir,
                 self.options,
@@ -589,7 +597,7 @@ class ProcessingRun:
 
         def produce_frames() -> dict[str, Any]:
             frame_selection = self.options.frame_selection_config()
-            frames, frame_warnings = _select_keyframes(
+            frames, frame_warnings = self.select_keyframes(
                 self.source.resolved_path,
                 run.frames_dir,
                 self.source.duration_sec,
@@ -636,23 +644,23 @@ class ProcessingRun:
 
         warnings = aggregate_warnings(warnings)
         self.progress.update("rendering", status="running")
-        markdown = _render_markdown(
+        markdown = self.render(
             str(self.source.resolved_path),
             self.source.duration_sec,
             transcript,
             frames,
             warnings,
-            getattr(self.source, "related_links", None),
+            self.source.related_links,
         )
         if self.source.provenance is None:
             raise AssertionError("current self-contained render requires provenance")
-        self_contained_markdown = _render_markdown(
+        self_contained_markdown = self.render(
             str(self.source.resolved_path),
             self.source.duration_sec,
             transcript,
             frames,
             warnings,
-            getattr(self.source, "related_links", None),
+            self.source.related_links,
             provenance=self.source.provenance,
             include_frame_links=False,
         )

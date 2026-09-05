@@ -1,21 +1,9 @@
 """Source acquisition and fingerprinting for Distill.
 
-Thin **SourceResolver** façade that composes pure identity
-(**source fingerprint**, **lock key**, **bundle key**, fast-path) from
-``source_identity`` with effectful acquisition (**acquisition lease**,
-staging, validation, promotion) from ``acquisition`` and the cache check
-against the **bundle store**. It owns no hashing or ``flock`` logic itself;
-it imports and re-exports them so ``from distill.source import ...`` keeps
-working.
-
-Vocabulary per ``CONTEXT.md``: **source**, **source fingerprint**,
-**options hash**, **bundle key**, **lock key**, **acquisition lease**,
-**bundle**, **generation**, **staging directory**.
-
-
-This module owns local path resolution, duration probing, safe output root
-validation, YouTube id lookup, the acquisition of a remote **source**, disk
-checks, and **source fingerprints**.
+SourceResolver coordinates local media inspection, remote acquisition, endpoint
+selection, and cache lookup. Identity algorithms live in source_identity;
+media inspection lives in media_inspect; acquisition owns the lease and download.
+This module owns source resolution and output-root validation.
 
 The cache is consulted before any capability is demanded (R-49). A tool that
 exists only to *produce* a **bundle** - yt-dlp to acquire a remote source,
@@ -79,65 +67,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-# Façade composition: pure identity and effectful acquisition own the
-# implementations; this module delegates and re-exports for compatibility.
-from .acquisition import (  # noqa: F401  re-exported: acquisition lease + helpers
-    ACQUISITION_EVENT_TYPE as ACQUISITION_EVENT_TYPE,
-)
-from .acquisition import (
-    BYTE_UNITS as BYTE_UNITS,
-)
-from .acquisition import (
-    LOCK_DIR_NAME as LOCK_DIR_NAME,
-)
-from .acquisition import (
-    MEDIA_CONTAINER_PREFERENCE as MEDIA_CONTAINER_PREFERENCE,
-)
-from .acquisition import (
-    MEDIA_DIR_NAME as MEDIA_DIR_NAME,
-)
-from .acquisition import (
-    PROMOTED_MEDIA_STEM as PROMOTED_MEDIA_STEM,
-)
-from .acquisition import (
-    STAGING_DIR_NAME as STAGING_DIR_NAME,
-)
-from .acquisition import (
-    YOUTUBE_DISK_FLOOR_BYTES as YOUTUBE_DISK_FLOOR_BYTES,
-)
-from .acquisition import (
-    AcquiredSource as AcquiredSource,
-)
-from .acquisition import (
-    AcquisitionLease as AcquisitionLease,
-)
-from .acquisition import (
-    YoutubeDownloader as YoutubeDownloader,
-)
-from .acquisition import (
-    YouTubeDownloaderProtocol as YouTubeDownloaderProtocol,
-)
-from .acquisition import (
-    check_disk_floor as check_disk_floor,
-)
-from .acquisition import (
-    parse_byte_amount as parse_byte_amount,
-)
-from .acquisition import (
-    parse_ytdlp_progress as parse_ytdlp_progress,
-)
-from .acquisition import (
-    promote_media as promote_media,
-)
-from .acquisition import (
-    release_acquisition_lease as release_acquisition_lease,
-)
-from .acquisition import (
-    select_downloaded_media as select_downloaded_media,
-)
-from .acquisition import (
-    validate_media_file as validate_media_file,
-)
+from . import acquisition, media_inspect, source_identity, youtube
 from .artifacts import Provenance, RedactionState, document_carries_a_reading
 from .bundle_store import (
     SINGLE_SOURCE_LOCK_WAIT_SEC,
@@ -146,148 +76,10 @@ from .bundle_store import (
 from .errors import DistillError, WarningRecord, errno_name, warning
 from .links import RelatedLink, extract_relevant_links
 from .local_vision import LocalVisionConfig
-from .media_inspect import (  # noqa: F401  re-exported: media inspection
-    CONTENT_HASH_LIMIT_BYTES as CONTENT_HASH_LIMIT_BYTES,
-)
-from .media_inspect import (
-    FFPROBE_TIMEOUTS as FFPROBE_TIMEOUTS,
-)
-from .media_inspect import (
-    FINGERPRINT_INTERIOR_ANCHORS as FINGERPRINT_INTERIOR_ANCHORS,
-)
-from .media_inspect import (
-    FINGERPRINT_SAMPLE_BYTES as FINGERPRINT_SAMPLE_BYTES,
-)
-from .media_inspect import (
-    _anchor_label as _anchor_label,
-)
-from .media_inspect import (
-    ensure_duration_allowed as ensure_duration_allowed,
-)
-from .media_inspect import (
-    fingerprint_anchor_offsets as fingerprint_anchor_offsets,
-)
-from .media_inspect import (
-    local_fingerprint as local_fingerprint,
-)
-from .media_inspect import (
-    manifest_duration as manifest_duration,
-)
-from .media_inspect import (
-    probe_duration as probe_duration,
-)
-from .media_inspect import (
-    source_hash as source_hash,
-)
 from .options import DistillOptions
 from .progress import ProgressReporter
 from .redact_secrets import redact_text
-from .source_identity import (  # noqa: F401  re-exported: pure identity
-    SourceIdentity as SourceIdentity,
-)
-from .source_identity import (
-    bundle_key as bundle_key,
-)
-from .source_identity import (
-    bundle_key_for as bundle_key_for,
-)
-from .source_identity import (
-    derive_local_identity as derive_local_identity,
-)
-from .source_identity import (
-    derive_source_identity as derive_source_identity,
-)
-from .source_identity import (
-    derive_youtube_identity as derive_youtube_identity,
-)
-from .source_identity import (
-    fingerprint_for_youtube as fingerprint_for_youtube,
-)
-from .source_identity import (
-    is_youtube_fast_path as is_youtube_fast_path,
-)
-from .source_identity import (
-    lock_key_for_video_id as lock_key_for_video_id,
-)
-from .source_identity import (
-    lock_key_for_youtube as lock_key_for_youtube,
-)
-from .source_identity import (
-    source_fingerprint_for_youtube as source_fingerprint_for_youtube,
-)
-from .source_identity import (
-    youtube_fingerprint as youtube_fingerprint,
-)
-from .source_identity import (
-    youtube_lock_key as youtube_lock_key,
-)
 from .vision_chain import CandidateKey, ResolvedRun, candidate_keys, resolve_chain
-from .youtube import (  # noqa: F401  re-exported: the YouTube client
-    NO_PLAYLIST_ARG as NO_PLAYLIST_ARG,
-)
-from .youtube import (
-    YOUTUBE_HOSTS as YOUTUBE_HOSTS,
-)
-from .youtube import (
-    YOUTUBE_STRIP_QUERY_KEYS as YOUTUBE_STRIP_QUERY_KEYS,
-)
-from .youtube import (
-    YOUTUBE_VIDEO_ID_PATTERN as YOUTUBE_VIDEO_ID_PATTERN,
-)
-from .youtube import (
-    YTDLP_DOWNLOAD_TIMEOUTS as YTDLP_DOWNLOAD_TIMEOUTS,
-)
-from .youtube import (
-    YTDLP_METADATA_TIMEOUTS as YTDLP_METADATA_TIMEOUTS,
-)
-from .youtube import (
-    YTDLP_SOCKET_TIMEOUT_SEC as YTDLP_SOCKET_TIMEOUT_SEC,
-)
-from .youtube import (
-    YouTubeMetadata as YouTubeMetadata,
-)
-from .youtube import (
-    _first_description_paragraph as _first_description_paragraph,
-)
-from .youtube import (
-    _metadata_text as _metadata_text,
-)
-from .youtube import (
-    _metadata_unavailable as _metadata_unavailable,
-)
-from .youtube import (
-    _run_ytdlp as _run_ytdlp,
-)
-from .youtube import (
-    _validated_youtube_video_id as _validated_youtube_video_id,
-)
-from .youtube import (
-    _ytdlp_command as _ytdlp_command,
-)
-from .youtube import (
-    canonical_youtube_id as canonical_youtube_id,
-)
-from .youtube import (
-    ensure_youtube_host as ensure_youtube_host,
-)
-from .youtube import (
-    normalize_youtube_url as normalize_youtube_url,
-)
-from .youtube import (
-    parse_youtube_url as parse_youtube_url,
-)
-from .youtube import (
-    youtube_description as youtube_description,
-)
-from .youtube import (
-    youtube_fast_path_video_id as youtube_fast_path_video_id,
-)
-from .youtube import (
-    youtube_metadata as youtube_metadata,
-)
-from .youtube import (
-    youtube_url_names_one_video as youtube_url_names_one_video,
-)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -300,7 +92,6 @@ thing a path can be. There is deliberately no "unreadable" member: a path that
 could not be asked about is not a kind of answer, it is the absence of one.
 """
 
-# YOUTUBE_DISK_FLOOR_BYTES re-exported from .acquisition (façade)
 # Wall-clock ceilings so a wedged tool or a stalled network call cannot hang the
 # whole run. yt-dlp additionally gets `--socket-timeout` so it aborts a stalled
 # connection on its own rather than blocking until the outer timeout fires.
@@ -317,18 +108,13 @@ could not be asked about is not a kind of answer, it is the absence of one.
 # are siblings under one output root so promotion is a rename on one filesystem
 # rather than a copy across two, and so the promoted directory holds nothing but
 # promoted media.
-# STAGING_DIR_NAME re-exported from .acquisition (façade)
-# MEDIA_DIR_NAME re-exported from .acquisition (façade)
-# LOCK_DIR_NAME re-exported from .acquisition (façade)
 # The stem yt-dlp is told to write, and so the only stem a completed download
 # has. A format fragment is `source.f140.m4a`, whose stem is `source.f140`, and
 # an in-flight file is `source.mp4.part`, whose stem is `source.mp4`: matching
 # the stem exactly is what separates the merged container from both (R-37).
-# PROMOTED_MEDIA_STEM re-exported from .acquisition (façade)
 # Preference order when a staging directory somehow holds more than one complete
 # container. Order is fixed rather than alphabetical so the choice is a stated
 # preference; anything unlisted sorts after everything listed, by suffix.
-# MEDIA_CONTAINER_PREFERENCE re-exported from .acquisition (façade)
 SENSITIVE_COMPONENTS = {
     ".ssh",
     ".gnupg",
@@ -337,15 +123,7 @@ SENSITIVE_COMPONENTS = {
     "library/keychains",
 }
 
-# BYTE_UNITS re-exported from .acquisition (façade)
 
-
-# ACQUISITION_EVENT_TYPE re-exported from .acquisition (façade)
-
-
-# _acquisition_log re-exported from .acquisition
-# AcquisitionLease re-exported from .acquisition
-# AcquiredSource re-exported from .acquisition
 @dataclass(frozen=True)
 class SourceInfo:
     source_type: str
@@ -380,10 +158,9 @@ class SourceInfo:
     """
     # Present only for a source this run acquired. A cache hit reads no media
     # and holds no lease; a local source has nothing to lease.
-    acquisition_lease: AcquisitionLease | None = None
+    acquisition_lease: acquisition.AcquisitionLease | None = None
 
 
-# release_acquisition_lease re-exported from .acquisition
 def _processed_at_utc() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -414,7 +191,6 @@ class SourceResolution:
     progress: ProgressReporter | None = None
 
 
-# YouTubeDownloaderProtocol re-exported from .acquisition
 def servable_duration(output_root: Path, bundle_key: str) -> float | None:
     """The duration of the **bundle** `bundle_key` names, if it is servable.
 
@@ -434,7 +210,7 @@ def servable_duration(output_root: Path, bundle_key: str) -> float | None:
     snapshot = BundleStore.open(output_root).load_active(bundle_key)
     if snapshot is None:
         return None
-    return manifest_duration(snapshot.manifest)
+    return media_inspect.manifest_duration(snapshot.manifest)
 
 
 def _probe_endpoint(endpoint: LocalVisionConfig) -> bool:
@@ -517,7 +293,9 @@ def _resolved_for(
         cached=lambda opts_hash: (
             None
             if output_root is None
-            else servable_interpretation_count(output_root, source_hash(fingerprint, opts_hash))
+            else servable_interpretation_count(
+                output_root, media_inspect.source_hash(fingerprint, opts_hash)
+            )
         ),
         probe=_probe_endpoint,
         # The clock that arms `PROBE_CEILING_SEC`. `resolve_chain` enforces its
@@ -578,7 +356,7 @@ def revalidate_chain(
     resolution = _resolved_for(options, fingerprint, source_type, output_root)
     return ChainRevalidation(
         resolution=resolution,
-        bundle_key=source_hash(fingerprint, resolution.opts_hash),
+        bundle_key=media_inspect.source_hash(fingerprint, resolution.opts_hash),
     )
 
 
@@ -676,7 +454,7 @@ class LocalSourceProvider:
                     f"source path resolved to {redact_text(resolved.name).text}",
                 )
             )
-        fingerprint = local_fingerprint(resolved, options.cache_mode, progress)
+        fingerprint = media_inspect.local_fingerprint(resolved, options.cache_mode, progress)
         # <!-- P3-D-015 --> The key comes from the resolution, not from the
         # options the run started with. Those still name whichever endpoint the
         # chain happened to list first, so deriving from them publishes entry
@@ -686,16 +464,16 @@ class LocalSourceProvider:
         # `probe_duration`.
         resolution = _resolved_for(options, fingerprint, "local", request.output_root)
         options = resolution.options
-        bundle_key = source_hash(fingerprint, resolution.opts_hash)
+        bundle_key = media_inspect.source_hash(fingerprint, resolution.opts_hash)
         duration = self._served_duration(request, bundle_key)
         if duration is None:
             if progress:
                 progress.update("duration_probe", status="running")
-            duration, probe_warnings = probe_duration(resolved)
+            duration, probe_warnings = media_inspect.probe_duration(resolved)
             warnings.extend(probe_warnings)
             if progress:
                 progress.complete("duration_probe", detail={"duration_sec": duration})
-            ensure_duration_allowed(duration, options.max_duration_sec)
+            media_inspect.ensure_duration_allowed(duration, options.max_duration_sec)
         else:
             # The cap is re-applied to the number the manifest gave, not assumed
             # from the **bundle key**. `max_duration_sec` is in the **options
@@ -704,7 +482,7 @@ class LocalSourceProvider:
             # process wrote, and R-23's premise is that its claims are input
             # rather than facts. The probe is what a cache hit does not need;
             # the operator's policy is not.
-            ensure_duration_allowed(duration, options.max_duration_sec)
+            media_inspect.ensure_duration_allowed(duration, options.max_duration_sec)
             if progress:
                 progress.skip_cached("duration_probe", detail={"source": "cached_manifest"})
         provenance = Provenance(
@@ -905,19 +683,6 @@ def sensitive_path_match(
     return None
 
 
-# youtube_lock_key re-exported from .source_identity
-
-
-# check_disk_floor re-exported from .acquisition
-
-
-# _probed_codec_types re-exported from .acquisition
-# _probed_duration_sec re-exported from .acquisition
-# validate_media_file re-exported from .acquisition
-
-
-# promote_media re-exported from .acquisition
-# YoutubeDownloader re-exported from .acquisition
 def _manifest_related_links(
     manifest: Mapping[str, Any], options: DistillOptions
 ) -> list[RelatedLink] | None:
@@ -983,7 +748,7 @@ class YouTubeSourceProvider:
     def cached(
         self,
         request: SourceRequest,
-        metadata: YouTubeMetadata | None = None,
+        metadata: youtube.YouTubeMetadata | None = None,
     ) -> SourceInfo | None:
         """Describe a source from a servable bundle, or `None` if there is none.
 
@@ -1002,12 +767,12 @@ class YouTubeSourceProvider:
         """
         if metadata is not None:
             return self.cached_for_video_id(request, metadata.video_id)
-        url_video_id = youtube_fast_path_video_id(request.value)
+        url_video_id = youtube.youtube_fast_path_video_id(request.value)
         if url_video_id is not None:
             served = self.cached_for_video_id(request, url_video_id)
             if served is not None:
                 return served
-        return self.cached_for_video_id(request, canonical_youtube_id(request.value))
+        return self.cached_for_video_id(request, youtube.canonical_youtube_id(request.value))
 
     def cached_for_video_id(self, request: SourceRequest, video_id: str) -> SourceInfo | None:
         """The servable **bundle** one video id names, or `None` for a miss.
@@ -1038,16 +803,16 @@ class YouTubeSourceProvider:
         # it, and asking only about entry 0's key would re-download a video
         # whose reading is already here.
         resolution = _resolved_for(request.options, fingerprint, "youtube", request.output_root)
-        sh = source_hash(fingerprint, resolution.opts_hash)
+        sh = media_inspect.source_hash(fingerprint, resolution.opts_hash)
         snapshot = BundleStore.open(request.output_root).load_active(sh)
         if snapshot is None:
             return None
         manifest = snapshot.manifest
-        duration = manifest_duration(manifest)
+        duration = media_inspect.manifest_duration(manifest)
         resolved_path = manifest.get("source_resolved_path")
         if duration is None or not isinstance(resolved_path, str):
             return None
-        ensure_duration_allowed(duration, request.options.max_duration_sec)
+        media_inspect.ensure_duration_allowed(duration, request.options.max_duration_sec)
         return SourceInfo(
             source_type="youtube",
             resolved_path=Path(resolved_path),
@@ -1063,15 +828,15 @@ class YouTubeSourceProvider:
                 video_id=video_id,
             ),
             youtube_video_id=video_id,
-            youtube_lock_key=youtube_lock_key(video_id),
+            youtube_lock_key=source_identity.youtube_lock_key(video_id),
             related_links=_manifest_related_links(manifest, request.options),
         )
 
     def resolve(
         self,
         request: SourceRequest,
-        downloader: YouTubeDownloaderProtocol | None = None,
-        metadata: YouTubeMetadata | None = None,
+        downloader: acquisition.YouTubeDownloaderProtocol | None = None,
+        metadata: youtube.YouTubeMetadata | None = None,
     ) -> SourceInfo:
         if request.output_root is None:
             raise DistillError("E_BAD_OUTPUT_DIR", "youtube", "output_root is required")
@@ -1080,20 +845,20 @@ class YouTubeSourceProvider:
         progress = request.progress
         if progress:
             progress.update("youtube_download", status="running", detail={"step": "disk_precheck"})
-        check_disk_floor(output_root)
+        acquisition.check_disk_floor(output_root)
         if progress:
             progress.update("youtube_download", status="running", detail={"step": "resolve_id"})
-        metadata = metadata or youtube_metadata(request.value)
+        metadata = metadata or youtube.youtube_metadata(request.value)
         video_id = metadata.video_id
-        lock_key = youtube_lock_key(video_id)
+        lock_key = source_identity.youtube_lock_key(video_id)
         fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
         # <!-- P3-D-015 --> The key names the endpoint the walk selected, not
         # whichever one the chain listed first. `resolution`, not `resolved` or
         # `source`, because both already mean something else here.
         resolution = _resolved_for(options, fingerprint, "youtube", output_root)
         options = resolution.options
-        source = source_hash(fingerprint, resolution.opts_hash)
-        downloader = downloader or YoutubeDownloader(
+        source = media_inspect.source_hash(fingerprint, resolution.opts_hash)
+        downloader = downloader or acquisition.YoutubeDownloader(
             output_root, lock_wait_sec=request.lock_wait_sec
         )
         acquired = downloader.acquire(request.value, lock_key, progress)
@@ -1105,16 +870,16 @@ class YouTubeSourceProvider:
             warnings = [*metadata.warnings, *acquired.warnings]
             if progress:
                 progress.update("duration_probe", status="running")
-            duration, probe_warnings = probe_duration(acquired.path)
+            duration, probe_warnings = media_inspect.probe_duration(acquired.path)
             warnings.extend(probe_warnings)
             if progress:
                 progress.complete("duration_probe", detail={"duration_sec": duration})
-            ensure_duration_allowed(duration, options.max_duration_sec)
+            media_inspect.ensure_duration_allowed(duration, options.max_duration_sec)
             if progress:
                 progress.update(
                     "youtube_download", status="running", detail={"step": "disk_postcheck"}
                 )
-            check_disk_floor(output_root)
+            acquisition.check_disk_floor(output_root)
             if progress:
                 progress.complete(
                     "youtube_download",
@@ -1135,7 +900,7 @@ class YouTubeSourceProvider:
             provenance = Provenance(
                 title=metadata.title,
                 channel=metadata.channel,
-                description=_first_description_paragraph(metadata.description) or None,
+                description=youtube._first_description_paragraph(metadata.description) or None,
                 upload_date=metadata.upload_date,
                 canonical_url=f"https://www.youtube.com/watch?v={video_id}",
                 duration_sec=duration,
@@ -1191,7 +956,7 @@ class SourceResolver:
         url: str,
         options: DistillOptions,
         output_root: Path,
-        metadata: YouTubeMetadata | None = None,
+        metadata: youtube.YouTubeMetadata | None = None,
     ) -> SourceInfo | None:
         return self.youtube.cached(
             SourceRequest(url, options, output_root=output_root),
@@ -1203,9 +968,9 @@ class SourceResolver:
         url: str,
         options: DistillOptions,
         output_root: Path,
-        downloader: YouTubeDownloaderProtocol | None = None,
+        downloader: acquisition.YouTubeDownloaderProtocol | None = None,
         progress: ProgressReporter | None = None,
-        metadata: YouTubeMetadata | None = None,
+        metadata: youtube.YouTubeMetadata | None = None,
         lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
     ) -> SourceInfo:
         return self.youtube.resolve(
@@ -1227,7 +992,7 @@ class SourceResolver:
         options: DistillOptions,
         *,
         progress: ProgressReporter | None = None,
-        downloader: YouTubeDownloaderProtocol | None = None,
+        downloader: acquisition.YouTubeDownloaderProtocol | None = None,
         lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
     ) -> SourceResolution:
         if source_type == "local":
@@ -1251,12 +1016,12 @@ class SourceResolver:
             )
 
         root = validate_output_root(options.output_dir)
-        url = normalize_youtube_url(value)
+        url = youtube.normalize_youtube_url(value)
         # Rejects non-YouTube hosts (and option-injection values) before yt-dlp
         # runs. What it returns is the value written in the URL, which is not on
         # its own enough to key a **bundle** by - `youtube_fast_path_video_id`
         # decides that below.
-        parse_youtube_url(url)
+        youtube.parse_youtube_url(url)
         request = SourceRequest(
             url,
             options,
@@ -1274,12 +1039,12 @@ class SourceResolver:
         # `youtube_fast_path_video_id` decides. A URL that names a playlist as
         # well as a video, or carries a value yt-dlp's extractor would not match
         # whole, is resolved the way it always was.
-        fast_path_video_id = youtube_fast_path_video_id(url)
+        fast_path_video_id = youtube.youtube_fast_path_video_id(url)
         if fast_path_video_id is not None:
             served = self._served_from_cache(request, fast_path_video_id)
             if served is not None:
                 return served
-        metadata = youtube_metadata(url)
+        metadata = youtube.youtube_metadata(url)
         # The resolved id is what the cache was always asked about, before the
         # reorder put a lookup in front of it. It is skipped only when the fast
         # path already asked this exact question and missed - so a URL the fast
@@ -1331,7 +1096,7 @@ def youtube_source_info(
     url: str,
     options: DistillOptions,
     output_root: Path,
-    downloader: YouTubeDownloaderProtocol | None = None,
+    downloader: acquisition.YouTubeDownloaderProtocol | None = None,
     progress: ProgressReporter | None = None,
 ) -> SourceInfo:
     return SourceResolver().youtube_source(url, options, output_root, downloader, progress)
@@ -1343,7 +1108,7 @@ def resolve_source_for_processing(
     options: DistillOptions,
     *,
     progress: ProgressReporter | None = None,
-    downloader: YouTubeDownloaderProtocol | None = None,
+    downloader: acquisition.YouTubeDownloaderProtocol | None = None,
     lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
 ) -> SourceResolution:
     """Resolve one **source** for a run, on that run's wait budget (D-044).

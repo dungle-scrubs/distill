@@ -136,7 +136,7 @@ def lease_is_held(lock_key: str, lock_path: Path) -> bool:
     that has an answer: `flock` is per descriptor, so a lease held by this same
     process is refused here exactly as another process's would be.
     """
-    from distill.source import AcquisitionLease
+    from distill.acquisition import AcquisitionLease
 
     lease = AcquisitionLease.take(lock_key, lock_path)
     if lease is None:

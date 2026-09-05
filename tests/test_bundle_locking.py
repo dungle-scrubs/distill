@@ -692,9 +692,9 @@ def test_a_run_takes_the_bundle_lock_for_the_budget_its_caller_named(
 
     monkeypatch.setattr(pipeline.BundleStore, "begin", record)
 
-    class StubSource:
-        source_hash = BUNDLE_KEY
-        warnings: list[dict[str, str]] = []
+    from distill.source import SourceInfo
+
+    stub_source = SourceInfo("local", tmp_path / "source.mp4", 1.0, "fingerprint", BUNDLE_KEY, [])
 
     root = tmp_path / "output"
     root.mkdir()
@@ -704,10 +704,10 @@ def test_a_run_takes_the_bundle_lock_for_the_budget_its_caller_named(
     # The default is the single-source budget, so a caller that says nothing
     # waits for the run a user is watching.
     with pytest.raises(DistillError):
-        pipeline.process_resolved_source(StubSource(), options, root, progress=progress)
+        pipeline.process_resolved_source(stub_source, options, root, progress=progress)
     with pytest.raises(DistillError):
         pipeline.process_resolved_source(
-            StubSource(),
+            stub_source,
             options,
             root,
             progress=progress,
@@ -735,9 +735,9 @@ def test_a_run_that_fails_mid_stage_abandons_its_hold_and_says_why(
 
     monkeypatch.setattr(pipeline.ProcessingRun, "_produce_generation", explode)
 
-    class StubSource:
-        source_hash = BUNDLE_KEY
-        warnings: list[dict[str, str]] = []
+    from distill.source import SourceInfo
+
+    stub_source = SourceInfo("local", tmp_path / "source.mp4", 1.0, "fingerprint", BUNDLE_KEY, [])
 
     root = tmp_path / "output"
     root.mkdir()
@@ -745,7 +745,7 @@ def test_a_run_that_fails_mid_stage_abandons_its_hold_and_says_why(
 
     with pytest.raises(DistillError):
         pipeline.process_resolved_source(
-            StubSource(),
+            stub_source,
             resolve_run_config({"output_dir": str(root), "job_id": "j"}).options,
             root,
             progress=ProgressReporter(emitter=lambda _event: None),

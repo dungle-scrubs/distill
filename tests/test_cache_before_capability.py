@@ -35,13 +35,14 @@ from fake_tools import (
     FAKE_FFPROBE,
     FAKE_YTDLP_METADATA_AND_DOWNLOAD,
 )
+from runtime_fakes import configure_run
 from test_local_integration import fake_transcribe
 
 from distill import frame_selection
 from distill import pipeline as distill_session
 from distill.configuration import resolve_run_config
 from distill.errors import DistillError
-from distill.source import local_fingerprint, source_hash
+from distill.media_inspect import local_fingerprint, source_hash
 
 VIDEO_ID = "cachedvideo"
 """Eleven characters, because that is the only shape the fast path reads.
@@ -94,7 +95,7 @@ def hermetic_run(monkeypatch: pytest.MonkeyPatch) -> None:
     publish - is the real thing.
     """
     monkeypatch.setattr(frame_selection, "scene_midpoint_candidates", lambda *_: [])
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
 
 def a_producing_path(fake_tool: Callable[[str, str], Path], *, youtube: bool) -> Path:

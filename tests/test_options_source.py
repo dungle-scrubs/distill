@@ -19,37 +19,43 @@ from fake_tools import (
     fake_ffprobe_flooding_stderr,
 )
 
+from distill.acquisition import (
+    AcquiredSource,
+    AcquisitionLease,
+    YoutubeDownloader,
+    parse_byte_amount,
+    parse_ytdlp_progress,
+)
 from distill.artifacts import RedactionState
 from distill.configuration import resolve_run_config
 from distill.errors import DistillError
+from distill.media_inspect import (
+    CONTENT_HASH_LIMIT_BYTES,
+    FINGERPRINT_INTERIOR_ANCHORS,
+    FINGERPRINT_SAMPLE_BYTES,
+    local_fingerprint,
+    probe_duration,
+    source_hash,
+)
 from distill.options import OPTION_DEFAULTS, DistillOptions
 from distill.progress import ProgressReporter
 from distill.run_command import OUTPUT_CAP_BYTES, TRUNCATION_WARNING_CODE
 from distill.source import (
-    CONTENT_HASH_LIMIT_BYTES,
-    FINGERPRINT_INTERIOR_ANCHORS,
-    FINGERPRINT_SAMPLE_BYTES,
-    AcquiredSource,
-    AcquisitionLease,
-    YoutubeDownloader,
-    YouTubeMetadata,
-    _ytdlp_command,
-    local_fingerprint,
-    normalize_youtube_url,
-    parse_byte_amount,
-    parse_youtube_url,
-    parse_ytdlp_progress,
-    probe_duration,
     resolve_local_source,
     sensitive_path_match,
-    source_hash,
     source_path_kind,
     validate_output_root,
+    youtube_source_info,
+)
+from distill.source_identity import youtube_lock_key
+from distill.youtube import (
+    YouTubeMetadata,
+    _ytdlp_command,
+    normalize_youtube_url,
+    parse_youtube_url,
     youtube_description,
     youtube_fast_path_video_id,
-    youtube_lock_key,
     youtube_metadata,
-    youtube_source_info,
     youtube_url_names_one_video,
 )
 
@@ -69,7 +75,7 @@ def test_non_youtube_host_is_rejected_before_download() -> None:
 
 
 def test_ensure_youtube_host_rejects_injection_and_foreign_hosts() -> None:
-    from distill.source import ensure_youtube_host
+    from distill.youtube import ensure_youtube_host
 
     for bad in ("--exec=touch /tmp/pwned", "-J", "https://evil.example.com/playlist?list=x"):
         with pytest.raises(DistillError) as exc:
@@ -629,9 +635,9 @@ def test_youtube_source_info_carries_the_lease_into_the_read(
                 )
             return AcquiredSource(path=video, lease=lease)
 
-    monkeypatch.setattr("distill.source.check_disk_floor", lambda _path: None)
+    monkeypatch.setattr("distill.acquisition.check_disk_floor", lambda _path: None)
     monkeypatch.setattr(
-        "distill.source.youtube_metadata",
+        "distill.youtube.youtube_metadata",
         lambda _url: YouTubeMetadata(
             video_id="abc123",
             description=(
@@ -641,7 +647,7 @@ def test_youtube_source_info_carries_the_lease_into_the_read(
             warnings=[],
         ),
     )
-    monkeypatch.setattr("distill.source.probe_duration", lambda _path: (12.0, []))
+    monkeypatch.setattr("distill.media_inspect.probe_duration", lambda _path: (12.0, []))
 
     source = youtube_source_info(
         "https://www.youtube.com/watch?v=abc123",
@@ -1242,9 +1248,7 @@ def test_a_duration_cap_and_narrow_window_that_would_build_an_unbounded_schedule
     from distill.frame_selection import MAX_CANDIDATE_SCHEDULE
 
     with pytest.raises(DistillError) as excinfo:
-        resolve_run_config(
-            {"max_duration_sec": 1_000_000_000.0, "max_static_window_sec": 0.001}
-        )
+        resolve_run_config({"max_duration_sec": 1_000_000_000.0, "max_static_window_sec": 0.001})
     error = excinfo.value
     assert error.code == "E_BAD_OPTIONS"
     assert error.stage == "options"

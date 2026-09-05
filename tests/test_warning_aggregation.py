@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from runtime_fakes import configure_run
 from test_local_integration import fake_transcribe, make_short_screencast
 
 from distill import pipeline as distill_session
@@ -20,14 +21,10 @@ from distill.artifacts import FrameArtifact, Interpretation, Provenance, Redacti
 from distill.bundle_store import BundleRun, BundleStore
 from distill.configuration import resolve_run_config
 from distill.errors import aggregate_warnings, warning
-from distill.local_vision import (
-    FrameInterpreter,
-    LocalVisionConfig,
-    LocalVisionFailure,
-    LocalVisionProbe,
-)
+from distill.local_vision import FrameInterpreter, LocalVisionConfig, LocalVisionProbe
 from distill.options import DistillOptions
 from distill.progress import ProgressReporter
+from distill.rapid_mlx import LocalVisionFailure
 from distill.redact_secrets import redact_text
 from distill.response import manifest_document
 from distill.source import SourceInfo
@@ -231,7 +228,7 @@ def test_a_published_manifest_carries_one_record_per_stage_and_code(
     """
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     def noisy_vision(
         frames: list[FrameArtifact],
@@ -245,7 +242,7 @@ def test_a_published_manifest_carries_one_record_per_stage_and_code(
             *[warning("local_vision", "frame_text_ungrounded", "nothing to read")] * 2,
         ]
 
-    monkeypatch.setattr(distill_session, "interpret_frames_with_local_vision", noisy_vision)
+    configure_run(monkeypatch, interpret_frames=noisy_vision)
 
     response = distill_session.process_local_video(
         {
@@ -473,9 +470,9 @@ def test_the_runs_own_fold_reaches_the_manifest_without_a_video(
             *[warning("local_vision", "frame_text_ungrounded", "nothing to read")] * 2,
         ]
 
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcript)
-    monkeypatch.setattr(distill_session, "select_keyframes", fake_keyframes)
-    monkeypatch.setattr(distill_session, "interpret_frames_with_local_vision", noisy_vision)
+    configure_run(monkeypatch, transcribe=fake_transcript)
+    configure_run(monkeypatch, select_keyframes=fake_keyframes)
+    configure_run(monkeypatch, interpret_frames=noisy_vision)
 
     video = tmp_path / "fixture.mp4"
     video.write_bytes(b"not a video, and nothing here reads one")

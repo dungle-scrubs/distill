@@ -109,8 +109,7 @@ EXTERNAL_TOOLS: dict[str, ExternalTool] = {
         requirement=Requirement.REQUIRED,
         invoked_when="a YouTube source this run must acquire; never for a local file or a cache hit",
         absence_cost=(
-            "the source cannot be acquired at all, so a YouTube run has nothing "
-            "to process"
+            "the source cannot be acquired at all, so a YouTube run has nothing to process"
         ),
     ),
     "tesseract": ExternalTool(
@@ -146,8 +145,7 @@ def missing_tool_warning(stage: str, tool_name: str) -> WarningRecord:
     tool = EXTERNAL_TOOLS[tool_name]
     if not tool.is_optional:
         raise ValueError(
-            f"{tool.name} is a required capability; its absence is a fatal error, "
-            "not a degradation"
+            f"{tool.name} is a required capability; its absence is a fatal error, not a degradation"
         )
     return warning(stage, tool.warning_code, _absence_message(tool))
 
