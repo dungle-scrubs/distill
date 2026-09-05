@@ -419,67 +419,6 @@ class ProcessingRun:
             self.rekeyed_from = settlement.rekeyed_from
         return result
 
-    def _divergence(self, run: BundleRun) -> ChainRevalidation | None:
-        # Test seam: ``tests/test_revalidation.py`` monkeypatches
-        # ``pipeline.revalidate_chain``; honor it via lazy lookup so a
-        # patched ``refuse`` that raises is not swallowed by the fallback.
-        _revalidate = None
-        try:
-            from . import pipeline as _pipeline  # noqa: PLC0415
-
-            _revalidate = getattr(_pipeline, "revalidate_chain", None)
-        except ImportError:
-            _revalidate = None
-        # Use pipeline's version only when it is a different object than the
-        # source's (i.e. monkeypatched); otherwise use the direct import.
-        if callable(_revalidate) and _revalidate is not revalidate_chain:
-            revalidated = _revalidate(
-                self.options,
-                self.source.source_fingerprint,
-                self.source.source_type,
-                self.output_root,
-            )
-        else:
-            revalidated = revalidate_chain(
-                self.options,
-                self.source.source_fingerprint,
-                self.source.source_type,
-                self.output_root,
-            )
-        if revalidated.bundle_key == run.bundle_key:
-            return None
-        return revalidated
-
-    def _leave_key_for(self, run: BundleRun, revalidated: ChainRevalidation) -> None:
-        self._log_divergence("chain_diverged", run, revalidated)
-        run.abandon(f"chain_rekeyed: {revalidated.bundle_key}")
-        self.rekeyed_from = run.bundle_key
-        self.options = revalidated.resolution.options
-        self.source = replace(
-            self.source,
-            source_hash=revalidated.bundle_key,
-            resolved_options=revalidated.resolution.options,
-        )
-
-    def _log_divergence(
-        self,
-        event: str,
-        run: BundleRun,
-        revalidated: ChainRevalidation,
-        **detail: Any,
-    ) -> None:
-        held = candidate_in_hand(self.options, self.source.source_type)
-        _pipeline_log(
-            event,
-            bundle_key=run.bundle_key,
-            entry=None if held is None else held.entry,
-            vision_mode=self.options.vision_mode,
-            new_bundle_key=revalidated.bundle_key,
-            new_entry=revalidated.resolution.entry,
-            new_vision_mode=revalidated.resolution.vision_mode,
-            **detail,
-        )
-
     def _cached_response(self, store: BundleStore, snapshot: BundleSnapshot) -> dict[str, Any]:
         snapshot, progress_summary = cache_hit_progress_summary(store, snapshot)
         manifest = snapshot.manifest

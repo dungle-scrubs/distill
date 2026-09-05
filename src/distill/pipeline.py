@@ -82,10 +82,6 @@ from .source import (  # noqa: F401  re-exported for test seam
     source_path_kind,
     validate_output_root,
 )
-from .vision_selection import (  # noqa: F401  deep vision chain walk
-    SelectionOutcome,
-    VisionSelection,
-)
 from .youtube import ensure_youtube_host, youtube_playlist_urls
 
 TOOLS = {

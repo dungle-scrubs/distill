@@ -21,14 +21,8 @@ from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src" / "distill"
 
-OWNERS = frozenset({"bundle_store.py", "bundle_layout.py"})
-"""Modules allowed to name the layout they own (deep split, Candidate 02).
-
-``bundle_store.py`` remains the façade and the bundle identity owner;
-``bundle_layout.py`` owns the filesystem layout names (``BundlePaths``,
-``MarkerVerdict``) as the deep module behind that façade. Both may name the
-layout literally; no other module may.
-"""
+OWNERS = frozenset({"bundle_store.py"})
+"""The store owns filesystem layout and lifecycle rules."""
 OWNER = "bundle_store.py"  # legacy alias for prose
 
 LAYOUT_NAMES = {
