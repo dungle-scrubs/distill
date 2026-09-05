@@ -513,6 +513,16 @@ class ExclusiveLock:
     fd: int
     released: bool = False
 
+    @staticmethod
+    def record_release_failure(subject: str, error: Exception, during: BaseException) -> None:
+        """Record cleanup failure without replacing the error already in flight."""
+        _bundle_log(
+            "lock_release_failed",
+            subject=subject,
+            error=repr(error),
+            during=type(during).__name__,
+        )
+
     @classmethod
     def take(
         cls,

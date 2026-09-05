@@ -39,7 +39,6 @@ from .errors import DistillError, WarningRecord, warning
 from .media_inspect import FFPROBE_TIMEOUTS
 from .progress import ProgressReporter
 from .run_command import CommandResult, run_json, stream
-from .source_identity import youtube_lock_key as _identity_lock_key
 from .youtube import (
     NO_PLAYLIST_ARG,
     YTDLP_DOWNLOAD_TIMEOUTS,
@@ -173,11 +172,6 @@ class YouTubeDownloaderProtocol(Protocol):
         lock_key: str,
         progress: ProgressReporter | None = None,
     ) -> AcquiredSource: ...
-
-
-def youtube_lock_key(video_id: str) -> str:
-    """The **lock key** for a YouTube **source** (delegated to pure identity)."""
-    return _identity_lock_key(video_id)
 
 
 def check_disk_floor(path: Path) -> None:

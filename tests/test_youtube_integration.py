@@ -11,14 +11,13 @@ from conftest import lease_is_held
 from runtime_fakes import configure_run
 from test_local_integration import fake_transcribe, make_short_screencast
 
-from distill import acquisition, media_inspect, youtube
+from distill import acquisition, media_inspect, source_identity, youtube
 from distill import pipeline as distill_session
 from distill import source as distill_source
 from distill.acquisition import AcquiredSource, AcquisitionLease
 from distill.artifacts import Provenance
 from distill.errors import DistillError
 from distill.local_vision import LocalVisionProbe
-from distill.media_inspect import source_hash
 from distill.progress import ProgressReporter
 from distill.source import SourceInfo
 from distill.source_identity import youtube_lock_key
@@ -109,7 +108,9 @@ def test_cache_hit_skips_youtube_download(
             resolved_path=video,
             duration_sec=1.0,
             source_fingerprint=fingerprint,
-            source_hash=source_hash(fingerprint, request.options.opts_hash("youtube")),
+            source_hash=source_identity.bundle_key(
+                fingerprint, request.options.opts_hash("youtube")
+            ),
             warnings=[],
             provenance=Provenance(
                 canonical_url=f"https://www.youtube.com/watch?v={video_id}",

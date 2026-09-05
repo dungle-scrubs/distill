@@ -38,11 +38,11 @@ from fake_tools import (
 from runtime_fakes import configure_run
 from test_local_integration import fake_transcribe
 
-from distill import frame_selection
+from distill import frame_selection, source_identity
 from distill import pipeline as distill_session
 from distill.configuration import resolve_run_config
 from distill.errors import DistillError
-from distill.media_inspect import local_fingerprint, source_hash
+from distill.source_identity import local_fingerprint
 
 VIDEO_ID = "cachedvideo"
 """Eleven characters, because that is the only shape the fast path reads.
@@ -217,7 +217,7 @@ def test_a_youtube_bundle_keyed_by_the_resolved_video_id_is_still_found(
     """
     options = resolve_run_config(youtube_args(tmp_path, cache_mode="fingerprint")).options
     fingerprint = hashlib.sha256(VIDEO_ID.encode()).hexdigest()
-    bundle_key = source_hash(fingerprint, options.opts_hash("youtube"))
+    bundle_key = source_identity.bundle_key(fingerprint, options.opts_hash("youtube"))
     write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")
 
     served = distill_session.process_youtube_video(youtube_args(tmp_path))
@@ -249,7 +249,7 @@ def test_a_bundle_keyed_by_a_resolved_id_the_url_does_not_carry_is_still_found(
         ),
     )
     options = resolve_run_config(youtube_args(tmp_path, cache_mode="fingerprint")).options
-    bundle_key = source_hash(
+    bundle_key = source_identity.bundle_key(
         hashlib.sha256(resolved_id.encode()).hexdigest(), options.opts_hash("youtube")
     )
     write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")
@@ -281,7 +281,7 @@ def test_a_playlist_attached_url_is_not_served_from_the_video_ids_bundle(
     playlist_url = f"{URL}&list=PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH"
     args = youtube_args(tmp_path, url=playlist_url, cache_mode="fingerprint")
     options = resolve_run_config(args).options
-    bundle_key = source_hash(
+    bundle_key = source_identity.bundle_key(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
     write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")
@@ -307,7 +307,7 @@ def test_a_youtube_manifest_duration_over_the_cap_is_refused_rather_than_served(
     """
     args = youtube_args(tmp_path, max_duration_sec=5.0)
     options = resolve_run_config(args).options
-    bundle_key = source_hash(
+    bundle_key = source_identity.bundle_key(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
     write_published_bundle(
@@ -338,7 +338,7 @@ def test_a_local_manifest_duration_over_the_cap_is_refused_rather_than_served(
     video = a_local_video(tmp_path)
     args = local_args(video, tmp_path, max_duration_sec=5.0)
     options = resolve_run_config(args).options
-    bundle_key = source_hash(
+    bundle_key = source_identity.bundle_key(
         local_fingerprint(video.resolve(), options.cache_mode), options.opts_hash("local")
     )
     write_published_bundle(tmp_path / "cache", bundle_key, source_type="local")
@@ -371,7 +371,7 @@ def test_a_url_naming_two_video_ids_is_not_served_from_the_first_ones_bundle(
     two_ids = f"{URL}&v=otherid1234"
     args = youtube_args(tmp_path, url=two_ids)
     options = resolve_run_config(args).options
-    bundle_key = source_hash(
+    bundle_key = source_identity.bundle_key(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
     write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")
@@ -417,7 +417,7 @@ def test_a_video_id_the_url_padded_is_not_a_bundle_key_of_its_own(
     padded = f"https://www.youtube.com/watch?v={VIDEO_ID}x"
     args = youtube_args(tmp_path, url=padded)
     options = resolve_run_config(args).options
-    bundle_key = source_hash(
+    bundle_key = source_identity.bundle_key(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
     write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")
@@ -445,7 +445,7 @@ def test_a_manifest_recording_a_boolean_duration_is_a_miss_not_a_one_second_hit(
     """
     args = youtube_args(tmp_path)
     options = resolve_run_config(args).options
-    bundle_key = source_hash(
+    bundle_key = source_identity.bundle_key(
         hashlib.sha256(VIDEO_ID.encode()).hexdigest(), options.opts_hash("youtube")
     )
     bundle = write_published_bundle(tmp_path / "cache", bundle_key, source_type="youtube")

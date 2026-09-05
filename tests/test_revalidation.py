@@ -44,7 +44,7 @@ import pytest
 from runtime_fakes import configure_run
 from test_bundle_locking import FakeClock, hold_the_lock, lock_is_held, lock_path
 
-from distill import bundle_store, pipeline, source
+from distill import bundle_store, pipeline, source, source_identity
 from distill.artifacts import FrameArtifact, Provenance, RedactionState
 from distill.bundle_store import (
     BATCH_ITEM_LOCK_WAIT_SEC,
@@ -55,7 +55,6 @@ from distill.bundle_store import (
 )
 from distill.errors import DistillError
 from distill.local_vision import LocalVisionConfig
-from distill.media_inspect import source_hash
 from distill.options import (
     VISION_MODE_CHAIN_EXHAUSTED,
     VISION_MODE_SELECTED,
@@ -270,7 +269,7 @@ def _key_of(chain: tuple[LocalVisionConfig, ...], entry: int) -> str:
         cached=lambda _opts_hash: None,
         probe=lambda endpoint: endpoint == chain[entry],
     )
-    return source_hash(FINGERPRINT, resolved.opts_hash)
+    return source_identity.bundle_key(FINGERPRINT, resolved.opts_hash)
 
 
 def _exhausted_key(chain: tuple[LocalVisionConfig, ...]) -> str:
@@ -286,7 +285,7 @@ def _exhausted_key(chain: tuple[LocalVisionConfig, ...]) -> str:
         cached=lambda _opts_hash: None,
         probe=lambda _endpoint: False,
     )
-    return source_hash(FINGERPRINT, resolved.opts_hash)
+    return source_identity.bundle_key(FINGERPRINT, resolved.opts_hash)
 
 
 def _run_that_waited(
@@ -366,7 +365,7 @@ def _run_that_waited(
     # happens: the run this test drives starts from its outcome, holding a
     # **bundle key** an endpoint answered for before the wait began.
     resolution = _resolved_for(options, FINGERPRINT, "local", root)
-    bundle_key = source_hash(FINGERPRINT, resolution.opts_hash)
+    bundle_key = source_identity.bundle_key(FINGERPRINT, resolution.opts_hash)
     probes.clear()
 
     holder: dict[str, int | None] = {"fd": hold_the_lock(root, bundle_key)}

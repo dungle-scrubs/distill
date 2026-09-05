@@ -25,6 +25,7 @@ from runtime_fakes import configure_run
 from test_local_integration import make_short_screencast
 
 from distill import pipeline as distill_session
+from distill import source_identity
 from distill.acquisition import AcquiredSource, AcquisitionLease
 from distill.artifacts import (
     FrameArtifact,
@@ -37,7 +38,6 @@ from distill.artifacts import (
 )
 from distill.bundle_store import BundleRun, BundleStore
 from distill.links import RelatedLink, extract_relevant_links
-from distill.media_inspect import source_hash
 from distill.options import DistillOptions
 from distill.progress import DEFAULT_MECHANISM_WEIGHTS
 from distill.render import render_markdown
@@ -551,7 +551,9 @@ def test_a_cache_hit_reads_its_related_links_back_as_carriers(tmp_path: Path) ->
     root.mkdir()
     options = DistillOptions()
     video_id = "abcdefghijk"
-    key = source_hash(hashlib.sha256(video_id.encode()).hexdigest(), options.opts_hash("youtube"))
+    key = source_identity.bundle_key(
+        hashlib.sha256(video_id.encode()).hexdigest(), options.opts_hash("youtube")
+    )
     fresh = SourceInfo(
         source_type="youtube",
         resolved_path=tmp_path / "video.mp4",

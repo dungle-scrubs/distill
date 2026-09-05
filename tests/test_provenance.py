@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from fake_tools import FAKE_FFPROBE
 
+from distill import source_identity
 from distill.acquisition import AcquiredSource, AcquisitionLease, YouTubeDownloaderProtocol
 from distill.artifacts import (
     Carrier,
@@ -22,7 +23,6 @@ from distill.artifacts import (
 )
 from distill.bundle_store import BundleRun, BundleStore, validate_manifest_schema
 from distill.errors import DistillError
-from distill.media_inspect import source_hash
 from distill.options import DistillOptions
 from distill.progress import ProgressReporter
 from distill.response import manifest_document
@@ -476,7 +476,7 @@ def test_provenance_survives_when_a_cache_hit_is_removed_before_begin(
     options = DistillOptions()
     video_id = "abcdefghijk"
     fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
-    bundle_key = source_hash(fingerprint, options.opts_hash("youtube"))
+    bundle_key = source_identity.bundle_key(fingerprint, options.opts_hash("youtube"))
     original = SourceInfo(
         source_type="youtube",
         resolved_path=tmp_path / "source.mp4",
@@ -714,6 +714,6 @@ def test_retitle_does_not_change_options_hash_or_bundle_key() -> None:
 
     assert "provenance" not in first_options.cache_payload("youtube")
     assert first_hash == second_hash
-    assert source_hash("source-fingerprint", first_hash) == source_hash(
-        "source-fingerprint", second_hash
-    )
+    assert source_identity.bundle_key(
+        "source-fingerprint", first_hash
+    ) == source_identity.bundle_key("source-fingerprint", second_hash)

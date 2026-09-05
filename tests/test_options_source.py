@@ -19,6 +19,7 @@ from fake_tools import (
     fake_ffprobe_flooding_stderr,
 )
 
+from distill import source_identity
 from distill.acquisition import (
     AcquiredSource,
     AcquisitionLease,
@@ -29,14 +30,7 @@ from distill.acquisition import (
 from distill.artifacts import RedactionState
 from distill.configuration import resolve_run_config
 from distill.errors import DistillError
-from distill.media_inspect import (
-    CONTENT_HASH_LIMIT_BYTES,
-    FINGERPRINT_INTERIOR_ANCHORS,
-    FINGERPRINT_SAMPLE_BYTES,
-    local_fingerprint,
-    probe_duration,
-    source_hash,
-)
+from distill.media_inspect import probe_duration
 from distill.options import OPTION_DEFAULTS, DistillOptions
 from distill.progress import ProgressReporter
 from distill.run_command import OUTPUT_CAP_BYTES, TRUNCATION_WARNING_CODE
@@ -47,7 +41,13 @@ from distill.source import (
     validate_output_root,
     youtube_source_info,
 )
-from distill.source_identity import youtube_lock_key
+from distill.source_identity import (
+    CONTENT_HASH_LIMIT_BYTES,
+    FINGERPRINT_INTERIOR_ANCHORS,
+    FINGERPRINT_SAMPLE_BYTES,
+    local_fingerprint,
+    youtube_lock_key,
+)
 from distill.youtube import (
     YouTubeMetadata,
     _ytdlp_command,
@@ -204,14 +204,16 @@ def test_local_vision_server_address_does_not_change_the_bundle_key(
     second = resolve_run_config({"local_vision_base_url": "http://127.0.0.1:9000/v1"}).options
 
     fingerprint = "same-source"
-    assert source_hash(fingerprint, first.opts_hash(source_type)) == source_hash(
+    assert source_identity.bundle_key(
+        fingerprint, first.opts_hash(source_type)
+    ) == source_identity.bundle_key(
         fingerprint,
         second.opts_hash(source_type),
     )
 
 
 def test_source_hash_uses_fingerprint_and_options_hash() -> None:
-    assert source_hash("abc", "def") == hashlib.sha256(b"abc:def").hexdigest()
+    assert source_identity.bundle_key("abc", "def") == hashlib.sha256(b"abc:def").hexdigest()
 
 
 def test_content_mode_refuses_files_over_5gb(
@@ -1500,6 +1502,6 @@ def test_the_source_carries_the_options_its_key_was_derived_from(
     assert info.resolved_options is not None
     assert info.resolved_options.local_vision_model == "entry-one-model"
     # And the key on the source is the one those options describe.
-    assert info.source_hash == source_hash(
+    assert info.source_hash == source_identity.bundle_key(
         info.source_fingerprint, info.resolved_options.opts_hash("local")
     )

@@ -54,7 +54,6 @@ what a **generation** contains, or install anything.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import stat
@@ -278,7 +277,7 @@ def _resolved_for(
 
     <!-- D-033 --> Here rather than in the pipeline, because a candidate key is
     an **options hash** but whether one is *cached* is a question about
-    `source_hash(fingerprint, opts_hash)` - and the fingerprint only exists once
+    `source_identity.bundle_key(fingerprint, opts_hash)` - and the fingerprint only exists once
     resolution is under way. Resolving earlier would look tidier and could only
     ever probe, never serve a hit, which is the cache-before-network property
     the walk exists to guarantee.
@@ -294,7 +293,7 @@ def _resolved_for(
             None
             if output_root is None
             else servable_interpretation_count(
-                output_root, media_inspect.source_hash(fingerprint, opts_hash)
+                output_root, source_identity.bundle_key(fingerprint, opts_hash)
             )
         ),
         probe=_probe_endpoint,
@@ -315,7 +314,7 @@ class ChainRevalidation:
     """A second walk of the **endpoint chain**, and the **bundle key** it names.
 
     The key travels with the resolution because the two are one answer: an
-    `opts_hash` is what the walk settled on and `source_hash(fingerprint,
+    `opts_hash` is what the walk settled on and `source_identity.bundle_key(fingerprint,
     opts_hash)` is the bundle it describes, and a caller that derived the second
     half itself would be a second place that knows how a bundle key is built.
     """
@@ -356,7 +355,7 @@ def revalidate_chain(
     resolution = _resolved_for(options, fingerprint, source_type, output_root)
     return ChainRevalidation(
         resolution=resolution,
-        bundle_key=media_inspect.source_hash(fingerprint, resolution.opts_hash),
+        bundle_key=source_identity.bundle_key(fingerprint, resolution.opts_hash),
     )
 
 
@@ -454,7 +453,7 @@ class LocalSourceProvider:
                     f"source path resolved to {redact_text(resolved.name).text}",
                 )
             )
-        fingerprint = media_inspect.local_fingerprint(resolved, options.cache_mode, progress)
+        fingerprint = source_identity.local_fingerprint(resolved, options.cache_mode, progress)
         # <!-- P3-D-015 --> The key comes from the resolution, not from the
         # options the run started with. Those still name whichever endpoint the
         # chain happened to list first, so deriving from them publishes entry
@@ -464,7 +463,7 @@ class LocalSourceProvider:
         # `probe_duration`.
         resolution = _resolved_for(options, fingerprint, "local", request.output_root)
         options = resolution.options
-        bundle_key = media_inspect.source_hash(fingerprint, resolution.opts_hash)
+        bundle_key = source_identity.bundle_key(fingerprint, resolution.opts_hash)
         duration = self._served_duration(request, bundle_key)
         if duration is None:
             if progress:
@@ -796,14 +795,14 @@ class YouTubeSourceProvider:
         """
         if request.output_root is None:
             raise DistillError("E_BAD_OUTPUT_DIR", "youtube", "output_root is required")
-        fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
+        fingerprint = source_identity.youtube_fingerprint(video_id)
         # <!-- P3-D-011 --> The cache question is asked about the key the walk
         # settles on, which may be a less-preferred entry's or the exhausted
         # one - a bundle already on disk is servable whichever endpoint made
         # it, and asking only about entry 0's key would re-download a video
         # whose reading is already here.
         resolution = _resolved_for(request.options, fingerprint, "youtube", request.output_root)
-        sh = media_inspect.source_hash(fingerprint, resolution.opts_hash)
+        sh = source_identity.bundle_key(fingerprint, resolution.opts_hash)
         snapshot = BundleStore.open(request.output_root).load_active(sh)
         if snapshot is None:
             return None
@@ -851,13 +850,13 @@ class YouTubeSourceProvider:
         metadata = metadata or youtube.youtube_metadata(request.value)
         video_id = metadata.video_id
         lock_key = source_identity.youtube_lock_key(video_id)
-        fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
+        fingerprint = source_identity.youtube_fingerprint(video_id)
         # <!-- P3-D-015 --> The key names the endpoint the walk selected, not
         # whichever one the chain listed first. `resolution`, not `resolved` or
         # `source`, because both already mean something else here.
         resolution = _resolved_for(options, fingerprint, "youtube", output_root)
         options = resolution.options
-        source = media_inspect.source_hash(fingerprint, resolution.opts_hash)
+        source = source_identity.bundle_key(fingerprint, resolution.opts_hash)
         downloader = downloader or acquisition.YoutubeDownloader(
             output_root, lock_wait_sec=request.lock_wait_sec
         )
