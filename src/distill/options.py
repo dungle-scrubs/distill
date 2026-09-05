@@ -110,11 +110,11 @@ GENERAL_OPTION_NAMES = tuple(
 The general schema is the option table except `job_id`, which identifies one
 invocation and cannot be pinned across every run in a directory (R-18).
 `force_reprocess` and `resume_partial` stay configurable: they govern cache
-reuse for a run and a later invocation can override either one. `config.py` is
+reuse for a run and a later invocation can override either one. `configuration.py` is
 told this vocabulary rather than holding a second copy that could drift.
 
 The local-vision options are deliberately not here. They arrive from their own
-files through `local_vision_config_from_args`, and a top-level key naming one in
+files through `configuration.resolve_run_config`, and a top-level key naming one in
 `distill.json` is not a second way to set it (the nested `local_vision` object
 is the one way).
 """
@@ -177,7 +177,7 @@ NUMERIC_OPTION_DOMAINS: dict[str, NumericDomain] = {
 
 A table rather than a check per call site, because the check that is written
 where a value is *used* is the one that is missing at the second use: the
-duration cap was validated in `from_args` and the batch limit nowhere, and
+duration cap was validated in the resolver and the batch limit nowhere, and
 `max_items=-1` became a slice taken from the wrong end.
 
 Retention's numbers - `keep_generations` and `max_age_days` - are not here.

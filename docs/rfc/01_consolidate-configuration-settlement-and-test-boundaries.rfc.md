@@ -3,14 +3,14 @@ number: 01
 version: "02"
 title: "Consolidate configuration, settlement, and test boundaries"
 type: refactor
-status: Accepted
+status: Implemented
 author: Codex (draft from user-supplied audit)
 date: 2026-09-05
 ---
 
 # RFC-01: Consolidate configuration, settlement, and test boundaries
 
-Version 02 records the owner-approved decisions and is accepted for implementation. Version 01 addressed the review of the unversioned draft at SHA-256 `27c150dd14cab69f87f8c8a9064b6b18439d65537d6ea3c6e92a7c924c133b91`.
+Version 02 records the owner-approved decisions and is implemented on main. Version 01 addressed the review of the unversioned draft at SHA-256 `27c150dd14cab69f87f8c8a9064b6b18439d65537d6ea3c6e92a7c924c133b91`.
 
 ## Abstract
 
@@ -22,7 +22,7 @@ Distill turns a recorded video into a durable, re-readable account of what was s
 
 This is a refactor RFC because ownership, dependency direction, and compatibility are design decisions. It covers configuration folding, option metadata, endpoint settlement, constructor dependencies, source identity, and the corresponding test boundaries across `src/distill/` and the test suite. The supplied whole-repository audit is its input, including both deepen and drift findings and all six extended sections.
 
-Bug fixes, formatting, CI maintenance, documentation corrections, and instruction-file repairs are tracked below as companion tasks. They do not need an RFC to establish that incorrect behavior needs correction. This draft neither implements those tasks nor claims they have passed verification.
+Bug fixes, formatting, CI maintenance, documentation corrections, and instruction-file repairs are tracked below as companion tasks. They do not need an RFC to establish that incorrect behavior needs correction. Implementation evidence is recorded below.
 
 ### Scope and fit check
 
@@ -200,9 +200,9 @@ This revision answers the [review of the unversioned draft](01_consolidate-confi
 
 ### Audit disposition
 
-This table answers the supplied audit, not a review of an earlier RFC. Numbers match its ranked list. No finding is treated as already fixed.
+This table records the accepted disposition of the supplied audit. Numbers match its ranked list; completion evidence follows the table.
 
-| Audit item | Disposition in this draft |
+| Audit item | Accepted disposition |
 | --- | --- |
 | 1. False no-endpoint render note | Companion bug fix; persisted attribution requirements in Security Considerations. |
 | 2. Configuration folding | Adopted in proposed change 1. |
@@ -225,6 +225,47 @@ This table answers the supplied audit, not a review of an earlier RFC. Numbers m
 The six extended sections are covered as follows: correctness and error handling by items 1, 4, 11, 12, and 17; test health by items 3, 5, and 6; documentation drift by items 7, 15, and 17; security by item 14 and preserved transport/redaction invariants; dependency and toolchain health by items 6 and 15; instruction-file convention by item 13. Floor-only dependency constraints and absent framework choices do not alone justify upgrades or replacements.
 
 The audit's rejected candidates remain protected: BundleStore's deep interface, the shared ExclusiveLock primitive, the documented warning-record representation, Carrier and its redaction ordering, transport plus endpoint policy in one module, the shared subprocess and durable-write paths, ADR-0006 redaction behavior, and the exempt measurement harness. Removing test facades does not reverse the YouTube/media inspection split.
+
+## Implementation Record
+
+Implemented on main on 2026-09-05:
+
+- `809017e` removes unused settlement code and the four bundle stubs (pipeline 70).
+- `06b1b51` consolidates configuration and derives vision flags from OptionSpec (pipeline 71).
+- `eff3e6c` injects dependencies and removes production test facades (pipeline 72).
+- `41f88aa` consolidates source identity and lock logging (pipeline 73).
+- The companion completion uses pipeline 74. It fixes persisted reader attribution,
+  coded artifact delivery failures, traceback propagation, scene-detector warnings,
+  and bounded job errors. It also adds explicit stage-call signatures, formatting
+  enforcement, unused-suppression checking, documentation corrections, and CLAUDE.md.
+
+No compatibility adapters remain at the removed import locations. Repository
+callers and tests migrated to their owners; no supported external consumer or
+documented import commitment was found. Commands, flags, and configuration formats
+remain supported. No dependency or CLI framework migration was made.
+
+The four vision entry points remain because their contracts differ: raising versus
+warning-returning calls, and backend validation versus interpreter-prevalidated
+calls. The caller-controlled `checked` boolean was not introduced. BundleStore's
+lifecycle implementation remains together. The existing branch policy is unchanged.
+
+Regression tests reproduced the false render note, successful responses after
+artifact failure, swallowed traceback opt-in, silent detector failure, and unbounded
+job failure before the fixes. `tests/test_rfc_companion_errors.py` covers command,
+call-tool, job, batch, saved-bundle, and cache-retry behavior. Filtered-view tests cover
+recorded modes, missing attribution, hostile model text, and removal of every frame.
+The revalidation failure test checks exception identity, no media work, and lock
+release through a fresh descriptor. Existing identity and configuration fixtures
+remain in the suite, with added document-read-count checks.
+
+Validation: 1,383 passed, 2 skipped; coverage 92.05% against the 80% CI floor.
+Ruff lint, Ruff format checks, ty, and pipeline signature checks pass locally.
+The two skips are the gated live vision and YouTube smoke tests. The latest remote
+CI run checked during implementation was
+[31266796690](https://github.com/dungle-scrubs/distill/actions/runs/31266796690),
+for older revision `a9b2bfa6a558f4d33467c8d85e015bf6df74fadf`: all four type-check
+steps failed and its signature job passed. These local commits have not been pushed,
+so that run is not evidence about this implementation.
 
 ## Alternatives Considered
 

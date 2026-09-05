@@ -12,7 +12,7 @@ exist.
 
 ADR-0001 required an eval before its reversal, and its central claim — that a
 frontier cloud reader "is the only thing that would meaningfully beat the local
-8-bit model" — turned out to be right. The eval measured it, on a 26-frame
+8-bit model" — turned out to be right. The eval measured it, on the then-current 26-frame
 human-verified corpus with six categories including injection-shaped,
 safety-blocked, and reader-disagreement frames (`tests/evals/README.md`,
 evidence in `tests/evals/gate_2_to_3_cloud.json`):

@@ -343,7 +343,9 @@ def _four_candidates_and_a_frame_each(monkeypatch: pytest.MonkeyPatch) -> None:
     # a test resting on.
     distinct_hashes = itertools.cycle(("0" * 16, "f" * 16))
     monkeypatch.setattr(
-        frame_selection, "scene_midpoint_candidates", lambda _path, _duration: [0.0, 2.0, 4.0, 6.0]
+        frame_selection,
+        "scene_midpoint_candidates",
+        lambda _path, _duration: ([0.0, 2.0, 4.0, 6.0], []),
     )
     monkeypatch.setattr(
         frame_selection,
@@ -425,7 +427,7 @@ def test_the_truncation_warning_reaches_the_published_manifest(
     monkeypatch.setattr(
         frame_selection,
         "scene_midpoint_candidates",
-        lambda _path, _duration: [0.0, 0.2, 0.4, 0.6, 0.8],
+        lambda _path, _duration: ([0.0, 0.2, 0.4, 0.6, 0.8], []),
     )
 
     response = distill_session.process_local_video(

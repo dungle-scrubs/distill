@@ -247,7 +247,7 @@ class DistillError(Exception):
         return {
             "code": self.code,
             "stage": self.stage,
-            "message": self.message,
+            "message": _capped(self.message),
             "details": json_safe_details(self.details),
         }
 

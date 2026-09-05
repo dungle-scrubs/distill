@@ -14,8 +14,20 @@ You will get an acknowledgement within a few days.
 
 ## Scope
 
-Distill runs local video files through system tools (`ffmpeg`, `tesseract`,
-`yt-dlp`, a local Rapid-MLX server) and writes bundles to disk. Out of scope:
+Distill processes local and YouTube video sources through external tools and
+writes bundles and artifacts to disk. Vision endpoints include the default
+local Rapid-MLX server and profile-compliant remote servers. Remote access
+requires explicit opt-in and HTTPS. Per-request address checks, disabled
+redirects and proxies, and response and run budgets remain in force. See
+[ADR-0005](docs/adr/0005-any-profile-compliant-vision-endpoint.md).
 
-- Vulnerabilities in third-party dependencies — report those upstream.
+An `api_key` in `distill.json` is stored as plaintext. Keep configuration files
+out of version control and restrict access to them. Use `api_key_env` to refer
+to an environment variable when credentials should stay out of the file.
+Distill excludes credentials from bundle identity and public configuration
+output. Content redaction does not make an artifact safe to publish without review.
+
+Out of scope:
+
+- Vulnerabilities in third-party dependencies - report those upstream.
 - Issues that require already having code execution on the host.

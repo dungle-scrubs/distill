@@ -381,7 +381,7 @@ def test_low_confidence_segments_are_dropped_with_warning(tmp_path: Path) -> Non
 
 
 def test_absent_ffmpeg_ends_the_run_because_the_table_says_it_is_required(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
     """ADR-0002 / R-34: a missing **required capability** is a **fatal error**.

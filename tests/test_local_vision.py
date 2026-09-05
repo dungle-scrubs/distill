@@ -2127,7 +2127,7 @@ class TestCredentialResolution:
 
         captured: dict[str, Any] = {}
 
-        def fake_get(requestor, url, timeout_sec, **kwargs):  # noqa: ANN001
+        def fake_get(requestor, url, timeout_sec, **kwargs):
             captured.update(kwargs)
             return _models_body(DEFAULT_MODEL)
 
@@ -2302,7 +2302,7 @@ class TestEndpointPolicyHttps:
 
         assert https_handlers, "the opener must have an HTTPS handler"
         for handler in https_handlers:
-            context = handler._context  # noqa: SLF001 - the pin is the point
+            context = handler._context
             assert context.verify_mode is ssl.CERT_REQUIRED
             assert context.check_hostname is True
 

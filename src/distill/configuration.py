@@ -334,7 +334,10 @@ def _resolve_general_layers(
         key: value for key, value in values.items() if not (key == "output_dir" and value == "")
     }
     origins = dict.fromkeys(values, root / GENERAL_CONFIG_FILENAME)
-    for layer in (environment_options(), args):
+    for layer in (
+        {key: value for key, value in environment_options().items() if key in known},
+        args,
+    ):
         for key, value in layer.items():
             if value is None and key in values:
                 continue

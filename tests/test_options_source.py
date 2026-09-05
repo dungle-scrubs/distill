@@ -932,7 +932,7 @@ def test_youtube_metadata_carries_its_invocations_truncation_warning(
 
 
 def test_an_absent_ytdlp_ends_the_run_even_on_the_best_effort_path(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
 ) -> None:
     """ADR-0002 / R-34: best-effort metadata does not downgrade a required tool.
 
@@ -968,7 +968,7 @@ def test_a_nan_max_duration_is_refused_rather_than_silencing_the_cap() -> None:
 
 
 def test_a_negative_max_items_is_refused_rather_than_slicing_from_the_end(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
     """FAILS FIRST (nit, R-03): `items[:-1]` drops the last item and calls it a limit.

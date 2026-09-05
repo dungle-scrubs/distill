@@ -65,11 +65,14 @@ could be claimed).
 - **One deadline for the whole walk.** How many endpoints a chain names is the
   operator's choice; how long a run waits should not be that choice multiplied
   by a timeout.
-- **Availability is not revalidated after waiting for the bundle lock.** The
-  cache *is* re-asked under the lock, because a stale cache answer makes a run
-  redo work already done. A stale availability answer is different in kind: it
-  yields a worse reading rather than a wrong bundle, and the memo's TTL bounds
-  how long it can persist. Recorded as owed rather than done.
+- **Long bundle-lock waits trigger bounded revalidation.** When acquisition
+  returns a producing run and accumulated wait reaches `REVALIDATE_AFTER_WAIT_SEC`
+  (150 seconds), `KeySettlement` revalidates selection before media stages start.
+  It makes at most two revalidation calls and changes the held bundle key at
+  most once. A cache snapshot returned by lock acquisition needs no revalidation.
+  The cache is checked under the lock; a changed reader must not publish under
+  the previous reader's key. Exceptions release the held lock and propagate.
+  This paragraph was corrected by RFC-01 to match the retained production policy.
 - **Reader-identity collisions across time are not addressed.** Two endpoints
   serving different weights under one model id still collide on a **bundle
   key**, exactly as ADR-0004 says. A chain makes that easier to arrange by

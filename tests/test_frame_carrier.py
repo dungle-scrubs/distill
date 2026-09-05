@@ -25,7 +25,7 @@ from distill.artifacts import (
 )
 from distill.bundle_store import BundleRun, BundleStore
 from distill.frame_selection import select_keyframes
-from distill.render import render_markdown
+from distill.render import VisionEvidence, render_markdown
 from distill.response import response_frames
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1] / "src" / "distill"
@@ -187,7 +187,7 @@ def _extracts_every_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
         output.write_bytes(b"png")
         return True, []
 
-    monkeypatch.setattr(frame_selection, "scene_midpoint_candidates", lambda _p, _d: [0.0])
+    monkeypatch.setattr(frame_selection, "scene_midpoint_candidates", lambda _p, _d: ([0.0], []))
     monkeypatch.setattr(frame_selection, "extract_frame", fake_extract)
     monkeypatch.setattr(frame_selection, "phash", lambda _path: "0f")
 
@@ -470,7 +470,14 @@ def test_the_render_names_the_model_that_read_the_frames() -> None:
         relative_path="frames/f1.png",
         extracted_text="a slide",
     )
-    rendered = render_markdown("demo.mp4", 1.0, None, [frame], [], vision_model="qwen3-vl:32b")
+    rendered = render_markdown(
+        "demo.mp4",
+        1.0,
+        None,
+        [frame],
+        [],
+        vision_evidence=VisionEvidence(("qwen3-vl:32b",), "read"),
+    )
 
     assert "qwen3-vl:32b" in rendered
 
@@ -490,6 +497,8 @@ def test_the_render_says_plainly_when_no_endpoint_read_the_frames() -> None:
         relative_path="frames/f1.png",
         extracted_text="a slide",
     )
-    degraded = render_markdown("demo.mp4", 1.0, None, [frame], [], vision_model=None)
+    degraded = render_markdown(
+        "demo.mp4", 1.0, None, [frame], [], vision_evidence=VisionEvidence(state="none")
+    )
 
     assert "No vision endpoint" in degraded

@@ -776,7 +776,7 @@ class _Dispatcher(threading.Thread):
                 continue
             try:
                 self._deliver(name, text)
-            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            except BaseException as exc:
                 self.failure = exc
                 return
 

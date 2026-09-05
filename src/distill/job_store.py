@@ -209,14 +209,11 @@ class JobOutcome:
         exercised, and the whole point of R-17 is that it is not the path that
         gets skipped.
         """
-        if isinstance(error, DistillError):
-            payload: dict[str, Any] = {
-                "code": error.code,
-                "stage": error.stage,
-                "message": error.message,
-            }
-        elif isinstance(error, BaseException):
-            payload = {"code": "E_INTERNAL", "stage": "internal", "message": str(error)}
+        if isinstance(error, BaseException):
+            failure = (
+                error if isinstance(error, DistillError) else DistillError.from_unexpected(error)
+            )
+            payload = failure.to_dict()
         else:
             payload = dict(error)
         return cls(status=FAILED, error=payload)

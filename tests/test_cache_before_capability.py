@@ -94,7 +94,7 @@ def hermetic_run(monkeypatch: pytest.MonkeyPatch) -> None:
     standard double. What is left - source resolution, the cache lookup, the
     publish - is the real thing.
     """
-    monkeypatch.setattr(frame_selection, "scene_midpoint_candidates", lambda *_: [])
+    monkeypatch.setattr(frame_selection, "scene_midpoint_candidates", lambda *_: ([], []))
     configure_run(monkeypatch, transcribe=fake_transcribe)
 
 
@@ -197,7 +197,7 @@ def test_the_cache_is_consulted_before_youtube_metadata_resolution(
 
 
 def test_a_youtube_bundle_keyed_by_the_resolved_video_id_is_still_found(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
     """Identity does not drift: the **source fingerprint** is the one it always was.
@@ -266,7 +266,7 @@ def test_a_bundle_keyed_by_a_resolved_id_the_url_does_not_carry_is_still_found(
 
 
 def test_a_playlist_attached_url_is_not_served_from_the_video_ids_bundle(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
     """The boundary of the reorder, stated as a refusal.
@@ -294,7 +294,7 @@ def test_a_playlist_attached_url_is_not_served_from_the_video_ids_bundle(
 
 
 def test_a_youtube_manifest_duration_over_the_cap_is_refused_rather_than_served(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
     """The same refusal on the path the cache reorder actually added.
@@ -323,7 +323,7 @@ def test_a_youtube_manifest_duration_over_the_cap_is_refused_rather_than_served(
 
 
 def test_a_local_manifest_duration_over_the_cap_is_refused_rather_than_served(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
     """A manifest's duration is input, not a fact, and the cap still applies.
@@ -351,7 +351,7 @@ def test_a_local_manifest_duration_over_the_cap_is_refused_rather_than_served(
 
 
 def test_a_url_naming_two_video_ids_is_not_served_from_the_first_ones_bundle(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
     """The playlist refusal, generalized: the fast path reads an id or declines.
@@ -431,7 +431,7 @@ def test_a_video_id_the_url_padded_is_not_a_bundle_key_of_its_own(
 
 
 def test_a_manifest_recording_a_boolean_duration_is_a_miss_not_a_one_second_hit(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
     """What `manifest_duration` refuses, the resolution treats as no bundle at all.

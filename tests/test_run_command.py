@@ -319,7 +319,7 @@ def test_a_blocking_callback_cannot_suspend_the_deadlines(tmp_path: Path) -> Non
                 terminate_grace_sec=0.2,
                 on_stdout_line=block,
             )
-        except BaseException as exc:  # noqa: BLE001 - handed to the assertions below
+        except BaseException as exc:
             outcome.append(exc)
 
     caller = threading.Thread(target=invoke, name="blocked-caller", daemon=True)

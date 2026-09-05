@@ -410,7 +410,7 @@ def resolve_chain(
         try:
             answered = probe(entry)
             detail = ""
-        except Exception as exc:  # noqa: BLE001 - any failure is unavailability
+        except Exception as exc:
             answered, detail = False, f"{type(exc).__name__}: {exc}"
         if answered:
             evidence.append(EntryOutcome(entry=index, outcome=SELECTED))

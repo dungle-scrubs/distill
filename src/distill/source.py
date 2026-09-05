@@ -1,4 +1,4 @@
-"""Source acquisition and fingerprinting for Distill.
+"""Source resolution and output-root validation for Distill.
 
 SourceResolver coordinates local media inspection, remote acquisition, endpoint
 selection, and cache lookup. Identity algorithms live in source_identity;
@@ -91,29 +91,6 @@ thing a path can be. There is deliberately no "unreadable" member: a path that
 could not be asked about is not a kind of answer, it is the absence of one.
 """
 
-# Wall-clock ceilings so a wedged tool or a stalled network call cannot hang the
-# whole run. yt-dlp additionally gets `--socket-timeout` so it aborts a stalled
-# connection on its own rather than blocking until the outer timeout fires.
-# ffprobe is run as `-v error`, which is silent by construction: it prints its
-# document when it has the answer and nothing before then, so the idle clock
-# never resets - see `silent_tool_timeouts`, which is why one number governs
-# here. A lower idle value would not catch a stall, it would just cut the probe's
-# budget, and a probe that runs out is fatal (`E_COMMAND`), not a degradation.
-# A download is bounded by silence, not by length (R-30): a legitimate multi-GB
-# fetch on a slow link may run for hours, while a wedged one stops emitting
-# progress within seconds. The total is a backstop against a tool that reports
-# progress forever without finishing.
-# Where a run assembles a download, and where a proven one is promoted to. They
-# are siblings under one output root so promotion is a rename on one filesystem
-# rather than a copy across two, and so the promoted directory holds nothing but
-# promoted media.
-# The stem yt-dlp is told to write, and so the only stem a completed download
-# has. A format fragment is `source.f140.m4a`, whose stem is `source.f140`, and
-# an in-flight file is `source.mp4.part`, whose stem is `source.mp4`: matching
-# the stem exactly is what separates the merged container from both (R-37).
-# Preference order when a staging directory somehow holds more than one complete
-# container. Order is fixed rather than alphabetical so the choice is a stated
-# preference; anything unlisted sorts after everything listed, by suffix.
 SENSITIVE_COMPONENTS = {
     ".ssh",
     ".gnupg",
@@ -230,7 +207,7 @@ def _chain_for(options: DistillOptions) -> tuple[LocalVisionConfig, ...]:
     """The **endpoint chain** these options name, however they were built.
 
     A config that names no chain still names an endpoint. `DistillOptions`
-    reached through `from_args` carries the one-entry chain `_with_chain`
+    resolved by `configuration` carries the one-entry chain the resolver
     derived, but one constructed directly does not - and treating an empty chain
     as the whole answer would exhaust immediately, re-keying a run that has a
     perfectly good endpoint configured the old way.

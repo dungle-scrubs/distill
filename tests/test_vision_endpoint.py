@@ -188,13 +188,13 @@ class _RecordingHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's name
+    def do_GET(self) -> None:
         self._record_and_answer({"data": []})
 
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's name
+    def do_POST(self) -> None:
         self._record_and_answer({"choices": [{"message": {"content": "{}"}}]})
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib's name
+    def log_message(self, format: str, *args: Any) -> None:
         return None
 
 

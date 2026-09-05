@@ -134,6 +134,8 @@ class DistillSession:
         except DistillError as exc:
             return {"error": exc.to_dict()}
         except Exception as exc:
+            if os.environ.get("DISTILL_TRACEBACK") == "1":
+                raise
             return {"error": DistillError.from_unexpected(exc).to_dict()}
 
 
@@ -366,6 +368,8 @@ class BatchRunner:
                 result["batch_index"] = index
                 results.append(result)
             except Exception as exc:
+                if not isinstance(exc, DistillError) and os.environ.get("DISTILL_TRACEBACK") == "1":
+                    raise
                 failure = (
                     exc if isinstance(exc, DistillError) else DistillError.from_unexpected(exc)
                 )
@@ -671,13 +675,12 @@ def timeout_diagnostics(effective_timeout_ms: int | None = None) -> dict[str, An
             source = TIMEOUT_ENV
         else:
             effective = configured
-            source = "app.config.json"
+            source = "default"
     return {
         "configured_timeout_ms": configured,
         "effective_timeout_ms": effective,
         "effective_timeout_source": source,
         "effective_meets_configured": effective >= configured,
-        "assumption": "A-004",
     }
 
 

@@ -152,7 +152,6 @@ def test_timeout_diagnostics_report_configured_and_effective_timeout() -> None:
     )
     payload = json.loads(result.stdout)
     assert payload == {
-        "assumption": "A-004",
         "configured_timeout_ms": 5_400_000,
         "effective_meets_configured": True,
         "effective_timeout_ms": 5_400_000,

@@ -429,6 +429,17 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
     assert frame["ocr_text"] == "Visible OCR text"
     assert frame["visual_interpretation"]["visual_summary"] == "A settings screen"
     assert frame["visual_interpretation"]["backend"] == "rapid-mlx"
+    for field in ("markdown_path", "self_contained_markdown_path", "artifact_path"):
+        rendered = Path(response[field]).read_text()
+        assert "No vision endpoint read these frames" not in rendered
+        assert "Frames read by" in rendered
+        assert "qwen3-vl:8b" in rendered
+    from distill.filtered_view import filtered_view_markdown
+
+    filtered = filtered_view_markdown(tmp_path / "cache", response["source_hash"])
+    assert "No vision endpoint read these frames" not in filtered
+    assert "qwen3-vl:8b" in filtered
+
     assert reporter.states["local_vision"].status == "completed"
     assert reporter.states["local_vision"].percent == 100.0
     assert "Visible OCR text" in seen_prompts[0]
@@ -823,33 +834,37 @@ def test_a_cache_hit_writes_the_artifact_too(
     assert Path(second["artifact_path"]).is_file()
 
 
-def test_an_unwritable_artifact_directory_does_not_fail_the_run(
+def test_an_unwritable_artifact_directory_reports_delivery_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """ADR-0002: the bundle is complete and the response still names every path
-    inside it, so a read-only artifact directory costs a convenience, not a
-    run."""
+    from distill.bundle_store import BundleStore
+    from distill.errors import DistillError
+
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
     configure_run(monkeypatch, transcribe=fake_transcribe)
     blocked = tmp_path / "blocked"
     blocked.mkdir(mode=0o500)
     monkeypatch.setenv("DISTILL_ARTIFACT_DIR", str(blocked / "artifacts"))
-
-    response = distill_session.process_local_video(
-        {
-            "path": str(video),
-            "output_dir": str(tmp_path / "cache"),
-            "ocr": False,
-            "caption_frames": False,
-            "max_keyframes": 1,
-            "max_static_window_sec": 1,
-        }
-    )
-
-    assert response["artifact_path"] is None
-    assert Path(response["self_contained_markdown_path"]).is_file()
+    try:
+        with pytest.raises(DistillError) as caught:
+            distill_session.process_local_video(
+                {
+                    "path": str(video),
+                    "output_dir": str(tmp_path / "cache"),
+                    "ocr": False,
+                    "caption_frames": False,
+                    "max_keyframes": 1,
+                    "max_static_window_sec": 1,
+                }
+            )
+        assert caught.value.code == "E_ARTIFACT_WRITE"
+        saved = BundleStore.open(tmp_path / "cache").load_active(caught.value.details["bundle_key"])
+        assert saved is not None
+        assert saved.self_contained_markdown.is_file()
+    finally:
+        blocked.chmod(0o700)
 
 
 def test_the_artifact_name_does_not_move_when_the_options_do(

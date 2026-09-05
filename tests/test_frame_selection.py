@@ -67,7 +67,7 @@ def test_scene_midpoint_candidates_falls_back_to_adaptive_detector(
         ),
     )
 
-    assert frame_selection.scene_midpoint_candidates(Path("demo.mp4"), 10.0) == [2.0]
+    assert frame_selection.scene_midpoint_candidates(Path("demo.mp4"), 10.0) == ([2.0], [])
 
 
 # A fake ffmpeg that writes the single frame it was asked for, and one that
@@ -88,7 +88,7 @@ sys.exit(1)
 
 
 def test_absent_ffmpeg_ends_the_run_because_the_table_says_it_is_required(
-    fake_tool: Callable[[str, str], Path],  # noqa: ARG001 - installs an empty PATH
+    fake_tool: Callable[[str, str], Path],
     tmp_path: Path,
 ) -> None:
     """ADR-0002 / R-34: a missing **required capability** is a **fatal error**.
@@ -162,7 +162,7 @@ def test_frame_selection_reports_scene_and_candidate_progress(
     monkeypatch.setattr(
         frame_selection,
         "scene_midpoint_candidates",
-        lambda _path, _duration: [0.0, 5.0],
+        lambda _path, _duration: ([0.0, 5.0], []),
     )
 
     def fake_extract_frame(
@@ -220,7 +220,7 @@ def test_a_truncated_frame_grab_still_yields_its_keyframe(
     have to survive, which is why `extract_frame` returns them separately.
     """
     fake_tool("ffmpeg", FAKE_FFMPEG_FLOODS_STDERR)
-    monkeypatch.setattr(frame_selection, "scene_midpoint_candidates", lambda _p, _d: [0.0])
+    monkeypatch.setattr(frame_selection, "scene_midpoint_candidates", lambda _p, _d: ([0.0], []))
     monkeypatch.setattr(frame_selection, "phash", lambda _path: "0f")
 
     frames, warnings = select_keyframes(
@@ -267,3 +267,27 @@ def test_a_wedged_but_installed_ffmpeg_still_only_costs_its_keyframe(
 
     assert extracted is False
     assert [item["code"] for item in warnings] == ["frame_extract_timeout"]
+
+
+@pytest.mark.parametrize(
+    ("unavailable", "expected_code"), [(True, "scene_detection_unavailable"), (False, None)]
+)
+def test_scene_detection_distinguishes_absence_from_empty_success(
+    monkeypatch: pytest.MonkeyPatch, unavailable: bool, expected_code: str | None
+) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    detector = (
+        None
+        if unavailable
+        else SimpleNamespace(
+            detect=lambda *_args: [],
+            ContentDetector=object,
+            AdaptiveDetector=object,
+        )
+    )
+    monkeypatch.setitem(sys.modules, "scenedetect", detector)
+    candidates, warnings = frame_selection.scene_midpoint_candidates(Path("demo.mp4"), 10.0)
+    assert candidates == []
+    assert [w["code"] for w in warnings] == ([] if expected_code is None else [expected_code])

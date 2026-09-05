@@ -1,4 +1,4 @@
-"""Run orchestration — the deep module that hides sequencing.
+"""Run orchestration - the deep module that hides sequencing.
 
 This module owns the **run** as a whole: how a source becomes a **generation**,
 or how a cached one is served instead. It is the deep counterpart to the shallow
@@ -7,15 +7,15 @@ dict`, and behind that seam it hides lock acquisition, wait accounting,
 candidate **bundle key** settlement (including the single-rekey bound D-005 and
 revalidation D-004), heartbeat, stage sequencing with resume, and publish.
 
-Stages are adapters against a narrow ``StageContext`` — they receive carriers
-and a progress reporter and return carriers — not direct imports in the caller.
+Stages use typed callables supplied to each ProcessingRun. Production defaults
+receive carriers and a progress reporter and return carriers.
 Only this module decides the order and the retry semantics.
 
 This is Candidate 01 of the architecture deepening review: pipeline.py was the
 shallow god module whose interface was as wide as its implementation. By
 concentrating sequencing here, the deletion test concentrates: deleting this
 module would require reimplementing cache coalescing, re-keying, and stage
-recovery in every caller. The interface is the test surface — cache-hit,
+recovery in every caller. The interface is the test surface - cache-hit,
 re-key, revalidation, and resume are unit tests against a fake ``BundleStore``.
 """
 
@@ -27,10 +27,10 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .artifact import artifact_entry_name, emit_artifact, resolve_artifact_dir
-from .artifacts import FrameArtifact, RedactionState, Transcript
+from .artifacts import FrameArtifact, Provenance, RedactionState, Transcript
 from .bundle_store import (
     SINGLE_SOURCE_LOCK_WAIT_SEC,
     BundleRun,
@@ -40,6 +40,7 @@ from .bundle_store import (
 )
 from .errors import DistillError, WarningRecord, aggregate_warnings
 from .frame_selection import select_keyframes
+from .links import RelatedLink
 from .local_vision import FrameInterpreter
 from .ocr import ocr_frames
 from .options import DistillOptions
@@ -50,10 +51,71 @@ from .progress import (
     ProgressHeartbeat,
     ProgressReporter,
 )
-from .render import render_markdown
+from .render import VisionEvidence, render_markdown
 from .response import manifest_document, response_frames, run_response
 from .source import ChainRevalidation, SourceInfo, candidate_in_hand, revalidate_chain
 from .vision_chain import REVALIDATE_AFTER_WAIT_SEC
+
+type FrameStageResult = tuple[list[FrameArtifact], list[WarningRecord]]
+
+
+class Transcriber(Protocol):
+    def __call__(
+        self,
+        video_path: Path,
+        work_dir: Path,
+        options: DistillOptions,
+        progress: ProgressReporter,
+        /,
+        *,
+        duration_sec: float,
+    ) -> tuple[dict[str, Any] | None, list[WarningRecord]]: ...
+
+
+class FrameSelector(Protocol):
+    def __call__(
+        self,
+        video_path: Path,
+        frames_dir: Path,
+        duration_sec: float,
+        max_keyframes: int,
+        min_interval_sec: float,
+        max_static_window_sec: float,
+        progress: ProgressReporter,
+        /,
+        *,
+        redaction: RedactionState,
+    ) -> FrameStageResult: ...
+
+
+class FrameReader(Protocol):
+    def __call__(
+        self,
+        frames: list[FrameArtifact],
+        options: DistillOptions,
+        progress: ProgressReporter,
+        /,
+        *,
+        transcript: Transcript | None,
+    ) -> FrameStageResult: ...
+
+
+class Renderer(Protocol):
+    def __call__(
+        self,
+        source_label: str,
+        duration_sec: float,
+        transcript: Transcript | None,
+        frames: list[FrameArtifact],
+        warnings: list[WarningRecord],
+        related_links: list[RelatedLink] | None,
+        /,
+        *,
+        provenance: Provenance | None = None,
+        include_frame_links: bool = True,
+        vision_evidence: VisionEvidence | None = None,
+    ) -> str: ...
+
 
 type Revalidator = Callable[[DistillOptions, str, str, Path], ChainRevalidation]
 
@@ -194,8 +256,8 @@ class StageRunner:
     that creates the stage payload and a ``revive`` that turns a persisted
     payload (or a fresh one) into typed carriers. The runner owns the decision
     to reuse a ``stage result`` vs recompute, the warning propagation, and the
-    heartbeat check. Every stage speaks carriers — no downstream subscripts a
-    raw payload — so the recovery is total and a document that does not hold
+    heartbeat check. Every stage speaks carriers - no downstream subscripts a
+    raw payload - so the recovery is total and a document that does not hold
     up simply triggers recomputation.
     """
 
@@ -364,15 +426,13 @@ class ProcessingRun:
     tool: str
     lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
 
-    transcribe: Callable[..., tuple[dict[str, Any] | None, list[WarningRecord]]] = transcribe_source
-    select_keyframes: Callable[..., tuple[list[FrameArtifact], list[WarningRecord]]] = (
-        select_keyframes
-    )
-    ocr_frames: Callable[..., tuple[list[FrameArtifact], list[WarningRecord]]] = ocr_frames
-    interpret_frames: Callable[..., tuple[list[FrameArtifact], list[WarningRecord]]] = (
-        interpret_frames
-    )
-    render: Callable[..., str] = render_markdown
+    transcribe: Transcriber = transcribe_source
+    select_keyframes: FrameSelector = select_keyframes
+    ocr_frames: Callable[
+        [list[FrameArtifact], str, bool, ProgressReporter, bool], FrameStageResult
+    ] = ocr_frames
+    interpret_frames: FrameReader = interpret_frames
+    render: Renderer = render_markdown
     revalidate: Revalidator = revalidate_chain
 
     waited_sec: float = field(default=0.0, init=False)
@@ -389,12 +449,14 @@ class ProcessingRun:
         try:
             with began as run:
                 try:
-                    return self._produce_generation(run, heartbeat)
+                    response, snapshot = self._produce_generation(run, heartbeat)
                 except BaseException as exc:
                     run.abandon(_abandon_reason(exc), during=exc)
                     raise
         finally:
             heartbeat.stop()
+        response["artifact_path"] = self._emit_artifact(snapshot)
+        return response
 
     def _begin(
         self, store: BundleStore, bundle_key: str, wait_sec: float
@@ -529,7 +591,7 @@ class ProcessingRun:
         )
         return carrier, [dict(item) for item in carrier.warnings]
 
-    def _emit_artifact(self, snapshot: BundleSnapshot) -> str | None:
+    def _emit_artifact(self, snapshot: BundleSnapshot) -> str:
         try:
             artifact_dir = resolve_artifact_dir(
                 explicit=self.options.artifact_dir,
@@ -550,8 +612,17 @@ class ProcessingRun:
                 )
             )
         except (OSError, ValueError, DistillError) as exc:
-            LOGGER.warning("artifact not written: %s", exc)
-            return None
+            raise DistillError(
+                "E_ARTIFACT_WRITE",
+                "artifact",
+                "the bundle is saved, but artifact delivery failed; retry delivery",
+                {
+                    "bundle_saved": True,
+                    "bundle_key": snapshot.bundle_key,
+                    "generation": snapshot.generation.name,
+                    "artifact_path": None,
+                },
+            ) from exc
 
     def _produce_local_vision(
         self, frames: list[FrameArtifact], transcript: Transcript | None
@@ -568,7 +639,7 @@ class ProcessingRun:
         self,
         run: BundleRun,
         heartbeat: ProgressHeartbeat,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], BundleSnapshot]:
         warnings = list(self.source.warnings)
 
         def produce_transcript() -> dict[str, Any]:
@@ -644,6 +715,9 @@ class ProcessingRun:
 
         warnings = aggregate_warnings(warnings)
         self.progress.update("rendering", status="running")
+        vision_evidence = VisionEvidence.from_generation(
+            frames, self.options.public_dict(self.source.source_type)
+        )
         markdown = self.render(
             str(self.source.resolved_path),
             self.source.duration_sec,
@@ -651,6 +725,7 @@ class ProcessingRun:
             frames,
             warnings,
             self.source.related_links,
+            vision_evidence=vision_evidence,
         )
         if self.source.provenance is None:
             raise AssertionError("current self-contained render requires provenance")
@@ -663,6 +738,7 @@ class ProcessingRun:
             self.source.related_links,
             provenance=self.source.provenance,
             include_frame_links=False,
+            vision_evidence=vision_evidence,
         )
         self.progress.complete("rendering")
         self.progress.update("bundle_publish", status="running")
@@ -691,12 +767,12 @@ class ProcessingRun:
             transcript is not None,
             warnings,
             cached=False,
-            artifact_path=self._emit_artifact(snapshot),
+            artifact_path=None,
             progress=progress_summary,
             job_id=self.options.job_id,
             waited_sec=self.waited_sec,
             rekeyed_from=self.rekeyed_from,
-        )
+        ), snapshot
 
 
 @dataclass(frozen=True, slots=True)

@@ -30,6 +30,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -110,14 +111,14 @@ def run(
     this is still running?" can be asked at all.
     """
 
-    def produce(_self: Any, _generation: Any, _heartbeat: Any) -> dict[str, Any]:
+    def produce() -> dict[str, Any]:
         if during is not None:
             during()
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(pipeline.ProcessingRun, "_produce_generation", produce)
+    monkeypatch.setattr(pipeline, "ProcessingRun", lambda *_args: SimpleNamespace(execute=produce))
     stub_acquisition(monkeypatch, source_hash)
     root.mkdir(parents=True, exist_ok=True)
     return pipeline.process_local_video(
@@ -449,7 +450,8 @@ def test_a_run_that_fails_unexpectedly_still_records_a_terminal_failure(
     assert status["error"] == {
         "code": "E_INTERNAL",
         "stage": "internal",
-        "message": "unmapped",
+        "message": "an unexpected RuntimeError ended the command",
+        "details": {"exception": "RuntimeError", "message": "unmapped"},
     }
 
 

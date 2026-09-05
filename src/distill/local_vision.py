@@ -1,6 +1,6 @@
 """Local vision backend configuration, availability checks, and frame interpretation.
 
-This module owns local-only vision provider setup and the frame-interpretation
+This module owns settled vision value types and the frame-interpretation
 pass: it decides whether a requested vision pass can run (or should degrade to
 OCR-only output), and when it can, ``FrameInterpreter`` reads each **keyframe**,
 requests an **interpretation**, grounds it against the frame's **extracted
@@ -14,8 +14,8 @@ carrier (R-19, D-019); the post-hoc ``_redact_result_fields`` helper this module
 used to apply afterwards is gone, along with the window in which an
 interpretation existed unredacted.
 
-Distill talks to a local Rapid-MLX server directly over its OpenAI-compatible
-HTTP API. The server is assumed to already be running (``rapid-mlx serve
+Distill uses the endpoint profile defined in ADR-0005. The default server
+is local Rapid-MLX. The server is assumed to already be running (``rapid-mlx serve
 <model>``); Distill probes ``GET <base_url>/models`` for availability and posts
 chat-completion requests to ``<base_url>/chat/completions``. Distill does not
 manage the server lifecycle, and it has no dependency on any other local
@@ -26,7 +26,7 @@ The transport, the OpenAI-style envelope parsing, and the endpoint policy
 follow a redirect, the 32 MiB bound) are ``rapid_mlx``'s - the one
 OpenAI-compatible client, whose default endpoint is a local Rapid-MLX server
 (ADR-0005, superseding ADR-0001). This module drives that client: it
-owns the configuration, decides whether a pass can run, and runs the
+owns settled configuration values, decides whether a pass can run, and runs the
 interpretation. The endpoint policy still lives next to the requests it governs,
 because both moved together; splitting them so a caller could reach around the
 policy is the thing that was avoided, not the file they share.
@@ -122,14 +122,6 @@ FRAME_READ_FAILURE_CODES = frozenset(
         rapid_mlx.ENDPOINT_REJECTED_CODE,
     }
 )
-# R-43. The two schemes the OpenAI-compatible API is served over; anything else
-# names a different protocol, and a vision endpoint is not a file or a gopher
-# hole no matter who wrote the config.
-# R-44. A chat-completion envelope is kilobytes; 32 MiB is orders of magnitude
-# past any real one, and past it the read stops rather than the process growing
-# to whatever the far end decided to send.
-# An HTTP error body is quoted into a message, never parsed, and the quote is
-# 200 characters. This is how much of one is worth reading to produce it.
 LOGGER = logging.getLogger(__name__)
 
 
@@ -504,13 +496,12 @@ def _validate_chain(endpoints: tuple[LocalVisionConfig, ...] | None) -> None:
     """The chain's shape, checked once the config is settled.
 
     Called from `_with_validated_endpoint` rather than while merging layers,
-    for the reason `_merged_local_vision_config` states: a per-call override is
-    allowed to rescue a file that names something unusable, and naming both
+    because a per-call override is allowed to rescue a file that names something unusable, and naming both
     `--local-vision-model` and `--local-vision-base-url` replaces the chain
     outright. Only the settled config is checked.
 
     `None` is not a chain anybody configured and is nothing to check - the
-    top-level fields answer for it, and `_with_chain` derives the one entry.
+    top-level fields answer for it, and the resolver derives the one entry.
     """
     if endpoints is None:
         return

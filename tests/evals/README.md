@@ -182,7 +182,7 @@ model is actually worth it — measured, not guessed.
 
 A record of what's already been measured, so it isn't re-litigated. The
 reader-comparison numbers below are from the original 16-frame set; the
-currently recorded plan 02 baseline predates the true-negative expansion and
+currently recorded plan 02 baseline predates the true-negative expansion.
 Treat WER/recall deltas under ~0.03 as
 run-to-run noise (single run per model). Re-run with
 `score.py --with-vision --model …` after starting Rapid-MLX to reproduce
@@ -194,7 +194,7 @@ The authoritative numbers are **not restated here**, because a number copied
 into prose drifts the moment the corpus or the metric changes - which is
 exactly what happened to the first version of this section. They live in:
 
-- `baseline_local.json` — the local reader over the current corpus, and the
+- `baseline_local.json` - the local reader over its recorded corpus, and the
   thresholds Gate 2 -> 3 is pinned to.
 - `gate_2_to_3_cloud.json` — the cloud comparison, its verdict, and the
   superseded first run retained with its diagnosis.

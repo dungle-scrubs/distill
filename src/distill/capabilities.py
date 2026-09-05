@@ -20,7 +20,7 @@ pins it against this table instead, and a classification changed here without
 the README changing with it fails the suite.
 
 It does not own tool discovery (each adapter finds its own binary: `ocr.py` for
-tesseract, `source.py` for ffprobe and yt-dlp), invocation or its failure
+tesseract, `media_inspect.py` for ffprobe, and `youtube.py` for yt-dlp), invocation or its failure
 taxonomy (`run_command.py`, whose error table raises `E_MISSING_TOOL` for a
 required tool that is not installed), or the shape of a warning record
 (`errors.py`). This module states which class a tool is in and supplies the
