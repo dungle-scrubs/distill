@@ -16,6 +16,12 @@ from untrusted_blocks import SENTINEL, assert_delimited, attack
 
 from distill import pipeline as distill_session
 from distill.artifacts import FrameArtifact, Interpretation
+from distill.config import config_dir
+from distill.configuration import (
+    load_local_vision_config,
+    local_vision_config_from_args,
+    resolve_run_config,
+)
 from distill.errors import DistillError
 from distill.grounding import UNGROUNDED
 from distill.local_vision import (
@@ -25,23 +31,17 @@ from distill.local_vision import (
     DEFAULT_TIMEOUT_SEC,
     FrameInterpreter,
     LocalVisionConfig,
-    LocalVisionFailure,
     LocalVisionProbe,
     _interpret_with_rapid_mlx,
-    config_dir,
-    load_local_vision_config,
-    local_vision_config_from_args,
-    parse_interpretation_json,
     probe_local_vision,
     probe_rapid_mlx_availability,
     try_interpret_image,
 )
-from distill.options import DistillOptions
 from distill.pipeline import local_vision_diagnostics
 
 # Direct, not through `local_vision`'s re-exports: the header builder is an
 # internal of the client module, and the facade should not widen to name it.
-from distill.rapid_mlx import _request_headers
+from distill.rapid_mlx import LocalVisionFailure, _request_headers, parse_interpretation_json
 
 DEFAULT_MODEL = DEFAULT_LOCAL_VISION_MODEL
 
@@ -142,7 +142,7 @@ def test_local_vision_config_loads_from_config_dir(
     )
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
 
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
 
     assert options.caption_frames is True
     assert options.local_vision_backend == "rapid-mlx"
@@ -153,7 +153,7 @@ def test_local_vision_config_loads_from_config_dir(
     monkeypatch.delenv("DISTILL_CONFIG_DIR")
     monkeypatch.setenv("CONFIG_DIR", str(tmp_path))
 
-    options_with_generic_config_dir = DistillOptions.from_args({})
+    options_with_generic_config_dir = resolve_run_config({}).options
 
     assert options_with_generic_config_dir.local_vision_model == DEFAULT_MODEL
     assert options_with_generic_config_dir.local_vision_base_url == DEFAULT_LOCAL_VISION_BASE_URL
@@ -895,14 +895,14 @@ def test_unsupported_backend_is_rejected() -> None:
 
 
 def test_rapid_mlx_backend_is_accepted_by_options() -> None:
-    options = DistillOptions.from_args({"local_vision_backend": "rapid-mlx"})
+    options = resolve_run_config({"local_vision_backend": "rapid-mlx"}).options
 
     assert options.local_vision_backend == "rapid-mlx"
 
 
 def test_non_rapid_mlx_backend_is_rejected_by_options() -> None:
     with pytest.raises(DistillError, match="must be 'rapid-mlx'"):
-        DistillOptions.from_args({"local_vision_backend": "ollama"})
+        resolve_run_config({"local_vision_backend": "ollama"})
 
 
 def test_config_dir_env_overrides_a_config_planted_under_home(
@@ -926,7 +926,7 @@ def test_config_dir_env_overrides_a_config_planted_under_home(
 
     assert hermetic_config_dir != home_config_dir
     assert config_dir() == hermetic_config_dir
-    assert DistillOptions.from_args({}).local_vision_model == DEFAULT_MODEL
+    assert resolve_run_config({}).options.local_vision_model == DEFAULT_MODEL
 
 
 def test_config_dir_falls_back_to_home_when_env_var_is_unset(
@@ -950,7 +950,7 @@ def test_config_dir_falls_back_to_home_when_env_var_is_unset(
     monkeypatch.setenv("HOME", str(tmp_path))
 
     assert config_dir() == home_config_dir
-    assert DistillOptions.from_args({}).local_vision_model == configured_model
+    assert resolve_run_config({}).options.local_vision_model == configured_model
 
 
 def test_local_vision_diagnostics_describe_rapid_mlx(
@@ -970,7 +970,7 @@ def test_local_vision_diagnostics_describe_rapid_mlx(
     monkeypatch.setattr("distill.pipeline.probe_local_vision", fake_probe)
 
     diagnostics = local_vision_diagnostics({})
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
 
     assert diagnostics["setup_command"] == f"rapid-mlx serve {DEFAULT_MODEL}"
     assert options.local_vision_model == DEFAULT_MODEL
@@ -1784,7 +1784,7 @@ class TestSecretCredential:
         import copy
         import pickle
 
-        from distill.local_vision import SecretCredential
+        from distill.rapid_mlx import SecretCredential
 
         secret = SecretCredential("sk-super-secret-value")
 
@@ -1802,7 +1802,7 @@ class TestSecretCredential:
     def test_config_never_exposes_the_credential_in_any_serialized_form(self) -> None:
         from dataclasses import asdict, replace
 
-        from distill.local_vision import SecretCredential
+        from distill.rapid_mlx import SecretCredential
 
         config = replace(LocalVisionConfig(), credential=SecretCredential("sk-super-secret-value"))
 
@@ -1826,7 +1826,7 @@ class TestSecretCredential:
         """
         from dataclasses import asdict, replace
 
-        from distill.local_vision import SecretCredential
+        from distill.rapid_mlx import SecretCredential
 
         entry = replace(
             LocalVisionConfig(base_url="https://10.0.0.5/v1", allow_remote_endpoint=True),
@@ -1837,7 +1837,7 @@ class TestSecretCredential:
         assert "sk-entry-secret-value" not in json.dumps(config.public_dict())
         assert "sk-entry-secret-value" not in repr(config)
         assert "sk-entry-secret-value" not in json.dumps(
-            DistillOptions.from_args({}).cache_payload("local")
+            resolve_run_config({}).options.cache_payload("local")
         )
         with pytest.raises(TypeError):
             asdict(config)
@@ -1850,8 +1850,7 @@ class TestSecretCredential:
         ],
     )
     def test_credential_bearing_base_url_is_rejected_without_echoing_it(self, url: str) -> None:
-        from distill.local_vision import _checked_endpoint_url
-        from distill.rapid_mlx import EndpointRejected
+        from distill.rapid_mlx import EndpointRejected, _checked_endpoint_url
 
         with pytest.raises(EndpointRejected) as excinfo:
             _checked_endpoint_url(url, allow_remote_endpoint=True)
@@ -1880,8 +1879,7 @@ class TestSecretCredential:
         ],
     )
     def test_malformed_credential_bearing_urls_never_echo_the_secret(self, url: str) -> None:
-        from distill.local_vision import _checked_endpoint_url
-        from distill.rapid_mlx import EndpointRejected
+        from distill.rapid_mlx import EndpointRejected, _checked_endpoint_url
 
         with pytest.raises(EndpointRejected) as excinfo:
             _checked_endpoint_url(url, allow_remote_endpoint=True)
@@ -1892,7 +1890,7 @@ class TestSecretCredential:
     def test_configs_differing_only_by_credential_are_not_equal(self) -> None:
         from dataclasses import replace
 
-        from distill.local_vision import SecretCredential
+        from distill.rapid_mlx import SecretCredential
 
         base = LocalVisionConfig()
         with_a = replace(base, credential=SecretCredential("sk-credential-a"))
@@ -1940,7 +1938,7 @@ class TestCredentialResolution:
         )
         monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
 
-        options = DistillOptions.from_args({})
+        options = resolve_run_config({}).options
         config = options.local_vision_config()
 
         assert config.credential is not None
@@ -1950,8 +1948,7 @@ class TestCredentialResolution:
         assert "sk-round-trip" not in json.dumps(options.cache_payload("local"))
 
     def test_bearer_header_present_exactly_when_a_credential_is(self) -> None:
-        from distill.local_vision import SecretCredential
-        from distill.rapid_mlx import _request_headers
+        from distill.rapid_mlx import SecretCredential, _request_headers
 
         with_credential = _request_headers(SecretCredential("sk-header-secret"))
         without_credential = _request_headers(None)
@@ -1966,7 +1963,7 @@ class TestCredentialResolution:
     ) -> None:
         from dataclasses import replace
 
-        from distill.local_vision import SecretCredential
+        from distill.rapid_mlx import SecretCredential
 
         class _RecordingOpener(_FakeOpener):
             def __init__(self, payload: bytes) -> None:
@@ -2035,7 +2032,7 @@ class TestCredentialResolution:
         from dataclasses import replace
         from email.message import Message
 
-        from distill.local_vision import SecretCredential
+        from distill.rapid_mlx import SecretCredential
 
         class _AuthRejectingOpener:
             def open(self, request: Any, timeout: float | None = None) -> Any:
@@ -2084,7 +2081,7 @@ class TestCredentialResolution:
             )
 
         monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
-        monkeypatch.setattr("distill.local_vision._urlopen_json", fake_urlopen, raising=False)
+        monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen, raising=False)
 
         interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe, debug=True)
         frames, warnings = interpreter.interpret(
@@ -2126,15 +2123,15 @@ class TestCredentialResolution:
     ) -> None:
         from dataclasses import replace
 
-        from distill.local_vision import SecretCredential
+        from distill.rapid_mlx import SecretCredential
 
         captured: dict[str, Any] = {}
 
-        def fake_get(requestor, url, timeout_sec, **kwargs):  # noqa: ANN001
+        def fake_get(requestor, url, timeout_sec, **kwargs):
             captured.update(kwargs)
             return _models_body(DEFAULT_MODEL)
 
-        monkeypatch.setattr("distill.local_vision._http_get_json", fake_get)
+        monkeypatch.setattr("distill.rapid_mlx._http_get_json", fake_get)
         config = replace(LocalVisionConfig(), credential=SecretCredential("sk-probe-secret"))
 
         probe = probe_rapid_mlx_availability(config)
@@ -2193,8 +2190,7 @@ class TestEndpointPolicyHttps:
     def test_http_to_a_non_loopback_literal_is_rejected_even_with_remote_allowed(
         self,
     ) -> None:
-        from distill.local_vision import _checked_endpoint_url
-        from distill.rapid_mlx import EndpointRejected
+        from distill.rapid_mlx import EndpointRejected, _checked_endpoint_url
 
         with pytest.raises(EndpointRejected) as excinfo:
             _checked_endpoint_url("http://203.0.113.7:8000/v1", allow_remote_endpoint=True)
@@ -2205,8 +2201,7 @@ class TestEndpointPolicyHttps:
     def test_http_name_resolving_off_machine_is_rejected_even_with_remote_allowed(
         self,
     ) -> None:
-        from distill.local_vision import _check_resolved_address
-        from distill.rapid_mlx import EndpointRejected
+        from distill.rapid_mlx import EndpointRejected, _check_resolved_address
 
         with pytest.raises(EndpointRejected) as excinfo:
             _check_resolved_address(
@@ -2222,7 +2217,7 @@ class TestEndpointPolicyHttps:
     def test_https_name_resolving_off_machine_is_permitted_with_remote_allowed(
         self,
     ) -> None:
-        from distill.local_vision import _check_resolved_address
+        from distill.rapid_mlx import _check_resolved_address
 
         addresses = _check_resolved_address(
             "vision.example.com",
@@ -2307,7 +2302,7 @@ class TestEndpointPolicyHttps:
 
         assert https_handlers, "the opener must have an HTTPS handler"
         for handler in https_handlers:
-            context = handler._context  # noqa: SLF001 - the pin is the point
+            context = handler._context
             assert context.verify_mode is ssl.CERT_REQUIRED
             assert context.check_hostname is True
 
@@ -2868,19 +2863,19 @@ class TestNonLocalProvenance:
     def test_was_remote_folds_into_bundle_identity_but_the_address_does_not(
         self,
     ) -> None:
-        local = DistillOptions.from_args({})
-        remote = DistillOptions.from_args(
+        local = resolve_run_config({}).options
+        remote = resolve_run_config(
             {
                 "local_vision_base_url": "https://10.0.0.5:8000/v1",
                 "local_vision_allow_remote_endpoint": True,
             }
-        )
-        another_remote = DistillOptions.from_args(
+        ).options
+        another_remote = resolve_run_config(
             {
                 "local_vision_base_url": "https://198.51.100.7:9000/v1",
                 "local_vision_allow_remote_endpoint": True,
             }
-        )
+        ).options
 
         # Remote- and local-produced bundles never share a key (D-012)...
         assert local.opts_hash("local") != remote.opts_hash("local")
@@ -2995,7 +2990,7 @@ def test_end_to_end_credential_budget_and_provenance_compose(
     monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path / "config"))
     (tmp_path / "frame0.png").write_bytes(b"png")
 
-    options = DistillOptions.from_args({})
+    options = resolve_run_config({}).options
     config = options.local_vision_config()
 
     auth_headers: list[str | None] = []
@@ -3037,7 +3032,7 @@ def test_end_to_end_credential_budget_and_provenance_compose(
         budgets_seen.append(kwargs.get("budget"))
         return original_post(*args, **kwargs)
 
-    monkeypatch.setattr("distill.local_vision._http_post_json", spying_post)
+    monkeypatch.setattr("distill.rapid_mlx._http_post_json", spying_post)
 
     interpreter = FrameInterpreter(config)
     frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
@@ -3198,8 +3193,8 @@ class TestFrameSalienceToggle:
     cache_key=True - on and off yield different bundle keys."""
 
     def test_defaults_on_and_is_disableable_and_keys_the_cache(self) -> None:
-        default = DistillOptions.from_args({})
-        disabled = DistillOptions.from_args({"frame_salience": False})
+        default = resolve_run_config({}).options
+        disabled = resolve_run_config({"frame_salience": False}).options
 
         assert default.frame_salience is True
         assert disabled.frame_salience is False
@@ -3410,7 +3405,7 @@ class TestFilteredRenderView:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         from distill.artifacts import RedactionState, Transcript
-        from distill.pipeline import interpret_frames_with_local_vision
+        from distill.run_orchestrator import interpret_frames
 
         (tmp_path / "frame0.png").write_bytes(b"png")
 
@@ -3428,9 +3423,9 @@ class TestFilteredRenderView:
             redaction=RedactionState.APPLIED,
         )
 
-        frames, _warnings = interpret_frames_with_local_vision(
+        frames, _warnings = interpret_frames(
             [_frame(1, tmp_path / "frame0.png")],
-            DistillOptions.from_args({}),
+            resolve_run_config({}).options,
             None,
             transcript=transcript,
         )

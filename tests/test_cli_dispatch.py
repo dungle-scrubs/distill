@@ -51,7 +51,7 @@ def test_timeout_diagnostics_dispatch_prints_json(capsys: pytest.CaptureFixture[
     assert code is None
     payload = json.loads(out)
     assert payload["configured_timeout_ms"] == 5_400_000
-    assert payload["assumption"] == "A-004"
+    assert payload["effective_timeout_source"] == "default"
 
 
 def test_timeout_probe_dispatch_short_probe(capsys: pytest.CaptureFixture[str]) -> None:

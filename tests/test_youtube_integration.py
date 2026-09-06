@@ -8,22 +8,20 @@ from typing import Any
 
 import pytest
 from conftest import lease_is_held
+from runtime_fakes import configure_run
 from test_local_integration import fake_transcribe, make_short_screencast
 
+from distill import acquisition, media_inspect, source_identity, youtube
 from distill import pipeline as distill_session
 from distill import source as distill_source
+from distill.acquisition import AcquiredSource, AcquisitionLease
 from distill.artifacts import Provenance
 from distill.errors import DistillError
 from distill.local_vision import LocalVisionProbe
 from distill.progress import ProgressReporter
-from distill.source import (
-    AcquiredSource,
-    AcquisitionLease,
-    SourceInfo,
-    YouTubeMetadata,
-    source_hash,
-    youtube_lock_key,
-)
+from distill.source import SourceInfo
+from distill.source_identity import youtube_lock_key
+from distill.youtube import YouTubeMetadata
 
 
 def test_mocked_youtube_integration_passes_through_shared_pipeline(
@@ -62,9 +60,9 @@ def test_mocked_youtube_integration_passes_through_shared_pipeline(
         "resolve",
         fake_resolve,
     )
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     monkeypatch.setattr(
-        distill_source,
+        youtube,
         "youtube_metadata",
         lambda _url: YouTubeMetadata("abcdefghijk", "", []),
     )
@@ -110,7 +108,9 @@ def test_cache_hit_skips_youtube_download(
             resolved_path=video,
             duration_sec=1.0,
             source_fingerprint=fingerprint,
-            source_hash=source_hash(fingerprint, request.options.opts_hash("youtube")),
+            source_hash=source_identity.bundle_key(
+                fingerprint, request.options.opts_hash("youtube")
+            ),
             warnings=[],
             provenance=Provenance(
                 canonical_url=f"https://www.youtube.com/watch?v={video_id}",
@@ -122,9 +122,9 @@ def test_cache_hit_skips_youtube_download(
         )
 
     monkeypatch.setattr(distill_source.YouTubeSourceProvider, "resolve", fake_resolve)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     monkeypatch.setattr(
-        distill_source,
+        youtube,
         "youtube_metadata",
         lambda _url: YouTubeMetadata(video_id, "", []),
     )
@@ -199,15 +199,15 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
         return reporter
 
     monkeypatch.setattr(distill_session, "ProgressReporter", make_reporter)
-    monkeypatch.setattr(distill_source, "YoutubeDownloader", FakeDownloader)
+    monkeypatch.setattr(acquisition, "YoutubeDownloader", FakeDownloader)
     monkeypatch.setattr(
-        distill_source,
+        youtube,
         "youtube_metadata",
         lambda _url: YouTubeMetadata(video_id, "", []),
     )
-    monkeypatch.setattr(distill_source, "check_disk_floor", lambda _path: None)
-    monkeypatch.setattr(distill_source, "probe_duration", lambda _path: (1.0, []))
-    monkeypatch.setattr(distill_session, "probe_local_vision", fake_probe)
+    monkeypatch.setattr(acquisition, "check_disk_floor", lambda _path: None)
+    monkeypatch.setattr(media_inspect, "probe_duration", lambda _path: (1.0, []))
+    configure_run(monkeypatch, probe=fake_probe)
     # R-36: transcription is the pipeline reading the acquired media, so the
     # lease must still be held while it runs. Observing it here rather than
     # after the run is what distinguishes "held for the read lifetime" from
@@ -219,7 +219,7 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
         held_during_read.append(lease_is_held("abcdefghijk", lock_path))
         return fake_transcribe(*args, **kwargs)
 
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", transcribe_under_the_lease)
+    configure_run(monkeypatch, transcribe=transcribe_under_the_lease)
 
     response = distill_session.process_youtube_video(
         {
@@ -327,9 +327,7 @@ def test_youtube_playlist_uses_playlist_output_subdirectory(
         lambda _url, _max_items: child_urls,
     )
 
-    def fake_process_youtube_video(
-        args: dict[str, object], **_budget: float
-    ) -> dict[str, object]:
+    def fake_process_youtube_video(args: dict[str, object], **_budget: float) -> dict[str, object]:
         # A playlist item is handed the batch lock budget (D-044), which this
         # double has no use for and must still accept.
         seen_child_args.append(args)

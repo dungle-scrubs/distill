@@ -14,16 +14,19 @@ uv run pytest          # should pass before you start
 
 ## Local vision
 
-Distill talks to a local Rapid-MLX server. For day-to-day work you do **not**
-need it running — the test suite fakes it by monkeypatching
-`distill.local_vision._urlopen_json`, so `uv run pytest` is fully hermetic. The
+Distill defaults to a local Rapid-MLX server and accepts endpoints that meet
+[ADR-0005](docs/adr/0005-any-profile-compliant-vision-endpoint.md). For day-to-day work you do **not**
+need it running - the test suite fakes it by monkeypatching
+`distill.rapid_mlx._urlopen_json`, so `uv run pytest` is fully hermetic. The
 live smoke test is gated behind `DISTILL_RUN_RAPID_MLX_SMOKE=1`.
 
-## Before opening a PR
+## Before landing a change
 
-1. `uv run pytest` — all tests pass.
-2. `uv run ruff check .` — no lint errors.
-3. If you changed any output-affecting module (`local_vision.py`, `options.py`,
+1. `uv run pytest` - all tests pass.
+2. `uv run ruff check .` - no lint errors.
+3. `uv run ruff format --check .` - no format drift.
+4. `uv run ty check` - no type errors.
+5. If you changed any output-affecting module (`local_vision.py`, `options.py`,
    `pipeline.py`, or the other signed modules), recompute `PIPELINE_SIGNATURE`
    as described in [AGENTS.md](AGENTS.md) and bump `PIPELINE_VERSION`, so
    `tests/test_pipeline_signature.py` stays green.

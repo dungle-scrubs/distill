@@ -25,7 +25,7 @@ the cryptographic sense, and nothing verifies who produced it.
 
 from __future__ import annotations
 
-PIPELINE_VERSION = 69
+PIPELINE_VERSION = 74
 
 # Output-affecting source files covered by PIPELINE_SIGNATURE, named by their
 # path relative to `src/distill/` in posix form so that modules in subpackages
@@ -38,10 +38,6 @@ PIPELINE_VERSION = 69
 SIGNED_MODULES = (
     "acquisition.py",
     "artifacts.py",
-    "bundle_layout.py",
-    "bundle_lifecycle.py",
-    "bundle_locks.py",
-    "bundle_prune.py",
     "bundle_store.py",
     "capabilities.py",
     "cli.py",
@@ -80,10 +76,6 @@ SIGNED_MODULES = (
     # unsigned - not affecting output is, and this decides output.
     "vision_chain.py",
     "vision_prompts.py",
-    # Centralizes the chain walk (candidate derivation, cache-before-network
-    # scan, memo/skip/deadline, revalidation, one-rekey bound, remote budget)
-    # so editing it can change which bundle a run serves and under which key.
-    "vision_selection.py",
     "youtube.py",
 )
 
@@ -154,4 +146,4 @@ EXEMPT_MODULES: dict[str, str] = {
 }
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "a32eaae8f3f92360e8bb8916cfc357ab1063511aa96cfc6acfe52ca97e678180"
+PIPELINE_SIGNATURE = "fd1eab53e33f741b0e08bcbc18fe6c552b6b92cdab39397740f498a7de7162ca"

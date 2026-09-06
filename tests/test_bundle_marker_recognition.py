@@ -455,7 +455,9 @@ def test_a_target_that_cannot_be_removed_is_reported_rather_than_fatal(
     )
     os.chmod(bundle, 0o555)
     try:
-        main(["cleanup-cache", "--output-dir", str(root), "--keep-generations", "1", "--no-dry-run"])
+        main(
+            ["cleanup-cache", "--output-dir", str(root), "--keep-generations", "1", "--no-dry-run"]
+        )
         result = json.loads(capsys.readouterr().out)
     finally:
         os.chmod(bundle, 0o755)

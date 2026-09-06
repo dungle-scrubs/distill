@@ -63,9 +63,7 @@ def test_a_closed_block_holds_the_text_a_commonmark_reader_reads() -> None:
     scanned = fenced_blocks(document)
     parsed = code_blocks(document)
 
-    assert [block.body for block in scanned] == [
-        block.content.rstrip("\n") for block in parsed
-    ]
+    assert [block.body for block in scanned] == [block.content.rstrip("\n") for block in parsed]
     assert [block.info for block in scanned] == [block.info for block in parsed]
     assert scanned[0].info == UNTRUSTED_TEXT_LABEL
 

@@ -29,8 +29,8 @@ import signal
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -39,7 +39,7 @@ from distill import bundle_store, pipeline
 from distill.bundle_store import ExclusiveLock
 from distill.errors import DistillError
 from distill.job_store import JobOutcome, JobStore
-from distill.source import SourceResolution
+from distill.source import SourceInfo, SourceResolution
 
 STAGE_FAILURE = DistillError("E_STAGE_BOOM", "keyframes", "keyframe selection failed")
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH"
@@ -64,14 +64,6 @@ on disk is exactly what a `kill -9` leaves.
 """
 
 
-@dataclass
-class StubSource:
-    """The little a run touches before it produces a **generation**."""
-
-    source_hash: str = "abc123"
-    warnings: list[dict[str, str]] = field(default_factory=list)
-
-
 def stub_acquisition(monkeypatch: pytest.MonkeyPatch, source_hash: str = "abc123") -> None:
     """Let a run past acquisition without a file, a probe or a network.
 
@@ -88,11 +80,8 @@ def stub_acquisition(monkeypatch: pytest.MonkeyPatch, source_hash: str = "abc123
         downloader: Any = None,
         lock_wait_sec: float = 0.0,
     ) -> SourceResolution:
-        # A stub stands in for the `SourceInfo` a real resolution returns: a run
-        # touches only its **bundle key** and its warnings before the stage
-        # these tests replace, and building a real one needs a real video.
         return SourceResolution(
-            StubSource(source_hash=source_hash),  # ty: ignore[invalid-argument-type]
+            SourceInfo("local", Path("fixture.mp4"), 1.0, "fingerprint", source_hash, []),
             output_root=None,
             progress=progress,
         )
@@ -122,14 +111,14 @@ def run(
     this is still running?" can be asked at all.
     """
 
-    def produce(_self: Any, _generation: Any, _heartbeat: Any) -> dict[str, Any]:
+    def produce() -> dict[str, Any]:
         if during is not None:
             during()
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(pipeline.ProcessingRun, "_produce_generation", produce)
+    monkeypatch.setattr(pipeline, "ProcessingRun", lambda *_args: SimpleNamespace(execute=produce))
     stub_acquisition(monkeypatch, source_hash)
     root.mkdir(parents=True, exist_ok=True)
     return pipeline.process_local_video(
@@ -461,7 +450,8 @@ def test_a_run_that_fails_unexpectedly_still_records_a_terminal_failure(
     assert status["error"] == {
         "code": "E_INTERNAL",
         "stage": "internal",
-        "message": "unmapped",
+        "message": "an unexpected RuntimeError ended the command",
+        "details": {"exception": "RuntimeError", "message": "unmapped"},
     }
 
 

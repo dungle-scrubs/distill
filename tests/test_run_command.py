@@ -160,9 +160,7 @@ def test_no_shell_invocation_path_exists_anywhere_in_the_package() -> None:
     """No module may hand a command line to a shell, here or elsewhere."""
     package_dir = Path(run_command.__file__).resolve().parent
     offenders = sorted(
-        path.name
-        for path in package_dir.rglob("*.py")
-        if "shell=True" in path.read_text()
+        path.name for path in package_dir.rglob("*.py") if "shell=True" in path.read_text()
     )
 
     assert offenders == []
@@ -321,7 +319,7 @@ def test_a_blocking_callback_cannot_suspend_the_deadlines(tmp_path: Path) -> Non
                 terminate_grace_sec=0.2,
                 on_stdout_line=block,
             )
-        except BaseException as exc:  # noqa: BLE001 - handed to the assertions below
+        except BaseException as exc:
             outcome.append(exc)
 
     caller = threading.Thread(target=invoke, name="blocked-caller", daemon=True)
@@ -730,9 +728,7 @@ EXACT_CAP_BYTES = 1000
     ("written", "truncated"),
     [(EXACT_CAP_BYTES - 1, False), (EXACT_CAP_BYTES, False), (EXACT_CAP_BYTES + 1, True)],
 )
-def test_the_cap_is_the_last_byte_kept_not_the_first_dropped(
-    written: int, truncated: bool
-) -> None:
+def test_the_cap_is_the_last_byte_kept_not_the_first_dropped(written: int, truncated: bool) -> None:
     """The boundary itself, so the one arithmetic line R-33 rests on is pinned.
 
     Output of exactly the cap fits; one byte more does not. Without this, `>`
@@ -843,7 +839,7 @@ def test_run_json_reports_a_bad_document_under_the_callers_error_code() -> None:
 
 def test_run_json_parses_the_document_a_tool_prints() -> None:
     payload, warnings = run_json(
-        child("import sys; sys.stdout.write('{\"format\": {\"duration\": \"3.5\"}}')"),
+        child('import sys; sys.stdout.write(\'{"format": {"duration": "3.5"}}\')'),
         stage="source",
         total_timeout_sec=GENEROUS_TOTAL_SEC,
         idle_timeout_sec=GENEROUS_IDLE_SEC,
@@ -1256,9 +1252,7 @@ def test_a_callback_that_raises_still_emits_its_boundary_event(
             on_stdout_line=explode,
         )
 
-    assert [event["detail"]["outcome"] for event in boundary_events(caplog)] == [
-        "callback_error"
-    ]
+    assert [event["detail"]["outcome"] for event in boundary_events(caplog)] == ["callback_error"]
 
 
 def test_an_unchecked_non_zero_exit_is_not_reported_as_ok(
@@ -1292,9 +1286,7 @@ HELPER_NAMES = frozenset({"run", "stream", "run_json"})
 
 def package_modules() -> list[Path]:
     return sorted(
-        module
-        for module in PACKAGE_ROOT.rglob("*.py")
-        if "__pycache__" not in module.parts
+        module for module in PACKAGE_ROOT.rglob("*.py") if "__pycache__" not in module.parts
     )
 
 
@@ -1328,11 +1320,7 @@ def call_sites() -> list[tuple[str, int, dict[str, ast.expr]]]:
                     (
                         module.name,
                         node.lineno,
-                        {
-                            keyword.arg: keyword.value
-                            for keyword in node.keywords
-                            if keyword.arg
-                        },
+                        {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg},
                     )
                 )
     return found
@@ -1384,6 +1372,7 @@ def test_only_run_command_imports_subprocess() -> None:
     Scope is the whole package with no exemption, which is why `measure.py` was
     migrated rather than excused: an offline harness still invokes ffmpeg.
     """
+
     def imports_subprocess(module: Path) -> bool:
         return any(
             (
@@ -1421,6 +1410,7 @@ TIMEOUT_FIELDS = {"total_timeout_sec": "total_sec", "idle_timeout_sec": "idle_se
 
 def test_no_call_site_inlines_a_timeout_value() -> None:
     """A literal at a call site is a limit nobody can find, review, or raise."""
+
     def reads_the_named_field(value: ast.expr, field: str) -> bool:
         return isinstance(value, ast.Attribute) and value.attr == field
 
@@ -1492,6 +1482,6 @@ def test_a_silent_tool_call_site_cannot_tighten_its_idle_value_alone() -> None:
 
 def test_the_silent_by_design_call_sites_declare_a_single_deadline() -> None:
     """tesseract and `ffprobe -v error` both answer only when they are done."""
-    for name in ("ocr.TESSERACT_TIMEOUTS", "source.FFPROBE_TIMEOUTS"):
+    for name in ("ocr.TESSERACT_TIMEOUTS", "media_inspect.FFPROBE_TIMEOUTS"):
         timeouts = declared_timeouts()[name]
         assert timeouts.idle_sec == timeouts.total_sec, name

@@ -10,14 +10,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from runtime_fakes import configure_run
 
 from distill import pipeline as distill_session
 from distill.artifacts import FrameArtifact, Interpretation
 from distill.local_vision import LocalVisionProbe
+from distill.media_inspect import probe_duration
 from distill.options import DistillOptions
 from distill.progress import ProgressCounter, ProgressReporter
 from distill.run_command import OUTPUT_CAP_BYTES, TRUNCATION_WARNING_CODE
-from distill.source import probe_duration
 
 
 def make_short_screencast(path: Path) -> None:
@@ -92,7 +93,7 @@ def test_short_local_screencast_fixture_produces_transcript_and_frames(
 ) -> None:
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     RECORDED_DURATIONS.clear()
 
     response = distill_session.process_local_video(
@@ -127,7 +128,7 @@ def test_a_fresh_run_writes_and_reports_both_render_artifacts(
     """FAILS FIRST: a generation carried and reported only `video.md`."""
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     response = distill_session.process_local_video(
         {
@@ -158,7 +159,7 @@ def test_a_credential_named_local_source_leaves_no_name_or_absolute_path_in_the_
     secret_name = f"ghp_{'a' * 36}"
     video = tmp_path / f"{secret_name}.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     response = distill_session.process_local_video(
         {
@@ -197,14 +198,14 @@ def test_cache_hit_returns_under_one_second(
         "max_keyframes": 3,
         "max_static_window_sec": 1,
     }
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     first = distill_session.process_local_video(args)
     assert first["cached"] is False
 
     def fail_transcribe(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("cache hit should not transcribe")
 
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fail_transcribe)
+    configure_run(monkeypatch, transcribe=fail_transcribe)
     started = time.perf_counter()
     cached = distill_session.process_local_video(args)
     elapsed = time.perf_counter() - started
@@ -228,7 +229,7 @@ def test_fresh_and_cache_hit_responses_report_the_same_frame_shape(
         "max_keyframes": 1,
         "max_static_window_sec": 1,
     }
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     fresh = distill_session.process_local_video(args)
     cached = distill_session.process_local_video(args)
@@ -261,7 +262,7 @@ def test_pipeline_reports_render_and_publish_progress_and_no_redaction_stage(
     make_short_screencast(video)
     reporter = ProgressReporter()
     monkeypatch.setattr(distill_session, "ProgressReporter", lambda **_kwargs: reporter)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     response = distill_session.process_local_video(
         {
@@ -290,7 +291,7 @@ def test_local_e2e_emits_stderr_progress_and_final_summary(
 ) -> None:
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     response = distill_session.process_local_video(
         {
@@ -315,7 +316,7 @@ def test_caption_frames_degrades_to_ocr_only_when_rapid_mlx_unavailable(
 ) -> None:
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     def fake_probe(_config: object) -> LocalVisionProbe:
         return LocalVisionProbe(
@@ -328,7 +329,7 @@ def test_caption_frames_degrades_to_ocr_only_when_rapid_mlx_unavailable(
             detail={},
         )
 
-    monkeypatch.setattr(distill_session, "probe_local_vision", fake_probe)
+    configure_run(monkeypatch, probe=fake_probe)
 
     response = distill_session.process_local_video(
         {
@@ -360,7 +361,7 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
 ) -> None:
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     def fake_ocr(
         frames: list[FrameArtifact],
@@ -406,9 +407,9 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
             None,
         )
 
-    monkeypatch.setattr(distill_session, "ocr_frames", fake_ocr)
-    monkeypatch.setattr(distill_session, "probe_local_vision", fake_probe)
-    monkeypatch.setattr(distill_session, "try_interpret_image_after_probe", fake_interpret)
+    configure_run(monkeypatch, ocr_frames=fake_ocr)
+    configure_run(monkeypatch, probe=fake_probe)
+    configure_run(monkeypatch, try_interpret=fake_interpret)
     reporter = ProgressReporter()
     monkeypatch.setattr(distill_session, "ProgressReporter", lambda **_kwargs: reporter)
 
@@ -428,6 +429,17 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
     assert frame["ocr_text"] == "Visible OCR text"
     assert frame["visual_interpretation"]["visual_summary"] == "A settings screen"
     assert frame["visual_interpretation"]["backend"] == "rapid-mlx"
+    for field in ("markdown_path", "self_contained_markdown_path", "artifact_path"):
+        rendered = Path(response[field]).read_text()
+        assert "No vision endpoint read these frames" not in rendered
+        assert "Frames read by" in rendered
+        assert "qwen3-vl:8b" in rendered
+    from distill.filtered_view import filtered_view_markdown
+
+    filtered = filtered_view_markdown(tmp_path / "cache", response["source_hash"])
+    assert "No vision endpoint read these frames" not in filtered
+    assert "qwen3-vl:8b" in filtered
+
     assert reporter.states["local_vision"].status == "completed"
     assert reporter.states["local_vision"].percent == 100.0
     assert "Visible OCR text" in seen_prompts[0]
@@ -456,7 +468,7 @@ def test_job_status_and_cache_cleanup_for_distill(
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
     cache = tmp_path / "cache"
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     response = distill_session.process_local_video(
         {
@@ -485,7 +497,7 @@ def test_directory_batch_processes_video_files(
 ) -> None:
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     response = distill_session.process_video_directory(
         {
@@ -509,12 +521,12 @@ def test_partial_resume_reuses_completed_transcript(
 ) -> None:
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     def fail_after_transcript(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("boom after transcript")
 
-    monkeypatch.setattr(distill_session, "select_keyframes", fail_after_transcript)
+    configure_run(monkeypatch, select_keyframes=fail_after_transcript)
     args = {
         "path": str(video),
         "output_dir": str(tmp_path / "cache"),
@@ -530,9 +542,9 @@ def test_partial_resume_reuses_completed_transcript(
     def fail_transcribe(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("partial resume should not transcribe again")
 
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fail_transcribe)
+    configure_run(monkeypatch, transcribe=fail_transcribe)
     monkeypatch.undo()
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fail_transcribe)
+    configure_run(monkeypatch, transcribe=fail_transcribe)
     response = distill_session.process_local_video(args)
 
     assert response["cached"] is False
@@ -565,7 +577,7 @@ def test_a_truncated_ocr_invocation_records_its_warning_in_the_bundle(
     """
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     RECORDED_DURATIONS.clear()
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
@@ -634,7 +646,7 @@ def test_a_published_generation_carries_no_audio_decode(
     """
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", transcribe_leaving_a_decode)
+    configure_run(monkeypatch, transcribe=transcribe_leaving_a_decode)
 
     response = distill_session.process_local_video(
         {
@@ -687,7 +699,7 @@ def test_the_decode_survives_in_scratch_for_a_run_that_resumes(
         transcribe_leaving_a_decode(video_path, work_dir, options, progress, duration_sec)
         raise RuntimeError("interrupted after the decode")
 
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fail_after_transcribing)
+    configure_run(monkeypatch, transcribe=fail_after_transcribing)
     with pytest.raises(RuntimeError):
         distill_session.process_local_video(args)
 
@@ -715,7 +727,7 @@ def test_a_resume_rebuilds_the_frames_it_recorded_and_publishes_from_them(
     """
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     def read_slide(
         frames: list[FrameArtifact],
@@ -726,11 +738,10 @@ def test_a_resume_rebuilds_the_frames_it_recorded_and_publishes_from_them(
     ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
         return [frame.with_extracted_text("SLIDE TEXT")[0] for frame in frames], []
 
-    monkeypatch.setattr(distill_session, "ocr_frames", read_slide)
-    monkeypatch.setattr(
-        distill_session,
-        "render_markdown",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom after ocr")),
+    configure_run(monkeypatch, ocr_frames=read_slide)
+    configure_run(
+        monkeypatch,
+        render=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom after ocr")),
     )
     args = {
         "path": str(video),
@@ -748,8 +759,8 @@ def test_a_resume_rebuilds_the_frames_it_recorded_and_publishes_from_them(
         raise AssertionError("a resume must not select keyframes again")
 
     monkeypatch.undo()
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
-    monkeypatch.setattr(distill_session, "select_keyframes", fail_select)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
+    configure_run(monkeypatch, select_keyframes=fail_select)
     response = distill_session.process_local_video(args)
 
     assert response["cached"] is False
@@ -769,7 +780,7 @@ def test_the_artifact_lands_outside_the_cache_and_survives_the_bundle(
     reclaimable: deleting the whole cache root must leave it readable."""
     video = tmp_path / "keynote.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     cache = tmp_path / "cache"
 
     response = distill_session.process_local_video(
@@ -803,7 +814,7 @@ def test_a_cache_hit_writes_the_artifact_too(
     question."""
     video = tmp_path / "keynote.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     args = {
         "path": str(video),
         "output_dir": str(tmp_path / "cache"),
@@ -823,33 +834,37 @@ def test_a_cache_hit_writes_the_artifact_too(
     assert Path(second["artifact_path"]).is_file()
 
 
-def test_an_unwritable_artifact_directory_does_not_fail_the_run(
+def test_an_unwritable_artifact_directory_reports_delivery_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """ADR-0002: the bundle is complete and the response still names every path
-    inside it, so a read-only artifact directory costs a convenience, not a
-    run."""
+    from distill.bundle_store import BundleStore
+    from distill.errors import DistillError
+
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     blocked = tmp_path / "blocked"
     blocked.mkdir(mode=0o500)
     monkeypatch.setenv("DISTILL_ARTIFACT_DIR", str(blocked / "artifacts"))
-
-    response = distill_session.process_local_video(
-        {
-            "path": str(video),
-            "output_dir": str(tmp_path / "cache"),
-            "ocr": False,
-            "caption_frames": False,
-            "max_keyframes": 1,
-            "max_static_window_sec": 1,
-        }
-    )
-
-    assert response["artifact_path"] is None
-    assert Path(response["self_contained_markdown_path"]).is_file()
+    try:
+        with pytest.raises(DistillError) as caught:
+            distill_session.process_local_video(
+                {
+                    "path": str(video),
+                    "output_dir": str(tmp_path / "cache"),
+                    "ocr": False,
+                    "caption_frames": False,
+                    "max_keyframes": 1,
+                    "max_static_window_sec": 1,
+                }
+            )
+        assert caught.value.code == "E_ARTIFACT_WRITE"
+        saved = BundleStore.open(tmp_path / "cache").load_active(caught.value.details["bundle_key"])
+        assert saved is not None
+        assert saved.self_contained_markdown.is_file()
+    finally:
+        blocked.chmod(0o700)
 
 
 def test_the_artifact_name_does_not_move_when_the_options_do(
@@ -865,7 +880,7 @@ def test_the_artifact_name_does_not_move_when_the_options_do(
     """
     video = tmp_path / "keynote.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
     args = {
         "path": str(video),
         "output_dir": str(tmp_path / "cache"),
@@ -897,7 +912,7 @@ def test_a_symlinked_source_leaks_neither_its_path_nor_its_name(
     make_short_screencast(target)
     link = tmp_path / "keynote.mp4"
     link.symlink_to(target)
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     response = distill_session.process_local_video(
         {
@@ -945,7 +960,7 @@ def test_a_cache_hit_with_vision_on_never_probes_and_returns_under_one_second(
         "max_keyframes": 3,
         "max_static_window_sec": 1,
     }
-    monkeypatch.setattr(distill_session, "transcribe_with_imports", fake_transcribe)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
 
     def one_interpretation(
         frames: list[Any], _options: Any, _progress: Any, **_kwargs: Any
@@ -967,7 +982,7 @@ def test_a_cache_hit_with_vision_on_never_probes_and_returns_under_one_second(
             [],
         )
 
-    monkeypatch.setattr(distill_session, "interpret_frames_with_local_vision", one_interpretation)
+    configure_run(monkeypatch, interpret_frames=one_interpretation)
     first = distill_session.process_local_video(args)
     assert first["cached"] is False
     # The generation has to hold a reading, or the second run is testing the

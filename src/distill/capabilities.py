@@ -20,7 +20,7 @@ pins it against this table instead, and a classification changed here without
 the README changing with it fails the suite.
 
 It does not own tool discovery (each adapter finds its own binary: `ocr.py` for
-tesseract, `source.py` for ffprobe and yt-dlp), invocation or its failure
+tesseract, `media_inspect.py` for ffprobe, and `youtube.py` for yt-dlp), invocation or its failure
 taxonomy (`run_command.py`, whose error table raises `E_MISSING_TOOL` for a
 required tool that is not installed), or the shape of a warning record
 (`errors.py`). This module states which class a tool is in and supplies the
@@ -109,8 +109,7 @@ EXTERNAL_TOOLS: dict[str, ExternalTool] = {
         requirement=Requirement.REQUIRED,
         invoked_when="a YouTube source this run must acquire; never for a local file or a cache hit",
         absence_cost=(
-            "the source cannot be acquired at all, so a YouTube run has nothing "
-            "to process"
+            "the source cannot be acquired at all, so a YouTube run has nothing to process"
         ),
     ),
     "tesseract": ExternalTool(
@@ -146,8 +145,7 @@ def missing_tool_warning(stage: str, tool_name: str) -> WarningRecord:
     tool = EXTERNAL_TOOLS[tool_name]
     if not tool.is_optional:
         raise ValueError(
-            f"{tool.name} is a required capability; its absence is a fatal error, "
-            "not a degradation"
+            f"{tool.name} is a required capability; its absence is a fatal error, not a degradation"
         )
     return warning(stage, tool.warning_code, _absence_message(tool))
 

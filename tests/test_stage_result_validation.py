@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from runtime_fakes import configure_run
 
 from distill import pipeline
 from distill.artifacts import FrameArtifact, Provenance, RedactionState
@@ -93,8 +94,8 @@ def processing_run(output_root: Path) -> ProcessingRun:
     the tool are what a full run needs to *produce* a bundle, which this is not
     doing.
     """
-    return ProcessingRun(
-        source=None,
+    return pipeline.ProcessingRun(
+        source=SourceInfo("local", output_root / "source.mp4", 1.0, "fingerprint", "a" * 16, []),
         options=DistillOptions(),
         output_root=output_root,
         progress=ProgressReporter(),
@@ -173,10 +174,10 @@ def resuming_run(
     selected.clear()
     video = tmp_path / "fixture.mp4"
     video.write_bytes(b"not a video, and never opened")
-    monkeypatch.setattr(pipeline, "transcribe_with_imports", fake_transcribe)
-    monkeypatch.setattr(pipeline, "select_keyframes", fake_select_keyframes)
-    monkeypatch.setattr(pipeline, "ocr_frames", fake_ocr_frames)
-    return ProcessingRun(
+    configure_run(monkeypatch, transcribe=fake_transcribe)
+    configure_run(monkeypatch, select_keyframes=fake_select_keyframes)
+    configure_run(monkeypatch, ocr_frames=fake_ocr_frames)
+    return pipeline.ProcessingRun(
         source=SourceInfo(
             source_type="local",
             resolved_path=video,

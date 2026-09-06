@@ -25,12 +25,12 @@ import pytest
 
 from distill.capabilities import EXTERNAL_TOOLS
 from distill.cli import PROCESSING_KEYS, build_parser
-from distill.source import (
+from distill.source import validate_output_root
+from distill.source_identity import (
     CONTENT_HASH_LIMIT_BYTES,
     FINGERPRINT_INTERIOR_ANCHORS,
     FINGERPRINT_SAMPLE_BYTES,
     fingerprint_anchor_offsets,
-    validate_output_root,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

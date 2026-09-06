@@ -20,10 +20,10 @@ from distill.local_vision import (
     CONSECUTIVE_TRANSPORT_FAILURE_LIMIT,
     FrameInterpreter,
     LocalVisionConfig,
-    LocalVisionFailure,
     LocalVisionProbe,
     _TransportBreaker,
 )
+from distill.rapid_mlx import LocalVisionFailure
 
 TIMEOUT = LocalVisionFailure(
     "local_vision_timeout",

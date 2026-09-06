@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .artifacts import FrameArtifact, Transcript
+from .acquisition import release_acquisition_lease
 from .bundle_store import (
     BATCH_ITEM_LOCK_WAIT_SEC,
     DEFAULT_KEEP_GENERATIONS,
@@ -29,19 +29,11 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .cache_doctor import inspect_cache
-from .config import resolve_options
-from .errors import DistillError, WarningRecord
+from .configuration import local_vision_config_from_args, resolve_options, resolve_run_config
+from .errors import DistillError
 from .filtered_view import filtered_view_markdown
-from .frame_selection import select_keyframes
 from .job_store import JobOutcome, JobStore
-from .local_vision import (
-    MAX_SOCKET_TIMEOUT_SEC,
-    FrameInterpreter,
-    local_vision_config_from_args,
-    probe_local_vision,
-    try_interpret_image_after_probe,
-)
-from .ocr import ocr_frames
+from .local_vision import MAX_SOCKET_TIMEOUT_SEC, probe_local_vision
 from .options import (
     GENERAL_OPTION_NAMES,
     DistillOptions,
@@ -49,44 +41,16 @@ from .options import (
     validated_number,
 )
 from .progress import (
-    ProgressCounter,
     ProgressReporter,
 )
-from .render import render_markdown
-
-# Re-exported for monkeypatch tests — used via distill.pipeline.<name>
-__all__ = [
-    "select_keyframes",
-    "ocr_frames",
-    "render_markdown",
-    "ProcessingRun",
-    "REKEY_BOUND_REASON",
-    "cache_hit_progress_summary",
-    "progress_summary_is_terminal",
-    "revalidation_is_owed",
-]
-from .run_orchestrator import (  # noqa: F401  re-exported — deep module
-    REKEY_BOUND_REASON,
-    ProcessingRun,
-    cache_hit_progress_summary,
-    progress_summary_is_terminal,
-    revalidation_is_owed,
-)
-from .source import (  # noqa: F401  re-exported for test seam
-    ChainRevalidation,
-    candidate_in_hand,
-    normalize_youtube_url,
-    release_acquisition_lease,
+from .run_orchestrator import ProcessingRun
+from .source import (
+    SourceInfo,
     resolve_source_for_processing,
-    revalidate_chain,
     source_path_kind,
     validate_output_root,
 )
-from .vision_selection import (  # noqa: F401  deep vision chain walk
-    SelectionOutcome,
-    VisionSelection,
-)
-from .youtube import ensure_youtube_host, youtube_playlist_urls
+from .youtube import ensure_youtube_host, normalize_youtube_url, youtube_playlist_urls
 
 TOOLS = {
     "process_local_video": "Process a local video into a transcript/keyframe markdown bundle",
@@ -170,6 +134,8 @@ class DistillSession:
         except DistillError as exc:
             return {"error": exc.to_dict()}
         except Exception as exc:
+            if os.environ.get("DISTILL_TRACEBACK") == "1":
+                raise
             return {"error": DistillError.from_unexpected(exc).to_dict()}
 
 
@@ -219,7 +185,7 @@ def acquire_and_process(
 def process_local_video(
     args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
 ) -> dict[str, Any]:
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     root = validate_output_root(options.output_dir)
 
     def work() -> dict[str, Any]:
@@ -239,7 +205,7 @@ def process_local_video(
 def process_youtube_video(
     args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
 ) -> dict[str, Any]:
-    options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
+    options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
     root = validate_output_root(options.output_dir)
     progress = ProgressReporter(emitter=progress_emitter(options.job_id))
 
@@ -301,7 +267,7 @@ def record_job(
 
 
 def process_resolved_source(
-    source: Any,
+    source: SourceInfo,
     options: DistillOptions,
     output_root: Path | None = None,
     progress: ProgressReporter | None = None,
@@ -332,7 +298,7 @@ def process_resolved_source(
         # run that went on carrying its original options would build a
         # **manifest** naming whichever endpoint the chain listed first while
         # publishing under the key of the one that answered.
-        options = getattr(source, "resolved_options", None) or options
+        options = source.resolved_options or options
         output_root = output_root or validate_output_root(options.output_dir)
         progress = progress or ProgressReporter(emitter=progress_emitter(options.job_id))
         run = ProcessingRun(source, options, output_root, progress, tool, lock_wait_sec)
@@ -402,6 +368,8 @@ class BatchRunner:
                 result["batch_index"] = index
                 results.append(result)
             except Exception as exc:
+                if not isinstance(exc, DistillError) and os.environ.get("DISTILL_TRACEBACK") == "1":
+                    raise
                 failure = (
                     exc if isinstance(exc, DistillError) else DistillError.from_unexpected(exc)
                 )
@@ -412,7 +380,7 @@ class BatchRunner:
 
 
 def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
-    options = DistillOptions.from_args(args)
+    options = resolve_run_config(args).options
     root = validate_output_root(options.output_dir)
     max_items = validated_count("max_items", args.get("max_items", 50))
     recursive = bool(args.get("recursive", False))
@@ -471,7 +439,7 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
         raise DistillError("E_BAD_URL", "youtube", "url is required")
     # Reject non-YouTube hosts / option-injection values before any yt-dlp call.
     ensure_youtube_host(url)
-    options = DistillOptions.from_args({**args, "cache_mode": "fingerprint"})
+    options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
     root = validate_output_root(options.output_dir)
     playlist_root = root / "playlists" / playlist_folder_name(url)
     max_items = validated_count("max_items", args.get("max_items", 25))
@@ -650,60 +618,6 @@ def get_job_status(args: dict[str, Any]) -> dict[str, Any]:
     return record.to_dict()
 
 
-def transcribe_with_imports(
-    video_path: Path,
-    work_dir: Path,
-    options: DistillOptions,
-    progress: ProgressCounter | ProgressReporter,
-    duration_sec: float,
-) -> tuple[dict[str, Any] | None, list[WarningRecord]]:
-    # No default: SourceInfo.duration_sec is always present, and omitting it here
-    # would silently disable ffmpeg -progress instead of failing loudly.
-    from .transcript import transcribe_video
-
-    return transcribe_video(
-        video_path,
-        work_dir,
-        options.whisper_model,
-        options.whisper_language,
-        options.vad_filter,
-        progress,
-        duration_sec,
-    )
-
-
-def interpret_frames_with_local_vision(
-    frames: list[FrameArtifact],
-    options: DistillOptions,
-    progress: ProgressReporter | None = None,
-    *,
-    transcript: Transcript | None = None,
-) -> tuple[list[FrameArtifact], list[WarningRecord]]:
-    """Interpret every frame, under the **redaction** policy the frames carry.
-
-    The interpreter is told nothing about redaction. `--no-redact-secrets` is
-    recorded on each **frame artifact** by `select_keyframes` and travels with
-    it, so the model's words are redacted where they enter the carrier (R-19)
-    rather than by a helper the vision pass had to remember to call.
-
-    The transcript is the salience context (D-003): each frame is judged
-    against the speech around its timestamp when `frame_salience` is on. A
-    missing transcript means absent salience, never a judgment against
-    nothing.
-    """
-    interpreter = FrameInterpreter(
-        config=options.local_vision_config(),
-        progress=progress,
-        probe=probe_local_vision,
-        try_interpret=try_interpret_image_after_probe,
-        frame_salience=options.frame_salience,
-    )
-    return interpreter.interpret(
-        frames,
-        transcript_segments=None if transcript is None else transcript.segments,
-    )
-
-
 def tool_registry() -> dict[str, ToolSpec]:
     return {
         "process_local_video": ToolSpec(
@@ -761,13 +675,12 @@ def timeout_diagnostics(effective_timeout_ms: int | None = None) -> dict[str, An
             source = TIMEOUT_ENV
         else:
             effective = configured
-            source = "app.config.json"
+            source = "default"
     return {
         "configured_timeout_ms": configured,
         "effective_timeout_ms": effective,
         "effective_timeout_source": source,
         "effective_meets_configured": effective >= configured,
-        "assumption": "A-004",
     }
 
 

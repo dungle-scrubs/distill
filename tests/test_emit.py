@@ -205,14 +205,33 @@ _UNDETECTED_BLOCK_OPENS = "on disk and leaves this check silent:"
 _UNDETECTED_BLOCK_CLOSES = "\nThose "
 
 _NUMBER_WORDS = (
-    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
-    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
-    "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
 )
 
 # Flags that make an `os.open` a write. `O_CREAT` counts on its own: a call that
 # may create the file is a call that may put something on disk.
 OS_WRITE_FLAGS = ("O_WRONLY", "O_RDWR", "O_CREAT", "O_APPEND", "O_TRUNC")
+
 
 @dataclass(frozen=True)
 class Licence:
@@ -611,13 +630,25 @@ def test_a_naive_write_text_outside_the_licence_list_is_detected() -> None:
     [
         ("def save(path, blob):\n    path.write_bytes(blob)\n", "write_bytes"),
         ("def save(path, text):\n    open(path, 'w').write(text)\n", "open(mode)"),
-        ("def save(path, text):\n    with open(path, mode='a') as f:\n        f.write(text)\n", "open(mode)"),
-        ("def save(path, text):\n    with path.open('w') as f:\n        f.write(text)\n", "open(mode)"),
-        ("def save(fd, text):\n    with os.fdopen(fd, 'w') as f:\n        f.write(text)\n", "fdopen(mode)"),
+        (
+            "def save(path, text):\n    with open(path, mode='a') as f:\n        f.write(text)\n",
+            "open(mode)",
+        ),
+        (
+            "def save(path, text):\n    with path.open('w') as f:\n        f.write(text)\n",
+            "open(mode)",
+        ),
+        (
+            "def save(fd, text):\n    with os.fdopen(fd, 'w') as f:\n        f.write(text)\n",
+            "fdopen(mode)",
+        ),
         ("def save(path):\n    return os.open(path, os.O_WRONLY | os.O_CREAT)\n", "os.open"),
         ("def save(path):\n    return os.open(path, flags=os.O_WRONLY | os.O_CREAT)\n", "os.open"),
         ("def save(fd, text):\n    os.write(fd, text.encode())\n", "os.write"),
-        ("def save(path, text):\n    with gzip.open(path, 'wt') as f:\n        f.write(text)\n", "open(mode)"),
+        (
+            "def save(path, text):\n    with gzip.open(path, 'wt') as f:\n        f.write(text)\n",
+            "open(mode)",
+        ),
         ("def save(document, handle):\n    json.dump(document, handle)\n", "json.dump"),
     ],
 )
@@ -681,10 +712,7 @@ def _documented_undetected_shapes() -> tuple[str, ...]:
     doc = __doc__ or ""
     block = doc.split(_UNDETECTED_BLOCK_OPENS)[1].split(_UNDETECTED_BLOCK_CLOSES)[0]
     return tuple(
-        entry
-        for line in block.splitlines()
-        for entry in re.split(r"\s{2,}", line.strip())
-        if entry
+        entry for line in block.splitlines() for entry in re.split(r"\s{2,}", line.strip()) if entry
     )
 
 

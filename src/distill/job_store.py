@@ -65,7 +65,6 @@ from typing import Any, Literal
 from .bundle_store import (
     ExclusiveLock,
     LockState,
-    _bundle_log,
     atomic_write_text,
     confined_path,
     ensure_safe_directory,
@@ -210,14 +209,11 @@ class JobOutcome:
         exercised, and the whole point of R-17 is that it is not the path that
         gets skipped.
         """
-        if isinstance(error, DistillError):
-            payload: dict[str, Any] = {
-                "code": error.code,
-                "stage": error.stage,
-                "message": error.message,
-            }
-        elif isinstance(error, BaseException):
-            payload = {"code": "E_INTERNAL", "stage": "internal", "message": str(error)}
+        if isinstance(error, BaseException):
+            failure = (
+                error if isinstance(error, DistillError) else DistillError.from_unexpected(error)
+            )
+            payload = failure.to_dict()
         else:
             payload = dict(error)
         return cls(status=FAILED, error=payload)
@@ -482,12 +478,7 @@ class JobStore:
         try:
             self._release(job_id)
         except Exception as release_failure:
-            _bundle_log(
-                "lock_release_failed",
-                subject=job_id,
-                error=repr(release_failure),
-                during=type(during).__name__,
-            )
+            ExclusiveLock.record_release_failure(job_id, release_failure, during)
 
     def _holder_is_live(self, job_id: str) -> bool:
         """Whether a run is still live on `job_id`, asked of the lock, not a clock.

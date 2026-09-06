@@ -104,7 +104,9 @@ def test_signature_change_requires_a_version_bump() -> None:
 
     # Each distinct signature owns a distinct version (no reuse), and the current
     # version is the newest — so a signature change cannot keep an old version.
-    assert len(set(history.values())) == len(history), "a PIPELINE_VERSION is reused across signatures"
+    assert len(set(history.values())) == len(history), (
+        "a PIPELINE_VERSION is reused across signatures"
+    )
     assert max(history.values()) == PIPELINE_VERSION
 
 
@@ -136,7 +138,9 @@ def test_signed_and_exempt_modules_exist_and_do_not_overlap() -> None:
     # hash. Alphabetical is the recorded convention; assert it so appending a
     # new entry at the end fails here instead of quietly making the ordering
     # incidental again.
-    assert list(SIGNED_MODULES) == sorted(SIGNED_MODULES), "SIGNED_MODULES is not in alphabetical order"
+    assert list(SIGNED_MODULES) == sorted(SIGNED_MODULES), (
+        "SIGNED_MODULES is not in alphabetical order"
+    )
 
 
 def test_every_exemption_records_a_reason() -> None:

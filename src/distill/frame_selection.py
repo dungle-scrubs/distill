@@ -58,27 +58,38 @@ for (R-48).
 FRAME_EXTRACT_TIMEOUTS = CommandTimeouts(total_sec=120.0, idle_sec=60.0)
 
 
-def scene_midpoint_candidates(video_path: Path, duration_sec: float) -> list[float]:
+def scene_midpoint_candidates(
+    video_path: Path,
+    duration_sec: float,
+) -> tuple[list[float], list[WarningRecord]]:
+    """Return detected midpoints and a warning if interval fallback loses detection."""
     try:
         from scenedetect import AdaptiveDetector, ContentDetector, detect
     except ImportError:
-        return []
+        return [], [
+            warning(
+                "frame_selection",
+                "scene_detection_unavailable",
+                "scene detection is unavailable; using fixed intervals",
+            )
+        ]
     try:
         scenes = detect(str(video_path), ContentDetector())
-    except Exception:
-        return []
-    if not scenes:
-        try:
+        if not scenes:
             scenes = detect(str(video_path), AdaptiveDetector())
-        except Exception:
-            scenes = []
-    candidates: list[float] = []
-    for start, end in scenes:
-        start_sec = start.get_seconds()
-        end_sec = end.get_seconds()
-        midpoint = max(0.0, min(duration_sec, (start_sec + end_sec) / 2))
-        candidates.append(midpoint)
-    return candidates
+        candidates = [
+            max(0.0, min(duration_sec, (start.get_seconds() + end.get_seconds()) / 2))
+            for start, end in scenes
+        ]
+    except Exception:
+        return [], [
+            warning(
+                "frame_selection",
+                "scene_detection_failed",
+                "scene detection failed; using fixed intervals",
+            )
+        ]
+    return candidates, []
 
 
 def quantized_timestamp(seconds: float, ceiling_sec: float) -> float:
@@ -287,9 +298,9 @@ def select_keyframes(
     source is a policy no later stage can forget to pass on (D-020).
     """
     frames_dir.mkdir(parents=True, exist_ok=True)
-    warnings: list[WarningRecord] = []
+    detected, warnings = scene_midpoint_candidates(video_path, duration_sec)
     candidates = filtered_candidates(
-        scene_midpoint_candidates(video_path, duration_sec),
+        detected,
         duration_sec,
         min_interval_sec,
         max_static_window_sec,

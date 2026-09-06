@@ -77,14 +77,16 @@ value).
 
 ### System dependencies
 
-Install these with your platform's package manager. Distill names what it needs
-and never installs it for you:
+Install system tools with your platform's package manager. The `yt-dlp` Python
+dependency installs its executable in Distill's environment during `uv sync`;
+Distill invokes that executable through `PATH`. Use `uv run distill` in a source
+checkout so this environment is active. Distill installs no tools at runtime:
 
 | Tool | Capability | Class | Install |
 | --- | --- | --- | --- |
 | `ffmpeg` | audio extraction and keyframe extraction | required | your platform's package manager |
 | `ffprobe` | source duration probing | required | ships with `ffmpeg` |
-| `yt-dlp` | YouTube source acquisition and metadata | required | `uv tool install yt-dlp` |
+| `yt-dlp` | YouTube source acquisition and metadata | required | installed with Distill; available under `uv run` |
 | `tesseract` | image-text extraction from keyframes | optional | your platform's package manager |
 | `rapid-mlx[vision]` | local vision server (see below) | optional | `pip install 'rapid-mlx[vision]'` |
 
@@ -156,6 +158,14 @@ its output where the work is. Resolution, highest precedence first:
 exists at or above the working directory, `artifact_dir` in a config file, the
 git work tree root, and finally `$XDG_DATA_HOME/distill/artifacts` outside any
 repository. The run's JSON result names it as `artifact_path`.
+
+If delivery fails, the command reports `E_ARTIFACT_WRITE` with a nonzero CLI
+exit status. Its details identify the saved `bundle_key` and `generation`,
+set `bundle_saved` to true, and leave `artifact_path` null. The bundle remains
+readable. Correct the artifact destination and retry: an available cache hit
+retries delivery without running the media stages. Call-tool and job status
+report failure too; a batch records the item as failed and follows its existing
+`continue_on_error` setting.
 
 Distill never edits your `.gitignore`. Whether `.distill/` is committed is
 your decision.
@@ -466,19 +476,15 @@ time* degrades to OCR-only output with a warning instead.
 ### Model
 
 **`Qwen3-VL-8B-Instruct` at 8-bit (`mlx-community/Qwen3-VL-8B-Instruct-8bit`) is
-the eval-chosen reader.** A human-verified 16-frame text-recovery eval
-(`tests/evals/README.md`) found it the strongest reader at token recall 0.91 /
-WER 0.13. Key findings:
-
-- **8-bit clearly beats 4-bit** - lower quantization loses readable text.
-- **Bigger is not better** - Qwen3-VL-30B gave no accuracy gain over 8B; a real
-  jump would require a frontier cloud reader, not a larger local one.
-- **MLX over Ollama** - ~28% faster on Apple Silicon at equal quality.
-- **OCR specialists are not worth it** - Tesseract ≈ PaddleOCR-VL (~0.53 raw-text
-  recall), both dwarfed by the VLM's 0.91.
+the eval-chosen reader.** See the [eval documentation](tests/evals/README.md)
+for the corpus, scoring procedure, baseline files, and measured comparisons.
+Re-run the eval before changing the default. Scores and corpus sizes belong
+with that evidence and are not copied here.
 
 Per-call `--local-vision-model` and `--local-vision-base-url` overrides are
-honored. Distill talks only to Rapid-MLX - no other runtime shims.
+honored. Rapid-MLX is the default local server. Other endpoints must satisfy
+[ADR-0005's compatibility profile](docs/adr/0005-any-profile-compliant-vision-endpoint.md).
+Distill uses one HTTP client with no provider-specific runtime branches.
 
 ## Extracted text is data, not instruction
 
@@ -516,7 +522,7 @@ uv run python tests/evals/score.py --with-vision
 ```
 
 The default suite never hits a real server: vision tests fake Rapid-MLX by
-monkeypatching `distill.local_vision._urlopen_json`. The live vision smoke test
+monkeypatching `distill.rapid_mlx._urlopen_json`. The live vision smoke test
 is gated behind `DISTILL_RUN_RAPID_MLX_SMOKE=1`.
 
 ## License

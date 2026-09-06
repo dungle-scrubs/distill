@@ -47,9 +47,10 @@ local-vision tests hold the first; the row above states the second.
 
 ## Local vision: Rapid-MLX, direct
 
-Distill's frame interpretation talks to a local **Rapid-MLX** server directly
-over its OpenAI-compatible HTTP API. This is the only supported local vision
-backend.
+Distill uses one HTTP client for frame interpretation. **Rapid-MLX** is the
+default local server. Other endpoints must meet the compatibility profile in
+[ADR-0005](docs/adr/0005-any-profile-compliant-vision-endpoint.md); an endpoint
+chain selects one reader under [ADR-0007](docs/adr/0007-an-endpoint-chain-selects-one-reader.md).
 
 - **Default model**: `mlx-community/Qwen3-VL-8B-Instruct-8bit` (Qwen3-VL-8B at
   8-bit). This is the eval-chosen reader.
@@ -79,9 +80,9 @@ backend.
 
 ### Single vision backend
 
-- **Rapid-MLX is the only local vision path.** Distill owns the HTTP call
-  directly via the stdlib `urllib` - no lifecycle/leasing/proxy layer, no
-  alternative runtime shims. Do not add backend branches for other providers.
+- **One HTTP client, with no provider dispatch.** Distill owns the call
+  through stdlib `urllib`. Keep endpoint compatibility in that client and
+  leave server lifecycle management to the operator.
 - **No `local_vision_provider` option.** `backend` is fixed to `rapid-mlx` and
   `model` selects the served model. The per-run overrides are
   `--local-vision-backend`, `--local-vision-model`, `--local-vision-base-url`,
@@ -90,15 +91,9 @@ backend.
 
 ### Why this model (eval rationale)
 
-A human-verified 16-frame text-recovery eval (`tests/evals/`) selected the
-8-bit reader. Do not change the default without re-running the eval:
-
-- **8-bit over 4-bit** - quantization directly costs readable text.
-- **Bigger is not better** - Qwen3-VL-30B gave no accuracy gain; a real jump
-  would require a frontier *cloud* reader, not a larger local one.
-- **MLX over Ollama** - ~28% faster on Apple Silicon at equal quality.
-- **OCR specialists aren't worth a backend** - Tesseract ≈ PaddleOCR-VL (~0.53
-  raw recall), both dwarfed by the VLM's 0.91.
+Before changing the default model, read [the eval procedure](tests/evals/README.md)
+and its linked baseline and gate evidence, then re-run the eval. Keep scores
+and corpus sizes in the evidence files rather than copying them into guidance.
 
 Reproduce with `uv run python tests/evals/score.py --with-vision`.
 
@@ -163,8 +158,10 @@ tool, and it is not a security control.
 ## Tests
 
 - Unit tests run offline and hermetic: `uv run pytest`.
-- Vision tests fake Rapid-MLX by monkeypatching `distill.local_vision._urlopen_json`
-  (for the `try_interpret_image` path) or by passing a `requestor=` callable to
-  `probe_rapid_mlx_availability` / `_interpret_with_rapid_mlx`. Never hit a real
-  server in the default suite.
+- Before landing, run `uv run ruff check .`, `uv run ruff format --check .`,
+  and `uv run ty check`.
+- Vision tests fake Rapid-MLX by monkeypatching `distill.rapid_mlx._urlopen_json`
+  or passing `requestor=` to the transport operations. Stage tests inject
+  dependencies into `ProcessingRun`, `YoutubeDownloader`, and `FrameInterpreter`.
+  Never hit a real server in the default suite.
 - The live smoke test is gated behind `DISTILL_RUN_RAPID_MLX_SMOKE=1`.

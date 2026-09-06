@@ -35,7 +35,8 @@ legible.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from .artifacts import (
     Carrier,
@@ -173,6 +174,49 @@ def _require_redaction_policy(*carriers: Carrier) -> None:
         serialize(carrier)
 
 
+@dataclass(frozen=True)
+class VisionEvidence:
+    """Attribution from the generation's readings and recorded options."""
+
+    models: tuple[str, ...] = ()
+    state: Literal["unknown", "read", "none", "no_readings"] = "unknown"
+
+    @classmethod
+    def from_generation(
+        cls,
+        frames: list[FrameArtifact],
+        options: Mapping[str, Any] | None = None,
+    ) -> VisionEvidence:
+        readings = [
+            reading
+            for frame in frames
+            if (reading := frame.reading) is not None and reading.carries_a_reading
+        ]
+        if readings:
+            models = tuple(sorted({reading.model for reading in readings if reading.model}))
+            return cls(models, "read")
+        mode = (options or {}).get("vision_mode")
+        if mode in {"disabled", "chain_exhausted"}:
+            return cls(state="none")
+        if mode == "selected":
+            return cls(state="no_readings")
+        return cls()
+
+    def lines(self) -> list[str]:
+        if self.state == "read":
+            if self.models:
+                return ["Frames read by:", "", *_untrusted_lines("\n".join(self.models))]
+            return [
+                "A vision endpoint produced frame interpretations; its model is not recorded.",
+                "",
+            ]
+        if self.state == "none":
+            return [NO_ENDPOINT_NOTE, ""]
+        if self.state == "no_readings":
+            return ["A vision endpoint was selected, but no frame interpretation succeeded.", ""]
+        return ["Vision endpoint attribution is unavailable for this generation.", ""]
+
+
 def render_markdown(
     source_label: str,
     duration_sec: float,
@@ -183,7 +227,7 @@ def render_markdown(
     *,
     provenance: Provenance | None = None,
     include_frame_links: bool = True,
-    vision_model: str | None = None,
+    vision_evidence: VisionEvidence | None = None,
 ) -> str:
     _require_redaction_policy(
         *frames,
@@ -213,10 +257,7 @@ def render_markdown(
             if provenance is None
             else _provenance_lines(provenance)
         ),
-        # Distill's own words, outside the untrusted boundary: which reader
-        # produced the interpretations is a fact about the run, not text
-        # anybody else chose.
-        *([f"Frames read by: {vision_model}", ""] if vision_model else [NO_ENDPOINT_NOTE, ""]),
+        *(vision_evidence or VisionEvidence.from_generation(frames)).lines(),
     ]
     if warnings:
         lines.extend(["## Warnings", ""])
@@ -471,6 +512,7 @@ def render_filtered_markdown(
     *,
     provenance: Provenance | None = None,
     include_frame_links: bool = True,
+    vision_evidence: VisionEvidence | None = None,
 ) -> str:
     """The read-time view that collapses judged-redundant frames (D-006).
 
@@ -492,6 +534,7 @@ def render_filtered_markdown(
         salience = FrameSalience.from_document(frame.salience) if frame.salience else None
         return salience is not None and not salience.adds_information
 
+    evidence = vision_evidence or VisionEvidence.from_generation(frames)
     kept = [frame for frame in frames if not judged_redundant(frame)]
     lead = [FILTERED_VIEW_BANNER]
     if frames and not kept:
@@ -500,7 +543,7 @@ def render_filtered_markdown(
         # A view, not a verdict. The run that published this generation already
         # passed `ensure_content` against its full frame set, so an empty
         # reading is what the filter did and not what the bundle is.
-        return "\n\n".join(lead if len(lead) > 1 else [*lead, NOTHING_LEFT_NOTE])
+        return "\n\n".join([*lead, NOTHING_LEFT_NOTE, "\n".join(evidence.lines())])
     rendered = render_markdown(
         source_label,
         duration_sec,
@@ -510,6 +553,7 @@ def render_filtered_markdown(
         related_links,
         provenance=provenance,
         include_frame_links=include_frame_links,
+        vision_evidence=evidence,
     )
     return "\n\n".join([*lead, rendered])
 

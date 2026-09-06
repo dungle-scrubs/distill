@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from runtime_fakes import configure_run
 
 from distill.cli import build_parser, main
 from distill.errors import DistillError
@@ -902,8 +903,6 @@ def test_a_failing_run_leaves_the_error_record_as_the_last_line_of_stderr(
     """
     from test_local_integration import fake_transcribe, make_short_screencast
 
-    from distill import pipeline as distill_pipeline
-
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
 
@@ -913,8 +912,8 @@ def test_a_failing_run_leaves_the_error_record_as_the_last_line_of_stderr(
     # Transcription is faked because a real one loads a model; keyframe
     # selection is real, because it is the stage whose progress this test is
     # about. The failure is put after it, which is where a real one lands.
-    monkeypatch.setattr(distill_pipeline, "transcribe_with_imports", fake_transcribe)
-    monkeypatch.setattr(distill_pipeline, "render_markdown", fail_at_the_render)
+    configure_run(monkeypatch, transcribe=fake_transcribe)
+    configure_run(monkeypatch, render=fail_at_the_render)
 
     with pytest.raises(SystemExit) as exit_info:
         main(

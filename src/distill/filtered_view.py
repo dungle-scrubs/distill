@@ -67,7 +67,7 @@ from .bundle_store import FRAMES_DIR_NAME, BundleSnapshot, BundleStore, confined
 from .errors import DistillError, WarningRecord, aggregate_warnings
 from .links import RelatedLink
 from .redact_secrets import redact_text
-from .render import render_filtered_markdown
+from .render import VisionEvidence, render_filtered_markdown
 from .response import frame_carrier_document
 from .transcript import segment_bounds, segment_words_are_placeable
 
@@ -145,6 +145,7 @@ def filtered_view_markdown(output_root: Path, bundle_key: str) -> str:
         frames,
         _view_warnings(snapshot, rebuilt, raised),
         related_links,
+        vision_evidence=VisionEvidence.from_generation(frames, snapshot.manifest.get("options")),
     )
 
 

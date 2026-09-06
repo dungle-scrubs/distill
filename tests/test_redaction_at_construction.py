@@ -21,9 +21,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from runtime_fakes import configure_run
 from test_local_integration import make_short_screencast
 
 from distill import pipeline as distill_session
+from distill import source_identity
+from distill.acquisition import AcquiredSource, AcquisitionLease
 from distill.artifacts import (
     FrameArtifact,
     Interpretation,
@@ -40,16 +43,13 @@ from distill.progress import DEFAULT_MECHANISM_WEIGHTS
 from distill.render import render_markdown
 from distill.response import manifest_document, response_related_links
 from distill.source import (
-    AcquiredSource,
-    AcquisitionLease,
     SourceInfo,
     SourceRequest,
-    YouTubeMetadata,
     YouTubeSourceProvider,
     _manifest_related_links,
-    source_hash,
     youtube_source_info,
 )
+from distill.youtube import YouTubeMetadata
 
 # One shape of secret used throughout, so that "the secret is gone" means the
 # same thing at every sink. `redact_secrets.SECRET_RULES` matches it on the
@@ -188,20 +188,13 @@ def run_interrupted_after_the_stages(
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
     output_dir = tmp_path / "cache"
-    monkeypatch.setattr(
-        distill_session,
-        "transcribe_with_imports",
-        # The transcript stage records a stage result too, and finding 15 is
-        # that nothing covered it: a run interrupted after it is the only place
-        # that file can be looked at, so it says the secret out loud here.
-        transcript_saying(f"the key is {SECRET}"),
-    )
-    monkeypatch.setattr(distill_session, "ocr_frames", ocr_reading(ocr_text))
+    configure_run(monkeypatch, transcribe=transcript_saying(f"the key is {SECRET}"))
+    configure_run(monkeypatch, ocr_frames=ocr_reading(ocr_text))
 
     def stop_before_publish(*_args: object, **_kwargs: object) -> str:
         raise RuntimeError("stopped once every stage result was recorded")
 
-    monkeypatch.setattr(distill_session, "render_markdown", stop_before_publish)
+    configure_run(monkeypatch, render=stop_before_publish)
 
     with pytest.raises(RuntimeError):
         distill_session.process_local_video(
@@ -311,11 +304,7 @@ def test_a_secret_spoken_in_the_transcript_is_redacted_in_transcript_json(
     """Finding 15: no pipeline stage ever passed the transcript through the policy."""
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(
-        distill_session,
-        "transcribe_with_imports",
-        transcript_saying(f"the key is {SECRET} do not share it"),
-    )
+    configure_run(monkeypatch, transcribe=transcript_saying(f"the key is {SECRET} do not share it"))
 
     response = distill_session.process_local_video(
         {
@@ -360,11 +349,7 @@ def test_the_transcript_opt_out_survives_to_disk(
     """The transcript honours `--no-redact-secrets` exactly as keyframe text does."""
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(
-        distill_session,
-        "transcribe_with_imports",
-        transcript_saying(f"the key is {SECRET}"),
-    )
+    configure_run(monkeypatch, transcribe=transcript_saying(f"the key is {SECRET}"))
 
     response = distill_session.process_local_video(
         {
@@ -566,7 +551,9 @@ def test_a_cache_hit_reads_its_related_links_back_as_carriers(tmp_path: Path) ->
     root.mkdir()
     options = DistillOptions()
     video_id = "abcdefghijk"
-    key = source_hash(hashlib.sha256(video_id.encode()).hexdigest(), options.opts_hash("youtube"))
+    key = source_identity.bundle_key(
+        hashlib.sha256(video_id.encode()).hexdigest(), options.opts_hash("youtube")
+    )
     fresh = SourceInfo(
         source_type="youtube",
         resolved_path=tmp_path / "video.mp4",
@@ -690,12 +677,12 @@ def resolve_youtube_source(
         if description is not None
         else f"Skill repo: https://github.com/example/repo?api_key={SECRET}"
     )
-    monkeypatch.setattr("distill.source.check_disk_floor", lambda _path: None)
+    monkeypatch.setattr("distill.acquisition.check_disk_floor", lambda _path: None)
     monkeypatch.setattr(
-        "distill.source.youtube_metadata",
+        "distill.youtube.youtube_metadata",
         lambda _url: YouTubeMetadata(video_id="abc123", description=said, warnings=[]),
     )
-    monkeypatch.setattr("distill.source.probe_duration", lambda _path: (12.0, []))
+    monkeypatch.setattr("distill.media_inspect.probe_duration", lambda _path: (12.0, []))
     try:
         return youtube_source_info(
             "https://www.youtube.com/watch?v=abc123",
@@ -775,14 +762,10 @@ def test_no_file_in_a_published_generation_holds_the_secret(
     """
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(
-        distill_session,
-        "transcribe_with_imports",
-        transcript_saying(f"the key is {SECRET}"),
-    )
-    monkeypatch.setattr(distill_session, "ocr_frames", ocr_reading(f"API_KEY={SECRET}"))
-    monkeypatch.setattr(distill_session, "probe_local_vision", vision_probe)
-    monkeypatch.setattr(distill_session, "try_interpret_image_after_probe", vision_reading(SECRET))
+    configure_run(monkeypatch, transcribe=transcript_saying(f"the key is {SECRET}"))
+    configure_run(monkeypatch, ocr_frames=ocr_reading(f"API_KEY={SECRET}"))
+    configure_run(monkeypatch, probe=vision_probe)
+    configure_run(monkeypatch, try_interpret=vision_reading(SECRET))
     source = SourceInfo(
         source_type="youtube",
         resolved_path=video,
@@ -848,15 +831,12 @@ def test_a_newly_covered_credential_format_is_redacted_in_a_published_generation
     bearer_value = "9f8c2b1a4d7e6f0c3b5a8d92e1f4c7b0"
     video = tmp_path / "fixture.mp4"
     make_short_screencast(video)
-    monkeypatch.setattr(
-        distill_session,
-        "transcribe_with_imports",
-        transcript_saying(f"the runner token is {gitlab_token}"),
-    )
-    monkeypatch.setattr(
-        distill_session,
-        "ocr_frames",
-        ocr_reading(f"curl -H 'Authorization: Bearer {bearer_value}' https://api.example.com"),
+    configure_run(monkeypatch, transcribe=transcript_saying(f"the runner token is {gitlab_token}"))
+    configure_run(
+        monkeypatch,
+        ocr_frames=ocr_reading(
+            f"curl -H 'Authorization: Bearer {bearer_value}' https://api.example.com"
+        ),
     )
     source = SourceInfo(
         source_type="youtube",

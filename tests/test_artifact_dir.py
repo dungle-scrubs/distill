@@ -166,9 +166,7 @@ def test_a_symlink_at_the_destination_is_refused_not_followed(tmp_path: Path) ->
     (artifacts / "F3lL98Pj90o.md").symlink_to(victim)
 
     with pytest.raises(DistillError, match="symlink"):
-        emit_artifact(
-            _render(tmp_path), artifacts, "F3lL98Pj90o", output_root=tmp_path / "cache"
-        )
+        emit_artifact(_render(tmp_path), artifacts, "F3lL98Pj90o", output_root=tmp_path / "cache")
 
     assert victim.read_text() == "do not touch"
 

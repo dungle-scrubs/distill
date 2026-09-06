@@ -170,7 +170,10 @@ def test_manifest_without_frames_is_a_typed_error(tmp_path: Path) -> None:
     ("malformed", "why"),
     [
         (["frame_0001.png"], "an entry that is not a document at all"),
-        ([{"index": "one", "timestamp_sec": 1.0, "relative_path": "frames/frame_0001.png"}], "a text index"),
+        (
+            [{"index": "one", "timestamp_sec": 1.0, "relative_path": "frames/frame_0001.png"}],
+            "a text index",
+        ),
         ([{"index": 1, "timestamp_sec": 1.0}], "no relative_path to address the image by"),
         (
             [{"index": 1, "timestamp_sec": 1.0, "relative_path": "../../escape.png"}],
@@ -763,3 +766,58 @@ def test_a_duration_that_is_not_a_measurement_is_a_typed_error(
         filtered_view_markdown(root, BUNDLE_KEY)
 
     assert raised.value.code == "E_BAD_MANIFEST", why
+
+
+@pytest.mark.parametrize("all_filtered", [False, True])
+def test_filtered_attribution_keeps_the_published_reader(
+    tmp_path: Path, all_filtered: bool
+) -> None:
+    root = tmp_path / "output"
+    publish(
+        root,
+        [
+            frame(
+                root,
+                1,
+                text="slide",
+                interpretation={
+                    "visual_summary": "A slide",
+                    "model": "stored-reader\n```\n# forged heading",
+                },
+                salience={"adds_information": not all_filtered},
+            )
+        ],
+    )
+    view = filtered_view_markdown(root, BUNDLE_KEY)
+    assert "Frames read by:" in view
+    assert "stored-reader" in view
+    assert "No vision endpoint read" not in view
+    # The model's fence cannot close the enclosing extracted-text block.
+    assert "````untrusted-text\nstored-reader\n```\n# forged heading\n````" in view
+
+
+@pytest.mark.parametrize(
+    ("mode", "note"),
+    [
+        ("disabled", "No vision endpoint read these frames"),
+        ("chain_exhausted", "No vision endpoint read these frames"),
+        ("selected", "no frame interpretation succeeded"),
+        (None, "attribution is unavailable"),
+    ],
+)
+def test_filtered_attribution_uses_recorded_mode(
+    tmp_path: Path, mode: str | None, note: str
+) -> None:
+    root = tmp_path / "output"
+    store = publish(root, [frame(root, 1, text="slide")])
+    snapshot = store.load_active(BUNDLE_KEY)
+    assert snapshot is not None
+    options = dict(snapshot.manifest["options"])
+    options.pop("vision_mode", None)
+    if mode is not None:
+        options["vision_mode"] = mode
+    rewrite_manifest(store, {"options": options})
+    view = filtered_view_markdown(root, BUNDLE_KEY)
+    assert note in view
+    if mode in {None, "selected"}:
+        assert "No vision endpoint read" not in view

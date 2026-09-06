@@ -88,10 +88,7 @@ def bundles_by_key(report: dict) -> dict[str, dict]:
 
 def verdicts_by_path(report: dict) -> dict[str, str]:
     """Every directory the walk looked at, bundle or not, and its marker verdict."""
-    return {
-        entry["path"]: entry["verdict"]
-        for entry in (*report["bundles"], *report["skipped"])
-    }
+    return {entry["path"]: entry["verdict"] for entry in (*report["bundles"], *report["skipped"])}
 
 
 def test_cache_doctor_reports_the_bundles_found_under_a_root(tmp_path: Path) -> None:

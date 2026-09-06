@@ -86,9 +86,7 @@ class ArgvHeads:
         if isinstance(node, ast.List | ast.Tuple):
             return self._resolve(node.elts[0], seen) if node.elts else set()
         if isinstance(node, ast.Name):
-            return self._union(
-                self._assigned.get(node.id, []) + self._bound.get(node.id, []), seen
-            )
+            return self._union(self._assigned.get(node.id, []) + self._bound.get(node.id, []), seen)
         if isinstance(node, ast.BoolOp):
             return self._union(node.values, seen)
         if isinstance(node, ast.IfExp):
@@ -132,8 +130,7 @@ def invoked_tools() -> dict[str, set[str]]:
         imported = {
             alias.asname or alias.name
             for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-            and (node.module or "").endswith("run_command")
+            if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("run_command")
             for alias in node.names
             if alias.name in HELPER_NAMES
         }
@@ -146,16 +143,10 @@ def invoked_tools() -> dict[str, set[str]]:
             ):
                 continue
             argv = next(
-                (
-                    keyword.value
-                    for keyword in node.keywords
-                    if keyword.arg == "argv"
-                ),
+                (keyword.value for keyword in node.keywords if keyword.arg == "argv"),
                 node.args[0] if node.args else None,
             )
-            found[f"{path.name}:{node.lineno}"] = (
-                heads.of(argv) if argv is not None else set()
-            )
+            found[f"{path.name}:{node.lineno}"] = heads.of(argv) if argv is not None else set()
     return found
 
 

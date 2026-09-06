@@ -354,7 +354,7 @@ def _vision_config(
     DISTILL_CONFIG_DIR to score a cloud reader without touching the machine's
     own settings. CLI overrides still win over the file.
     """
-    from distill.local_vision import load_local_vision_config
+    from distill.configuration import load_local_vision_config
 
     base = load_local_vision_config()
     overrides: dict[str, str] = {}

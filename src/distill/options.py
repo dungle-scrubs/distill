@@ -8,11 +8,9 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
-from uuid import uuid4
 
-from .config import resolve_options
 from .errors import DistillError
-from .frame_selection import CANDIDATE_TIMESTAMP_QUANTUM_SEC, MAX_CANDIDATE_SCHEDULE
+from .frame_selection import CANDIDATE_TIMESTAMP_QUANTUM_SEC
 from .local_vision import (
     DEFAULT_LOCAL_VISION_BACKEND,
     DEFAULT_LOCAL_VISION_BASE_URL,
@@ -20,10 +18,9 @@ from .local_vision import (
     DEFAULT_TIMEOUT_SEC,
     MAX_SOCKET_TIMEOUT_SEC,
     LocalVisionConfig,
-    SecretCredential,
     config_is_non_local,
-    local_vision_config_from_args,
 )
+from .rapid_mlx import SecretCredential
 from .version import PIPELINE_VERSION
 
 DEFAULT_MAX_DURATION_SEC = 7200.0
@@ -38,9 +35,10 @@ class OptionSpec:
     caster: Callable[[Any], Any]
     boolean: bool = False
     cache_key: bool = True
+    vision_field: str | None = None
 
 
-def _coerce_bool(value: Any, default: bool) -> bool:
+def coerce_bool(value: Any, default: bool) -> bool:
     if value is None:
         return default
     if isinstance(value, bool):
@@ -79,19 +77,44 @@ OPTION_SPECS: tuple[OptionSpec, ...] = (
     OptionSpec("force_reprocess", False, bool, boolean=True, cache_key=False),
     OptionSpec("job_id", "", str, cache_key=False),
     OptionSpec("resume_partial", True, bool, boolean=True, cache_key=False),
+    OptionSpec(
+        "caption_frames", True, bool, boolean=True, cache_key=False, vision_field="caption_frames"
+    ),
+    OptionSpec("local_vision_backend", DEFAULT_LOCAL_VISION_BACKEND, str, vision_field="backend"),
+    OptionSpec(
+        "local_vision_model", DEFAULT_LOCAL_VISION_MODEL, str, cache_key=False, vision_field="model"
+    ),
+    OptionSpec(
+        "local_vision_base_url",
+        DEFAULT_LOCAL_VISION_BASE_URL,
+        str,
+        cache_key=False,
+        vision_field="base_url",
+    ),
+    OptionSpec("local_vision_timeout_sec", DEFAULT_TIMEOUT_SEC, float, vision_field="timeout_sec"),
+    OptionSpec(
+        "local_vision_allow_remote_endpoint",
+        False,
+        bool,
+        boolean=True,
+        cache_key=False,
+        vision_field="allow_remote_endpoint",
+    ),
 )
 OPTION_DEFAULTS = {spec.name: spec.default for spec in OPTION_SPECS}
-GENERAL_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.name != "job_id")
+GENERAL_OPTION_NAMES = tuple(
+    spec.name for spec in OPTION_SPECS if spec.name != "job_id" and spec.vision_field is None
+)
 """The options a config file or an environment variable may set.
 
 The general schema is the option table except `job_id`, which identifies one
 invocation and cannot be pinned across every run in a directory (R-18).
 `force_reprocess` and `resume_partial` stay configurable: they govern cache
-reuse for a run and a later invocation can override either one. `config.py` is
+reuse for a run and a later invocation can override either one. `configuration.py` is
 told this vocabulary rather than holding a second copy that could drift.
 
 The local-vision options are deliberately not here. They arrive from their own
-files through `local_vision_config_from_args`, and a top-level key naming one in
+files through `configuration.resolve_run_config`, and a top-level key naming one in
 `distill.json` is not a second way to set it (the nested `local_vision` object
 is the one way).
 """
@@ -154,7 +177,7 @@ NUMERIC_OPTION_DOMAINS: dict[str, NumericDomain] = {
 
 A table rather than a check per call site, because the check that is written
 where a value is *used* is the one that is missing at the second use: the
-duration cap was validated in `from_args` and the batch limit nowhere, and
+duration cap was validated in the resolver and the batch limit nowhere, and
 `max_items=-1` became a slice taken from the wrong end.
 
 Retention's numbers - `keep_generations` and `max_age_days` - are not here.
@@ -271,7 +294,7 @@ def validated_count(name: str, value: Any) -> int:
     return int(validated_number(name, value))
 
 
-def _validated_option_type(spec: OptionSpec, value: Any) -> Any:
+def validated_option_type(spec: OptionSpec, value: Any) -> Any:
     """A general option value before any Python coercion can rewrite its type."""
     if spec.name in NUMERIC_OPTION_DOMAINS:
         return value
@@ -301,7 +324,7 @@ def _validated_option_type(spec: OptionSpec, value: Any) -> Any:
     )
 
 
-def _annotate_configured_refusal(
+def annotate_configured_refusal(
     error: DistillError,
     args: dict[str, Any],
     option: str,
@@ -312,7 +335,9 @@ def _annotate_configured_refusal(
     return error
 
 
-CACHE_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.cache_key)
+CACHE_OPTION_NAMES = tuple(
+    spec.name for spec in OPTION_SPECS if spec.cache_key and spec.vision_field is None
+)
 PROCESSING_OPTION_NAMES = tuple(spec.name for spec in OPTION_SPECS if spec.name != "cache_mode")
 VISION_MODE_DISABLED = "disabled"
 """Vision was never asked for - `--no-caption-frames`. No reader, by choice."""
@@ -330,9 +355,8 @@ bundle. What differs is what the operator asked for, so it differs in the key
 
 VISION_MODES = frozenset({VISION_MODE_DISABLED, VISION_MODE_SELECTED, VISION_MODE_CHAIN_EXHAUSTED})
 
-LOCAL_VISION_IDENTITY_OPTION_NAMES = (
-    "local_vision_backend",
-    "local_vision_timeout_sec",
+LOCAL_VISION_IDENTITY_OPTION_NAMES = tuple(
+    spec.name for spec in OPTION_SPECS if spec.vision_field is not None and spec.cache_key
 )
 """The identity-bearing vision options carried through verbatim.
 
@@ -436,127 +460,6 @@ class DistillOptions:
     """
     job_id: str = ""
     resume_partial: bool = True
-
-    @classmethod
-    def from_args(cls, args: dict[str, Any]) -> DistillOptions:
-        """Typed entry point that now delegates to the single resolver.
-
-        The ``dict[str, Any]`` seam is kept for existing callers and tests,
-        but the precedence (CLI > env > file > default) for ALL options
-        lives in ``configuration.resolve_run_config`` behind the typed
-        ``ResolvedRunConfig``. This wrapper preserves the untyped call shape
-        while the typed dataclass is the internal source of truth.
-        """
-        # Delegated so CLI > env > file > default is enforced once, for both
-        # general and vision, and vision is a view over the same layers.
-        try:
-            from .configuration import resolve_run_config as _resolve_run
-
-            return _resolve_run(dict(args)).options
-        except ImportError:
-            # Fallback to legacy path if configuration is not yet importable
-            # (kept for isolated import ordering; normally never taken).
-            args = resolve_options(args, general_keys=GENERAL_OPTION_NAMES)
-            local_vision = local_vision_config_from_args(args)
-        values: dict[str, Any] = {}
-        for spec in OPTION_SPECS:
-            default = OPTION_DEFAULTS[spec.name]
-            try:
-                raw_value = _validated_option_type(spec, args.get(spec.name, default))
-                if spec.boolean:
-                    values[spec.name] = _coerce_bool(raw_value, bool(default))
-                elif spec.name in NUMERIC_OPTION_DOMAINS:
-                    # Before the `None` branch below: `None` is a legitimate value
-                    # for `output_dir` and an unusable one for a quantity.
-                    values[spec.name] = validated_number(spec.name, raw_value)
-                elif raw_value is None:
-                    values[spec.name] = None
-                else:
-                    values[spec.name] = spec.caster(raw_value)
-            except DistillError as exc:
-                _annotate_configured_refusal(exc, args, spec.name)
-                raise
-        options = cls(
-            whisper_model=values["whisper_model"],
-            whisper_language=values["whisper_language"],
-            ocr=values["ocr"],
-            ocr_language=values["ocr_language"],
-            ocr_preprocess=values["ocr_preprocess"],
-            redact_secrets=values["redact_secrets"],
-            frame_salience=values["frame_salience"],
-            max_keyframes=values["max_keyframes"],
-            min_interval_sec=values["min_interval_sec"],
-            max_duration_sec=values["max_duration_sec"],
-            vad_filter=values["vad_filter"],
-            max_static_window_sec=values["max_static_window_sec"],
-            cache_mode=values["cache_mode"],
-            output_dir=values["output_dir"],
-            artifact_dir=values["artifact_dir"],
-            force_reprocess=values["force_reprocess"],
-            caption_frames=local_vision.caption_frames,
-            local_vision_backend=local_vision.backend,
-            local_vision_model=local_vision.model,
-            local_vision_base_url=local_vision.base_url,
-            # The raw argument when the caller supplied one, because the config
-            # layer's coercion answers an unusable number with the default -
-            # reasonable for a config file, and silence where an operator just
-            # named a timeout on the command line.
-            local_vision_timeout_sec=validated_number(
-                "local_vision_timeout_sec",
-                args.get("local_vision_timeout_sec", local_vision.timeout_sec),
-            ),
-            local_vision_allow_remote_endpoint=local_vision.allow_remote_endpoint,
-            local_vision_credential=local_vision.credential,
-            local_vision_credential_configured=local_vision.credential_configured,
-            local_vision_credential_env=local_vision.credential_env,
-            local_vision_endpoints=local_vision.endpoints,
-            job_id=str(values["job_id"] or f"distill-{uuid4().hex}"),
-            resume_partial=values["resume_partial"],
-        )
-        if options.cache_mode not in {"fingerprint", "content"}:
-            raise _annotate_configured_refusal(
-                DistillError(
-                    "E_BAD_OPTIONS",
-                    "options",
-                    "cache_mode must be 'fingerprint' or 'content'",
-                    {"cache_mode": options.cache_mode},
-                ),
-                args,
-                "cache_mode",
-            )
-        # Every numeric floor is `NUMERIC_OPTION_DOMAINS`, applied above as the
-        # value is read. A check here would run after construction, which is
-        # after `local_vision_config_from_args` has already spent the value.
-        if options.local_vision_backend != "rapid-mlx":
-            raise DistillError(
-                "E_BAD_OPTIONS",
-                "options",
-                "local_vision_backend must be 'rapid-mlx'",
-                {"local_vision_backend": options.local_vision_backend},
-            )
-        # The candidate schedule holds one keyframe every `max_static_window_sec`
-        # across the source, and nothing caps `max_duration_sec` - so a large cap
-        # and a narrow window are a schedule bounded only by memory (D-009). The
-        # bound is on the count, checked against the cap because the source's own
-        # duration is not known here and the cap is the worst a run will process.
-        worst_case_candidates = options.max_duration_sec / options.max_static_window_sec
-        if worst_case_candidates > MAX_CANDIDATE_SCHEDULE:
-            raise _annotate_configured_refusal(
-                DistillError(
-                    "E_BAD_OPTIONS",
-                    "options",
-                    "max_duration_sec and max_static_window_sec would build a keyframe "
-                    f"schedule of more than {MAX_CANDIDATE_SCHEDULE} candidates; widen "
-                    "the window or lower the duration cap",
-                    {
-                        "max_duration_sec": options.max_duration_sec,
-                        "max_static_window_sec": options.max_static_window_sec,
-                    },
-                ),
-                args,
-                "max_static_window_sec",
-            )
-        return options
 
     def local_vision_config(self) -> LocalVisionConfig:
         return LocalVisionConfig(

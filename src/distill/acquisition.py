@@ -22,61 +22,49 @@ import math
 import os
 import re
 import shutil
-import sys
-import time as _real_time
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-
-def _time_module():  # noqa: D401  hook for `distill.source` monkeypatch in tests
-    """Return the ``time`` module the façade currently exposes, if patched.
-
-    Tests monkeypatch ``distill.source.time`` to a fake clock (``BudgetClock``,
-    ``ShiftedClock``) to advance the monotonic clock without sleeping. The
-    **acquisition lease** wait loop lives here after the split, so the patch
-    must be observed here as well. A direct ``import time`` would keep the
-    original module and the fake wait would never fire. This indirection reads
-    the façade's ``time`` attribute when it has been replaced, otherwise the
-    real ``time``.
-    """
-    src = sys.modules.get("distill.source")
-    if src is not None:
-        candidate = getattr(src, "time", None)
-        if candidate is not None and candidate is not _real_time:
-            return candidate
-    return _real_time
-
-
-# Back-compat alias: `distill.acquisition.time` should mirror the façade's
-# `time` for the same reason, so `monkeypatch.setattr(acquisition, "time", ...)`
-# and `monkeypatch.setattr(source, "time", ...)` both work.
-time = _real_time  # type: ignore[assignment]  overwritten below if façade exists
-try:
-    # Keep the two modules' `time` names in sync when the façade is already loaded.
-    import distill.source as _source_mod  # noqa: F401  circular guard, imported lazily above
-
-    time = getattr(_source_mod, "time", _real_time)  # type: ignore[assignment]
-except Exception:
-    time = _real_time  # type: ignore[assignment]
-
-from .bundle_store import (  # noqa: E402  import after time-sync shim for test seam
+from .bundle_store import (
     SINGLE_SOURCE_LOCK_WAIT_SEC,
     ExclusiveLock,
     confined_path,
     ensure_safe_directory,
 )
-from .errors import DistillError, WarningRecord, warning  # noqa: E402
-from .media_inspect import FFPROBE_TIMEOUTS  # noqa: E402
-from .progress import ProgressReporter  # noqa: E402
-from .run_command import CommandResult, run_json, stream  # noqa: E402
-from .source_identity import youtube_lock_key as _identity_lock_key  # noqa: E402
-from .youtube import (  # noqa: E402
+from .errors import DistillError, WarningRecord, warning
+from .media_inspect import FFPROBE_TIMEOUTS
+from .progress import ProgressReporter
+from .run_command import CommandResult, run_json, stream
+from .youtube import (
     NO_PLAYLIST_ARG,
     YTDLP_DOWNLOAD_TIMEOUTS,
     YTDLP_SOCKET_TIMEOUT_SEC,
 )
+
+if TYPE_CHECKING:
+    from .source import SourceInfo
+
+
+class Clock(Protocol):
+    def monotonic(self) -> float: ...
+    def sleep(self, seconds: float, /) -> None: ...
+
+
+class SystemClock:
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float, /) -> None:
+        time.sleep(seconds)
+
+
+class MediaPromoter(Protocol):
+    def __call__(self, produced: Path, media_dir: Path, *, root: Path) -> Path: ...
+
 
 LOGGER = logging.getLogger("distill.source")
 
@@ -184,11 +172,6 @@ class YouTubeDownloaderProtocol(Protocol):
         lock_key: str,
         progress: ProgressReporter | None = None,
     ) -> AcquiredSource: ...
-
-
-def youtube_lock_key(video_id: str) -> str:
-    """The **lock key** for a YouTube **source** (delegated to pure identity)."""
-    return _identity_lock_key(video_id)
 
 
 def check_disk_floor(path: Path) -> None:
@@ -362,10 +345,10 @@ def promote_media(produced: Path, media_dir: Path, *, root: Path) -> Path:
     return promoted
 
 
-def release_acquisition_lease(source: Any, *, during: BaseException | None = None) -> None:
+def release_acquisition_lease(source: SourceInfo, *, during: BaseException | None = None) -> None:
     """Release the lease a **source** carries, if it carries one."""
-    lease = getattr(source, "acquisition_lease", None)
-    if not isinstance(lease, AcquisitionLease):
+    lease = source.acquisition_lease
+    if lease is None:
         return
     if during is None:
         lease.release()
@@ -390,9 +373,17 @@ class YoutubeDownloader:
         lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
         lock_poll_sec: float = 0.25,
         lock_warn_after_sec: float = 5.0,
+        clock: Clock | None = None,
+        select: Callable[[Path], Path] = select_downloaded_media,
+        validate: Callable[[Path], list[WarningRecord]] = validate_media_file,
+        promote: MediaPromoter = promote_media,
     ) -> None:
         """Acquire one remote **source** under an **acquisition lease**."""
         self.output_root = output_root
+        self.clock = clock if clock is not None else SystemClock()
+        self.select = select
+        self.validate = validate
+        self.promote = promote
         self.lock_wait_sec = lock_wait_sec
         self.lock_poll_sec = lock_poll_sec
         self.lock_warn_after_sec = lock_warn_after_sec
@@ -408,11 +399,6 @@ class YoutubeDownloader:
         The **acquisition lease** is returned rather than released: the caller
         reads the media under it and releases it when finished (R-36).
 
-        Helpers are looked up via the ``distill.source`` façade at call time
-        so a test that monkeypatches ``distill.source.validate_media_file``
-        (or ``promote_media``) sees that patch here. A direct top-level import
-        would keep the original object and the patch would have no effect,
-        after the split the **acquisition lease** wait loop moved here.
         """
         lease = self._take_lease(lock_key, progress)
         try:
@@ -420,21 +406,9 @@ class YoutubeDownloader:
             try:
                 result = self._download(url, staging_dir, progress)
 
-                def _get_source_attr(name: str, fallback):  # noqa: D401
-                    src = sys.modules.get("distill.source")
-                    if src is not None:
-                        cand = getattr(src, name, None)
-                        if cand is not None and cand is not fallback:
-                            return cand
-                    return fallback
-
-                _select = _get_source_attr("select_downloaded_media", select_downloaded_media)
-                _validate = _get_source_attr("validate_media_file", validate_media_file)
-                _promote = _get_source_attr("promote_media", promote_media)
-
-                produced = _select(staging_dir)
-                validation_warnings = _validate(produced)
-                promoted = _promote(produced, self._media_dir(lock_key), root=self.output_root)
+                produced = self.select(staging_dir)
+                validation_warnings = self.validate(produced)
+                promoted = self.promote(produced, self._media_dir(lock_key), root=self.output_root)
             finally:
                 self._discard(staging_dir)
             if progress:
@@ -538,13 +512,13 @@ class YoutubeDownloader:
         lock_key: str,
         lock: Path,
     ) -> tuple[AcquisitionLease | None, list[WarningRecord]]:
-        started = _time_module().monotonic()
+        started = self.clock.monotonic()
         warnings: list[WarningRecord] = []
         while True:
             confined_path(lock, self.output_root)
             lease = AcquisitionLease.take(lock_key, lock)
             if lease is not None:
-                waited = _time_module().monotonic() - started
+                waited = self.clock.monotonic() - started
                 if waited >= self.lock_warn_after_sec:
                     warnings.append(
                         warning(
@@ -554,6 +528,6 @@ class YoutubeDownloader:
                         )
                     )
                 return lease, warnings
-            if _time_module().monotonic() - started >= self.lock_wait_sec:
+            if self.clock.monotonic() - started >= self.lock_wait_sec:
                 return None, warnings
-            _time_module().sleep(self.lock_poll_sec)
+            self.clock.sleep(self.lock_poll_sec)

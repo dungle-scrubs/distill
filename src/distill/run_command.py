@@ -366,9 +366,7 @@ def _message(kind: FailureKind, argv: Sequence[str], *, idle_timeout_sec: float 
     return {
         FailureKind.MISSING_TOOL: f"required tool is not installed: {tool}",
         FailureKind.TOTAL_TIMEOUT: f"command exceeded its total deadline: {tool}",
-        FailureKind.IDLE_TIMEOUT: (
-            f"command produced no output for {idle_timeout_sec:g}s: {tool}"
-        ),
+        FailureKind.IDLE_TIMEOUT: (f"command produced no output for {idle_timeout_sec:g}s: {tool}"),
         FailureKind.EXIT_STATUS: f"command failed: {tool}",
         FailureKind.BAD_JSON: f"command returned invalid JSON: {tool}",
     }[kind]
@@ -661,9 +659,7 @@ def _group_id(proc: subprocess.Popen[bytes]) -> int | None:
     return pgid
 
 
-def _signal_group(
-    proc: subprocess.Popen[bytes], pgid: int | None, signal_number: int
-) -> None:
+def _signal_group(proc: subprocess.Popen[bytes], pgid: int | None, signal_number: int) -> None:
     """Signal the whole group, falling back to the child when there is no group."""
     try:
         if pgid is not None:
@@ -684,10 +680,7 @@ def _has_exited(proc: subprocess.Popen[bytes]) -> bool:
     an invocation signals the group, so no path may notice the exit by reaping.
     """
     try:
-        return (
-            os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-            is not None
-        )
+        return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
     except OSError:  # already reaped, or never ours
         return True
 
@@ -783,7 +776,7 @@ class _Dispatcher(threading.Thread):
                 continue
             try:
                 self._deliver(name, text)
-            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            except BaseException as exc:
                 self.failure = exc
                 return
 
@@ -832,9 +825,7 @@ def _shutdown_readers(readers: Sequence[_StreamReader], proc: subprocess.Popen[b
                 pipe.close()
 
 
-def _truncation_messages(
-    tool: str, stream: str, sink: _CappedSink, cap_bytes: int
-) -> list[str]:
+def _truncation_messages(tool: str, stream: str, sink: _CappedSink, cap_bytes: int) -> list[str]:
     """Every way this stream lost bytes, one **warning** message each (R-33).
 
     A tail left unread because a helper held the pipe open past the drain

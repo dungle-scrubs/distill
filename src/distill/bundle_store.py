@@ -245,12 +245,8 @@ PROVENANCE_OPTIONAL_TEXT_FIELDS = (
     "description",
     "upload_date",
 )
-PROVENANCE_RFC3339_UTC_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z"
-)
-PROVENANCE_CANONICAL_URL_RE = re.compile(
-    r"https://www\.youtube\.com/watch\?v=[0-9A-Za-z_-]{11}"
-)
+PROVENANCE_RFC3339_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z")
+PROVENANCE_CANONICAL_URL_RE = re.compile(r"https://www\.youtube\.com/watch\?v=[0-9A-Za-z_-]{11}")
 
 LOCK_DIR_NAME = "_locks"
 """Where the run locks live: beside the bundles, not inside them.
@@ -516,6 +512,16 @@ class ExclusiveLock:
     path: Path
     fd: int
     released: bool = False
+
+    @staticmethod
+    def record_release_failure(subject: str, error: Exception, during: BaseException) -> None:
+        """Record cleanup failure without replacing the error already in flight."""
+        _bundle_log(
+            "lock_release_failed",
+            subject=subject,
+            error=repr(error),
+            during=type(during).__name__,
+        )
 
     @classmethod
     def take(
@@ -1171,9 +1177,7 @@ class BundleStore:
                 )
             self.sleep(min(LOCK_POLL_SEC, wait_sec - waited))
 
-    def patch_published(
-        self, snapshot: BundleSnapshot, fields: dict[str, Any]
-    ) -> BundleSnapshot:
+    def patch_published(self, snapshot: BundleSnapshot, fields: dict[str, Any]) -> BundleSnapshot:
         """Amend a published **manifest**, keeping it a valid marker throughout.
 
         The amendment goes through the same atomic replace as the original
@@ -1613,8 +1617,7 @@ class BundleStore:
                     bundle_root=bundle_root,
                     bundle_key=key,
                     reason=(
-                        "superseded generation beyond the newest "
-                        f"{policy.keep_generations} kept"
+                        f"superseded generation beyond the newest {policy.keep_generations} kept"
                     ),
                 )
                 for generation in generations
@@ -1922,8 +1925,7 @@ class BundleRun:
 
 
 UNRECLAIMABLE_NOTE = (
-    "no rule can reclaim this directory - remove it by hand once you have "
-    "checked it is Distill's"
+    "no rule can reclaim this directory - remove it by hand once you have checked it is Distill's"
 )
 """What a user has to be told about a directory prune will never propose.
 
@@ -2349,8 +2351,7 @@ def _ownership_marker(directory: Path) -> MarkerVerdict:
         return MarkerVerdict(
             kind="foreign",
             reason=(
-                f"{OWNERSHIP_MARKER_NAME} records bundle key {identity!r}, "
-                f"not {directory.name!r}"
+                f"{OWNERSHIP_MARKER_NAME} records bundle key {identity!r}, not {directory.name!r}"
             ),
             bundle_key=identity,
         )
@@ -2416,9 +2417,7 @@ def _validate_manifest_provenance(value: object) -> None:
     try:
         datetime.fromisoformat(f"{processed_at[:-1]}+00:00")
     except ValueError as exc:
-        raise _invalid_manifest_field(
-            "provenance.processed_at", "RFC3339 UTC string"
-        ) from exc
+        raise _invalid_manifest_field("provenance.processed_at", "RFC3339 UTC string") from exc
 
     for name in PROVENANCE_OPTIONAL_TEXT_FIELDS:
         if name in provenance and not isinstance(provenance[name], str):
@@ -2607,9 +2606,7 @@ def write_manifest(bundle_root: Path, manifest: dict[str, Any]) -> Path:
     is stated about (R-12).
     """
     path = bundle_root / MANIFEST_NAME
-    atomic_write_text(
-        path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", root=bundle_root
-    )
+    atomic_write_text(path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", root=bundle_root)
     return path
 
 
@@ -2867,9 +2864,7 @@ def write_stage_result(
         _unrecordable_stage_result(name, bundle_key, f"write_refused: {errno_name(exc)}")
 
 
-def _recordable_stage_result(
-    path: Path, *, root: Path, stage: str, bundle_key: str
-) -> bool:
+def _recordable_stage_result(path: Path, *, root: Path, stage: str, bundle_key: str) -> bool:
     """Whether a **stage result** may be written at `path`, logging why not.
 
     Two questions, and a refusal to either is a stage result that goes
