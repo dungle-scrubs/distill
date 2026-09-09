@@ -5,8 +5,8 @@ name: Release
 # it points at must already be on main and green under ci.yml. This workflow
 # re-runs the Linux gate as a last check, builds the distributions, and
 # publishes them to PyPI through trusted publishing (OIDC) - no API tokens
-# anywhere. The pending publisher for `distill-video` on pypi.org must name
-# this file (release.yml) and the `pypi` environment.
+# anywhere. The pending publisher for `dungle-scrubs-distill` on pypi.org must
+# name this file (release.yml) and the `pypi` environment.
 on:
   push:
     tags:
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/p/distill-video
+      url: https://pypi.org/p/dungle-scrubs-distill
     permissions:
       id-token: write  # OIDC token for trusted publishing
     steps:

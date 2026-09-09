@@ -21,21 +21,22 @@ screen recordings into LLM agents.
 
 ## Install
 
-> **Package name:** the distribution is published as **`distill-video`** (PyPI / git
-> install), but it installs the **`distill`** Python package and a **`distill`**
-> console script. The CLI you type is `distill`, not `distill-video`.
+> **Package name:** the distribution is published as **`dungle-scrubs-distill`**
+> (PyPI / git install), but it installs the **`distill`** Python package and a
+> **`distill`** console script. The CLI you type is `distill`, not
+> `dungle-scrubs-distill`.
 
 Distill needs Python 3.13+ and a few system tools (next section). From PyPI:
 
 ```bash
 # pip
-pip install distill-video
+pip install dungle-scrubs-distill
 
 # uv, into an existing project
-uv add distill-video
+uv add dungle-scrubs-distill
 
 # uv, as a standalone CLI
-uv tool install distill-video
+uv tool install dungle-scrubs-distill
 ```
 
 To run from a git checkout instead - for development, or for changes not yet
@@ -51,7 +52,7 @@ uv run distill list-tools
 Or add the git URL to an existing uv project:
 
 ```bash
-uv add "distill-video @ git+https://github.com/dungle-scrubs/distill.git"
+uv add "dungle-scrubs-distill @ git+https://github.com/dungle-scrubs/distill.git"
 ```
 
 ### Several vision endpoints
