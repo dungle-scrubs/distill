@@ -20,6 +20,10 @@ htmlcov/
 .env
 .env.*
 
+# Distill's own project artifact directory: run output (published bundles and
+# renders) produced when Distill processes a video inside this repository.
+.distill/
+
 # OS / editor
 .DS_Store
 Thumbs.db
