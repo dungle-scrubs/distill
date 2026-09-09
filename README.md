@@ -1,3 +1,11 @@
+<div align="center">
+  <img
+    src="https://raw.githubusercontent.com/dungle-scrubs/distill/v0.3.0/assets/mark.svg"
+    width="148"
+    alt="Distill mark"
+  />
+</div>
+
 # Distill
 
 Distill converts local videos and personal-use YouTube videos into structured,
@@ -17,17 +25,30 @@ screen recordings into LLM agents.
 > install), but it installs the **`distill`** Python package and a **`distill`**
 > console script. The CLI you type is `distill`, not `distill-video`.
 
-Distill needs Python 3.13+ and a few system tools. With [uv](https://docs.astral.sh/uv/) installed:
+Distill needs Python 3.13+ and a few system tools (next section). From PyPI:
 
 ```bash
-# clone
+# pip
+pip install distill-video
+
+# uv, into an existing project
+uv add distill-video
+
+# uv, as a standalone CLI
+uv tool install distill-video
+```
+
+To run from a git checkout instead - for development, or for changes not yet
+released:
+
+```bash
 git clone https://github.com/dungle-scrubs/distill.git
 cd distill
 uv sync
 uv run distill list-tools
 ```
 
-Or add it to an existing uv project:
+Or add the git URL to an existing uv project:
 
 ```bash
 uv add "distill-video @ git+https://github.com/dungle-scrubs/distill.git"
@@ -78,9 +99,10 @@ value).
 ### System dependencies
 
 Install system tools with your platform's package manager. The `yt-dlp` Python
-dependency installs its executable in Distill's environment during `uv sync`;
-Distill invokes that executable through `PATH`. Use `uv run distill` in a source
-checkout so this environment is active. Distill installs no tools at runtime:
+dependency installs its executable in Distill's environment during
+installation; Distill invokes that executable through `PATH`, so an installed
+Distill has it, and a source checkout needs `uv run distill` for that
+environment to be active. Distill installs no tools at runtime:
 
 | Tool | Capability | Class | Install |
 | --- | --- | --- | --- |
