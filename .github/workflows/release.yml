@@ -1,0 +1,87 @@
+name: Release
+
+# A tag push is the release trigger: the tag must name the version being
+# published (vX.Y.Z, checked against DISTILL_VERSION below), and the commit
+# it points at must already be on main and green under ci.yml. This workflow
+# re-runs the Linux gate as a last check, builds the distributions, and
+# publishes them to PyPI through trusted publishing (OIDC) - no API tokens
+# anywhere. The pending publisher for `distill-video` on pypi.org must name
+# this file (release.yml) and the `pypi` environment.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      # Same provisioning as ci.yml: ffmpeg and tesseract make the coverage
+      # floor measure the real extraction and OCR paths, not the skip branches.
+      - name: Install optional capabilities (ffmpeg, tesseract)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg tesseract-ocr
+
+      - name: Check tag matches DISTILL_VERSION
+        run: |
+          v="$(uv run python -c 'from distill.release import DISTILL_VERSION; print(DISTILL_VERSION)')"
+          test "${GITHUB_REF_NAME}" = "v${v}"
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Format check (ruff)
+        run: uv run ruff format --check .
+
+      - name: Type check (ty)
+        run: uv run ty check
+
+      - name: Test (pytest, with coverage floor)
+        run: uv run pytest --cov --cov-fail-under=80
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check metadata
+        run: uvx twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/distill-video
+    permissions:
+      id-token: write  # OIDC token for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
