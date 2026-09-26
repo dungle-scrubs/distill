@@ -5,6 +5,60 @@ All notable changes to Distill are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-26
+
+### Added
+
+- **X (Twitter) posts as a source kind: `process-x-video`.** One post's video
+  becomes a bundle like any other source. Accepted URL forms are the post
+  forms on `x.com` and `twitter.com`; `/video/N` and `/photo/N` suffixes are
+  refused. A post carrying several videos is processed as its **first**
+  video, pinned by `--playlist-items 1`, with a `multi_video_post` warning
+  counting the rest. The **source fingerprint** hashes the status id read
+  from the URL, in a domain distinct from YouTube's (sha256 over an `x:`
+  prefix) - the extractor's resolved media id never participates, because a
+  quote tweet resolves to the quoted media's id. Consequences: a cache hit
+  for a post URL invokes no yt-dlp, a post and a post that quotes it produce
+  two bundles, and re-keying after an upgrade needs no tool installed
+  (ADR-0008).
+- **`--cookies` and `--cookies-from-browser`** on every remote-processing
+  command: session authentication passed through to yt-dlp. Both are
+  `cache_key=False` machine-local claims - they reach yt-dlp's arguments and
+  never the options hash or a manifest. X usually serves video only to
+  authenticated sessions; guest access is what a run without these does.
+- **`distill guide [topic]`**: run-time guidance for callers and agents as
+  JSON with the text under `markdown`. Topics: `sources`, `vision`, `cache`,
+  `consuming`. The guide module is exempt from the pipeline signature
+  (printed output, never bundle content) and its claims are held by tests,
+  including one that derives every registered `process-*` command from the
+  parser.
+- **`visual_extraction` in every processing response**: mode (`vision`,
+  `ocr_only`, `none`), frames total, frames carrying readings, frames
+  carrying OCR text, and - when the mode is not `vision` - advice naming
+  what a differently-configured run would add. Derived from the frame
+  documents, so a cache hit and a fresh run answer identically.
+
+### Changed
+
+- `YoutubeDownloader` is `YtDlpDownloader`, parametrized by stage, label and
+  download arguments, so an X run labels its errors, locks and progress as X
+  (`x_download`) rather than as YouTube. `SourceInfo.youtube_video_id` and
+  `youtube_lock_key` are `remote_source_id` and `remote_lock_key`.
+- Manifest validation accepts the X canonical URL
+  (`https://x.com/i/web/status/<id>`) beside the YouTube watch URL.
+- An X download's progress reports under the `x_download` mechanism, weighted
+  like `youtube_download`.
+
+### Re-keying
+
+- **Every cache reprocesses on first run.** The pipeline version moves 75 →
+  78: the X source kind, the response field, and the progress weight each
+  earn a bump, and the release itself moves `DISTILL_VERSION`, which is
+  stamped into every manifest. Old bundles stay on disk under their old keys
+  until pruned. The new `cookies` and `cookies_from_browser` options do not
+  re-key anything: they are machine-local claims and sit outside the options
+  hash.
+
 ## [Unreleased]
 
 The remediation of the 0.1.0 audit. Pre-1.0 and with no dependents, so on-disk
