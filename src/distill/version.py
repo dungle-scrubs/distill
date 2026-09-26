@@ -25,7 +25,7 @@ the cryptographic sense, and nothing verifies who produced it.
 
 from __future__ import annotations
 
-PIPELINE_VERSION = 75
+PIPELINE_VERSION = 77
 
 # Output-affecting source files covered by PIPELINE_SIGNATURE, named by their
 # path relative to `src/distill/` in posix form so that modules in subpackages
@@ -76,6 +76,11 @@ SIGNED_MODULES = (
     # unsigned - not affecting output is, and this decides output.
     "vision_chain.py",
     "vision_prompts.py",
+    # The X client: owns how a post URL is parsed into the status id the
+    # **source fingerprint** hashes (ADR-0008) and what provenance is read
+    # from a post. Editing it changes which bundle an X URL resolves to and
+    # what that bundle records.
+    "x_twitter.py",
     "youtube.py",
 )
 
@@ -119,6 +124,15 @@ EXEMPT_MODULES: dict[str, str] = {
         "mode that stored the view beside the generation would make the module "
         "signed."
     ),
+    "guide.py": (
+        "Prints run-time guidance for the caller (`distill guide [topic]`). It "
+        "writes nothing and reaches no bundle write path: its markdown exists "
+        "under no bundle key, enters no manifest, and is never read back as "
+        "pipeline input, so nothing it renders can make a served bundle differ "
+        "from what the current code would produce. Printed-to-caller is what "
+        "this exemption rests on; a mode that recorded the text into a bundle "
+        "or a manifest would make the module signed."
+    ),
     "job_store.py": (
         "Owns job records and their identifier domain, written under the cache "
         "root's _jobs/ directory. Those records live outside every bundle "
@@ -146,4 +160,4 @@ EXEMPT_MODULES: dict[str, str] = {
 }
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "5355d5360639dffdd2c4c32a21cf15df284c76af9c30a451fea881459998596d"
+PIPELINE_SIGNATURE = "f7d80d2e506affda0a29732e3b62398fe1d9a165e9477cee86545962367d2d98"

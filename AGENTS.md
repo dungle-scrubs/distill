@@ -22,13 +22,21 @@ One scope inside that scope: a YouTube run can only skip `yt-dlp` when the
 `source.youtube_fast_path_video_id` decides. It declines a URL that also names a
 playlist, one whose id is not exactly eleven id characters, and one that names
 more than one video - each of those is resolved by `yt-dlp` before the cache is
-consulted, so a run of one needs the tool with or without a bundle on disk.
+consulted, so a run of one needs the tool with or without a bundle on disk. An
+X run has no such scope: its **bundle key** is keyed on the status id the URL
+carries (ADR-0008), so the fast path holds for every post URL that parses, and
+`yt-dlp` is needed only to produce a **generation**. A post carrying several
+videos is processed as its first video, pinned by `--playlist-items 1`. X
+usually serves video only to authenticated sessions, so the `cookies` and
+`cookies_from_browser` options (`cache_key=False`, like any **machine-local
+claim**) pass through to yt-dlp's argv and reach no **bundle**; guest access is
+what a run without them does.
 
 | Tool | Capability | Class | What its absence costs |
 | --- | --- | --- | --- |
 | `ffmpeg` | audio extraction and keyframe extraction | required | no audio can be extracted and no keyframe can be captured, which leaves a generation with neither a transcript nor frame artifacts and no usable bundle to publish |
 | `ffprobe` | source duration probing | required | the source's duration cannot be read, so keyframe timestamps and the duration cap have nothing to work from and the run ends before any stage produces output |
-| `yt-dlp` | YouTube source acquisition and metadata | required | the source cannot be acquired at all, so a YouTube run has nothing to process |
+| `yt-dlp` | YouTube and X source acquisition and metadata | required | the source cannot be acquired at all, so a YouTube or X run has nothing to process |
 | `tesseract` | image-text extraction from keyframes | optional | keyframes contribute no extracted text, so interpretations cannot be corroborated and grounding falls back to the vision model alone; the transcript, keyframes and render are unaffected |
 
 A call site that catches a missing tool asks `missing_tool_consequence` what the
@@ -162,6 +170,6 @@ tool, and it is not a security control.
   and `uv run ty check`.
 - Vision tests fake Rapid-MLX by monkeypatching `distill.rapid_mlx._urlopen_json`
   or passing `requestor=` to the transport operations. Stage tests inject
-  dependencies into `ProcessingRun`, `YoutubeDownloader`, and `FrameInterpreter`.
+  dependencies into `ProcessingRun`, `YtDlpDownloader`, and `FrameInterpreter`.
   Never hit a real server in the default suite.
 - The live smoke test is gated behind `DISTILL_RUN_RAPID_MLX_SMOKE=1`.

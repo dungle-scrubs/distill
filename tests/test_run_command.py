@@ -1355,6 +1355,7 @@ def test_the_package_has_call_sites_to_check() -> None:
         "media_inspect.py",
         "ocr.py",
         "transcript.py",
+        "x_twitter.py",
         "youtube.py",
     }
 

@@ -246,7 +246,18 @@ PROVENANCE_OPTIONAL_TEXT_FIELDS = (
     "upload_date",
 )
 PROVENANCE_RFC3339_UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z")
-PROVENANCE_CANONICAL_URL_RE = re.compile(r"https://www\.youtube\.com/watch\?v=[0-9A-Za-z_-]{11}")
+# One alternative per remote kind, each the canonical form its client builds:
+# a YouTube watch URL carrying the eleven-character id, and an X status URL
+# carrying the status id (`/i/web/status/` needs no screen name, so it is the
+# canonical form for every post). A kind added without its alternative here
+# fails every manifest it publishes, which is the point.
+PROVENANCE_CANONICAL_URL_RE = re.compile(
+    r"(?:"
+    r"https://www\.youtube\.com/watch\?v=[0-9A-Za-z_-]{11}"
+    r"|"
+    r"https://x\.com/i/web/status/[0-9]+"
+    r")"
+)
 
 LOCK_DIR_NAME = "_locks"
 """Where the run locks live: beside the bundles, not inside them.
@@ -2430,7 +2441,7 @@ def _validate_manifest_provenance(value: object) -> None:
     ):
         raise _invalid_manifest_field(
             "provenance.canonical_url",
-            "canonical YouTube watch URL",
+            "canonical source URL",
         )
 
 

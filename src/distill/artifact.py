@@ -107,7 +107,7 @@ def resolve_artifact_dir(
     return root / "distill" / "artifacts"
 
 
-def artifact_entry_name(youtube_video_id: str | None, fingerprint: str, stem: str) -> str:
+def artifact_entry_name(remote_source_id: str | None, fingerprint: str, stem: str) -> str:
     """The artifact's filename stem: stable across runs of the same source.
 
     A YouTube id already names the recording uniquely and reads well in a
@@ -129,8 +129,8 @@ def artifact_entry_name(youtube_video_id: str | None, fingerprint: str, stem: st
     `--no-redact-secrets` governs what the operator sees inside their own
     reading, never what gets written as a filename beside it.
     """
-    if youtube_video_id:
-        return _safe_name(youtube_video_id) or _safe_name(fingerprint[:_FINGERPRINT_CHARACTERS])
+    if remote_source_id:
+        return _safe_name(remote_source_id) or _safe_name(fingerprint[:_FINGERPRINT_CHARACTERS])
     suffix = _safe_name(fingerprint[:_FINGERPRINT_CHARACTERS])
     safe_stem = _capped(_safe_name(redact_text(stem).text))
     return f"{safe_stem}-{suffix}" if safe_stem else suffix

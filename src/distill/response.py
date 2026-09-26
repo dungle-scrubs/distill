@@ -216,6 +216,49 @@ def frame_carrier_document(document: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def visual_extraction(frames: list[dict[str, Any]]) -> dict[str, Any]:
+    """What the visual stage extracted for this generation, with advice when thin.
+
+    One object answering the question callers otherwise miss: did the frames
+    get read as images, or only OCR'd for literal text, or neither? The mode
+    is derived from the frame documents themselves - the manifest of a cache
+    hit and the response of a fresh run describe the same generation, so both
+    answer identically. `advice` states, in Distill's own words, what a
+    differently-configured run would add; it is `None` when nothing is
+    missing. Advice is guidance about a configuration choice, never content:
+    nothing here enters the untrusted-data boundary.
+    """
+    readings = sum(
+        1 for frame in frames if document_carries_a_reading(frame.get("visual_interpretation"))
+    )
+    ocr_count = sum(1 for frame in frames if str(frame.get("ocr_text") or "").strip())
+    if readings:
+        mode = "vision"
+        advice = None
+    elif ocr_count:
+        mode = "ocr_only"
+        advice = (
+            "frames carry OCR text only. A run with caption frames enabled and a "
+            "reachable vision endpoint publishes a different bundle whose frames "
+            "carry per-frame interpretations (the vision model is identity-affecting, "
+            "so the re-run is a new bundle key, not an overwrite)."
+        )
+    else:
+        mode = "none"
+        advice = (
+            "frames carry no extracted text and no readings. Re-run with OCR enabled, "
+            "and with caption frames plus a reachable vision endpoint, to add frame "
+            "text and per-frame interpretations."
+        )
+    return {
+        "mode": mode,
+        "frames_total": len(frames),
+        "frames_with_readings": readings,
+        "frames_with_ocr_text": ocr_count,
+        "advice": advice,
+    }
+
+
 def run_response(
     snapshot: BundleSnapshot,
     source: SourceInfo,
@@ -288,6 +331,7 @@ def run_response(
         "distill_version": DISTILL_VERSION,
         "job_id": job_id,
         "summary": summary,
+        "visual_extraction": visual_extraction(frames),
         "warnings": warnings,
     }
     related_links = response_related_links(source.related_links)

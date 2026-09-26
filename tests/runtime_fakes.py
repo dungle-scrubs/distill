@@ -35,6 +35,6 @@ def configure_run(monkeypatch: pytest.MonkeyPatch, **dependencies: Any) -> None:
 
 def configure_downloader(monkeypatch: pytest.MonkeyPatch, **dependencies: Any) -> None:
     """Use the same configured constructor for direct and source-resolution tests."""
-    constructor = acquisition.YoutubeDownloader
+    constructor = acquisition.YtDlpDownloader
     factory = partial(constructor, **dependencies)
-    monkeypatch.setattr(acquisition, "YoutubeDownloader", factory)
+    monkeypatch.setattr(acquisition, "YtDlpDownloader", factory)

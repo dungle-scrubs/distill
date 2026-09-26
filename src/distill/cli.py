@@ -37,6 +37,7 @@ import sys
 from typing import Any, NoReturn
 
 from .errors import INTERNAL_CODE, INTERNAL_STAGE, DistillError
+from .guide import guide_payload
 from .options import OPTION_SPECS, PROCESSING_OPTION_NAMES
 from .pipeline import (
     DistillSession,
@@ -303,6 +304,12 @@ def build_parser() -> argparse.ArgumentParser:
     youtube.add_argument("url")
     _add_common_processing_options(youtube)
 
+    x_video = subcommands.add_parser(
+        "process-x-video", help="Process the first video of one X (Twitter) post URL"
+    )
+    x_video.add_argument("url")
+    _add_common_processing_options(x_video)
+
     directory = subcommands.add_parser(
         "process-video-directory", help="Process videos in a directory"
     )
@@ -368,6 +375,11 @@ def build_parser() -> argparse.ArgumentParser:
     vision = subcommands.add_parser("local-vision-diagnostics", help="Probe local vision settings")
     _add_common_processing_options(vision, LOCAL_VISION_DIAGNOSTIC_KEYS)
 
+    guide = subcommands.add_parser(
+        "guide", help="Print agent-oriented usage guidance as JSON with the text under 'markdown'"
+    )
+    guide.add_argument("topic", nargs="?", help="One of: sources, vision, cache, consuming")
+
     raw = subcommands.add_parser(
         "call-tool", help="Call a package tool by MCP-style name and JSON args"
     )
@@ -400,6 +412,13 @@ def _dispatch(argv: list[str] | None) -> None:
         _print_json(
             call_registered_tool(
                 "process_youtube_video",
+                {**_args_payload(args, PROCESSING_KEYS), "url": args.url},
+            )
+        )
+    elif args.command == "process-x-video":
+        _print_json(
+            call_registered_tool(
+                "process_x_video",
                 {**_args_payload(args, PROCESSING_KEYS), "url": args.url},
             )
         )
@@ -440,6 +459,8 @@ def _dispatch(argv: list[str] | None) -> None:
     elif args.command == "local-vision-diagnostics":
         payload = _args_payload(args, LOCAL_VISION_DIAGNOSTIC_KEYS)
         _print_json(local_vision_diagnostics(payload))
+    elif args.command == "guide":
+        _print_json(guide_payload(args.topic))
     elif args.command == "call-tool":
         response = DistillSession().call_tool(args.tool, _tool_args(args.args))
         # The session speaks the MCP envelope, where a failure is a result

@@ -13,7 +13,7 @@ import pytest
 from fake_tools import FAKE_FFPROBE
 
 from distill import source_identity
-from distill.acquisition import AcquiredSource, AcquisitionLease, YouTubeDownloaderProtocol
+from distill.acquisition import AcquiredSource, AcquisitionLease, RemoteDownloaderProtocol
 from distill.artifacts import (
     Carrier,
     Provenance,
@@ -440,7 +440,7 @@ def test_youtube_resolution_reuses_one_request_for_cache_and_acquisition(
         def resolve(
             self,
             request: SourceRequest,
-            downloader: YouTubeDownloaderProtocol | None = None,
+            downloader: RemoteDownloaderProtocol | None = None,
             metadata: YouTubeMetadata | None = None,
         ) -> SourceInfo:
             _ = (downloader, metadata)
@@ -456,7 +456,7 @@ def test_youtube_resolution_reuses_one_request_for_cache_and_acquisition(
 
     monkeypatch.setattr(
         "distill.youtube.youtube_metadata",
-        lambda _url: YouTubeMetadata("abcdefghijk", "", []),
+        lambda _url, *extra: YouTubeMetadata("abcdefghijk", "", []),
     )
     resolver = SourceResolver(youtube=RecordingProvider())
 

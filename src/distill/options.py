@@ -70,6 +70,12 @@ OPTION_SPECS: tuple[OptionSpec, ...] = (
     OptionSpec("max_static_window_sec", 90.0, float),
     OptionSpec("cache_mode", "fingerprint", str, cache_key=False),
     OptionSpec("output_dir", None, lambda value: value, cache_key=False),
+    # yt-dlp authentication for remote sources (X video needs it in practice;
+    # see ADR-0008). cache_key=False because a credential is a **machine-local
+    # claim**: which jar a run authenticated from does not describe what the
+    # run produced, and must not re-key bundles or reach a manifest.
+    OptionSpec("cookies", None, lambda value: value, cache_key=False),
+    OptionSpec("cookies_from_browser", None, lambda value: value, cache_key=False),
     # Where the deliverable goes, as distinct from where derived state lives.
     # cache_key=False for the same reason output_dir is: moving the artifact
     # does not change what the run produced.
@@ -413,6 +419,8 @@ class DistillOptions:
     max_static_window_sec: float = 90.0
     cache_mode: str = "fingerprint"
     output_dir: str | None = None
+    cookies: str | None = None
+    cookies_from_browser: str | None = None
     artifact_dir: str | None = None
     force_reprocess: bool = False
     caption_frames: bool = True

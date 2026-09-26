@@ -23,7 +23,7 @@ from distill import source_identity
 from distill.acquisition import (
     AcquiredSource,
     AcquisitionLease,
-    YoutubeDownloader,
+    YtDlpDownloader,
     parse_byte_amount,
     parse_ytdlp_progress,
 )
@@ -640,7 +640,7 @@ def test_youtube_source_info_carries_the_lease_into_the_read(
     monkeypatch.setattr("distill.acquisition.check_disk_floor", lambda _path: None)
     monkeypatch.setattr(
         "distill.youtube.youtube_metadata",
-        lambda _url: YouTubeMetadata(
+        lambda _url, *extra: YouTubeMetadata(
             video_id="abc123",
             description=(
                 "Skill repo: https://github.com/example/catch-me-up\n"
@@ -710,7 +710,7 @@ def test_youtube_lock_wait_ends_in_the_lease_and_a_warning(tmp_path: Path) -> No
     lock = tmp_path / "video.lock"
     held = AcquisitionLease.take("video", lock)
     assert held is not None
-    downloader = YoutubeDownloader(
+    downloader = YtDlpDownloader(
         tmp_path,
         lock_wait_sec=10.0,
         lock_poll_sec=0.005,
@@ -739,7 +739,7 @@ def test_youtube_lock_wait_that_runs_out_denies_the_lease(tmp_path: Path) -> Non
     lock = tmp_path / "video.lock"
     held = AcquisitionLease.take("video", lock)
     assert held is not None
-    downloader = YoutubeDownloader(
+    downloader = YtDlpDownloader(
         tmp_path,
         lock_wait_sec=0.02,
         lock_poll_sec=0.005,
@@ -768,9 +768,7 @@ def test_ytdlp_download_progress_is_read_from_stdout(
     fake_tool("ffprobe", FAKE_FFPROBE)
     progress = ProgressReporter()
 
-    YoutubeDownloader(tmp_path).acquire(
-        "https://youtu.be/abc123", "abc123", progress
-    ).lease.release()
+    YtDlpDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123", progress).lease.release()
 
     # The two leading Nones are the lock step and yt-dlp's indeterminate
     # "Destination:" line; every percent after them came off stdout.
@@ -795,7 +793,7 @@ def test_ytdlp_download_progress_percent_advances(
     monkeypatch.setenv("FAKE_YTDLP_ARGV_FILE", str(argv_file))
     progress = ProgressReporter()
 
-    acquired = YoutubeDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123", progress)
+    acquired = YtDlpDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123", progress)
 
     assert acquired.path.name == "source.mp4"
     argv = literal_eval(argv_file.read_text())
@@ -826,7 +824,7 @@ def test_ytdlp_download_emits_a_boundary_event(
     fake_tool("ffprobe", FAKE_FFPROBE)
 
     with caplog.at_level(logging.DEBUG, logger="distill.run_command"):
-        YoutubeDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123").lease.release()
+        YtDlpDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123").lease.release()
 
     events = [json.loads(record.message) for record in caplog.records]
     # yt-dlp fetches the media; ffprobe is the validation that gates promotion.
@@ -859,7 +857,7 @@ def test_youtube_downloader_preserves_ytdlp_error(
 ) -> None:
     """A failed download raises E_YTDLP carrying run_command's failure payload."""
     fake_tool("yt-dlp", FAKE_YTDLP_FAILING)
-    downloader = YoutubeDownloader(tmp_path)
+    downloader = YtDlpDownloader(tmp_path)
 
     with pytest.raises(DistillError) as exc:
         downloader.acquire("https://youtu.be/abc123", "abc123", ProgressReporter())
@@ -883,7 +881,7 @@ def test_youtube_downloader_releases_its_lock_when_ytdlp_fails(
     fake_tool("yt-dlp", FAKE_YTDLP_FAILING)
 
     with pytest.raises(DistillError):
-        YoutubeDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123")
+        YtDlpDownloader(tmp_path).acquire("https://youtu.be/abc123", "abc123")
 
     # The lock file stays where it is; what a release gives up is the lock the
     # kernel granted, and that is what the next run needs to find free.

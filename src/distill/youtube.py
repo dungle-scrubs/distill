@@ -258,9 +258,32 @@ def _first_description_paragraph(description: str) -> str:
     return re.split(r"(?:\u2029|\n[ \t]*\n)", normalized.strip(), maxsplit=1)[0]
 
 
-def youtube_description(url: str) -> tuple[str, list[WarningRecord]]:
+def ytdlp_auth_args(cookies: str | None, cookies_from_browser: str | None) -> list[str]:
+    """The yt-dlp arguments that authenticate one run, from **machine-local claims**.
+
+    A cookie jar is the credential of the operator's own session, so it travels
+    the same road as a **vision endpoint**'s credential: it reaches the tool's
+    argv and nothing else - never the **options hash**, never a **manifest**
+    (its option is `cache_key=False`), because which jar authenticated a run
+    does not describe what the run produced (ADR-0004, ADR-0008). Both sources
+    may be given; yt-dlp merges the jars. Neither is also fine - guest
+    extraction is what a run without these does.
+    """
+    args: list[str] = []
+    if cookies:
+        args += ["--cookies", cookies]
+    if cookies_from_browser:
+        args += ["--cookies-from-browser", cookies_from_browser]
+    return args
+
+
+def youtube_description(
+    url: str, extra_args: list[str] | None = None
+) -> tuple[str, list[WarningRecord]]:
     try:
-        proc = _run_ytdlp(["--skip-download", "--print", "%(description)s"], url)
+        proc = _run_ytdlp(
+            [*(extra_args or []), "--skip-download", "--print", "%(description)s"], url
+        )
     except DistillError as exc:
         # An absent tool is the capability table's decision here too. The
         # description being best-effort does not make an absent yt-dlp a
@@ -275,9 +298,9 @@ def youtube_description(url: str) -> tuple[str, list[WarningRecord]]:
     return proc.stdout.strip(), list(proc.warnings)
 
 
-def youtube_metadata(url: str) -> YouTubeMetadata:
+def youtube_metadata(url: str, extra_args: list[str] | None = None) -> YouTubeMetadata:
     try:
-        proc = _run_ytdlp(["--skip-download", "--dump-json"], url)
+        proc = _run_ytdlp([*(extra_args or []), "--skip-download", "--dump-json"], url)
     except DistillError:
         video_id = youtube_fast_path_video_id(url)
         if video_id is None:
@@ -317,8 +340,8 @@ def youtube_metadata(url: str) -> YouTubeMetadata:
             description="",
             warnings=[*probe_warnings, _metadata_unavailable()],
         )
-    video_id = canonical_youtube_id(url)
-    description, metadata_warnings = youtube_description(url)
+    video_id = canonical_youtube_id(url, extra_args)
+    description, metadata_warnings = youtube_description(url, extra_args)
     return YouTubeMetadata(
         video_id=video_id,
         description=description,
@@ -326,9 +349,9 @@ def youtube_metadata(url: str) -> YouTubeMetadata:
     )
 
 
-def canonical_youtube_id(url: str) -> str:
+def canonical_youtube_id(url: str, extra_args: list[str] | None = None) -> str:
     parse_youtube_url(url)
-    proc = _run_ytdlp(["--simulate", "--print", "id"], url)
+    proc = _run_ytdlp([*(extra_args or []), "--simulate", "--print", "id"], url)
     if proc.returncode != 0:
         raise DistillError(
             "E_YTDLP",
@@ -343,12 +366,18 @@ def canonical_youtube_id(url: str) -> str:
     return video_id
 
 
-def youtube_playlist_urls(url: str, max_items: int) -> list[str]:
+def youtube_playlist_urls(
+    url: str, max_items: int, extra_args: list[str] | None = None
+) -> list[str]:
     # _run_ytdlp adds `--socket-timeout`, a `--` terminator before the URL, and
     # maps a missing/hung yt-dlp onto clean errors. `names_one_video=False` is
     # the one call in Distill whose subject really is a playlist: the default
     # would have this enumerate a single video.
-    proc = _run_ytdlp(["--flat-playlist", "--print", "webpage_url"], url, names_one_video=False)
+    proc = _run_ytdlp(
+        [*(extra_args or []), "--flat-playlist", "--print", "webpage_url"],
+        url,
+        names_one_video=False,
+    )
     if proc.returncode != 0:
         raise DistillError(
             "E_YTDLP",

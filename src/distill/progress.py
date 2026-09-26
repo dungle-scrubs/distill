@@ -88,6 +88,10 @@ DEFAULT_MECHANISM_WEIGHTS: tuple[MechanismWeight, ...] = (
     MechanismWeight("cache_lookup", 1.0),
     MechanismWeight("source_fingerprint", 4.0),
     MechanismWeight("youtube_download", 15.0),
+    # One weight per remote kind's mechanism, derived in the downloader as
+    # `{stage}_download`. Both name "download a remote source", which is why
+    # they carry the same share.
+    MechanismWeight("x_download", 15.0),
     MechanismWeight("duration_probe", 1.0),
     MechanismWeight("audio_extraction", 8.0),
     MechanismWeight("transcription", 35.0),

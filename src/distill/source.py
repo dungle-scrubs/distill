@@ -66,7 +66,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from . import acquisition, media_inspect, source_identity, youtube
+from . import acquisition, media_inspect, source_identity, x_twitter, youtube
 from .artifacts import Provenance, RedactionState, document_carries_a_reading
 from .bundle_store import (
     SINGLE_SOURCE_LOCK_WAIT_SEC,
@@ -109,8 +109,12 @@ class SourceInfo:
     source_hash: str
     warnings: list[WarningRecord]
     provenance: Provenance | None = None
-    youtube_video_id: str | None = None
-    youtube_lock_key: str | None = None
+    remote_source_id: str | None = None
+    """The id the remote kind names its media by - a YouTube video id, or an
+    X status id. Used for the artifact filename and cache diagnostics, never
+    for identity: the **source fingerprint** is the identity, and where each
+    kind's id comes from is its client's to say (ADR-0008)."""
+    remote_lock_key: str | None = None
     resolved_options: DistillOptions | None = None
     """The options as the **endpoint chain** walk settled them, if it ran.
 
@@ -688,12 +692,26 @@ def _manifest_related_links(
     ]
 
 
+def _canonical_remote_url(source_type: str, remote_source_id: str) -> str:
+    """The canonical URL one remote kind builds for its own id.
+
+    Named once because two places build it - a fresh resolution and a cache
+    hit rebuilding **provenance** from a **manifest** - and the second must
+    not disagree with the first about what "canonical" means. The X form uses
+    `/i/web/status/` because it needs no screen name; every post has an id.
+    """
+    if source_type == "x":
+        return f"https://x.com/i/web/status/{remote_source_id}"
+    return f"https://www.youtube.com/watch?v={remote_source_id}"
+
+
 def _manifest_provenance(
     manifest: Mapping[str, Any],
     options: DistillOptions,
     *,
     duration_sec: float,
     processed_at: str,
+    source_type: str,
     video_id: str,
 ) -> Provenance:
     """Rebuild cached provenance as a carrier under this run's policy."""
@@ -710,7 +728,7 @@ def _manifest_provenance(
         description=optional_string("description"),
         upload_date=optional_string("upload_date"),
         canonical_url=(
-            optional_string("canonical_url") or f"https://www.youtube.com/watch?v={video_id}"
+            optional_string("canonical_url") or _canonical_remote_url(source_type, video_id)
         ),
         duration_sec=duration_sec,
         processed_at=optional_string("processed_at") or processed_at,
@@ -748,7 +766,17 @@ class YouTubeSourceProvider:
             served = self.cached_for_video_id(request, url_video_id)
             if served is not None:
                 return served
-        return self.cached_for_video_id(request, youtube.canonical_youtube_id(request.value))
+        # The miss path asks yt-dlp for the canonical id, so it authenticates
+        # like the run that produces would.
+        return self.cached_for_video_id(
+            request,
+            youtube.canonical_youtube_id(
+                request.value,
+                youtube.ytdlp_auth_args(
+                    request.options.cookies, request.options.cookies_from_browser
+                ),
+            ),
+        )
 
     def cached_for_video_id(self, request: SourceRequest, video_id: str) -> SourceInfo | None:
         """The servable **bundle** one video id names, or `None` for a miss.
@@ -801,17 +829,18 @@ class YouTubeSourceProvider:
                 request.options,
                 duration_sec=duration,
                 processed_at=request.processed_at,
+                source_type="youtube",
                 video_id=video_id,
             ),
-            youtube_video_id=video_id,
-            youtube_lock_key=source_identity.youtube_lock_key(video_id),
+            remote_source_id=video_id,
+            remote_lock_key=source_identity.youtube_lock_key(video_id),
             related_links=_manifest_related_links(manifest, request.options),
         )
 
     def resolve(
         self,
         request: SourceRequest,
-        downloader: acquisition.YouTubeDownloaderProtocol | None = None,
+        downloader: acquisition.RemoteDownloaderProtocol | None = None,
         metadata: youtube.YouTubeMetadata | None = None,
     ) -> SourceInfo:
         if request.output_root is None:
@@ -824,7 +853,10 @@ class YouTubeSourceProvider:
         acquisition.check_disk_floor(output_root)
         if progress:
             progress.update("youtube_download", status="running", detail={"step": "resolve_id"})
-        metadata = metadata or youtube.youtube_metadata(request.value)
+        metadata = metadata or youtube.youtube_metadata(
+            request.value,
+            youtube.ytdlp_auth_args(options.cookies, options.cookies_from_browser),
+        )
         video_id = metadata.video_id
         lock_key = source_identity.youtube_lock_key(video_id)
         fingerprint = source_identity.youtube_fingerprint(video_id)
@@ -834,8 +866,10 @@ class YouTubeSourceProvider:
         resolution = _resolved_for(options, fingerprint, "youtube", output_root)
         options = resolution.options
         source = source_identity.bundle_key(fingerprint, resolution.opts_hash)
-        downloader = downloader or acquisition.YoutubeDownloader(
-            output_root, lock_wait_sec=request.lock_wait_sec
+        downloader = downloader or acquisition.YtDlpDownloader(
+            output_root,
+            download_args=youtube.ytdlp_auth_args(options.cookies, options.cookies_from_browser),
+            lock_wait_sec=request.lock_wait_sec,
         )
         acquired = downloader.acquire(request.value, lock_key, progress)
         # Everything from here reads the acquired media, so every failure has to
@@ -878,7 +912,7 @@ class YouTubeSourceProvider:
                 channel=metadata.channel,
                 description=youtube._first_description_paragraph(metadata.description) or None,
                 upload_date=metadata.upload_date,
-                canonical_url=f"https://www.youtube.com/watch?v={video_id}",
+                canonical_url=_canonical_remote_url("youtube", video_id),
                 duration_sec=duration,
                 processed_at=request.processed_at,
                 redaction=(
@@ -900,8 +934,158 @@ class YouTubeSourceProvider:
             warnings=warnings,
             provenance=provenance,
             resolved_options=options,
-            youtube_video_id=video_id,
-            youtube_lock_key=lock_key,
+            remote_source_id=video_id,
+            remote_lock_key=lock_key,
+            related_links=related_links,
+            acquisition_lease=acquired.lease,
+        )
+
+
+class XSourceProvider:
+    """Resolve one X **source**: a post's first video, keyed by the URL's id.
+
+    The shape mirrors `YouTubeSourceProvider` - cache before acquisition, the
+    chain walk settles the **bundle key**, the downloader stages and promotes -
+    but the identity rule is the one ADR-0008 records: the **source
+    fingerprint** hashes the status id the URL carries, and the id yt-dlp's
+    metadata reports is never read. That is what keeps a cache hit free of
+    yt-dlp, and it is why there is no canonical-id second lookup the way the
+    YouTube provider has: the URL id is the published id by construction.
+    """
+
+    def cached_for_status_id(self, request: SourceRequest, status_id: str) -> SourceInfo | None:
+        """The servable **bundle** one status id names, or `None` for a miss.
+
+        The same question `YouTubeSourceProvider.cached_for_video_id` asks, and
+        it is answered from the store's `load_active` for the same reason: a
+        **manifest** naming a retention-deleted **generation** is a promise, not
+        evidence. The duration cap applies here on the same terms - one policy
+        cannot answer differently by kind of **source**.
+        """
+        if request.output_root is None:
+            raise DistillError("E_BAD_OUTPUT_DIR", "x", "output_root is required")
+        fingerprint = source_identity.x_status_fingerprint(status_id)
+        resolution = _resolved_for(request.options, fingerprint, "x", request.output_root)
+        sh = source_identity.bundle_key(fingerprint, resolution.opts_hash)
+        snapshot = BundleStore.open(request.output_root).load_active(sh)
+        if snapshot is None:
+            return None
+        manifest = snapshot.manifest
+        duration = media_inspect.manifest_duration(manifest)
+        resolved_path = manifest.get("source_resolved_path")
+        if duration is None or not isinstance(resolved_path, str):
+            return None
+        media_inspect.ensure_duration_allowed(duration, request.options.max_duration_sec)
+        return SourceInfo(
+            source_type="x",
+            resolved_path=Path(resolved_path),
+            duration_sec=duration,
+            source_fingerprint=fingerprint,
+            source_hash=sh,
+            warnings=[],
+            provenance=_manifest_provenance(
+                manifest,
+                request.options,
+                duration_sec=duration,
+                processed_at=request.processed_at,
+                source_type="x",
+                video_id=status_id,
+            ),
+            remote_source_id=status_id,
+            remote_lock_key=source_identity.x_status_lock_key(status_id),
+            related_links=_manifest_related_links(manifest, request.options),
+        )
+
+    def resolve(
+        self,
+        request: SourceRequest,
+        downloader: acquisition.RemoteDownloaderProtocol | None = None,
+        metadata: x_twitter.XMetadata | None = None,
+    ) -> SourceInfo:
+        if request.output_root is None:
+            raise DistillError("E_BAD_OUTPUT_DIR", "x", "output_root is required")
+        options = request.options
+        output_root = request.output_root
+        progress = request.progress
+        if progress:
+            progress.update("x_download", status="running", detail={"step": "disk_precheck"})
+        acquisition.check_disk_floor(output_root, stage="x")
+        status_id = x_twitter.parse_x_status_id(request.value)
+        metadata = metadata or x_twitter.x_metadata(
+            request.value,
+            youtube.ytdlp_auth_args(options.cookies, options.cookies_from_browser),
+        )
+        lock_key = source_identity.x_status_lock_key(status_id)
+        fingerprint = source_identity.x_status_fingerprint(status_id)
+        resolution = _resolved_for(options, fingerprint, "x", output_root)
+        options = resolution.options
+        source = source_identity.bundle_key(fingerprint, resolution.opts_hash)
+        downloader = downloader or acquisition.YtDlpDownloader(
+            output_root,
+            stage="x",
+            label="X",
+            download_args=(
+                *youtube.ytdlp_auth_args(options.cookies, options.cookies_from_browser),
+                *x_twitter.PLAYLIST_ITEMS_FIRST,
+            ),
+            lock_wait_sec=request.lock_wait_sec,
+        )
+        acquired = downloader.acquire(request.value, lock_key, progress)
+        # Everything from here reads the acquired media, so every failure has
+        # to release the lease rather than strand it until the staleness window
+        # expires - the same discipline the YouTube provider states (R-36).
+        try:
+            warnings = [*metadata.warnings, *acquired.warnings]
+            if progress:
+                progress.update("duration_probe", status="running")
+            duration, probe_warnings = media_inspect.probe_duration(acquired.path)
+            warnings.extend(probe_warnings)
+            if progress:
+                progress.complete("duration_probe", detail={"duration_sec": duration})
+            media_inspect.ensure_duration_allowed(duration, options.max_duration_sec)
+            if progress:
+                progress.update("x_download", status="running", detail={"step": "disk_postcheck"})
+            acquisition.check_disk_floor(output_root, stage="x")
+            if progress:
+                progress.complete(
+                    "x_download",
+                    detail={"path": str(acquired.path.resolve()), "step": "complete"},
+                )
+            related_links = extract_relevant_links(
+                metadata.description,
+                source="x_post_text",
+                redact=options.redact_secrets,
+            )
+            warnings.extend(dict(item) for link in related_links for item in link.warnings)
+            provenance = Provenance(
+                title=metadata.title,
+                channel=metadata.uploader,
+                description=youtube._first_description_paragraph(metadata.description) or None,
+                upload_date=metadata.upload_date,
+                canonical_url=_canonical_remote_url("x", status_id),
+                duration_sec=duration,
+                processed_at=request.processed_at,
+                redaction=(
+                    RedactionState.NOT_APPLIED
+                    if options.redact_secrets
+                    else RedactionState.DISABLED
+                ),
+            )
+            warnings.extend(dict(item) for item in provenance.warnings)
+        except BaseException:
+            acquired.lease.release()
+            raise
+        return SourceInfo(
+            source_type="x",
+            resolved_path=acquired.path.resolve(),
+            duration_sec=duration,
+            source_fingerprint=fingerprint,
+            source_hash=source,
+            warnings=warnings,
+            provenance=provenance,
+            resolved_options=options,
+            remote_source_id=status_id,
+            remote_lock_key=lock_key,
             related_links=related_links,
             acquisition_lease=acquired.lease,
         )
@@ -912,9 +1096,11 @@ class SourceResolver:
         self,
         local: LocalSourceProvider | None = None,
         youtube: YouTubeSourceProvider | None = None,
+        x: XSourceProvider | None = None,
     ) -> None:
         self.local = local or LocalSourceProvider()
         self.youtube = youtube or YouTubeSourceProvider()
+        self.x = x or XSourceProvider()
 
     def local_source(
         self,
@@ -944,12 +1130,34 @@ class SourceResolver:
         url: str,
         options: DistillOptions,
         output_root: Path,
-        downloader: acquisition.YouTubeDownloaderProtocol | None = None,
+        downloader: acquisition.RemoteDownloaderProtocol | None = None,
         progress: ProgressReporter | None = None,
         metadata: youtube.YouTubeMetadata | None = None,
         lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
     ) -> SourceInfo:
         return self.youtube.resolve(
+            SourceRequest(
+                url,
+                options,
+                output_root=output_root,
+                progress=progress,
+                lock_wait_sec=lock_wait_sec,
+            ),
+            downloader=downloader,
+            metadata=metadata,
+        )
+
+    def x_source(
+        self,
+        url: str,
+        options: DistillOptions,
+        output_root: Path,
+        downloader: acquisition.RemoteDownloaderProtocol | None = None,
+        progress: ProgressReporter | None = None,
+        metadata: x_twitter.XMetadata | None = None,
+        lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
+    ) -> SourceInfo:
+        return self.x.resolve(
             SourceRequest(
                 url,
                 options,
@@ -968,7 +1176,7 @@ class SourceResolver:
         options: DistillOptions,
         *,
         progress: ProgressReporter | None = None,
-        downloader: acquisition.YouTubeDownloaderProtocol | None = None,
+        downloader: acquisition.RemoteDownloaderProtocol | None = None,
         lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
     ) -> SourceResolution:
         if source_type == "local":
@@ -983,11 +1191,47 @@ class SourceResolver:
                 output_root=local_root,
                 progress=progress,
             )
+        if source_type == "x":
+            root = validate_output_root(options.output_dir)
+            url = x_twitter.normalize_x_url(value)
+            # Refuses non-X hosts, non-post paths and /video suffixes before
+            # yt-dlp runs. Unlike YouTube's parse, what it returns is the id
+            # the run publishes under: the extractor matches the same digits,
+            # so the fast path needs no narrower rule to stay sound (ADR-0008).
+            status_id = x_twitter.parse_x_status_id(url)
+            request = SourceRequest(
+                url,
+                options,
+                output_root=root,
+                progress=progress,
+                lock_wait_sec=lock_wait_sec,
+            )
+            # The cache before the capability (R-49, finding 22), and for this
+            # kind the fast path is unconditional: the URL's id is the id a run
+            # would publish under whenever the URL parsed at all, so a hit
+            # found this way serves without yt-dlp being installed.
+            served = self._served_x_from_cache(request, status_id)
+            if served is not None:
+                return served
+            return SourceResolution(
+                self.x.resolve(
+                    request,
+                    downloader=downloader,
+                    metadata=x_twitter.x_metadata(
+                        url,
+                        youtube.ytdlp_auth_args(
+                            request.options.cookies, request.options.cookies_from_browser
+                        ),
+                    ),
+                ),
+                output_root=root,
+                progress=progress,
+            )
         if source_type != "youtube":
             raise DistillError(
                 "E_BAD_SOURCE",
                 "source",
-                "source_type must be 'local' or 'youtube'",
+                "source_type must be 'local', 'youtube' or 'x'",
                 {"source_type": source_type},
             )
 
@@ -1020,7 +1264,9 @@ class SourceResolver:
             served = self._served_from_cache(request, fast_path_video_id)
             if served is not None:
                 return served
-        metadata = youtube.youtube_metadata(url)
+        metadata = youtube.youtube_metadata(
+            url, youtube.ytdlp_auth_args(options.cookies, options.cookies_from_browser)
+        )
         # The resolved id is what the cache was always asked about, before the
         # reorder put a lookup in front of it. It is skipped only when the fast
         # path already asked this exact question and missed - so a URL the fast
@@ -1055,7 +1301,23 @@ class SourceResolver:
         if request.progress:
             request.progress.skip_cached(
                 "youtube_download",
-                detail={"source": "cached_manifest", "video_id": cached.youtube_video_id},
+                detail={"source": "cached_manifest", "video_id": cached.remote_source_id},
+            )
+        return SourceResolution(cached, output_root=request.output_root, progress=request.progress)
+
+    def _served_x_from_cache(
+        self, request: SourceRequest, status_id: str
+    ) -> SourceResolution | None:
+        """The X twin of `_served_from_cache`, under the same force rule."""
+        if request.options.force_reprocess:
+            return None
+        cached = self.x.cached_for_status_id(request, status_id)
+        if cached is None:
+            return None
+        if request.progress:
+            request.progress.skip_cached(
+                "x_download",
+                detail={"source": "cached_manifest", "status_id": cached.remote_source_id},
             )
         return SourceResolution(cached, output_root=request.output_root, progress=request.progress)
 
@@ -1072,7 +1334,7 @@ def youtube_source_info(
     url: str,
     options: DistillOptions,
     output_root: Path,
-    downloader: acquisition.YouTubeDownloaderProtocol | None = None,
+    downloader: acquisition.RemoteDownloaderProtocol | None = None,
     progress: ProgressReporter | None = None,
 ) -> SourceInfo:
     return SourceResolver().youtube_source(url, options, output_root, downloader, progress)
@@ -1084,7 +1346,7 @@ def resolve_source_for_processing(
     options: DistillOptions,
     *,
     progress: ProgressReporter | None = None,
-    downloader: acquisition.YouTubeDownloaderProtocol | None = None,
+    downloader: acquisition.RemoteDownloaderProtocol | None = None,
     lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
 ) -> SourceResolution:
     """Resolve one **source** for a run, on that run's wait budget (D-044).
