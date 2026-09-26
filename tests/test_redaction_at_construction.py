@@ -680,7 +680,7 @@ def resolve_youtube_source(
     monkeypatch.setattr("distill.acquisition.check_disk_floor", lambda _path: None)
     monkeypatch.setattr(
         "distill.youtube.youtube_metadata",
-        lambda _url: YouTubeMetadata(video_id="abc123", description=said, warnings=[]),
+        lambda _url, *extra: YouTubeMetadata(video_id="abc123", description=said, warnings=[]),
     )
     monkeypatch.setattr("distill.media_inspect.probe_duration", lambda _path: (12.0, []))
     try:

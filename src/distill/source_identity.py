@@ -1,8 +1,10 @@
 """Source fingerprints, acquisition lock keys, and bundle keys.
 
 Local fingerprints read bounded samples or complete content according to cache
-mode. YouTube fingerprints and lock keys hash the resolved video id. Bundle
-keys combine the source fingerprint and options hash; URL parsing lives in youtube.
+mode. YouTube fingerprints and lock keys hash the resolved video id; X
+fingerprints and lock keys hash the status id read from the URL, in a distinct
+domain so the two kinds can never collide (ADR-0008). Bundle keys combine the
+source fingerprint and options hash; URL parsing lives in youtube and x_twitter.
 """
 
 from __future__ import annotations
@@ -26,6 +28,26 @@ def youtube_fingerprint(video_id: str) -> str:
 def youtube_lock_key(video_id: str) -> str:
     """Coordinate acquisition of a resolved video, independent of processing options."""
     return youtube_fingerprint(video_id)
+
+
+def x_status_fingerprint(status_id: str) -> str:
+    """Identify the media a post URL names, by the URL's own status id.
+
+    The id is hashed in a domain of its own (`x:` prefix) rather than bare the
+    way a YouTube video id is. A bare hash would give an X status id and a
+    YouTube video id that spelled the same string the same **source
+    fingerprint** - and so the same **bundle key** if their **options hashes**
+    ever agreed. Different kinds naming one bundle is a latent collision, and
+    the prefix retires it for the price of a byte. YouTube's function stays
+    bare: changing it would re-key every existing YouTube bundle for a
+    collision the X side already prevents.
+    """
+    return hashlib.sha256(b"x:" + status_id.encode()).hexdigest()
+
+
+def x_status_lock_key(status_id: str) -> str:
+    """Coordinate acquisition of one post's media, independent of processing options."""
+    return x_status_fingerprint(status_id)
 
 
 def fingerprint_anchor_offsets(size: int) -> list[int]:

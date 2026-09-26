@@ -10,8 +10,8 @@ this file.
 ### Sources and identity
 
 **Source**:
-The single piece of media a run processes — one local video file, or one
-YouTube video.
+The single piece of media a run processes — one local video file, one
+YouTube video, or the first video of one X post.
 _Avoid_: input, video (ambiguous with the media file itself)
 
 **Source fingerprint**:

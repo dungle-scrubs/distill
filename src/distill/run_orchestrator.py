@@ -599,7 +599,7 @@ class ProcessingRun:
                 cwd=Path.cwd(),
             )
             entry = artifact_entry_name(
-                self.source.youtube_video_id,
+                self.source.remote_source_id,
                 self.source.source_fingerprint,
                 Path(self.source.resolved_path).stem,
             )

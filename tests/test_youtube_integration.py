@@ -20,7 +20,7 @@ from distill.errors import DistillError
 from distill.local_vision import LocalVisionProbe
 from distill.progress import ProgressReporter
 from distill.source import SourceInfo
-from distill.source_identity import youtube_lock_key
+from distill.source_identity import youtube_lock_key as remote_lock_key
 from distill.youtube import YouTubeMetadata
 
 
@@ -30,7 +30,7 @@ def test_mocked_youtube_integration_passes_through_shared_pipeline(
 ) -> None:
     video = tmp_path / "youtube.mp4"
     make_short_screencast(video)
-    lock_key = youtube_lock_key("abcdefghijk")
+    lock_key = remote_lock_key("abcdefghijk")
 
     def fake_resolve(
         _provider: object,
@@ -51,8 +51,8 @@ def test_mocked_youtube_integration_passes_through_shared_pipeline(
                 duration_sec=1.0,
                 processed_at="2026-07-29T14:20:00Z",
             ),
-            youtube_video_id="abcdefghijk",
-            youtube_lock_key=lock_key,
+            remote_source_id="abcdefghijk",
+            remote_lock_key=lock_key,
         )
 
     monkeypatch.setattr(
@@ -64,7 +64,7 @@ def test_mocked_youtube_integration_passes_through_shared_pipeline(
     monkeypatch.setattr(
         youtube,
         "youtube_metadata",
-        lambda _url: YouTubeMetadata("abcdefghijk", "", []),
+        lambda _url, *extra: YouTubeMetadata("abcdefghijk", "", []),
     )
 
     response = distill_session.process_youtube_video(
@@ -92,7 +92,7 @@ def test_cache_hit_skips_youtube_download(
     make_short_screencast(video)
     video_id = "abcdefghijk"
     fingerprint = hashlib.sha256(video_id.encode()).hexdigest()
-    lock_key = youtube_lock_key(video_id)
+    lock_key = remote_lock_key(video_id)
     download_calls = {"count": 0}
 
     def fake_resolve(
@@ -117,8 +117,8 @@ def test_cache_hit_skips_youtube_download(
                 duration_sec=1.0,
                 processed_at="2026-07-29T14:20:00Z",
             ),
-            youtube_video_id=video_id,
-            youtube_lock_key=lock_key,
+            remote_source_id=video_id,
+            remote_lock_key=lock_key,
         )
 
     monkeypatch.setattr(distill_source.YouTubeSourceProvider, "resolve", fake_resolve)
@@ -126,7 +126,7 @@ def test_cache_hit_skips_youtube_download(
     monkeypatch.setattr(
         youtube,
         "youtube_metadata",
-        lambda _url: YouTubeMetadata(video_id, "", []),
+        lambda _url, *extra: YouTubeMetadata(video_id, "", []),
     )
 
     args = {
@@ -158,10 +158,19 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
     video_id = "abcdefghijk"
 
     class FakeDownloader:
-        def __init__(self, output_root: Path, *, lock_wait_sec: float = 0.0) -> None:
+        def __init__(
+            self,
+            output_root: Path,
+            *,
+            lock_wait_sec: float = 0.0,
+            **downloader_args: Any,
+        ) -> None:
             # The budget the run named reaches the downloader (D-044), so a
             # stand-in for one takes it too - taking a different shape here is
-            # how the suite stopped noticing that production passed none.
+            # how the suite stopped noticing that production passed none. The
+            # remaining constructor args (stage, download_args, ...) name how
+            # the tool would be invoked; a stand-in that runs no tool accepts
+            # and ignores them.
             self.lock_wait_sec = lock_wait_sec
             self.lock_path = output_root / "_youtube_locks" / "abcdefghijk.lock"
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -199,11 +208,11 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
         return reporter
 
     monkeypatch.setattr(distill_session, "ProgressReporter", make_reporter)
-    monkeypatch.setattr(acquisition, "YoutubeDownloader", FakeDownloader)
+    monkeypatch.setattr(acquisition, "YtDlpDownloader", FakeDownloader)
     monkeypatch.setattr(
         youtube,
         "youtube_metadata",
-        lambda _url: YouTubeMetadata(video_id, "", []),
+        lambda _url, *extra: YouTubeMetadata(video_id, "", []),
     )
     monkeypatch.setattr(acquisition, "check_disk_floor", lambda _path: None)
     monkeypatch.setattr(media_inspect, "probe_duration", lambda _path: (1.0, []))
@@ -305,7 +314,7 @@ def test_successful_youtube_run_with_local_vision_warning_finishes_progress(
 
 
 # `test_concurrent_youtube_calls_for_same_video_share_lock_key` lived here and
-# was classified a *defect* under R-07: it called `youtube_lock_key` twice in one
+# was classified a *defect* under R-07: it called `remote_lock_key` twice in one
 # thread and asserted a pure hash is stable, which exercises no concurrency at
 # all while reading as if it covered two runs meeting. Real mutual exclusion is
 # the kernel's, and it is proved by two real processes in
@@ -324,7 +333,7 @@ def test_youtube_playlist_uses_playlist_output_subdirectory(
     monkeypatch.setattr(
         distill_session,
         "youtube_playlist_urls",
-        lambda _url, _max_items: child_urls,
+        lambda _url, _max_items, *extra: child_urls,
     )
 
     def fake_process_youtube_video(args: dict[str, object], **_budget: float) -> dict[str, object]:
@@ -383,7 +392,7 @@ def test_the_playlist_summary_does_not_write_through_a_symlink(
     Distill, which a write that never asks for it does not have.
     """
     url = "https://www.youtube.com/playlist?list=PLQHpFq3RA7fEJ0z3DABwTPvwre0Vu6OBH"
-    monkeypatch.setattr(distill_session, "youtube_playlist_urls", lambda _url, _max: [])
+    monkeypatch.setattr(distill_session, "youtube_playlist_urls", lambda _url, _max, *extra: [])
     output_root = tmp_path / "out"
     output_root.mkdir()
     victim = tmp_path / "user-notes.md"

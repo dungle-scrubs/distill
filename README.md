@@ -109,7 +109,7 @@ environment to be active. Distill installs no tools at runtime:
 | --- | --- | --- | --- |
 | `ffmpeg` | audio extraction and keyframe extraction | required | your platform's package manager |
 | `ffprobe` | source duration probing | required | ships with `ffmpeg` |
-| `yt-dlp` | YouTube source acquisition and metadata | required | installed with Distill; available under `uv run` |
+| `yt-dlp` | YouTube and X source acquisition and metadata | required | installed with Distill; available under `uv run` |
 | `tesseract` | image-text extraction from keyframes | optional | your platform's package manager |
 | `rapid-mlx[vision]` | local vision server (see below) | optional | `pip install 'rapid-mlx[vision]'` |
 
@@ -122,10 +122,11 @@ work and producing a bundle with nothing in it.
 
 Both classes are about a run that does the work. A run that hits the cache does
 none of it: it serves the **generation** already on disk, so a cached local
-bundle is servable with `ffprobe` absent, and a cached YouTube bundle with
-`yt-dlp` absent - as long as the video id can be read from the URL itself. A URL
-that also names a playlist, or whose id is not exactly eleven id characters, or
-that names more than one video, has to be resolved by `yt-dlp` before its
+bundle is servable with `ffprobe` absent, a cached YouTube bundle with
+`yt-dlp` absent as long as the video id can be read from the URL itself, and a
+cached X bundle with `yt-dlp` absent for every post URL that parses. A YouTube
+URL that also names a playlist, or whose id is not exactly eleven id characters,
+or that names more than one video, has to be resolved by `yt-dlp` before its
 **bundle key** is known, so a run of one needs the tool whether or not the
 bundle is already there. Per tool, an absence costs:
 
@@ -133,7 +134,7 @@ bundle is already there. Per tool, an absence costs:
 | --- | --- | --- |
 | `ffmpeg` | required | no audio can be extracted and no keyframe can be captured, which leaves a generation with neither a transcript nor frame artifacts and no usable bundle to publish |
 | `ffprobe` | required | the source's duration cannot be read, so keyframe timestamps and the duration cap have nothing to work from and the run ends before any stage produces output |
-| `yt-dlp` | required | the source cannot be acquired at all, so a YouTube run has nothing to process |
+| `yt-dlp` | required | the source cannot be acquired at all, so a YouTube or X run has nothing to process |
 | `tesseract` | optional | keyframes contribute no extracted text, so interpretations cannot be corroborated and grounding falls back to the vision model alone; the transcript, keyframes and render are unaffected |
 
 Distill never installs any of them - an absent optional tool is a warning, not a
@@ -152,6 +153,9 @@ distill process-local-video ./demo.mp4
 
 # personal-use YouTube video
 distill process-youtube-video "https://youtu.be/..."
+
+# the first video of one X (Twitter) post
+distill process-x-video --cookies-from-browser safari "https://x.com/user/status/..."
 
 # a whole directory (recursive)
 distill process-video-directory ./recordings --recursive --max-items 10
@@ -350,12 +354,14 @@ stdout's contents survives a descriptor the caller broke.
 | --- | --- |
 | `process-local-video PATH` | Process one local video file into a bundle. |
 | `process-youtube-video URL` | Download and process one personal-use YouTube video. |
+| `process-x-video URL` | Download and process the first video of one X (Twitter) post. A post carrying several videos is processed as its first, with a warning recording the rest. X usually serves video only to authenticated sessions, so pass `--cookies` or `--cookies-from-browser`; guest access works when X allows it and fails with the acquisition error when it does not. |
 | `process-video-directory PATH` | Process every video in a directory. Flags: `--recursive`, `--max-items`, `--continue-on-error/--no-continue-on-error`, plus the processing options. |
 | `process-youtube-playlist URL` | Process videos from a YouTube playlist or channel URL. Flags: `--max-items`, `--continue-on-error/--no-continue-on-error`, plus the processing options. |
 | `cleanup-cache` | Prune old cache bundles. Flags: `--output-dir`, `--max-age-days`, `--keep-generations`, `--dry-run/--no-dry-run`. |
 | `cache-doctor` | Report what is under an output root - bundles, active generations, orphan generations, locks, a prune preview - and change nothing. Flags: `--output-dir`, `--max-age-days`, `--keep-generations`. |
 | `get-job-status JOB_ID` | Read a Distill job status record. Flags: `--output-dir`. |
 | `filtered-view BUNDLE_KEY` | Print the filtered view of an already-published bundle - the render with the frames the vision model judged redundant left out - as JSON with the document under `markdown`. Changes nothing under the output root. Flags: `--output-dir`. |
+| `guide [TOPIC]` | Print run-time guidance for callers and agents as JSON with the text under `markdown`. Topics: `sources`, `vision`, `cache`, `consuming`. No topic prints the index. Changes nothing. |
 | `list-tools` | Print the registered tool names as JSON. |
 | `timeout-diagnostics` | Show the configured vs. effective timeout (assumption A-004). |
 | `timeout-probe PROBE_MS` | Sleep for a bounded timeout probe; long probes require `DISTILL_ENABLE_LONG_TIMEOUT_PROBE=1`. |
@@ -393,6 +399,7 @@ there; what is missing is the line saying whether anything backed them up. When
 that line is what you are after, read the generation's own `video.md`.
 
 The processing commands (`process-local-video`, `process-youtube-video`,
+`process-x-video`,
 `process-video-directory`, `process-youtube-playlist`) share these options: `--whisper-model`,
 `--whisper-language`, `--ocr`/`--no-ocr`, `--ocr-language`, `--ocr-preprocess`,
 `--redact-secrets`/`--no-redact-secrets`, `--artifact-dir`,
@@ -400,6 +407,7 @@ The processing commands (`process-local-video`, `process-youtube-video`,
 (whether keyframes are judged against the surrounding speech; on by default, and
 part of bundle identity), `--max-keyframes`, `--min-interval-sec`,
 `--max-duration-sec`, `--vad-filter`/`--no-vad-filter`, `--max-static-window-sec`,
+`--cookies`, `--cookies-from-browser`,
 `--output-dir`, `--force-reprocess`, `--job-id`, `--resume-partial`,
 `--caption-frames`/`--no-caption-frames`, `--local-vision-backend`,
 `--local-vision-model`, `--local-vision-base-url`,

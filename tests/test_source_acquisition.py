@@ -99,7 +99,7 @@ def test_leftover_format_fragment_is_not_selected_over_the_merged_media(
     leftovers.mkdir(parents=True)
     (leftovers / "source.f140.m4a").write_bytes(b"audio-fragment")
 
-    acquired = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY, ProgressReporter())
+    acquired = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY, ProgressReporter())
 
     assert acquired.path.name == "source.mp4"
     assert acquired.path.read_bytes() == b"video"
@@ -119,14 +119,14 @@ def test_failed_download_leaves_the_previously_promoted_source_intact(
     """
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
     fake_tool("ffprobe", FAKE_FFPROBE)
-    first = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    first = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
     promoted = first.path
     assert promoted.read_bytes() == b"video"
     first.lease.release()
 
     fake_tool("yt-dlp", FAKE_YTDLP_TRUNCATES_THEN_FAILS)
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_YTDLP"
     assert promoted.exists()
@@ -145,19 +145,19 @@ def test_second_run_with_different_options_cannot_disturb_media_being_read(
     """
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
     fake_tool("ffprobe", FAKE_FFPROBE)
-    first = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    first = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
     assert first.path.read_bytes() == b"video"
 
     fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_LOCKED"
     assert first.path.read_bytes() == b"video"
 
     # Once the first run is finished reading, the source is acquirable again.
     first.lease.release()
-    second = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    second = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
     assert second.path.read_bytes() == b"clobbered"
     second.lease.release()
 
@@ -218,7 +218,7 @@ class RendezvousOs:
 rendezvous_os = RendezvousOs(os)
 bundle_store.os = rendezvous_os
 try:
-    acquired = acquisition.YoutubeDownloader(
+    acquired = acquisition.YtDlpDownloader(
         Path(output_root), lock_wait_sec=0.0
     ).acquire(url, lock_key)
     verdict = {"acquired": True, "media": str(acquired.path)}
@@ -310,7 +310,7 @@ def test_a_filesystem_that_cannot_grant_the_lock_stops_the_run(
     monkeypatch.setattr(distill_bundle_store.fcntl, "flock", refuse)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(tmp_path, lock_wait_sec=5.0).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(tmp_path, lock_wait_sec=5.0).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_LOCK_UNSUPPORTED"
     assert exc.value.details["errno"] == "ENOLCK"
@@ -333,14 +333,14 @@ def test_a_lease_a_live_run_holds_is_not_stealable_however_old_it_is(
     """
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
     fake_tool("ffprobe", FAKE_FFPROBE)
-    first = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    first = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
     lock = lock_path(tmp_path)
     advance_monotonic_clock(monkeypatch, by_sec=3600.0)
     os.utime(lock, (0, 0))
 
     fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_LOCKED"
     assert first.path.read_bytes() == b"video"
@@ -358,7 +358,7 @@ from distill import source as distill_source
 from distill import acquisition
 
 url, lock_key, output_root = sys.argv[1:]
-acquired = acquisition.YoutubeDownloader(Path(output_root)).acquire(url, lock_key)
+acquired = acquisition.YtDlpDownloader(Path(output_root)).acquire(url, lock_key)
 print(acquired.path, flush=True)
 # Nothing here ever releases: giving the lease up is what killing this process
 # has to accomplish on its own.
@@ -404,7 +404,7 @@ def test_a_lease_whose_holder_was_killed_is_reacquirable_at_once(
     os.waitid(os.P_PID, holder.pid, os.WEXITED | os.WNOWAIT)
 
     fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
-    reclaimed = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    reclaimed = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     assert reclaimed.path.read_bytes() == b"clobbered"
     assert reclaimed.warnings == []
@@ -444,7 +444,7 @@ def test_releasing_a_lease_this_process_does_not_hold_frees_nobody(
 
     fake_tool("yt-dlp", FAKE_YTDLP_CLOBBERING)
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
     assert exc.value.code == "E_LOCKED"
     assert promoted_names(tmp_path) == ["source.mp4"]
     holder.kill()
@@ -594,9 +594,9 @@ def test_each_run_stages_its_download_in_its_own_directory(
     abandoned.mkdir(parents=True)
     (abandoned / "source.mp4").write_bytes(b"scratch from a run that died")
 
-    first = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    first = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
     first.lease.release()
-    second = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    second = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
     second.lease.release()
 
     staged = [Path(line) for line in log.read_text().splitlines()]
@@ -621,7 +621,7 @@ def test_a_format_fragment_beside_the_container_is_never_selected(
     fake_tool("yt-dlp", FAKE_YTDLP_LEAVES_FORMAT_FRAGMENTS)
     fake_tool("ffprobe", FAKE_FFPROBE)
 
-    acquired = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    acquired = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     assert acquired.path.read_bytes() == b"video"
     assert promoted_names(tmp_path) == ["source.mp4"]
@@ -669,7 +669,7 @@ def test_an_audio_only_download_is_rejected_before_promotion(
     fake_tool("ffprobe", FAKE_FFPROBE)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_MEDIA"
     assert exc.value.details["codec_types"] == ["audio"]
@@ -685,7 +685,7 @@ def test_an_empty_download_is_rejected_before_promotion(
     fake_tool("ffprobe", FAKE_FFPROBE)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_MEDIA"
     assert promoted_names(tmp_path) == []
@@ -718,7 +718,7 @@ def test_promotion_moves_the_validated_file_rather_than_copying_it(
     (previous / "source.mp4").write_bytes(b"previous")
     previous_inode = (previous / "source.mp4").stat().st_ino
 
-    acquired = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    acquired = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     assert acquired.path.stat().st_ino == validated[0]
     assert acquired.path.stat().st_ino != previous_inode
@@ -742,7 +742,7 @@ def test_a_previously_promoted_source_is_never_cleared_in_place(
     directory.mkdir(parents=True)
     (directory / "source.mkv").write_bytes(b"promoted by an earlier run")
 
-    acquired = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    acquired = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     assert (directory / "source.mkv").read_bytes() == b"promoted by an earlier run"
     assert promoted_names(tmp_path) == ["source.mkv", "source.mp4"]
@@ -763,9 +763,9 @@ def test_acquisition_emits_lease_validation_and_promotion_events(
     fake_tool("ffprobe", FAKE_FFPROBE)
 
     with caplog.at_level(logging.DEBUG, logger="distill.source"):
-        acquired = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+        acquired = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
         with pytest.raises(DistillError):
-            acquisition.YoutubeDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
+            acquisition.YtDlpDownloader(tmp_path, lock_wait_sec=0.0).acquire(URL, LOCK_KEY)
         acquired.lease.release()
 
     events = [
@@ -797,7 +797,7 @@ def test_a_rejected_media_file_is_reported_with_its_verdict(
     fake_tool("ffprobe", FAKE_FFPROBE)
 
     with caplog.at_level(logging.DEBUG, logger="distill.source"), pytest.raises(DistillError):
-        acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     events = [
         json.loads(record.message) for record in caplog.records if record.name == "distill.source"
@@ -825,7 +825,7 @@ def test_a_download_with_no_playable_duration_is_rejected_before_promotion(
     fake_tool("ffprobe", FAKE_FFPROBE_NO_DURATION)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_MEDIA"
     assert exc.value.details["duration_sec"] == 0.0
@@ -845,7 +845,7 @@ def test_a_truncated_validation_probe_travels_with_the_acquired_source(
     fake_tool("yt-dlp", FAKE_YTDLP_DOWNLOAD)
     fake_tool("ffprobe", fake_ffprobe_flooding_stderr(OUTPUT_CAP_BYTES))
 
-    acquired = acquisition.YoutubeDownloader(tmp_path).acquire(URL, LOCK_KEY)
+    acquired = acquisition.YtDlpDownloader(tmp_path).acquire(URL, LOCK_KEY)
     try:
         assert acquired.path.exists()
         assert [
@@ -892,7 +892,7 @@ def test_staging_cleanup_cannot_delete_through_a_symlinked_staging_directory(
     staging_root(output_root).symlink_to(victim.parent, target_is_directory=True)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(output_root).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_OUTPUT_DIR"
     # The link names the *parent*, so what the walk would have removed is every
@@ -923,7 +923,7 @@ def test_acquisition_creates_nothing_through_a_symlinked_directory(
     output_root.joinpath(derived).symlink_to(victim, target_is_directory=True)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(output_root).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_OUTPUT_DIR"
     assert sorted(entry.name for entry in victim.iterdir()) == ["holiday.jpg"]
@@ -948,7 +948,7 @@ def test_a_symlink_planted_inside_staging_is_refused_rather_than_walked(
     (staging_root(output_root) / "abandoned-run").symlink_to(victim, target_is_directory=True)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(output_root).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_OUTPUT_DIR"
     assert sorted(entry.name for entry in victim.iterdir()) == ["holiday.jpg"]
@@ -975,7 +975,7 @@ def test_promotion_cannot_write_through_a_symlinked_media_directory(
     media_root(output_root).symlink_to(victim, target_is_directory=True)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(output_root).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_OUTPUT_DIR"
     assert (victim / "source.mp4").read_bytes() == b"the user's only copy"
@@ -1000,7 +1000,7 @@ def test_the_lease_is_not_taken_through_a_symlinked_lock_directory(
     output_root.joinpath("_youtube_locks").symlink_to(victim, target_is_directory=True)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(output_root).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_OUTPUT_DIR"
     assert sorted(entry.name for entry in victim.iterdir()) == ["holiday.jpg"]
@@ -1027,7 +1027,7 @@ def test_a_download_that_produces_a_link_is_never_selected(
     monkeypatch.setenv("FAKE_YTDLP_LINK_TARGET", str(victim))
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(output_root).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_YTDLP"
     assert exc.value.details["produced"] == ["source.mp4"]
@@ -1067,7 +1067,7 @@ def test_staging_substituted_mid_run_does_not_promote_the_users_file(
     configure_downloader(monkeypatch, validate=substitute_staging)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(output_root).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_OUTPUT_DIR"
     assert sorted(entry.name for entry in victim.iterdir()) == ["holiday.jpg", "source.mp4"]
@@ -1109,7 +1109,7 @@ def test_discarding_staging_never_deletes_through_a_substituted_path(
     configure_downloader(monkeypatch, promote=promote_then_substitute)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(output_root).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_OUTPUT_DIR"
     survivors = sorted(str(entry.relative_to(victim)) for entry in victim.rglob("*"))
@@ -1137,7 +1137,7 @@ def test_a_link_pre_created_at_the_promoted_media_path_is_refused(
     (media_root(output_root) / "source.mp4").symlink_to(victim)
 
     with pytest.raises(DistillError) as exc:
-        acquisition.YoutubeDownloader(output_root).acquire(URL, LOCK_KEY)
+        acquisition.YtDlpDownloader(output_root).acquire(URL, LOCK_KEY)
 
     assert exc.value.code == "E_BAD_OUTPUT_DIR"
     assert victim.read_bytes() == b"irreplaceable"
@@ -1215,7 +1215,7 @@ def resolving_youtube(
     monkeypatch.setattr(
         youtube,
         "youtube_metadata",
-        lambda _url: YouTubeMetadata("abc123", "", []),
+        lambda _url, *extra: YouTubeMetadata("abc123", "", []),
     )
     return distill_source.resolve_source_for_processing(
         "youtube",
@@ -1232,7 +1232,7 @@ def test_a_single_source_run_waits_for_the_lock_key_another_run_holds(
 ) -> None:
     """FAILS FIRST (finding 4-opus, D-044): the budget never reached the downloader.
 
-    `YoutubeDownloader` defaulted to a wait of zero and production constructed
+    `YtDlpDownloader` defaulted to a wait of zero and production constructed
     it with that default, so a second run of the same video was denied by the
     lease on its first attempt and never reached the wait D-044 describes. The
     300 s budget and the coalescing it exists to deliver were only reachable
@@ -1435,7 +1435,7 @@ def test_downloading_a_watch_url_acquires_the_one_video_the_url_names(
     argv_file = tmp_path / "argv.txt"
     monkeypatch.setenv("FAKE_YTDLP_ARGV_FILE", str(argv_file))
 
-    acquired = acquisition.YoutubeDownloader(tmp_path).acquire(
+    acquired = acquisition.YtDlpDownloader(tmp_path).acquire(
         "https://www.youtube.com/watch?v=abc123&list=PLxyz",
         LOCK_KEY,
         ProgressReporter(),

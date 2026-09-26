@@ -50,11 +50,17 @@ from .source import (
     source_path_kind,
     validate_output_root,
 )
-from .youtube import ensure_youtube_host, normalize_youtube_url, youtube_playlist_urls
+from .youtube import (
+    ensure_youtube_host,
+    normalize_youtube_url,
+    youtube_playlist_urls,
+    ytdlp_auth_args,
+)
 
 TOOLS = {
     "process_local_video": "Process a local video into a transcript/keyframe markdown bundle",
     "process_youtube_video": "Download and process one YouTube video into a transcript/keyframe markdown bundle",
+    "process_x_video": "Download and process the first video of one X (Twitter) post into a transcript/keyframe markdown bundle",
     "process_video_directory": "Process video files in a local directory into Distill bundles",
     "process_youtube_playlist": "Process videos from a YouTube playlist or channel URL",
     "cleanup_cache": "Prune old Distill cache bundles and generations",
@@ -221,6 +227,27 @@ def process_youtube_video(
         )
 
     return record_job(JobStore.open(root), options.job_id, "process_youtube_video", work)
+
+
+def process_x_video(
+    args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+) -> dict[str, Any]:
+    options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
+    root = validate_output_root(options.output_dir)
+    progress = ProgressReporter(emitter=progress_emitter(options.job_id))
+
+    def work() -> dict[str, Any]:
+        return acquire_and_process(
+            "x",
+            str(args.get("url", "")),
+            options,
+            root,
+            progress=progress,
+            tool="process_x_video",
+            lock_wait_sec=lock_wait_sec,
+        )
+
+    return record_job(JobStore.open(root), options.job_id, "process_x_video", work)
 
 
 def progress_emitter(job_id: str) -> Any:
@@ -459,7 +486,11 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
         # playlist is a yt-dlp call - the parent job's first real step and the
         # first thing that can fail without a single item ever being tried.
         ensure_safe_directory(playlist_root, root)
-        urls = youtube_playlist_urls(url, max_items)
+        urls = youtube_playlist_urls(
+            url,
+            max_items,
+            ytdlp_auth_args(options.cookies, options.cookies_from_browser),
+        )
         runner = BatchRunner(
             job_id=options.job_id,
             tool="process_youtube_playlist",
@@ -627,6 +658,10 @@ def tool_registry() -> dict[str, ToolSpec]:
         "process_youtube_video": ToolSpec(
             TOOLS["process_youtube_video"],
             process_youtube_video,
+        ),
+        "process_x_video": ToolSpec(
+            TOOLS["process_x_video"],
+            process_x_video,
         ),
         "process_video_directory": ToolSpec(
             TOOLS["process_video_directory"],

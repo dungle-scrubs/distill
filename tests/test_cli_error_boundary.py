@@ -464,6 +464,7 @@ def registered_subcommands() -> tuple[str, ...]:
 INTERNAL_FAULT_ARGV: dict[str, list[str]] = {
     "process-local-video": ["process-local-video", "video.mp4"],
     "process-youtube-video": ["process-youtube-video", "https://youtu.be/abcdefghijk"],
+    "process-x-video": ["process-x-video", "https://x.com/user/status/1234567890123456789"],
     "process-video-directory": ["process-video-directory", "clips"],
     "process-youtube-playlist": ["process-youtube-playlist", "https://youtube.com/playlist?list=P"],
     "cleanup-cache": ["cleanup-cache"],
@@ -475,11 +476,13 @@ INTERNAL_FAULT_ARGV: dict[str, list[str]] = {
     "timeout-probe": ["timeout-probe", "1"],
     "local-vision-diagnostics": ["local-vision-diagnostics"],
     "call-tool": ["call-tool", "cache_doctor"],
+    "guide": ["guide"],
 }
 """One accepted invocation per subcommand, for the sweep below."""
 
 CLI_WORK_SEAMS = (
     "call_registered_tool",
+    "guide_payload",
     "filtered_view",
     "list_tools",
     "local_vision_diagnostics",

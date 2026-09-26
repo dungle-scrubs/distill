@@ -40,6 +40,7 @@ def test_list_tools_dispatch_prints_sorted_tools(capsys: pytest.CaptureFixture[s
             "get_job_status",
             "process_local_video",
             "process_video_directory",
+            "process_x_video",
             "process_youtube_playlist",
             "process_youtube_video",
         ]

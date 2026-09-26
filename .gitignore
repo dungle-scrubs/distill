@@ -36,3 +36,7 @@ Thumbs.db
 # publishing it ahead of the fixes would be premature disclosure. It also
 # holds plan.db, a binary SQLite file. Revisit once the plan is complete.
 .plans/
+
+# Task scratchpads: per-task evidence and working files. Each task keeps its
+# own directory here; nothing in it is ever committed.
+.scratch/

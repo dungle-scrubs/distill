@@ -39,6 +39,7 @@ def test_list_tools_returns_both_tools() -> None:
             "get_job_status",
             "process_local_video",
             "process_video_directory",
+            "process_x_video",
             "process_youtube_playlist",
             "process_youtube_video",
         ]

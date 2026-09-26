@@ -1,7 +1,8 @@
 """Effectful acquisition: lease, download, validation, promotion.
 
 This module owns the **acquisition lease** (via ``flock`` on an
-``ExclusiveLock``), staging a YouTube **source** download, validating the
+``ExclusiveLock``), staging a remote **source** download (YouTube or X - the
+mechanics are shared and labeled per kind), validating the
 produced media, and promoting it onto its immutable path with a single
 ``os.replace`` (R-35). The **acquisition lease** is held for the media file's
 whole read lifetime, not only for the download (R-36), so the lease is handed
@@ -24,7 +25,7 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -74,6 +75,13 @@ LOCK_DIR_NAME = "_youtube_locks"
 PROMOTED_MEDIA_STEM = "source"
 MEDIA_CONTAINER_PREFERENCE = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
 YOUTUBE_DISK_FLOOR_BYTES = 1024 * 1024 * 1024
+
+DOWNLOAD_FORMAT_SPEC = "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best/bv*+ba/b"
+"""One preference order for "a playable file at or under 720p", every remote kind.
+
+An X run and a YouTube run stage media under the same rule, so neither kind's
+bundles quietly drift to a different container or resolution than the other's.
+"""
 
 BYTE_UNITS = {
     "B": 1,
@@ -127,13 +135,15 @@ class AcquisitionLease:
         return self.lock.released
 
     @classmethod
-    def take(cls, lock_key: str, lock_path: Path) -> AcquisitionLease | None:
+    def take(
+        cls, lock_key: str, lock_path: Path, *, stage: str = "youtube"
+    ) -> AcquisitionLease | None:
         """Take the lease, or report ``None`` if another run holds it."""
         lock = ExclusiveLock.take(
             lock_key,
             lock_path,
-            stage="youtube",
-            message="filesystem cannot lock the YouTube source directory",
+            stage=stage,
+            message="filesystem cannot lock the remote source directory",
         )
         if lock is None:
             return None
@@ -165,7 +175,7 @@ class AcquiredSource:
     warnings: list[WarningRecord] = field(default_factory=list)
 
 
-class YouTubeDownloaderProtocol(Protocol):
+class RemoteDownloaderProtocol(Protocol):
     def acquire(
         self,
         url: str,
@@ -174,12 +184,12 @@ class YouTubeDownloaderProtocol(Protocol):
     ) -> AcquiredSource: ...
 
 
-def check_disk_floor(path: Path) -> None:
+def check_disk_floor(path: Path, *, stage: str = "youtube") -> None:
     usage = shutil.disk_usage(path)
     if usage.free < YOUTUBE_DISK_FLOOR_BYTES:
         raise DistillError(
             "E_DISK_SPACE",
-            "youtube",
+            stage,
             "at least 1 GB free disk space is required",
             {"free_bytes": usage.free},
         )
@@ -246,10 +256,12 @@ def select_downloaded_media(staging_dir: Path) -> Path:
     return min(candidates, key=_container_rank)
 
 
-def _reject_media(path: Path, reason: str, message: str, **detail: Any) -> DistillError:
+def _reject_media(
+    path: Path, reason: str, message: str, *, stage: str = "youtube", **detail: Any
+) -> DistillError:
     """Record a rejection verdict and build the error that carries it."""
     _acquisition_log("media_validated", path=str(path), verdict="rejected", reason=reason, **detail)
-    return DistillError("E_BAD_MEDIA", "youtube", message, {"path": str(path), **detail})
+    return DistillError("E_BAD_MEDIA", stage, message, {"path": str(path), **detail})
 
 
 def _probed_codec_types(probe: Any) -> list[str]:
@@ -275,11 +287,11 @@ def _probed_duration_sec(probe: Any) -> float:
     return duration if math.isfinite(duration) else 0.0
 
 
-def validate_media_file(path: Path) -> list[WarningRecord]:
+def validate_media_file(path: Path, *, stage: str = "youtube") -> list[WarningRecord]:
     """Confirm a staged file is the media Distill asked for, before promoting it."""
     size = path.stat().st_size if path.is_file() else 0
     if size == 0:
-        raise _reject_media(path, "empty_file", "downloaded source file is empty")
+        raise _reject_media(path, "empty_file", "downloaded source file is empty", stage=stage)
     try:
         probe, probe_warnings = run_json(
             [
@@ -292,7 +304,7 @@ def validate_media_file(path: Path) -> list[WarningRecord]:
                 "json",
                 str(path),
             ],
-            stage="youtube",
+            stage=stage,
             total_timeout_sec=FFPROBE_TIMEOUTS.total_sec,
             idle_timeout_sec=FFPROBE_TIMEOUTS.idle_sec,
         )
@@ -305,6 +317,7 @@ def validate_media_file(path: Path) -> list[WarningRecord]:
             path,
             "no_video_stream",
             "downloaded source file carries no video stream",
+            stage=stage,
             codec_types=codec_types,
         )
     duration_sec = _probed_duration_sec(probe)
@@ -313,6 +326,7 @@ def validate_media_file(path: Path) -> list[WarningRecord]:
             path,
             "no_duration",
             "downloaded source file reports no playable duration",
+            stage=stage,
             duration_sec=duration_sec,
         )
     _acquisition_log(
@@ -365,24 +379,45 @@ def release_acquisition_lease(source: SourceInfo, *, during: BaseException | Non
         )
 
 
-class YoutubeDownloader:
+class YtDlpDownloader:
+    """Acquire one remote **source** with yt-dlp, under an **acquisition lease**.
+
+    The mechanics - lease, staging, validation, promotion - are the same for
+    every remote kind Distill names; what differs per kind is the label its
+    errors carry, the progress mechanism its events report, and the extra
+    yt-dlp args its URL convention needs. Those are constructor parameters
+    with the YouTube values as defaults, so a YouTube run behaves exactly as
+    it did and an X run passes `stage="x"`, `label="X"` and the first-video
+    pin (`x_twitter.PLAYLIST_ITEMS_FIRST`).
+    """
+
     def __init__(
         self,
         output_root: Path,
         *,
+        stage: str = "youtube",
+        label: str = "YouTube",
+        download_args: Sequence[str] = (),
         lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
         lock_poll_sec: float = 0.25,
         lock_warn_after_sec: float = 5.0,
         clock: Clock | None = None,
         select: Callable[[Path], Path] = select_downloaded_media,
-        validate: Callable[[Path], list[WarningRecord]] = validate_media_file,
+        validate: Callable[[Path], list[WarningRecord]] | None = None,
         promote: MediaPromoter = promote_media,
     ) -> None:
         """Acquire one remote **source** under an **acquisition lease**."""
         self.output_root = output_root
+        self.stage = stage
+        self.label = label
+        self.download_args = list(download_args)
+        # The progress mechanism a download reports under, derived from the
+        # stage so the two can never disagree: `youtube_download` today, and
+        # `x_download` for an X run - each with its own weight in `progress`.
+        self.mechanism = f"{stage}_download"
         self.clock = clock if clock is not None else SystemClock()
         self.select = select
-        self.validate = validate
+        self.validate = validate or (lambda path: validate_media_file(path, stage=stage))
         self.promote = promote
         self.lock_wait_sec = lock_wait_sec
         self.lock_poll_sec = lock_poll_sec
@@ -412,7 +447,7 @@ class YoutubeDownloader:
             finally:
                 self._discard(staging_dir)
             if progress:
-                progress.complete("youtube_download", detail={"path": str(promoted)})
+                progress.complete(self.mechanism, detail={"path": str(promoted)})
         except BaseException:
             lease.release()
             raise
@@ -449,11 +484,13 @@ class YoutubeDownloader:
         locks = ensure_safe_directory(self.output_root / LOCK_DIR_NAME, self.output_root)
         lock = locks / f"{lock_key}.lock"
         if progress:
-            progress.update("youtube_download", status="running", detail={"step": "lock"})
+            progress.update(self.mechanism, status="running", detail={"step": "lock"})
         lease, lock_warnings = self._acquire(lock_key, lock)
         if lease is None:
             _acquisition_log("lease_denied", lock_key=lock_key, lock_path=str(lock), reason="held")
-            raise DistillError("E_LOCKED", "youtube", "YouTube source is locked by another process")
+            raise DistillError(
+                "E_LOCKED", self.stage, f"{self.label} source is locked by another process"
+            )
         lease.warnings.extend(lock_warnings)
         _acquisition_log("lease_acquired", lock_key=lock_key, lock_path=str(lock))
         return lease
@@ -468,8 +505,9 @@ class YoutubeDownloader:
         command = [
             "yt-dlp",
             NO_PLAYLIST_ARG,
+            *self.download_args,
             "-f",
-            "best[ext=mp4][height<=720]/best[height<=720]/best[ext=mp4]/best/bv*+ba/b",
+            DOWNLOAD_FORMAT_SPEC,
             "--newline",
             "--progress",
             "--socket-timeout",
@@ -493,14 +531,14 @@ class YoutubeDownloader:
             if not parsed or progress is None:
                 return
             progress.update(
-                "youtube_download",
+                self.mechanism,
                 percent=(float(parsed["percent"]) if "percent" in parsed else None),
                 detail=parsed,
             )
 
         return stream(
             command,
-            stage="youtube",
+            stage=self.stage,
             total_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.total_sec,
             idle_timeout_sec=YTDLP_DOWNLOAD_TIMEOUTS.idle_sec,
             on_stdout_line=report,
@@ -516,15 +554,15 @@ class YoutubeDownloader:
         warnings: list[WarningRecord] = []
         while True:
             confined_path(lock, self.output_root)
-            lease = AcquisitionLease.take(lock_key, lock)
+            lease = AcquisitionLease.take(lock_key, lock, stage=self.stage)
             if lease is not None:
                 waited = self.clock.monotonic() - started
                 if waited >= self.lock_warn_after_sec:
                     warnings.append(
                         warning(
-                            "youtube",
+                            self.stage,
                             "long_lock_wait",
-                            f"waited {waited:.1f}s for YouTube source lock",
+                            f"waited {waited:.1f}s for {self.label} source lock",
                         )
                     )
                 return lease, warnings
