@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         python-version: ["3.13", "3.14"]
 
     steps:
@@ -64,12 +64,8 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: uv run pytest --cov --cov-fail-under=80
 
-      # macOS runs the suite without the gate: R-52 asks macOS to prove the
-      # suite passes there, and it must pass with the optional capabilities
-      # absent (they degrade to skips, never to failures - see ADR-0002).
-      - name: Test (pytest)
-        if: matrix.os != 'ubuntu-latest'
-        run: uv run pytest
+      # The macOS proof leg (suite passes with optional capabilities absent,
+      # per R-52/ADR-0002) runs locally on mini: scripts/local-test-macos.sh.
 
   signature:
     name: Pipeline signature check
