@@ -1,7 +1,7 @@
 [project]
 name = "dungle-scrubs-distill"
 version = "0.4.0"
-description = "Distill local videos and YouTube recordings into structured, LLM-readable bundles (transcript, keyframes, OCR, vision captions)."
+description = "Get a talk's speech and slide details without watching it."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -24,6 +24,8 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    # Whisper's decoder passes metadata_errors to av.open; PyAV 19 removed it.
+    "av>=11,<19",
     "faster-whisper>=1.2.1",
     "imagehash>=4.3.2",
     "pillow>=10.0.0",

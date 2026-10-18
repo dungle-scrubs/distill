@@ -19,6 +19,7 @@ from distill.errors import DistillError
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src" / "distill"
 README = REPO_ROOT / "README.md"
+REFERENCE = REPO_ROOT / "docs" / "reference.md"
 
 # The names `run_command` exports for invoking a tool. A call to one of these is
 # where a tool name enters the process.
@@ -254,10 +255,10 @@ def test_an_optional_tool_absence_is_not_allowed_to_end_a_run() -> None:
         missing_tool_error("ocr", "tesseract")
 
 
-def readme_dependency_rows() -> dict[str, tuple[str, str]]:
-    """Tool -> (capability, class), read off the README's four-column table."""
+def dependency_rows(document: Path) -> dict[str, tuple[str, str]]:
+    """Tool -> (capability, class), read off a document's four-column table."""
     rows: dict[str, tuple[str, str]] = {}
-    for line in README.read_text(encoding="utf-8").splitlines():
+    for line in document.read_text(encoding="utf-8").splitlines():
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         if len(cells) != 4 or not cells[0].startswith("`"):
             continue
@@ -265,18 +266,18 @@ def readme_dependency_rows() -> dict[str, tuple[str, str]]:
     return rows
 
 
-def test_the_readme_states_the_class_the_table_records() -> None:
+@pytest.mark.parametrize("document", [README, REFERENCE], ids=["README", "REFERENCE"])
+def test_the_document_states_the_class_the_table_records(document: Path) -> None:
     """D-022: the docstring's claim about the README is backed by this test.
 
-    Nothing renders the README's system-dependency table from `EXTERNAL_TOOLS` -
-    it is prose, written by hand - so the only thing keeping the promise it
-    makes about degradation aligned with the code is this assertion. A tool
-    reclassified here without the README changing with it fails the suite.
+    Both the README and reference carry system-dependency tables written by
+    hand. Check each against `EXTERNAL_TOOLS` so reclassifying a tool without
+    updating either document fails the suite.
     """
-    rows = readme_dependency_rows()
+    rows = dependency_rows(document)
 
     for name, tool in EXTERNAL_TOOLS.items():
-        assert name in rows, f"{name} is classified but the README does not list it"
+        assert name in rows, f"{name} is classified but {document.name} does not list it"
         capability, requirement = rows[name]
         assert capability == tool.capability, name
         assert requirement == str(tool.requirement), name

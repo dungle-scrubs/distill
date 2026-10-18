@@ -171,6 +171,7 @@ name = "dungle-scrubs-distill"
 version = "0.4.0"
 source = { editable = "." }
 dependencies = [
+    { name = "av" },
     { name = "faster-whisper" },
     { name = "imagehash" },
     { name = "pillow" },
@@ -189,6 +190,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "av", specifier = ">=11,<19" },
     { name = "faster-whisper", specifier = ">=1.2.1" },
     { name = "imagehash", specifier = ">=4.3.2" },
     { name = "pillow", specifier = ">=10.0.0" },

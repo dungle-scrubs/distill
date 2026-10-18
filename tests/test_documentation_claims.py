@@ -1,11 +1,18 @@
 """What the documentation claims, held against the code that would keep it.
 
 R-51, and D-022's rule that an overstated claim in a README is a defect. Nothing
-renders `README.md` or `AGENTS.md` from the package - both are written by hand -
-so the only thing that can keep a documented default, class, flag or bound in
-step with the code is an assertion. Each test here names one claim and derives
-the other side of it from the package rather than restating it, so a claim that
-stops being true fails the suite instead of aging quietly.
+renders `README.md`, `docs/reference.md`, or `AGENTS.md` from the package -
+all three are written by hand - so the only thing that can keep a documented
+default, class, flag or bound in step with the code is an assertion. Each test
+here names one claim and derives the other side of it from the package rather
+than restating it, so a claim that stops being true fails the suite instead of
+aging quietly.
+
+Most relocated reference prose now lives in `docs/reference.md`, so the
+detailed Configuration, Commands, system-dependencies absence-cost, shared
+processing-options, and fingerprint-sampling checks are read against it. The
+README keeps a default-output-root summary and a link to the reference page;
+AGENTS.md keeps the capability table the agent uses to triage a missing tool.
 
 The scope is claims a program can check: a default value, a classification, a
 registered flag, a derived bound. Prose that describes a property (what a
@@ -35,6 +42,7 @@ from distill.source_identity import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 README = REPO_ROOT / "README.md"
+REFERENCE = REPO_ROOT / "docs" / "reference.md"
 AGENTS = REPO_ROOT / "AGENTS.md"
 CONFIG_SOURCE = REPO_ROOT / "src" / "distill" / "config.py"
 VERSION_SOURCE = REPO_ROOT / "src" / "distill" / "version.py"
@@ -116,11 +124,19 @@ def table_rows(text: str, columns: int) -> dict[str, tuple[str, ...]]:
     """
     rows: dict[str, tuple[str, ...]] = {}
     for line in text.splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         if len(cells) != columns or not cells[0].startswith("`"):
             continue
         rows[cells[0].strip("`")] = tuple(cells[1:])
     return rows
+
+
+def test_table_rows_ignores_inline_pipes_in_prose() -> None:
+    text = "`| head` always produces.\n\n| `guide [TOPIC]` | Print guidance. |\n"
+
+    assert table_rows(text, columns=2) == {"guide [TOPIC]": ("Print guidance.",)}
 
 
 def registered_options() -> set[str]:
@@ -191,8 +207,8 @@ def test_the_readme_states_the_default_output_root_the_code_uses() -> None:
 
 
 def test_phase_one_configuration_claims_match_their_mechanisms() -> None:
-    readme = README.read_text(encoding="utf-8")
-    configuration = readme.split("## Configuration", 1)[1].split("## Commands", 1)[0]
+    reference = REFERENCE.read_text(encoding="utf-8")
+    configuration = reference.split("## Configuration", 1)[1].split("## Commands", 1)[0]
     flowed_configuration = flowed(configuration)
     lower_configuration = flowed_configuration.lower()
     config_source = CONFIG_SOURCE.read_text(encoding="utf-8")
@@ -206,23 +222,22 @@ def test_phase_one_configuration_claims_match_their_mechanisms() -> None:
     assert "argparse" in flowed_configuration
     assert "2.5" in flowed_configuration
     assert "E_BAD_OPTIONS" in flowed_configuration
-    assert "Configuring one does not configure the other" in flowed(readme)
+    assert "Configuring one does not configure the other" in flowed(reference)
     assert "explicit override is authoritative even when it is absent" in flowed(config_source)
     assert "every processing option there is part of the options" not in version_source
 
 
-def test_the_readme_states_the_class_and_cost_the_capability_table_records() -> None:
-    """ADR-0002 in the README, per tool rather than as a blanket promise.
+def test_the_reference_states_the_class_and_cost_the_capability_table_records() -> None:
+    """ADR-0002 in the reference, per tool rather than as a blanket promise.
 
-    The three-column table states what an absence costs; the four-column
-    dependency table above it states the class, and `test_capabilities.py` holds
-    that one. Both are checked here against `EXTERNAL_TOOLS`, because a cost
-    stated for the wrong class is the reading of ADR-0002 that finding 13 was.
+    The reference states absence costs; the README states installation
+    requirements, checked separately in `test_capabilities.py`. A cost stated
+    for the wrong class is the reading of ADR-0002 that finding 13 was.
     """
-    rows = table_rows(README.read_text(encoding="utf-8"), columns=3)
+    rows = table_rows(REFERENCE.read_text(encoding="utf-8"), columns=3)
 
     for name, tool in EXTERNAL_TOOLS.items():
-        assert name in rows, f"{name} is classified but the README states no absence cost"
+        assert name in rows, f"{name} is classified but the reference states no absence cost"
         requirement, cost = rows[name]
         assert requirement == str(tool.requirement), name
         assert cost == tool.absence_cost, name
@@ -240,8 +255,8 @@ def test_agents_carries_the_same_capability_table() -> None:
         assert cost == tool.absence_cost, name
 
 
-def test_the_readme_commands_table_lists_every_registered_subcommand() -> None:
-    """ "The following subcommands" has to be all of them, and only them.
+def test_the_reference_commands_table_lists_every_registered_subcommand() -> None:
+    """The reference must list all registered subcommands, and no others.
 
     Read off `build_parser`'s own registry, so a command added without a row -
     which is how `cache-doctor` came to be documented only in an upgrade note -
@@ -252,18 +267,18 @@ def test_the_readme_commands_table_lists_every_registered_subcommand() -> None:
     unremarked: a row for `frobnicate` documents a command nobody can run, which
     is a reader following instructions into a usage error.
     """
-    documented = {command.split()[0] for command in table_rows(prose(README), columns=2)}
+    documented = {command.split()[0] for command in table_rows(prose(REFERENCE), columns=2)}
 
     assert documented == registered_subcommands()
 
 
-def test_the_readme_names_every_shared_processing_option() -> None:
+def test_the_reference_names_every_shared_processing_option() -> None:
     """The flag list the processing commands share, against the list they take.
 
-    Scoped to the paragraph that claims to be the list, not to the README as a
-    whole: a flag documented only in the section about what it is for leaves the
-    list itself stale, which is how `--local-vision-allow-remote-endpoint` came
-    to be missing from it.
+    Scoped to the paragraph that claims to be the list, not to the reference as
+    a whole: a flag documented only in the section about what it is for leaves
+    the list itself stale, which is how `--local-vision-allow-remote-endpoint`
+    came to be missing from it.
 
     Both directions, and the second one is scoped per command. A flag in this
     paragraph is claimed to be taken by *each* of the commands the paragraph
@@ -274,11 +289,11 @@ def test_the_readme_names_every_shared_processing_option() -> None:
     """
     listing = re.search(
         r"The processing commands \((?P<commands>.*?)\).*?for the full list\.",
-        flowed(prose(README)),
+        flowed(prose(REFERENCE)),
         re.DOTALL,
     )
 
-    assert listing is not None, "the README lists no shared processing options"
+    assert listing is not None, "the reference lists no shared processing options"
     named = {flag for span in INLINE_CODE.findall(listing.group(0)) for flag in FLAG.findall(span)}
     for key in PROCESSING_KEYS:
         flag = f"--{key.replace('_', '-')}"
@@ -311,7 +326,11 @@ def distill_flags(text: str) -> set[str]:
     }
 
 
-@pytest.mark.parametrize("document", [README, AGENTS], ids=["README", "AGENTS"])
+@pytest.mark.parametrize(
+    "document",
+    [README, REFERENCE, AGENTS],
+    ids=["README", "REFERENCE", "AGENTS"],
+)
 def test_no_document_names_a_flag_the_parser_does_not_register(document: Path) -> None:
     """A flag in prose that no command takes is a claim nothing keeps."""
     registered = registered_options()
@@ -320,21 +339,23 @@ def test_no_document_names_a_flag_the_parser_does_not_register(document: Path) -
     assert named <= registered, sorted(named - registered)
 
 
-def test_the_readme_states_the_sampling_bounds_the_fingerprint_actually_reads() -> None:
+def test_the_reference_states_the_sampling_bounds_the_fingerprint_actually_reads() -> None:
     """R-51's collision property is stated in terms of what is read.
 
-    The numbers a reader is asked to reason about - how many anchors, how much
-    at each, how much in total, and where `content` stops - are derived here
-    from the code that does the reading, so a widened anchor set leaves the
-    README's arithmetic failing rather than quietly wrong.
+    The fingerprint explanation moved with the output-layout section to
+    `docs/reference.md`. The numbers a reader is asked to reason about - how
+    many anchors, how much at each, how much in total, and where `content`
+    stops - are derived here from the code that does the reading, so a widened
+    anchor set leaves the reference's arithmetic failing rather than quietly
+    wrong.
 
-    Each number is asserted *inside the phrase that carries its claim*, not as a
-    free-floating substring. Loose, the two byte counts were interchangeable:
-    swapping them in the README - 576 KiB at each of nine anchors, bounding a
+    Each number is asserted *inside the phrase that carries its claim*, not as
+    a free-floating substring. Loose, the two byte counts were interchangeable:
+    swapping them in the prose - 576 KiB at each of nine anchors, bounding a
     lookup at 64 KiB, wrong by a factor of 81 in both directions - left both
     strings present and the test green.
     """
-    documented = flowed(prose(README))
+    documented = flowed(prose(REFERENCE))
     anchors = len(fingerprint_anchor_offsets(FINGERPRINT_SAMPLE_BYTES * 1000))
     total_kib = anchors * FINGERPRINT_SAMPLE_BYTES // 1024
 
@@ -345,3 +366,13 @@ def test_the_readme_states_the_sampling_bounds_the_fingerprint_actually_reads() 
     assert f"{NUMBER_WORDS[FINGERPRINT_INTERIOR_ANCHORS]} evenly spread interior" in documented
     assert f"bounds a cache lookup at {total_kib} KiB" in documented
     assert f"refuses files over {CONTENT_HASH_LIMIT_BYTES // 1024**3} GB" in documented
+
+
+def test_the_readme_links_to_the_reference() -> None:
+    """Relocated reference content must remain reachable from the README."""
+    readme = README.read_text(encoding="utf-8")
+
+    assert re.search(r"\[[^\]]+\]\((?:\./)?docs/reference\.md\)", readme), (
+        "the README does not link to docs/reference.md; a reader has no path "
+        "to the relocated reference content."
+    )
