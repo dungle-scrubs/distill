@@ -1,6 +1,6 @@
 # Distill
 
-Get a talk's speech and slide details without watching it.
+consume a video without watching it
 
 Give your agent one self-contained markdown file with what a video says and
 shows, so it can extract information that automated subtitles miss. Distill
