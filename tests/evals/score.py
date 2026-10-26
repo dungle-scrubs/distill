@@ -23,15 +23,20 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import time
 import tomllib
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from distill.grounding import assess_grounding
 from distill.ocr import find_tesseract_command, ocr_frame
 from distill.redact_secrets import redact_for_prompt
+
+if TYPE_CHECKING:
+    from distill.local_vision import LocalVisionConfig
 
 EVAL_ROOT = Path(__file__).resolve().parent
 FRAMES_DIR = EVAL_ROOT / "frames"
@@ -48,6 +53,14 @@ VALID_CATEGORIES = frozenset(
     }
 )
 VALID_LEGIBILITY = frozenset({"clean", "partial", "unreadable"})
+
+EVAL_SOURCE_TYPE = "eval"
+"""What the eval's frames are, for the options hash the chain walk computes.
+
+The hash is not the point: the eval looks up nothing in a bundle cache. But
+`resolve_chain` computes one per candidate key, and it needs a source type to
+compute it with.
+"""
 
 _PUNCT = str.maketrans(dict.fromkeys("\"'`.,:;!?()[]{}<>|/\\-–—_=+*#", " "))
 
@@ -264,6 +277,7 @@ def evaluate(
     model: str | None = None,
     backend: str | None = None,
     base_url: str | None = None,
+    endpoint: LocalVisionConfig | None = None,
 ) -> list[CaseResult]:
     # The same lookup that gates this function must also drive the OCR call.
     # find_tesseract_command() falls back to well-known install paths that are
@@ -273,7 +287,7 @@ def evaluate(
     tesseract_cmd = find_tesseract_command()
     if not tesseract_cmd:
         raise SystemExit("tesseract not found; install it before scoring OCR")
-    interpret = _vision_interpreter(model, backend, base_url) if with_vision else None
+    interpret = _vision_interpreter(model, backend, base_url, endpoint) if with_vision else None
     results: list[CaseResult] = []
     for case in load_labelled_cases():
         case_id = case.id
@@ -368,12 +382,15 @@ def _vision_config(
 
 
 def _vision_interpreter(
-    model: str | None = None, backend: str | None = None, base_url: str | None = None
+    model: str | None = None,
+    backend: str | None = None,
+    base_url: str | None = None,
+    endpoint: LocalVisionConfig | None = None,
 ):
     from distill.local_vision import probe_local_vision, try_interpret_image
     from distill.vision_prompts import build_technical_frame_prompt
 
-    config = _vision_config(model, backend, base_url)
+    config = endpoint if endpoint is not None else _scored_endpoint(model, backend, base_url)
     probe = probe_local_vision(config)
     if not probe.available:
         raise SystemExit(f"vision backend unavailable ({probe.code}): {probe.message}")
@@ -384,6 +401,72 @@ def _vision_interpreter(
         return result
 
     return interpret
+
+
+def _scored_endpoint(
+    model: str | None = None,
+    backend: str | None = None,
+    base_url: str | None = None,
+) -> LocalVisionConfig:
+    """The endpoint the eval scores against: the one a run would use.
+
+    `--model` and `--base-url` name one endpoint, and that one is scored.
+    Without them the config may name an **endpoint chain**, and a run walks the
+    chain and uses the first entry that answers. The eval walks it the same
+    way, so the score is evidence about the endpoint the run would have used
+    rather than about the one the config lists first.
+    """
+    config = _vision_config(model, backend, base_url)
+    if model or base_url:
+        return config
+    return _endpoint_from_chain(config)
+
+
+def _endpoint_from_chain(config: LocalVisionConfig) -> LocalVisionConfig:
+    """The endpoint the chain walk selects, chosen the way a run chooses it.
+
+    `resolve_chain` is the pipeline's own walk (`vision_chain.py`), not a
+    second selector written here: an eval that picked its endpoint by its own
+    rule would drift from the run it is evidence for the first time the two
+    rules disagreed. The eval has no bundle to serve, so every candidate key
+    reads as absent and the walk goes straight to probing the chain in order.
+    """
+    from distill.local_vision import probe_local_vision
+    from distill.options import DistillOptions
+    from distill.vision_chain import resolve_chain
+
+    chain = config.endpoints or (config,)
+    resolution = resolve_chain(
+        DistillOptions(local_vision_endpoints=chain),
+        chain,
+        EVAL_SOURCE_TYPE,
+        cached=lambda _opts_hash: None,
+        probe=lambda entry: probe_local_vision(entry).available,
+        now=time.monotonic,
+    )
+    if resolution.endpoint is None:
+        # Nothing in the chain answered. The first entry's own probe says why -
+        # unreachable, wrong model, refused - and it is the entry a run would
+        # have tried first.
+        probe = probe_local_vision(chain[0])
+        raise SystemExit(f"vision backend unavailable ({probe.code}): {probe.message}")
+    return resolution.endpoint
+
+
+def _safe_base_url(url: str) -> str:
+    """The address as Distill's own messages show it: the authority only.
+
+    A URL can carry a key in its userinfo or its path, and this text is
+    pasted into bug reports.
+    """
+    from distill import rapid_mlx
+
+    return rapid_mlx._safe_url_for_message(url)
+
+
+def _endpoint_label(endpoint: LocalVisionConfig) -> str:
+    """How the scored endpoint is named in the output: its model and its address."""
+    return f"{endpoint.model} at {_safe_base_url(endpoint.base_url)}"
 
 
 def _mean(values: list[float]) -> float | None:
@@ -485,7 +568,13 @@ def main() -> None:
     if args.gate is not None and not args.with_vision:
         parser.error("--gate requires --with-vision")
 
-    results = evaluate(args.with_vision, args.model, args.backend, args.base_url)
+    # The endpoint is chosen before anything is scored, and named in the
+    # output: a score that does not say which reader produced it is evidence
+    # about an unknown reader.
+    endpoint = (
+        _scored_endpoint(args.model, args.backend, args.base_url) if args.with_vision else None
+    )
+    results = evaluate(args.with_vision, args.model, args.backend, args.base_url, endpoint=endpoint)
     summary = summarize(results)
     gate: dict[str, object] | None = None
     if args.gate is not None:
@@ -520,6 +609,11 @@ def main() -> None:
             run["vision_config"] = _vision_config(
                 args.model, args.backend, args.base_url
             ).public_dict()
+        if endpoint is not None:
+            run["scored_endpoint"] = {
+                "model": endpoint.model,
+                "base_url": _safe_base_url(endpoint.base_url),
+            }
         output = {"run": run, "summary": summary, "cases": [vars(r) for r in results]}
         if gate is not None:
             output["gate"] = gate
@@ -530,6 +624,9 @@ def main() -> None:
     if not results:
         print("No verified cases yet. Fill in <id>.gt.txt and set verified = true in cases.toml.")
         return
+    if endpoint is not None:
+        print(f"  scored endpoint: {_endpoint_label(endpoint)}")
+        print()
     category_width = max(len(category) for category in VALID_CATEGORIES)
     for r in results:
         vis = f"{r.vision_wer:.2f}" if r.vision_wer is not None else " -  "

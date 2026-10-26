@@ -60,7 +60,7 @@ def configure_evaluation(
     monkeypatch.setattr(
         score,
         "_vision_interpreter",
-        lambda _model, _backend, _base_url: lambda _image, _ocr_text: interpretation,
+        lambda *_args, **_kwargs: lambda _image, _ocr_text: interpretation,
     )
 
 
@@ -588,3 +588,92 @@ def test_the_gate_evidence_file_is_internally_consistent() -> None:
     ]
     assert evidence["summary"]["cases_scored"] == len(scored_ids)
     assert [case["id"] for case in evidence["cases"]] == scored_ids
+
+
+def a_chain_config() -> object:
+    """A config that names a two-entry **endpoint chain**, and a default beside it.
+
+    The default is the config's own top-level address: the one the scorer used
+    to read, whichever chain the file named.
+    """
+    from distill.local_vision import LocalVisionConfig
+
+    return LocalVisionConfig(
+        model="default-model",
+        base_url="http://127.0.0.1:8000/v1",
+        endpoints=(
+            LocalVisionConfig(model="model-a", base_url="http://127.0.0.1:8001/v1"),
+            LocalVisionConfig(model="model-b", base_url="http://127.0.0.1:8002/v1"),
+        ),
+    )
+
+
+def a_probe(available: bool, model: str, base_url: str) -> object:
+    from distill.local_vision import LocalVisionProbe
+
+    return LocalVisionProbe(
+        available=available,
+        backend="rapid-mlx",
+        model=model,
+        base_url=base_url,
+        code="local_vision_unreachable",
+        message="no answer",
+        detail={},
+    )
+
+
+def test_the_scored_endpoint_is_the_one_the_chain_walk_selects(monkeypatch) -> None:
+    """A config that names a chain is scored against the endpoint a run would use.
+
+    The scorer used to read the config's own top-level address, so a config
+    naming a chain was scored against the default endpoint rather than the one
+    the chain selects. The score was then evidence about a reader the run would
+    not have used.
+    """
+    from distill import configuration, local_vision
+
+    config = a_chain_config()
+    monkeypatch.setattr(configuration, "load_local_vision_config", lambda: config)
+    monkeypatch.setattr(
+        local_vision,
+        "probe_local_vision",
+        lambda entry: a_probe(entry.model == "model-b", entry.model, entry.base_url),
+    )
+
+    endpoint = score._scored_endpoint()
+
+    assert endpoint.model == "model-b"
+    assert endpoint.base_url == "http://127.0.0.1:8002/v1"
+
+
+def test_an_explicit_base_url_scores_that_one_endpoint(monkeypatch) -> None:
+    """`--base-url` names one endpoint, and the chain does not overrule it."""
+    from distill import configuration, local_vision
+
+    monkeypatch.setattr(configuration, "load_local_vision_config", a_chain_config)
+
+    def fail_probe(_entry: object) -> object:
+        raise AssertionError("the chain was walked even though an endpoint was named")
+
+    monkeypatch.setattr(local_vision, "probe_local_vision", fail_probe)
+
+    endpoint = score._scored_endpoint(base_url="http://127.0.0.1:9000/v1")
+
+    assert endpoint.base_url == "http://127.0.0.1:9000/v1"
+
+
+def test_the_scored_endpoint_is_named_with_its_model_and_sanitized_address() -> None:
+    """The output says which reader produced the score, without the secret parts.
+
+    A URL can carry a key in its userinfo or its path, and this text is pasted
+    into bug reports, so the address is the authority only - the same form
+    Distill's own messages use.
+    """
+    from distill.local_vision import LocalVisionConfig
+
+    endpoint = LocalVisionConfig(
+        model="model-a",
+        base_url="http://user:key@127.0.0.1:8001/v1?token=secret",
+    )
+
+    assert score._endpoint_label(endpoint) == "model-a at http://127.0.0.1:8001"

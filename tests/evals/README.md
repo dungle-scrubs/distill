@@ -134,6 +134,13 @@ uv run python tests/evals/score.py --with-vision --model qwen3-vl:30b-a3b
 uv run python tests/evals/score.py --with-vision --json
 ```
 
+The scorer names the endpoint it scored: the model, and the base URL as the
+authority only. It picks that endpoint the way a run picks one. Without
+`--model` or `--base-url` the config may name an **endpoint chain**, and the
+scorer walks it with the pipeline's own walk and scores the first entry that
+answers, so the score is evidence about the endpoint a run would have used.
+`--model` and `--base-url` name one endpoint, and that one is scored.
+
 ## Metrics
 
 - **`text_recovery_accuracy`**: mean order-insensitive token recall over scored
