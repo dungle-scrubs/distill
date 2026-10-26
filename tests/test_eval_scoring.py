@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 from eval_helpers import load_eval_module, load_score_module
+
+if TYPE_CHECKING:
+    from distill.local_vision import LocalVisionConfig
 
 score = load_score_module()
 generate_negatives = load_eval_module("generate_negatives")
@@ -590,22 +596,31 @@ def test_the_gate_evidence_file_is_internally_consistent() -> None:
     assert [case["id"] for case in evidence["cases"]] == scored_ids
 
 
-def a_chain_config() -> object:
-    """A config that names a two-entry **endpoint chain**, and a default beside it.
+def a_chain_config() -> dict[str, object]:
+    """A configuration file's worth of a two-entry **endpoint chain**.
 
-    The default is the config's own top-level address: the one the scorer used
-    to read, whichever chain the file named.
+    The chain is what a run walks; the scorer's flags are resolved against it.
     """
-    from distill.local_vision import LocalVisionConfig
+    return {
+        "endpoints": [
+            {"model": "model-a", "base_url": "http://127.0.0.1:8001/v1"},
+            {"model": "model-b", "base_url": "http://127.0.0.1:8002/v1"},
+        ]
+    }
 
-    return LocalVisionConfig(
-        model="default-model",
-        base_url="http://127.0.0.1:8000/v1",
-        endpoints=(
-            LocalVisionConfig(model="model-a", base_url="http://127.0.0.1:8001/v1"),
-            LocalVisionConfig(model="model-b", base_url="http://127.0.0.1:8002/v1"),
-        ),
-    )
+
+def use_a_chain_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Scope Distill's configuration to a directory naming a two-entry chain.
+
+    The scorer reads the same configuration layers a run reads, so the chain
+    is written where a run would find it: a configuration directory, named by
+    DISTILL_CONFIG_DIR, holding `distill.local-vision.json`.
+    """
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "distill.local-vision.json").write_text(json.dumps(a_chain_config()))
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(config_dir))
+    return config_dir
 
 
 def a_probe(available: bool, model: str, base_url: str) -> object:
@@ -622,7 +637,28 @@ def a_probe(available: bool, model: str, base_url: str) -> object:
     )
 
 
-def test_the_scored_endpoint_is_the_one_the_chain_walk_selects(monkeypatch) -> None:
+def record_probes(
+    monkeypatch: pytest.MonkeyPatch,
+    available: Callable[[LocalVisionConfig], bool] = lambda entry: True,
+) -> list[tuple[str, str]]:
+    """Fake the endpoint probe, recording every endpoint that was asked.
+
+    The endpoints are asked in the order the walk tries them, so the record
+    says which one the scorer settled on and which it never reached.
+    """
+    from distill import local_vision
+
+    asked: list[tuple[str, str]] = []
+
+    def probe(entry: LocalVisionConfig) -> object:
+        asked.append((entry.model, entry.base_url))
+        return a_probe(bool(available(entry)), entry.model, entry.base_url)
+
+    monkeypatch.setattr(local_vision, "probe_local_vision", probe)
+    return asked
+
+
+def test_the_scored_endpoint_is_the_one_the_chain_walk_selects(tmp_path, monkeypatch) -> None:
     """A config that names a chain is scored against the endpoint a run would use.
 
     The scorer used to read the config's own top-level address, so a config
@@ -630,36 +666,154 @@ def test_the_scored_endpoint_is_the_one_the_chain_walk_selects(monkeypatch) -> N
     the chain selects. The score was then evidence about a reader the run would
     not have used.
     """
-    from distill import configuration, local_vision
-
-    config = a_chain_config()
-    monkeypatch.setattr(configuration, "load_local_vision_config", lambda: config)
-    monkeypatch.setattr(
-        local_vision,
-        "probe_local_vision",
-        lambda entry: a_probe(entry.model == "model-b", entry.model, entry.base_url),
-    )
+    use_a_chain_config(monkeypatch, tmp_path)
+    asked = record_probes(monkeypatch, available=lambda entry: entry.model == "model-b")
 
     endpoint = score._scored_endpoint()
 
     assert endpoint.model == "model-b"
     assert endpoint.base_url == "http://127.0.0.1:8002/v1"
+    assert asked == [
+        ("model-a", "http://127.0.0.1:8001/v1"),
+        ("model-b", "http://127.0.0.1:8002/v1"),
+    ]
 
 
-def test_an_explicit_base_url_scores_that_one_endpoint(monkeypatch) -> None:
-    """`--base-url` names one endpoint, and the chain does not overrule it."""
-    from distill import configuration, local_vision
+def test_a_model_override_over_a_chain_is_the_runs_own_refusal(tmp_path, monkeypatch) -> None:
+    """`--model` over a chain of more than one entry is refused, as a run refuses it.
 
-    monkeypatch.setattr(configuration, "load_local_vision_config", a_chain_config)
+    The model decides which bundle a run publishes under, so a run asked for
+    one model against a chain of two refuses rather than guessing which entry
+    was meant. The scorer used to score the named model at the built-in
+    default address - a reader no run would ever call.
+    """
+    from distill.configuration import local_vision_config_from_args
+    from distill.errors import DistillError
 
-    def fail_probe(_entry: object) -> object:
-        raise AssertionError("the chain was walked even though an endpoint was named")
+    use_a_chain_config(monkeypatch, tmp_path)
+    asked = record_probes(monkeypatch)
 
-    monkeypatch.setattr(local_vision, "probe_local_vision", fail_probe)
+    with pytest.raises(DistillError) as run_refusal:
+        local_vision_config_from_args({"local_vision_model": "model-x"})
+    with pytest.raises(DistillError) as scorer_refusal:
+        score._scored_endpoint(model="model-x")
+
+    assert scorer_refusal.value.code == "E_BAD_OPTIONS"
+    # The scorer's refusal is the run's refusal, word for word: the scorer
+    # does not get to write a better one.
+    assert scorer_refusal.value.message == run_refusal.value.message
+    assert asked == [], "the endpoint was probed even though the options were refused"
+
+
+def test_a_base_url_override_moves_the_chains_first_entry(tmp_path, monkeypatch) -> None:
+    """`--base-url` re-addresses the chain's first entry and leaves the rest.
+
+    A run asked for an address asks the chain's first entry there first and
+    falls through to the others. The scorer used to score the built-in default
+    model at the named address - a reader no run would call.
+    """
+    from distill.configuration import local_vision_config_from_args
+
+    use_a_chain_config(monkeypatch, tmp_path)
+    asked = record_probes(monkeypatch)
 
     endpoint = score._scored_endpoint(base_url="http://127.0.0.1:9000/v1")
 
+    assert endpoint.model == "model-a"
     assert endpoint.base_url == "http://127.0.0.1:9000/v1"
+    # The first entry is the one a run would try first, so it is the one asked.
+    assert asked == [("model-a", "http://127.0.0.1:9000/v1")]
+
+    run_config = local_vision_config_from_args(
+        {"local_vision_base_url": "http://127.0.0.1:9000/v1"}
+    )
+    assert [(entry.model, entry.base_url) for entry in run_config.endpoints or ()] == [
+        ("model-a", "http://127.0.0.1:9000/v1"),
+        ("model-b", "http://127.0.0.1:8002/v1"),
+    ]
+
+
+def test_a_model_and_a_base_url_together_name_one_endpoint(tmp_path, monkeypatch) -> None:
+    """Both flags name one endpoint completely, and that one is scored.
+
+    A run told to use that endpoint carries no other, so there is no fallback
+    to fall through to - the chain is replaced by the endpoint named.
+    """
+    use_a_chain_config(monkeypatch, tmp_path)
+    asked = record_probes(monkeypatch)
+
+    endpoint = score._scored_endpoint(model="model-x", base_url="http://127.0.0.1:9000/v1")
+
+    assert endpoint.model == "model-x"
+    assert endpoint.base_url == "http://127.0.0.1:9000/v1"
+    assert asked == [("model-x", "http://127.0.0.1:9000/v1")]
+    # The chain is replaced, not kept beside the endpoint named: a run told to
+    # use one endpoint carries no other to fall through to.
+    config = score._vision_config(model="model-x", base_url="http://127.0.0.1:9000/v1")
+    assert [(entry.model, entry.base_url) for entry in config.endpoints] == [
+        ("model-x", "http://127.0.0.1:9000/v1")
+    ]
+
+
+def test_the_backend_flag_still_names_the_backend(tmp_path, monkeypatch) -> None:
+    """`--backend` lands on the resolved config, and does not disturb the chain.
+
+    The backend is an endpoint field, not a chain-wide one: naming it says
+    which server speaks HTTP, not which entry of the chain is meant.
+    """
+    use_a_chain_config(monkeypatch, tmp_path)
+
+    config = score._vision_config(backend="rapid-mlx")
+
+    assert config.backend == "rapid-mlx"
+    assert [(entry.model, entry.base_url) for entry in config.endpoints] == [
+        ("model-a", "http://127.0.0.1:8001/v1"),
+        ("model-b", "http://127.0.0.1:8002/v1"),
+    ]
+
+
+def test_the_scorer_stops_with_the_runs_refusal_instead_of_scoring(tmp_path, monkeypatch) -> None:
+    """`score.py --model model-x` stops with the run's refusal, and scores nothing.
+
+    The scorer is a tool an operator runs by hand, so the refusal has to read
+    as the run's refusal - the same code, the same message - rather than as a
+    traceback out of the eval tooling.
+    """
+    from distill.configuration import local_vision_config_from_args
+    from distill.errors import DistillError
+
+    use_a_chain_config(monkeypatch, tmp_path)
+    record_probes(monkeypatch)
+
+    def refuse_to_score(*_args, **_kwargs):
+        raise AssertionError("the corpus was scored after the options were refused")
+
+    monkeypatch.setattr(score, "evaluate", refuse_to_score)
+
+    with pytest.raises(DistillError) as run_refusal:
+        local_vision_config_from_args({"local_vision_model": "model-x"})
+    with pytest.raises(SystemExit) as stopped:
+        score.main(["--with-vision", "--model", "model-x"])
+
+    assert str(stopped.value) == f"{run_refusal.value.code}: {run_refusal.value.message}"
+    assert "E_BAD_OPTIONS" in str(stopped.value)
+
+
+def test_the_json_run_block_records_the_resolved_chain(tmp_path, monkeypatch) -> None:
+    """The run block keeps every configured address, sanitized.
+
+    The block is committed with a baseline, so it records the **effective**
+    config - the chain a run would walk - and no address in it keeps a key.
+    """
+    use_a_chain_config(monkeypatch, tmp_path)
+
+    public = score._public_config(score._vision_config())
+
+    assert [entry["model"] for entry in public["endpoints"]] == ["model-a", "model-b"]
+    assert [entry["base_url"] for entry in public["endpoints"]] == [
+        "http://127.0.0.1:8001",
+        "http://127.0.0.1:8002",
+    ]
 
 
 def test_the_scored_endpoint_is_named_with_its_model_and_sanitized_address() -> None:

@@ -135,11 +135,21 @@ uv run python tests/evals/score.py --with-vision --json
 ```
 
 The scorer names the endpoint it scored: the model, and the base URL as the
-authority only. It picks that endpoint the way a run picks one. Without
-`--model` or `--base-url` the config may name an **endpoint chain**, and the
-scorer walks it with the pipeline's own walk and scores the first entry that
-answers, so the score is evidence about the endpoint a run would have used.
-`--model` and `--base-url` name one endpoint, and that one is scored.
+authority only. It picks that endpoint the way a run picks one. The config may
+name an **endpoint chain**, and the scorer walks it with the pipeline's own
+walk and scores the first entry that answers, so the score is evidence about
+the endpoint a run would have used.
+
+The flags resolve through the run's own rule, so they land where a run's land:
+
+- `--base-url` re-addresses the chain's first entry and leaves the rest as the
+  fallbacks a run would try. The scorer scores the first entry that answers.
+- `--model` over a chain of more than one entry is **refused**, with the run's
+  `E_BAD_OPTIONS`: the model decides which bundle a run publishes under, so a
+  run asked for one model against a chain of two does not guess which entry was
+  meant. The scorer stops with the same message instead of scoring.
+- `--model` and `--base-url` together name one endpoint completely, and the
+  chain is replaced by it, so that endpoint is scored.
 
 ## Metrics
 

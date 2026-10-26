@@ -27,10 +27,11 @@ import time
 import tomllib
 import unicodedata
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from distill.errors import DistillError
 from distill.grounding import assess_grounding
 from distill.ocr import find_tesseract_command, ocr_frame
 from distill.redact_secrets import redact_for_prompt
@@ -358,27 +359,34 @@ def evaluate(
 
 def _vision_config(
     model: str | None = None, backend: str | None = None, base_url: str | None = None
-):
+) -> LocalVisionConfig:
     """The config the eval scores against, resolved the way a run resolves it.
 
-    Loaded through `load_local_vision_config` rather than constructed bare, so
-    a credential (`api_key_env`) and the remote opt-in come from the same
-    config layers production reads - the Gate 2->3 comparison is only evidence
-    about the endpoint path if it goes through that path. Scope it with
-    DISTILL_CONFIG_DIR to score a cloud reader without touching the machine's
-    own settings. CLI overrides still win over the file.
-    """
-    from distill.configuration import load_local_vision_config
+    Resolved through `local_vision_config_from_args`, the run's own entry
+    point, so the overrides land the way a run's land rather than the way a
+    dataclass replacement lands them. The two are not the same rule: the model
+    decides which bundle a run publishes under, so a run asked for one model
+    against a chain of more than one endpoint refuses (E_BAD_OPTIONS) instead
+    of guessing, while the address alone moves the chain's first entry and
+    leaves the rest as the fallbacks a run would try. Naming both replaces the
+    chain with the one endpoint they name.
 
-    base = load_local_vision_config()
-    overrides: dict[str, str] = {}
+    The config layers are the ones production reads, so a credential
+    (`api_key_env`) and the remote opt-in come from the same place - the
+    Gate 2->3 comparison is only evidence about the endpoint path if it goes
+    through that path. Scope it with DISTILL_CONFIG_DIR to score a cloud reader
+    without touching the machine's own settings.
+    """
+    from distill.configuration import local_vision_config_from_args
+
+    args: dict[str, str] = {}
     if model:
-        overrides["model"] = model
+        args["local_vision_model"] = model
     if backend:
-        overrides["backend"] = backend
+        args["local_vision_backend"] = backend
     if base_url:
-        overrides["base_url"] = base_url.rstrip("/")
-    return replace(base, **overrides) if overrides else base
+        args["local_vision_base_url"] = base_url
+    return local_vision_config_from_args(args)
 
 
 def _vision_interpreter(
@@ -410,16 +418,17 @@ def _scored_endpoint(
 ) -> LocalVisionConfig:
     """The endpoint the eval scores against: the one a run would use.
 
-    `--model` and `--base-url` name one endpoint, and that one is scored.
-    Without them the config may name an **endpoint chain**, and a run walks the
-    chain and uses the first entry that answers. The eval walks it the same
-    way, so the score is evidence about the endpoint the run would have used
+    The flags resolve through the run's own rule (`_vision_config`), so what
+    is left is either the one endpoint they named or a chain - and either way
+    the endpoint is chosen by the pipeline's own walk, the way a run chooses
+    one. The score is then evidence about the endpoint a run would have used
     rather than about the one the config lists first.
+
+    A flag that names no endpoint the run could use is refused before this
+    point, by the run's own rule and with the run's own message: the scorer
+    does not score a reader no run would call.
     """
-    config = _vision_config(model, backend, base_url)
-    if model or base_url:
-        return config
-    return _endpoint_from_chain(config)
+    return _endpoint_from_chain(_vision_config(model, backend, base_url))
 
 
 def _endpoint_from_chain(config: LocalVisionConfig) -> LocalVisionConfig:
@@ -561,7 +570,7 @@ def summarize(results: list[CaseResult]) -> dict:
     }
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--with-vision", action="store_true", help="also score the vision model")
     parser.add_argument(
@@ -586,16 +595,23 @@ def main() -> None:
         default=None,
         help="apply the acceptance rule from a recorded baseline JSON",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.gate is not None and not args.with_vision:
         parser.error("--gate requires --with-vision")
 
     # The endpoint is chosen before anything is scored, and named in the
     # output: a score that does not say which reader produced it is evidence
     # about an unknown reader.
-    endpoint = (
-        _scored_endpoint(args.model, args.backend, args.base_url) if args.with_vision else None
-    )
+    endpoint = None
+    if args.with_vision:
+        try:
+            endpoint = _scored_endpoint(args.model, args.backend, args.base_url)
+        except DistillError as exc:
+            # The run's own refusal, in the scorer's own shape: its code and
+            # its message, and no score. The flags named an endpoint the run
+            # would refuse to use, so scoring one anyway would produce a
+            # number about a reader no run would call.
+            raise SystemExit(f"{exc.code}: {exc.message}") from exc
     results = evaluate(args.with_vision, args.model, args.backend, args.base_url, endpoint=endpoint)
     summary = summarize(results)
     gate: dict[str, object] | None = None
