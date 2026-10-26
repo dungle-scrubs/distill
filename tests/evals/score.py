@@ -464,6 +464,28 @@ def _safe_base_url(url: str) -> str:
     return rapid_mlx._safe_url_for_message(url)
 
 
+def _public_config(config) -> dict:
+    """The config's public fields, with every address shown as `_safe_base_url` shows it.
+
+    `public_dict` keeps `base_url` as configured, at the top level and in each
+    chain entry, and the run block is committed with a baseline.
+    """
+
+    def sanitized(value):
+        if isinstance(value, dict):
+            return {
+                key: _safe_base_url(item)
+                if key == "base_url" and isinstance(item, str)
+                else sanitized(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [sanitized(item) for item in value]
+        return value
+
+    return sanitized(config.public_dict())
+
+
 def _endpoint_label(endpoint: LocalVisionConfig) -> str:
     """How the scored endpoint is named in the output: its model and its address."""
     return f"{endpoint.model} at {_safe_base_url(endpoint.base_url)}"
@@ -606,9 +628,9 @@ def main() -> None:
         # the EFFECTIVE config (defaults resolved), not the flags as typed.
         run: dict[str, object] = {"with_vision": args.with_vision}
         if args.with_vision:
-            run["vision_config"] = _vision_config(
-                args.model, args.backend, args.base_url
-            ).public_dict()
+            run["vision_config"] = _public_config(
+                _vision_config(args.model, args.backend, args.base_url)
+            )
         if endpoint is not None:
             run["scored_endpoint"] = {
                 "model": endpoint.model,

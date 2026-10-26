@@ -677,3 +677,28 @@ def test_the_scored_endpoint_is_named_with_its_model_and_sanitized_address() -> 
     )
 
     assert score._endpoint_label(endpoint) == "model-a at http://127.0.0.1:8001"
+
+
+def test_the_json_run_block_shows_every_configured_address_sanitized() -> None:
+    """The run block is committed with a baseline, so no address in it keeps a key.
+
+    `public_dict` reports `base_url` as configured, at the top level and in each
+    chain entry.
+    """
+    from distill.local_vision import LocalVisionConfig
+
+    secret = "http://user:key@127.0.0.1:8001/v1?token=secret"
+    config = LocalVisionConfig(
+        model="model-a",
+        base_url=secret,
+        endpoints=(
+            LocalVisionConfig(model="model-a", base_url=secret),
+            LocalVisionConfig(model="model-b", base_url="http://127.0.0.1:8002/v1"),
+        ),
+    )
+
+    public = score._public_config(config)
+
+    text = json.dumps(public)
+    assert "key" not in text and "secret" not in text
+    assert public["base_url"] == "http://127.0.0.1:8001"
