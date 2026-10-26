@@ -37,6 +37,14 @@ entries derive the same **bundle key**, so there would be nothing left to
 tell their bundles apart. Each entry is read from a fresh default, so entry
 2 never inherits entry 1's credential or its remote opt-in.
 
+An entry may carry `"forwards_off_machine": true`
+([ADR-0009](adr/0009-a-forwards-off-machine-declaration-marks-the-run-non-local.md)):
+the operator's statement that this endpoint - loopback or not - relays
+keyframes and surrounding transcript text off the machine, which is what a
+proxy in front of a hosted model does and what no address can show. The
+declaration is per entry and re-keys the bundle for it, like remoteness;
+it changes no transport rule and needs no `allow_remote_endpoint`.
+
 The cache is asked before any endpoint is. If a bundle for any of the keys
 the chain could publish under is already on disk, it is served and no
 endpoint is contacted at all, including when the cached bundle came from a
@@ -317,7 +325,7 @@ broke.
 | `list-tools` | Print the registered tool names as JSON. |
 | `timeout-diagnostics` | Show the configured vs. effective timeout (assumption A-004). |
 | `timeout-probe PROBE_MS` | Sleep for a bounded timeout probe; long probes require `DISTILL_ENABLE_LONG_TIMEOUT_PROBE=1`. |
-| `local-vision-diagnostics` | Probe the local Rapid-MLX vision server and print the resolved config. Flags: `--caption-frames/--no-caption-frames`, `--local-vision-backend`, `--local-vision-model`, `--local-vision-base-url`, `--local-vision-timeout-sec`, `--local-vision-allow-remote-endpoint/--no-local-vision-allow-remote-endpoint`. |
+| `local-vision-diagnostics` | Probe the local Rapid-MLX vision server and print the resolved config. Flags: `--caption-frames/--no-caption-frames`, `--local-vision-backend`, `--local-vision-model`, `--local-vision-base-url`, `--local-vision-timeout-sec`, `--local-vision-allow-remote-endpoint/--no-local-vision-allow-remote-endpoint`, `--local-vision-forwards-off-machine/--no-local-vision-forwards-off-machine`. |
 | `call-tool TOOL [--args JSON]` | Call any registered tool by its MCP-style name with a JSON arguments object. Prints the MCP envelope, so the tool's own JSON is the string at `.result.content[0].text` rather than the printed document itself. |
 
 `filtered-view` is a reading of a bundle, not a second render of it. It
@@ -365,7 +373,8 @@ part of bundle identity), `--max-keyframes`, `--min-interval-sec`,
 `--output-dir`, `--force-reprocess`, `--job-id`, `--resume-partial`,
 `--caption-frames`/`--no-caption-frames`, `--local-vision-backend`,
 `--local-vision-model`, `--local-vision-base-url`,
-`--local-vision-timeout-sec`, and `--local-vision-allow-remote-endpoint`. Run
+`--local-vision-timeout-sec`, `--local-vision-allow-remote-endpoint`, and
+`--local-vision-forwards-off-machine`. Run
 `distill COMMAND --help` for the full list.
 
 Each numeric option has a domain, and a value outside it is refused with
@@ -423,7 +432,16 @@ By default Distill targets `http://127.0.0.1:8000/v1` (Rapid-MLX's default
 port). Override the endpoint with `--local-vision-base-url`. If the server
 is down, the configured model is not loaded, or the endpoint is refused,
 Distill degrades to OCR-only output rather than failing the run, and
-records a warning naming which of those it was.
+records a warning naming which of those it was. That includes an endpoint
+that refuses a completion request with an HTTP 4xx that is neither an auth
+failure (401/403) nor retryable (429): a server that rejects the request's
+shape - LM Studio answers 400 to `response_format` - or a 404 for an
+unknown model is reported as a refused request naming the status, not as
+malformed JSON. A refusal degrades only the keyframe it answered - the
+endpoint was out of profile for that frame, not for the run - and the run
+continues with the remaining keyframes; a refusal at the config level,
+such as LM Studio's 400 to `response_format` on every request, degrades
+every keyframe one at a time.
 
 ### Which endpoint Distill will speak to
 
@@ -448,15 +466,28 @@ points is a decision rather than a default:
   preferred, and it wins over an inline value) or `api_key` in the
   local-vision config. The value is sent as `Authorization: Bearer` and
   never appears in logs, errors, renders, or bundles. A credential that
-  is *configured but empty* on a non-loopback endpoint is a fatal config
-  error (the typo guard); configuring none at all is intentional no-auth.
-- Remote runs are bounded. With the opt-out set, the vision stage carries
-  a run-wide budget (wall clock and received bytes) and 429/5xx answers
-  are retried within `Retry-After` bounds, then the remainder of the run
-  degrades to OCR-only. A run that may send keyframes off-machine also
-  records a `non_local_only_processing` warning in its render, and that
-  fact becomes part of bundle identity; the endpoint's address never
+  is *configured but empty* is a fatal config error (the typo guard) on
+  any endpoint the run treats as non-local - a remote one, or a loopback
+  one declared to forward off the machine; configuring none at all is
+  intentional no-auth.
+- Runs that may send keyframes off the machine are bounded. With the
+  remote opt-out set, or a loopback endpoint declared to forward off the
+  machine, the vision stage carries a run-wide budget (wall clock and
+  received bytes); once it is spent, the remainder of the run degrades to
+  OCR-only. On any endpoint, 429/5xx answers are retried within
+  `Retry-After` bounds. A run that may send keyframes off the machine
+  also records a `non_local_only_processing` warning in its render, and
+  that fact becomes part of bundle identity; the endpoint's address never
   does.
+- Declare a forwarding proxy. A loopback endpoint that relays keyframes to
+  a hosted reader - the external-proxy route
+  ([ADR-0009](adr/0009-a-forwards-off-machine-declaration-marks-the-run-non-local.md))
+  - is local to every transport check and off the machine in fact. Pass
+  `--local-vision-forwards-off-machine` (or set
+  `"forwards_off_machine": true` in the local-vision config or one
+  endpoint entry) to say so. The declaration changes no transport rule;
+  it makes the run non-local for the disclosure above, with a warning
+  message naming the declaration.
 
 A *misconfigured* endpoint (bad scheme, credential in the URL, remote
 without the opt-out, configured-but-empty credential) is a fatal error at

@@ -83,8 +83,23 @@ TRANSPORT_FAILURE_CODES = frozenset(
 # evidence it works. A success is the other member of this class and needs no
 # code. Everything else (an unreadable image file, a cancelled run) happened on
 # this side of the wire and says nothing either way.
+#
+# A refused request (a 4xx that is neither auth nor retryable) sits here, not
+# among the immediate failures, because D-008's off-profile case is per-frame
+# by definition: an endpoint that 400s the image content part is out of
+# profile *for that frame* - the frame degrades to OCR-only and the run
+# continues with the next keyframe, whose request may be nothing like the
+# refused one. The refusal still arrived as a response, so it resets the
+# consecutive-failure tally rather than counting toward it. A config-level
+# refusal (LM Studio's 400 to `response_format`) repeats on every keyframe and
+# degrades them one at a time; that is the accepted cost of keeping the
+# per-frame rule true.
 DELIVERED_RESPONSE_CODES = frozenset(
-    {"local_vision_malformed_response", "local_vision_retry_exhausted"}
+    {
+        "local_vision_malformed_response",
+        "local_vision_retry_exhausted",
+        rapid_mlx.REQUEST_REFUSED_CODE,
+    }
 )
 # 429/5xx handling (D-008): the server asked for a pause, so honor it - but
 # bounded on both axes, attempts and seconds, because Retry-After is the
@@ -98,7 +113,9 @@ _sleep = time.sleep
 # rejected credential will be rejected again on the next keyframe, and a
 # rejected endpoint is a property of the config, not of the frame - retrying
 # either is sending more keyframes to an endpoint that already said no
-# (D-016, D-008).
+# (D-016, D-008). A refused request is deliberately absent: a refusal is
+# per-frame under D-008, so it degrades its own keyframe and never this set
+# (see DELIVERED_RESPONSE_CODES for why).
 IMMEDIATE_FAILURE_CODES = frozenset(
     {
         "local_vision_auth_rejected",
@@ -120,6 +137,7 @@ FRAME_READ_FAILURE_CODES = frozenset(
         "local_vision_auth_rejected",
         rapid_mlx.VisionStageBudget.CODE,
         rapid_mlx.ENDPOINT_REJECTED_CODE,
+        rapid_mlx.REQUEST_REFUSED_CODE,
     }
 )
 LOGGER = logging.getLogger(__name__)
@@ -140,6 +158,21 @@ class LocalVisionConfig:
     client will do with an answer rather than about whose answer it is. And
     the widened host narrows the scheme: a non-loopback endpoint must speak
     `https` (D-008) - plain `http` is loopback-only, opt-out or not.
+    """
+    forwards_off_machine: bool = False
+    """ADR-0009's declaration: the operator states that this endpoint, loopback
+    or not, relays keyframes and surrounding transcript text to a reader off
+    the machine - an external proxy of the kind ADR-0005 points
+    non-conforming providers behind.
+
+    A disclosure, not a transport rule. It changes nothing about where the
+    client will connect (R-43's loopback rule, D-008's scheme rule, the
+    redirect refusal and the response cap hold exactly as before) and it does
+    not require `allow_remote_endpoint`. What it changes is D-012's answer:
+    the run records the `non_local_only_processing` warning and folds
+    non-local into **bundle identity**, because the address cannot show what
+    a proxy does with what reaches it - only the operator knows, and this is
+    how they say so.
     """
     credential: rapid_mlx.SecretCredential | None = field(
         default=None, repr=False, metadata={"secret": True}
@@ -228,11 +261,17 @@ class LocalVisionConfig:
 
 def config_is_non_local(config: LocalVisionConfig) -> bool:
     """D-012's predicate, in one place: this run MAY send keyframes off the
-    producing machine. True when the operator opted into a remote endpoint,
-    the scheme is not `http` (which the transport proves loopback on every
-    request, opt-in or not - D-008), and the host is not a literal loopback
-    address. An `https` hostname counts as remote: it cannot be settled
-    statically, and provenance folds fail closed."""
+    producing machine. True first when the operator declared that the endpoint
+    forwards off the machine (ADR-0009) - a fact about what the endpoint does
+    with what reaches it, which no address can show, so the declaration is
+    believed as stated and needs neither `allow_remote_endpoint` nor a
+    non-loopback host. Otherwise true when the operator opted into a remote
+    endpoint, the scheme is not `http` (which the transport proves loopback on
+    every request, opt-in or not - D-008), and the host is not a literal
+    loopback address. An `https` hostname counts as remote: it cannot be
+    settled statically, and provenance folds fail closed."""
+    if config.forwards_off_machine:
+        return True
     if not config.allow_remote_endpoint:
         return False
     try:
@@ -425,6 +464,8 @@ class _TransportBreaker:
             skipped = self._skipped
         if opened is None or not skipped:
             return None
+        # No phrase for a refused request: a refusal is per-frame (D-008) and
+        # never opens the breaker, so it cannot be the code this table names.
         immediate_phrases = {
             "local_vision_auth_rejected": "the endpoint rejected the credential",
             rapid_mlx.ENDPOINT_REJECTED_CODE: "the endpoint was rejected",
@@ -471,7 +512,14 @@ def _debug_enabled(value: bool | None = None) -> bool:
     return os.environ.get(DEBUG_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-ENDPOINT_FIELD_NAMES = ("model", "base_url", "api_key", "api_key_env", "allow_remote_endpoint")
+ENDPOINT_FIELD_NAMES = (
+    "model",
+    "base_url",
+    "api_key",
+    "api_key_env",
+    "allow_remote_endpoint",
+    "forwards_off_machine",
+)
 """The config keys that describe *one* **vision endpoint**.
 
 Named as a set rather than checked inline because two rules need the same
@@ -616,12 +664,12 @@ def _check_credential_is_not_empty(
     index: int | None = None,
 ) -> None:
     """D-016's typo guard: a credential the operator *configured* resolved to
-    nothing, on an endpoint that says remote is intended and whose host is not
-    literally loopback.
+    nothing, on an endpoint the run treats as non-local - remote-opted, or
+    declared to forward off the machine (ADR-0009).
 
-    Without `allow_remote_endpoint` the per-request resolved-address check
-    already proves the endpoint local (D-029), so a hostname like `localhost` is
-    not punished. Configuring no credential at all remains intentional no-auth.
+    Without either mark the per-request resolved-address check already proves
+    the endpoint local (D-029), so a hostname like `localhost` is not punished.
+    Configuring no credential at all remains intentional no-auth.
     """
     if not (
         captioning
@@ -646,7 +694,7 @@ def _check_credential_is_not_empty(
         "E_BAD_OPTIONS",
         "local_vision",
         f"{where}local_vision credential is configured but empty{named}; refusing "
-        "to send keyframes to a non-loopback endpoint without it.",
+        "to send keyframes off the machine without it.",
         details,
     )
 
@@ -692,6 +740,12 @@ def probe_rapid_mlx_availability(
     existing warning codes so the OCR-only fallback behaves as before.
     """
     models_url = rapid_mlx._models_url(config.base_url)
+    # The authority only, for every detail and log below: these surfaces are
+    # diagnostics an operator pastes into a bug report, and a base_url path
+    # can carry a key (D-007) - the same rule the transport's error text
+    # already follows. The configured URL itself is echoed by the config, not
+    # by an error detail.
+    safe_models_url = rapid_mlx._safe_url_for_message(models_url)
     try:
         payload = rapid_mlx._http_get_json(
             requestor,
@@ -744,7 +798,7 @@ def probe_rapid_mlx_availability(
             base_url=config.base_url,
             code="local_vision_timeout",
             message="Rapid-MLX local vision probe timed out; continuing with OCR-only output.",
-            detail={"error": str(exc), "url": models_url},
+            detail={"error": str(exc), "url": safe_models_url},
         )
     except urllib.error.URLError as exc:
         return LocalVisionProbe(
@@ -754,7 +808,7 @@ def probe_rapid_mlx_availability(
             base_url=config.base_url,
             code="local_vision_rapid_mlx_unavailable",
             message="Rapid-MLX is unavailable for local vision; continuing with OCR-only output. Start it with `rapid-mlx serve <model>`.",
-            detail={"error": str(exc), "url": models_url},
+            detail={"error": str(exc), "url": safe_models_url},
         )
     except OSError as exc:
         return LocalVisionProbe(
@@ -764,7 +818,7 @@ def probe_rapid_mlx_availability(
             base_url=config.base_url,
             code="local_vision_rapid_mlx_unavailable",
             message="Rapid-MLX local vision connection dropped during probe; continuing with OCR-only output.",
-            detail={"error": str(exc), "url": models_url},
+            detail={"error": str(exc), "url": safe_models_url},
         )
     except (ValueError, RuntimeError) as exc:
         # An HTTP error or a non-envelope answer from /models says nothing
@@ -773,7 +827,7 @@ def probe_rapid_mlx_availability(
         # attempted completion decides; only a transport-level failure above
         # stops the probe, because both endpoints share a server.
         rapid_mlx._boundary_log(
-            "models_catalog_unavailable", {"error": str(exc)[:200], "url": models_url}
+            "models_catalog_unavailable", {"error": str(exc)[:200], "url": safe_models_url}
         )
         payload = {"data": []}
 
@@ -804,7 +858,7 @@ def probe_rapid_mlx_availability(
                 detail={
                     "configured_model": config.model,
                     "served_models": served,
-                    "url": models_url,
+                    "url": safe_models_url,
                     "completion_error": attempt_failure.message,
                     "completion_code": attempt_failure.code,
                     **{
@@ -824,7 +878,7 @@ def probe_rapid_mlx_availability(
                 f"Model '{config.model}' is not in the /models catalog but a "
                 "completion succeeded; proceeding."
             ),
-            detail={"served_models": served, "url": models_url, "model_not_listed": True},
+            detail={"served_models": served, "url": safe_models_url, "model_not_listed": True},
         )
     return LocalVisionProbe(
         available=True,
@@ -833,7 +887,7 @@ def probe_rapid_mlx_availability(
         base_url=config.base_url,
         code="local_vision_available",
         message="Rapid-MLX local vision target is available.",
-        detail={"served_models": served, "url": models_url},
+        detail={"served_models": served, "url": safe_models_url},
     )
 
 
@@ -906,6 +960,14 @@ def _attempt_minimal_completion(
             "local_vision_rapid_mlx_unavailable",
             f"completion attempt could not reach the endpoint: {exc}",
             {"error": str(exc)},
+        )
+    except rapid_mlx.HttpRequestRefused as exc:
+        # Its own event, not the model-shaped failure: a refusal names the
+        # cause the operator can act on - the request's shape, the model's
+        # name - and reporting it as a missing model would hide it, exactly
+        # as it would for the auth rejection handled above.
+        return rapid_mlx.LocalVisionFailure(
+            rapid_mlx.REQUEST_REFUSED_CODE, exc.message, {"status": exc.status, **exc.detail}
         )
     except (RuntimeError, ValueError) as exc:
         # An HTTP error or non-envelope answer to a well-formed completion for
@@ -1036,13 +1098,26 @@ class FrameInterpreter:
             # D-012: both provenance surfaces - this warning and the identity
             # fold in options.cache_payload - read the SAME predicate on the
             # same input, before any I/O (including the probe's), so a bundle
-            # keyed non-local always carries the disclosure.
+            # keyed non-local always carries the disclosure. The message says
+            # which way the run was made non-local, because the operator
+            # action that would un-make it is different: withdraw a
+            # declaration about a proxy, or stop pointing at a remote host.
+            if self.config.forwards_off_machine:
+                message = (
+                    "the operator declared that the vision endpoint forwards "
+                    "keyframes and surrounding transcript text off the machine; "
+                    "the generation may not be local-only processing."
+                )
+            else:
+                message = (
+                    "this run was configured to send keyframes and surrounding "
+                    "transcript text to a non-loopback vision endpoint; the "
+                    "generation may not be local-only processing."
+                )
             non_local = warning(
                 "local_vision",
                 "non_local_only_processing",
-                "this run was configured to send keyframes and surrounding "
-                "transcript text to a non-loopback vision endpoint; the "
-                "generation may not be local-only processing.",
+                message,
             )
             self._record_warning(non_local)
             provenance_warnings.append(non_local)
@@ -1118,10 +1193,15 @@ class FrameInterpreter:
         # instance rides every request the stage makes, so the probe's GET
         # and attempted completion charge the same bounds as the frames
         # (D-008: run-wide means the run, not the run minus its first two
-        # requests). Attached only when the config opts into a remote
-        # endpoint: remote cost is the threat, and a slow-but-working local
-        # model must not be half-degraded by a run-wide clock.
-        if self.config.budget is None and self.config.allow_remote_endpoint:
+        # requests). Attached only when the run may send keyframes off the
+        # machine - `allow_remote_endpoint`, or ADR-0009's declaration on a
+        # loopback proxy, which spends hosted cost per frame exactly as a
+        # remote endpoint does - because off-machine cost is the threat, and
+        # a slow-but-working local model must not be half-degraded by a
+        # run-wide clock.
+        if self.config.budget is None and (
+            self.config.allow_remote_endpoint or self.config.forwards_off_machine
+        ):
             budget = rapid_mlx.VisionStageBudget(
                 wall_clock_sec=float(self.budget_sec), max_bytes=int(self.budget_bytes)
             )
@@ -1586,6 +1666,11 @@ def _interpret_with_rapid_mlx(
         "stream": False,
     }
     completions_url = rapid_mlx._completions_url(config.base_url)
+    # Authority only, in every failure detail below (D-007): a base_url path
+    # can carry a key, the transport's exception text already sanitizes it,
+    # and a detail that undid that would hand the key to whatever surface the
+    # detail reaches. The request itself still uses the full URL.
+    safe_completions_url = rapid_mlx._safe_url_for_message(completions_url)
     last_preview = ""
     for _attempt in range(DEFAULT_MAX_ATTEMPTS):
         try:
@@ -1605,20 +1690,62 @@ def _interpret_with_rapid_mlx(
             raise rapid_mlx.LocalVisionFailure(
                 "local_vision_rapid_mlx_unavailable",
                 "Rapid-MLX local vision target was unreachable during generation; continuing with OCR-only output.",
-                {"error": str(exc), "url": completions_url},
+                {"error": str(exc), "url": safe_completions_url},
             ) from exc
         except OSError as exc:
             # e.g. ConnectionResetError while reading the response body.
             raise rapid_mlx.LocalVisionFailure(
                 "local_vision_rapid_mlx_unavailable",
                 "Rapid-MLX local vision connection dropped during generation; continuing with OCR-only output.",
-                {"error": str(exc), "url": completions_url},
+                {"error": str(exc), "url": safe_completions_url},
             ) from exc
-        except (ValueError, RuntimeError) as exc:
+        except rapid_mlx.HttpRequestRefused as exc:
+            # A 4xx refusal arrived as a response, so it is neither malformed
+            # JSON (nothing was parsed) nor a transport fault (nothing failed
+            # to arrive). Its own code, and the message the transport built
+            # under the bounded-preview rules: status, sanitized URL, and a
+            # preview that is withheld on an authenticated request.
+            raise rapid_mlx.LocalVisionFailure(
+                rapid_mlx.REQUEST_REFUSED_CODE,
+                exc.message,
+                {"status": exc.status, **exc.detail},
+            ) from exc
+        except rapid_mlx.ResponseBodyNotAnObject as exc:
+            # A body that parsed but is not an object: the same "unusable
+            # response" class as the RuntimeError cases below - something
+            # arrived and this side could not use it - so the message names
+            # the cause. Only a body that is not JSON at all may say
+            # "malformed JSON".
+            raise rapid_mlx.LocalVisionFailure(
+                "local_vision_malformed_response",
+                f"Rapid-MLX local vision returned an unusable response: {exc}; "
+                "continuing with OCR-only output.",
+                {"error": str(exc), "url": safe_completions_url},
+            ) from exc
+        except ValueError as exc:
+            # A body that really is not JSON: the malformed-JSON finding this
+            # path has always carried, and nothing else may claim it.
             raise rapid_mlx.LocalVisionFailure(
                 "local_vision_malformed_response",
                 "Rapid-MLX local vision returned malformed JSON; continuing with OCR-only output.",
-                {"error": str(exc), "url": completions_url},
+                {"error": str(exc), "url": safe_completions_url},
+            ) from exc
+        except RuntimeError as exc:
+            # Not a refusal (caught above): a response this side could not
+            # use - an unfollowable 3xx, a read that stopped mid-body, a body
+            # over the cap. The code stays malformed-response: something
+            # arrived, so it is evidence the transport works (M7.2) and no
+            # transport fault. The message names the cause from the exception
+            # text, which every transport raise site sanitizes before it is
+            # built - authority-only URL (the byte-cap raise included),
+            # bounded preview - rather than filing every one of these
+            # under "malformed JSON", which is the one thing most of them are
+            # not.
+            raise rapid_mlx.LocalVisionFailure(
+                "local_vision_malformed_response",
+                f"Rapid-MLX local vision returned an unusable response: {exc}; "
+                "continuing with OCR-only output.",
+                {"error": str(exc), "url": safe_completions_url},
             ) from exc
         raw_response = rapid_mlx._chat_content(envelope)
         interpreted = rapid_mlx.parse_interpretation_json(raw_response)

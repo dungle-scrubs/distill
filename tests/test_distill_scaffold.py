@@ -118,6 +118,7 @@ def test_local_vision_diagnostics_cli_accepts_all_overrides() -> None:
             "--local-vision-timeout-sec",
             "45",
             "--local-vision-allow-remote-endpoint",
+            "--local-vision-forwards-off-machine",
         ]
     )
 
@@ -127,6 +128,7 @@ def test_local_vision_diagnostics_cli_accepts_all_overrides() -> None:
     assert args.local_vision_base_url == "http://127.0.0.1:8000/v1"
     assert args.local_vision_timeout_sec == 45.0
     assert args.local_vision_allow_remote_endpoint is True
+    assert args.local_vision_forwards_off_machine is True
 
     from distill.cli import LOCAL_VISION_DIAGNOSTIC_KEYS
 

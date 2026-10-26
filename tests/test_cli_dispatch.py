@@ -211,6 +211,90 @@ def test_local_vision_diagnostics_dispatch_runs_with_every_override(
     assert payload["probe"]["available"] is True
 
 
+def test_local_vision_diagnostics_reports_a_forwards_off_machine_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """ADR-0009's loopback-proxy case, on the command an operator checks their
+    config with: the declaration reaches the resolved config the command
+    prints, on a loopback `http` endpoint that needs no remote opt-in.
+    """
+    from distill.local_vision import LocalVisionProbe
+
+    monkeypatch.setattr(
+        "distill.pipeline.probe_local_vision",
+        lambda config: LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="",
+            message="",
+            detail={},
+        ),
+    )
+    code, out, _ = _run(
+        [
+            "local-vision-diagnostics",
+            "--local-vision-base-url",
+            "http://127.0.0.1:17501/v1",
+            "--local-vision-forwards-off-machine",
+        ],
+        capsys,
+    )
+    assert code is None
+    payload = json.loads(out)
+    assert payload["config"]["forwards_off_machine"] is True
+    assert payload["config"]["allow_remote_endpoint"] is False
+    assert payload["probe"]["available"] is True
+
+
+def test_local_vision_diagnostics_carries_the_flag_onto_every_chain_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """The declaration flag against an explicit file chain, on the command an
+    operator checks it with: every entry the diagnostics walks shows `true`,
+    because the run could select any of them and an explicit chain reads only
+    its entries (ADR-0009).
+    """
+    from distill.local_vision import LocalVisionProbe
+
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:17501/v1"},
+                ]
+            }
+        )
+    )
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "distill.pipeline.probe_local_vision",
+        lambda config: LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="",
+            message="",
+            detail={},
+        ),
+    )
+    code, out, _ = _run(
+        ["local-vision-diagnostics", "--local-vision-forwards-off-machine"],
+        capsys,
+    )
+    assert code is None
+    payload = json.loads(out)
+    entries = payload["config"]["endpoints"]
+    assert [entry["model"] for entry in entries] == ["qwen3-vl:8b", "qwen3-vl:32b"]
+    assert [entry["forwards_off_machine"] for entry in entries] == [True, True]
+
+
 def test_main_propagates_distill_error_to_stderr(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

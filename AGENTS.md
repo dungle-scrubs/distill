@@ -75,6 +75,18 @@ chain selects one reader under [ADR-0007](docs/adr/0007-an-endpoint-chain-select
   loopback-only, opt-out or not), the vision stage gains a run-wide
   wall-clock + byte budget, and the run records a `non_local_only_processing`
   warning that folds into bundle identity.
+- **A loopback proxy that forwards off the machine is declared, not detected**
+  ([ADR-0009](docs/adr/0009-a-forwards-off-machine-declaration-marks-the-run-non-local.md)):
+  `forwards_off_machine` - `--local-vision-forwards-off-machine` on the same
+  commands, or `"forwards_off_machine": true` in the local-vision config or
+  one endpoint-chain entry - states that the endpoint relays keyframes and
+  surrounding transcript text off the machine, which is ADR-0005's
+  external-proxy route and something no address can show. It changes no
+  transport rule and needs no `allow_remote_endpoint`; it makes
+  `config_is_non_local` true, so the run records the `non_local_only_processing`
+  warning naming the declaration, folds non-local into bundle identity, and
+  arms the vision stage's run-wide wall-clock + byte budget - a forwarding
+  proxy spends hosted cost per frame, exactly as a remote endpoint does.
 - **Start the server yourself** - Distill assumes it is already running:
   ```bash
   rapid-mlx serve mlx-community/Qwen3-VL-8B-Instruct-8bit
@@ -84,7 +96,16 @@ chain selects one reader under [ADR-0007](docs/adr/0007-an-endpoint-chain-select
   stdlib `urllib` (no new runtime dependency).
 - If the server is down, the configured model is not loaded, or the endpoint is
   refused, Distill degrades to OCR-only output rather than failing the run, and
-  records a **warning** naming which of those it was.
+  records a **warning** naming which of those it was. That includes an
+  endpoint that refuses a completion request with an HTTP 4xx that is neither
+  an auth failure (401/403) nor retryable (429): a server that rejects the
+  request's shape - LM Studio answers 400 to `response_format` - or a 404 for
+  an unknown model is reported as a refused request naming the status, not as
+  malformed JSON. A refusal degrades only the keyframe it answered - the
+  endpoint was out of profile for that frame, not for the run (D-008) - and
+  the run continues with the remaining keyframes; a refusal at the config
+  level, such as LM Studio's 400 to `response_format` on every request,
+  degrades every keyframe one at a time.
 
 ### Single vision backend
 
@@ -94,7 +115,8 @@ chain selects one reader under [ADR-0007](docs/adr/0007-an-endpoint-chain-select
 - **No `local_vision_provider` option.** `backend` is fixed to `rapid-mlx` and
   `model` selects the served model. The per-run overrides are
   `--local-vision-backend`, `--local-vision-model`, `--local-vision-base-url`,
-  `--local-vision-timeout-sec`, `--local-vision-allow-remote-endpoint` and
+  `--local-vision-timeout-sec`, `--local-vision-allow-remote-endpoint`,
+  `--local-vision-forwards-off-machine` and
   `--caption-frames`/`--no-caption-frames`.
 
 ### Why this model (eval rationale)

@@ -54,6 +54,16 @@ LOGGER = logging.getLogger("distill.local_vision")
 
 ENDPOINT_REJECTED_CODE = "local_vision_endpoint_rejected"
 
+REQUEST_REFUSED_CODE = "local_vision_request_refused"
+"""A request the endpoint answered with a non-auth, non-retryable HTTP 4xx.
+
+The endpoint read the request and said no to *it* - a body shape it will not
+accept (LM Studio answers 400 to `response_format`), a model it does not know
+(404), a route that is not there - rather than failing to answer. Nothing was
+parsed, so "malformed JSON" is the one thing it is not, and the frame path
+maps it onto this code instead.
+"""
+
 
 ALLOWED_ENDPOINT_SCHEMES = frozenset({"http", "https"})
 
@@ -76,11 +86,12 @@ _monotonic = time.monotonic
 _READ_CHUNK_BYTES = 64 * 1024
 
 
-# Run-wide vision-stage budget defaults (D-008). They exist to bound REMOTE
-# cost - the interpreter only attaches a budget when the config opts into a
-# remote endpoint, because a slow local model is not the threat and must not
-# be half-degraded by a run-wide clock. The probe runs before the budget is
-# created, so its two requests are bounded by timeout_sec alone.
+# Run-wide vision-stage budget defaults (D-008). They exist to bound
+# OFF-MACHINE cost - the interpreter attaches a budget when the config opts
+# into a remote endpoint or declares that the endpoint forwards off the
+# machine (ADR-0009) - because a slow local model is not the threat and must
+# not be half-degraded by a run-wide clock. The probe runs before the budget
+# is created, so its two requests are bounded by timeout_sec alone.
 # 3600s clears the run's own worst case (default 80 keyframes x 30s
 # timeout = 2400s) with margin; the bound exists for runaway remote cost,
 # not to race a working endpoint.
@@ -167,6 +178,48 @@ class EndpointRejected(LocalVisionFailure):
     def __init__(self, reason: str, message: str, detail: dict[str, Any] | None = None) -> None:
         super().__init__(ENDPOINT_REJECTED_CODE, message, {"reason": reason, **(detail or {})})
         self.reason = reason
+
+
+class HttpRequestRefused(RuntimeError):
+    """The endpoint's own refusal of a request: a non-auth, non-retryable 4xx.
+
+    A `RuntimeError` still, because that is the transport's existing contract
+    for "an HTTP-level answer the caller must classify": the `/models` probe
+    keeps treating it as advisory (D-008 - a catalog that answers an error
+    says nothing about completions), while the frame-interpretation path
+    catches it ahead of the malformed-JSON mapping it used to fall into. A
+    refusal is not malformed JSON, and reporting it as that sent the operator
+    to fix a parser the endpoint never offended.
+
+    Not a `LocalVisionFailure`, for the same reason: the transport raises one
+    of those only where it has already decided the consequence
+    (`local_vision_auth_rejected`, `local_vision_retryable`); a 4xx refusal's
+    consequence differs by caller, so the decision stays with the caller.
+
+    The message is built at the raise site, where the bounded-preview rules
+    live (never an error body on an authenticated request, the sanitized URL
+    only), and the same detail rides on the exception so a caller can surface
+    structure without re-parsing the sentence.
+    """
+
+    def __init__(self, status: int, message: str, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.detail = detail or {}
+
+
+class ResponseBodyNotAnObject(ValueError):
+    """A response body that parsed as JSON but is not an object.
+
+    A `ValueError` still - that is the transport's existing contract for
+    "this payload is unusable", and callers that lump every unusable payload
+    together catch exactly that - but its own class, so a caller that reports
+    *causes* can tell a body that parsed from one that is not JSON at all.
+    Reporting the first as "malformed JSON" sends the operator to fix a
+    parser for an answer that parsed fine; the message says what arrived
+    instead.
+    """
 
 
 class SecretCredential:
@@ -573,7 +626,7 @@ def _http_get_json(
             budget=budget,
         )
     if not isinstance(payload, dict):
-        raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
+        raise ResponseBodyNotAnObject(f"expected a JSON object, got {type(payload).__name__}")
     return payload
 
 
@@ -600,7 +653,7 @@ def _http_post_json(
             budget=budget,
         )
     if not isinstance(payload, dict):
-        raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
+        raise ResponseBodyNotAnObject(f"expected a JSON object, got {type(payload).__name__}")
     return payload
 
 
@@ -899,7 +952,12 @@ def _urlopen_json(
             # evidence the transport works and must not count toward the
             # breaker's consecutive-failure tally. It is unusable for the same
             # reason a truncated body is - hence malformed, not unavailable.
-            raise RuntimeError(f"response from {url} exceeds the {MAX_RESPONSE_BYTES} byte cap")
+            # The URL is sanitized here like every other transport error: a
+            # path can carry a key (D-007), and this text is echoed into
+            # warning messages.
+            raise RuntimeError(
+                f"response from {_safe_url_for_message(url)} exceeds the {MAX_RESPONSE_BYTES} byte cap"
+            )
         raw = payload.decode("utf-8")
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
@@ -948,6 +1006,26 @@ def _urlopen_json(
                 f"HTTP {exc.code} from {_safe_url_for_message(url)}: the endpoint answered "
                 "a redirect that could not be followed, and redirects are not followed in "
                 "any case"
+            ) from exc
+        if 400 <= exc.code < 500:
+            # The endpoint read the request and refused it, and will refuse the
+            # next identical one the same way. Its own exception rather than
+            # the bare `RuntimeError` below, so the paths that classify
+            # transport errors can tell a refusal (a response, saying no about
+            # the request) from an unusable answer (something parsed, or not
+            # parseable). The preview is the same bounded one the generic
+            # branch states - withheld on an authenticated request, 200 chars
+            # at most, never a channel.
+            raise HttpRequestRefused(
+                exc.code,
+                f"Local vision endpoint refused the request (HTTP {exc.code} from "
+                f"{_safe_url_for_message(url)}): {detail[:200]}; continuing with "
+                "OCR-only output.",
+                {
+                    "status": exc.code,
+                    "url": _safe_url_for_message(url),
+                    "body_preview": detail[:200],
+                },
             ) from exc
         # The URL is sanitized (authority only) and the endpoint's text is a
         # bounded 200-char preview: diagnostic enough for "model not loaded",

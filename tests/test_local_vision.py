@@ -403,6 +403,35 @@ def test_the_same_model_local_and_remote_is_not_a_collision(tmp_path: Path) -> N
     assert len(load_local_vision_config(tmp_path).endpoints or ()) == 2
 
 
+def test_the_same_model_with_and_without_a_declaration_is_not_a_collision(
+    tmp_path: Path,
+) -> None:
+    """The declaration is half of an entry's identity, the way remoteness is:
+    two same-model loopback entries - one declared to forward off the machine,
+    one not - derive different keys because `local_vision_non_local` differs
+    (ADR-0009 through D-012), so nothing collides and nothing is refused.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                    },
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "http://127.0.0.1:17501/v1",
+                        "forwards_off_machine": True,
+                    },
+                ]
+            }
+        )
+    )
+
+    assert len(load_local_vision_config(tmp_path).endpoints or ()) == 2
+
+
 def test_a_top_level_endpoint_field_beside_endpoints_is_refused(tmp_path: Path) -> None:
     """P3-D-013: naming an endpoint twice, two ways, means neither is settled.
 
@@ -773,6 +802,140 @@ def test_both_flags_together_replace_the_chain(tmp_path: Path) -> None:
     assert [(entry.model, entry.base_url) for entry in config.endpoints or ()] == [
         ("qwen3-vl:4b", "http://127.0.0.1:8200/v1")
     ]
+
+
+def _undeclared_two_entry_chain(tmp_path: Path) -> None:
+    """A file chain of loopback entries nobody declared (ADR-0009's hole).
+
+    Different models, because (model, non-local) is an entry's identity: two
+    same-model entries both carrying the declaration would collide once the
+    flag declares them, and that refusal is P3-D-020's to make, not this
+    test's to dodge around.
+    """
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:8000/v1"},
+                    {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:17501/v1"},
+                ]
+            }
+        )
+    )
+
+
+def test_the_forwards_off_machine_flag_reaches_every_entry_of_a_chain(
+    tmp_path: Path,
+) -> None:
+    """ADR-0009's flag against an explicit chain: the override must land on
+    the entries, not on the top-level config the chain never reads.
+
+    The model and address overrides are handled where chains are decided
+    (`_chain_after_overrides`); every other override lands on the top-level
+    config, which an explicit `endpoints` chain ignores. Left there,
+    `--local-vision-forwards-off-machine` against undeclared entries would
+    publish the undeclared bundle key with no disclosure - and the operator
+    said declared. So the flag wins over the file for every entry the run
+    could select, and the fold follows: the same chain, flag versus no flag,
+    publishes a non-local bundle under its own key.
+    """
+    from distill.options import DistillOptions
+    from distill.vision_chain import resolve_chain
+
+    _undeclared_two_entry_chain(tmp_path)
+
+    undeclared = local_vision_config_from_args({}, tmp_path)
+    declared = local_vision_config_from_args({"local_vision_forwards_off_machine": True}, tmp_path)
+
+    assert [entry.forwards_off_machine for entry in undeclared.endpoints or ()] == [False, False]
+    assert [entry.forwards_off_machine for entry in declared.endpoints or ()] == [True, True]
+
+    undeclared_won = resolve_chain(
+        DistillOptions(),
+        undeclared.endpoints or (),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: True,
+    )
+    declared_won = resolve_chain(
+        DistillOptions(),
+        declared.endpoints or (),
+        "local",
+        cached=lambda key: None,
+        probe=lambda config: True,
+    )
+
+    assert undeclared_won.options.cache_payload("local")["local_vision_non_local"] is False
+    assert declared_won.options.cache_payload("local")["local_vision_non_local"] is True
+    assert undeclared_won.opts_hash != declared_won.opts_hash
+
+
+def test_the_no_forwards_off_machine_flag_clears_a_files_declared_entries(
+    tmp_path: Path,
+) -> None:
+    """The flag is an override in both directions: `--no-` must clear a
+    file's declarations on every entry, not merely fail to add its own - an
+    operator who withdrew a proxy declaration and left the file untouched
+    has said local, and the run they get has to say it too."""
+    (tmp_path / "distill.local-vision.json").write_text(
+        json.dumps(
+            {
+                "endpoints": [
+                    {
+                        "model": "qwen3-vl:8b",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                        "forwards_off_machine": True,
+                    },
+                    {
+                        "model": "qwen3-vl:32b",
+                        "base_url": "http://127.0.0.1:17501/v1",
+                        "forwards_off_machine": True,
+                    },
+                ]
+            }
+        )
+    )
+
+    config = local_vision_config_from_args({"local_vision_forwards_off_machine": False}, tmp_path)
+
+    assert [entry.forwards_off_machine for entry in config.endpoints or ()] == [False, False]
+
+
+def test_the_forwards_off_machine_flag_honours_the_endpoint_override_rules(
+    tmp_path: Path,
+) -> None:
+    """The declaration rides the chain rules the model and address set
+    (P3-D-016), it does not rewrite them: an address-only override still
+    moves entry 0 and leaves the rest, and both endpoint flags together still
+    replace the chain - with the declaration on the one entry that remains,
+    which the top-level path already carried."""
+    _two_entry_chain(tmp_path)
+
+    moved = local_vision_config_from_args(
+        {
+            "local_vision_base_url": "http://127.0.0.1:8100/v1",
+            "local_vision_forwards_off_machine": True,
+        },
+        tmp_path,
+    )
+    assert [(entry.model, entry.base_url) for entry in moved.endpoints or ()] == [
+        ("qwen3-vl:8b", "http://127.0.0.1:8100/v1"),
+        ("qwen3-vl:32b", "http://127.0.0.1:9000/v1"),
+    ]
+    assert [entry.forwards_off_machine for entry in moved.endpoints or ()] == [True, True]
+
+    replaced = local_vision_config_from_args(
+        {
+            "local_vision_model": "qwen3-vl:4b",
+            "local_vision_base_url": "http://127.0.0.1:8200/v1",
+            "local_vision_forwards_off_machine": True,
+        },
+        tmp_path,
+    )
+    assert [(entry.model, entry.base_url) for entry in replaced.endpoints or ()] == [
+        ("qwen3-vl:4b", "http://127.0.0.1:8200/v1")
+    ]
+    assert [entry.forwards_off_machine for entry in replaced.endpoints or ()] == [True]
 
 
 def test_per_call_local_vision_model_override(tmp_path: Path) -> None:
@@ -1190,6 +1353,330 @@ def test_interpret_image_malformed_response_returns_warning(
     assert result is None
     assert warning is not None
     assert warning["code"] == "local_vision_malformed_response"
+
+
+@pytest.mark.parametrize("status", [400, 404])
+def test_a_refused_completion_is_reported_as_refused_not_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: int,
+) -> None:
+    """The finding this fixes: LM Studio answers HTTP 400 to
+    `response_format: {"type": "json_object"}`, and a 404 names a model the
+    endpoint does not know. Neither is malformed JSON - nothing was parsed -
+    so neither may be reported as it. The warning names the status, says the
+    endpoint refused the request, and carries the bounded preview of the
+    endpoint's reason beside the sanitized URL.
+    """
+    from email.message import Message
+
+    attempts: list[str] = []
+
+    class _RefusingOpener:
+        def open(self, request: Any, timeout: float | None = None) -> Any:
+            attempts.append(request.full_url)
+            raise urllib.error.HTTPError(
+                request.full_url,
+                status,
+                "refused",
+                Message(),
+                io.BytesIO(b'{"error": "response_format json_object not supported"}'),
+            )
+
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _RefusingOpener())
+
+    result, warning = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert warning is not None
+    assert warning["code"] == "local_vision_request_refused"
+    assert f"HTTP {status}" in warning["message"]
+    assert "refused the request" in warning["message"]
+    assert "malformed" not in warning["message"]
+    # The sanitized URL (authority only) and the bounded preview of the body.
+    assert "127.0.0.1:8000" in warning["message"]
+    assert "chat/completions" not in warning["message"]
+    assert "response_format json_object not supported" in warning["message"]
+    # A refusal raises out of the attempt loop on the first answer: retrying
+    # an endpoint that refused the request's shape is the same refusal again.
+    assert attempts == [f"{DEFAULT_LOCAL_VISION_BASE_URL}/chat/completions"]
+
+
+def test_a_refusal_never_echoes_an_error_body_on_an_authenticated_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The bounded-preview rule the refusal inherits from the error path it
+    replaces: on an authenticated request the body is withheld, because a
+    server that echoes the Authorization header into its error body would
+    otherwise reflect the credential into diagnostics. The status and the
+    refusal still surface."""
+    from dataclasses import replace
+    from email.message import Message
+
+    from distill.rapid_mlx import SecretCredential
+
+    class _RefusingOpener:
+        def open(self, request: Any, timeout: float | None = None) -> Any:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                400,
+                "bad request",
+                Message(),
+                io.BytesIO(b"sk-refusal-secret echoed back"),
+            )
+
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _RefusingOpener())
+    config = replace(LocalVisionConfig(), credential=SecretCredential("sk-refusal-secret"))
+
+    result, warning = try_interpret_image(config, image, "Interpret.", prompt_profile="technical")
+
+    assert result is None
+    assert warning is not None
+    assert warning["code"] == "local_vision_request_refused"
+    assert "HTTP 400" in warning["message"]
+    surface = json.dumps(warning)
+    assert "sk-refusal-secret" not in surface
+    assert "echoed back" not in surface
+    assert "withheld" in warning["message"]
+
+
+def test_a_success_body_that_is_not_json_still_reports_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The other side of the split, at the transport: a 200 whose body is not
+    JSON at all remains the malformed-response finding it always was."""
+
+    class _ServingOpener:
+        def open(self, request: Any, timeout: float | None = None) -> Any:
+            return io.BytesIO(b"<html>definitely not json</html>")
+
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _ServingOpener())
+
+    result, warning = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert warning is not None
+    assert warning["code"] == "local_vision_malformed_response"
+
+
+def test_a_models_http_error_stays_advisory_and_the_completion_decides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D-008, held where a refusal could eat it: a `/models` that answers an
+    HTTP error is advisory, not a verdict, so the attempted completion
+    decides - and decides "available" here. Classifying 4xx completions as
+    refusals changed nothing on this path."""
+    from email.message import Message
+
+    class _ModelsRefusingOpener:
+        def open(self, request: Any, timeout: float | None = None) -> Any:
+            if request.full_url.endswith("/models"):
+                raise urllib.error.HTTPError(
+                    request.full_url, 400, "bad request", Message(), io.BytesIO(b"no catalog")
+                )
+            return io.BytesIO(json.dumps(_chat_envelope("pong")).encode())
+
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _ModelsRefusingOpener())
+
+    probe = probe_rapid_mlx_availability(LocalVisionConfig())
+
+    assert probe.available is True
+    assert probe.detail["model_not_listed"] is True
+
+
+def test_a_refused_probe_completion_is_its_own_event_not_a_missing_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 404 the bug report names, one step earlier: the model is not in the
+    catalog, the probe's attempted completion is refused with a 404, and the
+    probe reports the refusal itself - with the status - rather than folding
+    it into `local_vision_model_unavailable`, which would hide the one cause
+    the operator can act on."""
+    from email.message import Message
+
+    class _CompletionRefusingOpener:
+        def open(self, request: Any, timeout: float | None = None) -> Any:
+            if request.full_url.endswith("/models"):
+                return io.BytesIO(json.dumps(_models_body("other-model")).encode())
+            raise urllib.error.HTTPError(
+                request.full_url, 404, "not found", Message(), io.BytesIO(b"model not found")
+            )
+
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _CompletionRefusingOpener())
+
+    probe = probe_rapid_mlx_availability(LocalVisionConfig(model="qwen3-vl:32b"))
+
+    assert probe.available is False
+    assert probe.code == "local_vision_request_refused"
+    assert probe.detail["status"] == 404
+    assert probe.detail["completion_code"] == "local_vision_request_refused"
+    assert "HTTP 404" in probe.message
+
+
+def test_a_refusal_degrades_only_its_frame_and_the_run_keeps_reading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """D-008's per-frame rule, held where the old placement broke it: an
+    endpoint that 400s one frame's image content part is out of profile *for
+    that frame*, so that frame degrades to OCR-only while the frames around
+    it keep their readings. A refusal arrived as a response - evidence the
+    transport works, not that it failed - so it resets the breaker's tally
+    and never opens it: every keyframe is still attempted."""
+    from distill.rapid_mlx import REQUEST_REFUSED_CODE, HttpRequestRefused
+
+    for index in range(3):
+        (tmp_path / f"frame{index}.png").write_bytes(b"png")
+    attempts: list[str] = []
+
+    def fake_urlopen(
+        method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+    ) -> Any:
+        attempts.append(url)
+        text = next(
+            part["text"] for part in body["messages"][0]["content"] if part.get("type") == "text"
+        )
+        if "frame1" in text:
+            raise HttpRequestRefused(
+                400,
+                "Local vision endpoint refused the request (HTTP 400 from "
+                "http://127.0.0.1:8000): image content part not supported; "
+                "continuing with OCR-only output.",
+                {
+                    "status": 400,
+                    "url": "http://127.0.0.1:8000",
+                    "body_preview": "image content part not supported",
+                },
+            )
+        if "frame0" in text:
+            return _chat_envelope(_frame_json(visual_summary="chart read from frame0"))
+        return _chat_envelope(_frame_json(visual_summary="chart read from frame2"))
+
+    monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+
+    interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe, debug=True)
+    frames, warnings = interpreter.interpret(
+        [
+            _frame(index + 1, tmp_path / f"frame{index}.png", extracted_text=f"frame{index}")
+            for index in range(3)
+        ]
+    )
+
+    # The breaker never opened: all three keyframes were attempted.
+    assert len(attempts) == 3
+    assert interpreter.debug_info()["breaker"]["open"] is False
+    assert BREAKER_WARNING_CODE not in {w["code"] for w in warnings}
+    # The refused frame degraded; the frames around it kept their readings.
+    assert _summary(frames[0]) == "chart read from frame0"
+    assert frames[1].reading is None
+    assert frames[1].extracted_text == "frame1"
+    assert _summary(frames[2]) == "chart read from frame2"
+    # Exactly the one per-frame refusal warning, naming the refusal.
+    [refusal_warning] = [w for w in warnings if w["code"] == REQUEST_REFUSED_CODE]
+    assert "refused the request" in refusal_warning["message"]
+    assert "HTTP 400" in refusal_warning["message"]
+
+
+def test_a_refusal_on_every_frame_degrades_each_frame_and_the_run_completes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The config-level refusal (LM Studio's 400 to `response_format`) from
+    end to end: the endpoint refuses every keyframe, so every keyframe
+    degrades to OCR-only, the warnings name the refusal (one record, its
+    `occurrences` counting every refused keyframe), the run completes with
+    all its frames, and the breaker - whose tally a refusal resets - never
+    opens."""
+    from distill.rapid_mlx import REQUEST_REFUSED_CODE, HttpRequestRefused
+
+    for index in range(3):
+        (tmp_path / f"frame{index}.png").write_bytes(b"png")
+    attempts: list[str] = []
+
+    def fake_urlopen(
+        method: str, url: str, body: Any = None, timeout_sec: float = 30.0, **_: Any
+    ) -> Any:
+        attempts.append(url)
+        raise HttpRequestRefused(
+            400,
+            "Local vision endpoint refused the request (HTTP 400 from "
+            "http://127.0.0.1:8000): response_format not supported; continuing "
+            "with OCR-only output.",
+            {
+                "status": 400,
+                "url": "http://127.0.0.1:8000",
+                "body_preview": "response_format not supported",
+            },
+        )
+
+    monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+
+    interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe, debug=True)
+    frames, warnings = interpreter.interpret(
+        [
+            _frame(index + 1, tmp_path / f"frame{index}.png", extracted_text=f"frame{index}")
+            for index in range(3)
+        ]
+    )
+
+    # Every keyframe paid for its own answer: none was skipped by a breaker.
+    assert len(attempts) == 3
+    assert len(frames) == 3
+    assert interpreter.debug_info()["breaker"]["open"] is False
+    assert BREAKER_WARNING_CODE not in {w["code"] for w in warnings}
+    # Each frame degraded, kept its OCR text, and says why it has no reading.
+    # One warning record names the refusal for all three frames: repeats fold
+    # into `occurrences`, one per refused keyframe.
+    [refusal_warning] = [w for w in warnings if w["code"] == REQUEST_REFUSED_CODE]
+    assert refusal_warning["occurrences"] == 3
+    for frame in frames:
+        assert frame.reading is None
+        assert frame.extracted_text.startswith("frame")
+        assert frame.grounding is not None
+        assert frame.grounding.get("level") == UNGROUNDED
+    assert "refused the request" in refusal_warning["message"]
+    assert "HTTP 400" in refusal_warning["message"]
+
+
+def test_a_refused_frame_carries_the_ungrounded_assessment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FRAME_READ_FAILURE_CODES membership: a refused keyframe ends with no
+    reading, so it carries the explicit ungrounded assessment like any other
+    frame the model produced no usable output for."""
+    from distill.rapid_mlx import HttpRequestRefused
+
+    (tmp_path / "frame0.png").write_bytes(b"png")
+
+    def fake_urlopen(*_args: Any, **_kwargs: Any) -> Any:
+        raise HttpRequestRefused(
+            404,
+            "Local vision endpoint refused the request (HTTP 404 from "
+            "http://127.0.0.1:8000); continuing with OCR-only output.",
+            {"status": 404, "url": "http://127.0.0.1:8000"},
+        )
+
+    monkeypatch.setattr("distill.rapid_mlx._urlopen_json", fake_urlopen)
+
+    interpreter = FrameInterpreter(LocalVisionConfig(), probe=_available_probe)
+    frames, _warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+    assert frames[0].reading is None
+    assert frames[0].grounding is not None
+    assert frames[0].grounding.get("level") == UNGROUNDED
 
 
 def test_interpretation_parser_accepts_fenced_or_prefaced_json() -> None:
@@ -2355,8 +2842,14 @@ class TestAttemptCompletionAvailability:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """Off-profile (D-008): an endpoint that 400s the image content part
-        is out of profile for that frame - the frame degrades to OCR-only, the
-        run continues, and the hostile error body is bounded, not parsed."""
+        is out of profile for that frame - the frame degrades to OCR-only and
+        the run continues with the next keyframe, whose request is not
+        condemned by this frame's refusal (the run-level behaviour is pinned
+        by the interpreter tests over `FrameInterpreter.interpret`). The
+        hostile error body is bounded, not parsed, and the refusal is its own
+        code, not malformed JSON: the endpoint refused the request, and the
+        bounded preview of its reason is what the warning carries.
+        """
         from email.message import Message
 
         class _ImageRejectingOpener:
@@ -2379,7 +2872,10 @@ class TestAttemptCompletionAvailability:
 
         assert result is None
         assert failure_warning is not None
-        assert failure_warning["code"] == "local_vision_malformed_response"
+        assert failure_warning["code"] == "local_vision_request_refused"
+        assert "HTTP 400" in failure_warning["message"]
+        assert "refused the request" in failure_warning["message"]
+        assert "image content part not supported" in failure_warning["message"]
 
     def test_the_attempted_completion_is_minimal_and_carries_an_image_part(
         self,
@@ -2507,8 +3003,9 @@ class TestBoundedRemoteBehavior:
         monkeypatch.setattr("distill.rapid_mlx._OPENER", _CountingOpener(payload))
 
         interpreter = FrameInterpreter(
-            # The budget bounds remote cost, so it attaches only to a config
-            # that opted into a remote endpoint (loopback + opt-in is legal).
+            # The budget bounds off-machine cost, so it attaches only to a
+            # config that may send keyframes off the machine - the remote
+            # opt-in (loopback + opt-in is legal), or ADR-0009's declaration.
             LocalVisionConfig(allow_remote_endpoint=True),
             probe=_available_probe,
             # Enough for one response, not two: the second request must find
@@ -2530,6 +3027,46 @@ class TestBoundedRemoteBehavior:
         # must never read as "0 consecutive transport failures".
         assert "budget was spent" in summary["message"]
         assert "consecutive transport failures" not in summary["message"]
+
+    def test_a_declared_endpoint_arms_the_byte_budget(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """ADR-0009: a declared forwarding endpoint spends hosted cost per
+        frame exactly as a remote one does - the proxy only hides whose - so
+        the budget arms on the declaration too, on an endpoint every transport
+        check still calls loopback. Modelled on the byte-budget test above:
+        enough budget for one response, not two, and the remainder degrades.
+        """
+        from dataclasses import replace
+
+        for index in range(3):
+            (tmp_path / f"frame{index}.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        opened = {"n": 0}
+
+        class _CountingOpener(_FakeOpener):
+            def open(self, request: Any, timeout: float | None = None) -> Any:
+                opened["n"] += 1
+                return super().open(request, timeout)
+
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _CountingOpener(payload))
+
+        declared = replace(LocalVisionConfig(), forwards_off_machine=True)
+        assert declared.allow_remote_endpoint is False  # the declaration alone
+        interpreter = FrameInterpreter(
+            declared,
+            probe=_available_probe,
+            budget_bytes=len(payload) + 10,
+        )
+        frames, warnings = interpreter.interpret(
+            [_frame(index + 1, tmp_path / f"frame{index}.png") for index in range(3)]
+        )
+
+        assert frames[0].reading is not None
+        assert frames[1].reading is None
+        assert frames[2].reading is None
+        assert opened["n"] <= 2
+        assert "local_vision_budget_exhausted" in {w["code"] for w in warnings}
 
     def test_the_wall_clock_budget_degrades_the_remainder(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2598,8 +3135,10 @@ class TestBoundedRemoteBehavior:
     def test_a_local_run_carries_no_budget(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """The budget bounds remote cost (D-008); a slow-but-working local
-        model must never be half-degraded by a run-wide clock."""
+        """The budget bounds off-machine cost (D-008) - the remote opt-in or
+        ADR-0009's declaration - and a plain local run has neither, so a
+        slow-but-working local model must never be half-degraded by a
+        run-wide clock."""
         for index in range(3):
             (tmp_path / f"frame{index}.png").write_bytes(b"png")
         payload = json.dumps(_chat_envelope(_frame_json())).encode()
@@ -2860,6 +3399,52 @@ class TestNonLocalProvenance:
 
         assert "non_local_only_processing" not in {w["code"] for w in warnings}
 
+    def test_a_declared_forwarding_loopback_run_records_the_non_local_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """ADR-0009: the declaration alone makes the run non-local.
+
+        Loopback `http`, no `allow_remote_endpoint` - every transport fact says
+        local, and the operator's statement about what the endpoint does with
+        what reaches it is the one thing the address cannot show. The warning
+        keeps D-012's code and says which way the run was made non-local.
+        """
+        from dataclasses import replace
+
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _FakeOpener(payload))
+        declared = replace(LocalVisionConfig(), forwards_off_machine=True)
+
+        interpreter = FrameInterpreter(declared, probe=_available_probe)
+        _frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        (non_local,) = [w for w in warnings if w["code"] == "non_local_only_processing"]
+        assert "declared that the vision endpoint forwards" in non_local["message"]
+        assert "off the machine" in non_local["message"]
+
+    def test_the_remote_endpoint_case_keeps_its_own_warning_message(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Two causes, two messages, one code: the operator action that would
+        un-make each is different, so each names its own cause."""
+        from dataclasses import replace
+
+        (tmp_path / "frame0.png").write_bytes(b"png")
+        payload = json.dumps(_chat_envelope(_frame_json())).encode()
+        monkeypatch.setattr("distill.rapid_mlx._OPENER", _FakeOpener(payload))
+        remote = replace(
+            LocalVisionConfig(),
+            base_url="https://10.0.0.5:8000/v1",
+            allow_remote_endpoint=True,
+        )
+
+        interpreter = FrameInterpreter(remote, probe=_available_probe)
+        _frames, warnings = interpreter.interpret([_frame(1, tmp_path / "frame0.png")])
+
+        (non_local,) = [w for w in warnings if w["code"] == "non_local_only_processing"]
+        assert "non-loopback vision endpoint" in non_local["message"]
+
     def test_was_remote_folds_into_bundle_identity_but_the_address_does_not(
         self,
     ) -> None:
@@ -2935,6 +3520,102 @@ class TestNonLocalProvenance:
         config = replace(LocalVisionConfig(), base_url=base_url, allow_remote_endpoint=allow_remote)
 
         assert config_is_non_local(config) is expected
+
+    def test_a_forwards_off_machine_declaration_is_non_local_without_the_opt_in(
+        self,
+    ) -> None:
+        """ADR-0009's predicate arm, checked first: the declaration needs
+        neither `allow_remote_endpoint` nor a non-loopback address, and holds
+        for the default loopback endpoint with every transport rule intact."""
+        from dataclasses import replace
+
+        from distill.local_vision import config_is_non_local
+
+        declared = replace(LocalVisionConfig(), forwards_off_machine=True)
+        assert declared.allow_remote_endpoint is False
+        assert declared.base_url == DEFAULT_LOCAL_VISION_BASE_URL
+        assert config_is_non_local(declared) is True
+
+        # And without it, the same loopback endpoint stays local-only.
+        assert config_is_non_local(LocalVisionConfig()) is False
+
+    def test_the_declaration_alone_folds_non_local_into_bundle_identity(self) -> None:
+        """D-012 through ADR-0009: the same config, differing only by the
+        declaration, publishes under a different **bundle key** - so a bundle
+        keyed non-local always carries the disclosure, and a proxy-forwarded
+        reading can never be served as a local-only one."""
+        plain = resolve_run_config({}).options
+        declared = resolve_run_config({"local_vision_forwards_off_machine": True}).options
+
+        assert plain.cache_payload("local")["local_vision_non_local"] is False
+        assert declared.cache_payload("local")["local_vision_non_local"] is True
+        assert plain.opts_hash("local") != declared.opts_hash("local")
+
+    def test_forwards_off_machine_parses_from_the_file_and_the_flag_wins(
+        self, tmp_path: Path
+    ) -> None:
+        """The config key, the per-endpoint key, and the CLI precedence:
+        file says true, the flag says false, and the explicit override is
+        authoritative - the same order every vision option follows."""
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps({"forwards_off_machine": True})
+        )
+
+        from_file = load_local_vision_config(tmp_path)
+        assert from_file.forwards_off_machine is True
+        assert [entry.forwards_off_machine for entry in from_file.endpoints or ()] == [True]
+
+        overridden = local_vision_config_from_args(
+            {"local_vision_forwards_off_machine": False}, base_dir=tmp_path
+        )
+        assert overridden.forwards_off_machine is False
+
+    def test_a_chain_entry_declaration_parses_and_marks_only_that_entry(
+        self, tmp_path: Path
+    ) -> None:
+        """The declaration is per endpoint, like every `ENDPOINT_FIELD_NAMES`
+        key: an entry is read from a fresh default, so one entry's declaration
+        never leaks into another's."""
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps(
+                {
+                    "endpoints": [
+                        {
+                            "model": "qwen3-vl:8b",
+                            "base_url": "http://127.0.0.1:17501/v1",
+                            "forwards_off_machine": True,
+                        },
+                        {"model": "qwen3-vl:32b", "base_url": "http://127.0.0.1:9000/v1"},
+                    ]
+                }
+            )
+        )
+
+        config = load_local_vision_config(tmp_path)
+        assert [entry.forwards_off_machine for entry in config.endpoints or ()] == [True, False]
+        # The top-level scalars stay defaults: the chain names the endpoints.
+        assert config.forwards_off_machine is False
+
+    def test_a_top_level_declaration_beside_endpoints_is_refused(self, tmp_path: Path) -> None:
+        """P3-D-013 covers the declaration because it is an endpoint field:
+        naming it at the top level beside a chain picks an endpoint two ways
+        at once, exactly as a top-level `allow_remote_endpoint` does."""
+        (tmp_path / "distill.local-vision.json").write_text(
+            json.dumps(
+                {
+                    "forwards_off_machine": True,
+                    "endpoints": [
+                        {"model": "qwen3-vl:8b", "base_url": "http://127.0.0.1:17501/v1"}
+                    ],
+                }
+            )
+        )
+
+        with pytest.raises(DistillError) as refusal:
+            load_local_vision_config(tmp_path)
+
+        assert refusal.value.code == "E_BAD_OPTIONS"
+        assert "forwards_off_machine" in refusal.value.message
 
     def test_the_warning_survives_an_unavailable_endpoint(self, tmp_path: Path) -> None:
         """The fold is computed from options before any I/O; the disclosure
@@ -3571,6 +4252,39 @@ def test_a_rejected_credential_does_not_read_as_a_server_that_is_down(
     assert entry["credential_env"] == "A_KEY"
     assert entry["credential_set"] is True
     assert "401" in json.dumps(report)
+    # The server answered. Nothing in the report may suggest starting one.
+    assert "setup_command" not in report
+    assert "rapid_mlx_note" not in report
+
+
+def test_a_refused_endpoint_does_not_read_as_a_server_that_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refused-request twin of the auth-rejection test above: an endpoint
+    that answered HTTP 400 to the completion attempt is up and saying no about
+    the request (LM Studio to `response_format`, a 404 for an unknown model).
+    `setup_command` answers "nothing is running"; a server that just refused
+    one is the wrong diagnosis, and an operator following it restarts a
+    healthy server and learns nothing."""
+    monkeypatch.setenv("DISTILL_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "distill.pipeline.probe_local_vision",
+        lambda config: SimpleNamespace(
+            available=False,
+            backend="rapid-mlx",
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_request_refused",
+            message="Local vision endpoint refused the request (HTTP 400)",
+            detail={"status": 400},
+        ),
+    )
+
+    report = distill_session.local_vision_diagnostics({})
+
+    (entry,) = report["endpoints"]
+    assert entry["code"] == "local_vision_request_refused"
+    assert entry["detail"]["status"] == 400
     # The server answered. Nothing in the report may suggest starting one.
     assert "setup_command" not in report
     assert "rapid_mlx_note" not in report

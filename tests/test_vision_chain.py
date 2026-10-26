@@ -849,3 +849,45 @@ def test_a_remote_selection_still_says_the_run_was_not_local_only() -> None:
     assert local_won.options.cache_payload("local")["local_vision_non_local"] is False
     assert remote_won.options.cache_payload("local")["local_vision_non_local"] is True
     assert local_won.opts_hash != remote_won.opts_hash
+
+
+def test_a_declared_entry_marks_its_selection_non_local() -> None:
+    """ADR-0009 through the chain, under the rule remoteness already follows:
+    the declaration is per entry, and it folds for exactly the entry that
+    carried it - a loopback proxy entry declared to forward off the machine
+    publishes a non-local bundle when it answers, and the plain loopback entry
+    beside it does not.
+
+    Same model on both entries, because the declaration alone is what keeps
+    their keys apart - the fold is the difference, not the reader.
+    """
+    plain = LocalVisionConfig(model="qwen3-vl:8b", base_url="http://127.0.0.1:8000/v1")
+    declared = LocalVisionConfig(
+        model="qwen3-vl:8b",
+        base_url="http://127.0.0.1:17501/v1",
+        forwards_off_machine=True,
+    )
+    chain = (plain, declared)
+
+    plain_won = resolve_chain(
+        DistillOptions(), chain, "local", cached=lambda k: None, probe=lambda c: c is plain
+    )
+    declared_won = resolve_chain(
+        DistillOptions(), chain, "local", cached=lambda k: None, probe=lambda c: c is declared
+    )
+
+    assert plain_won.options.cache_payload("local")["local_vision_non_local"] is False
+    assert declared_won.options.cache_payload("local")["local_vision_non_local"] is True
+    assert plain_won.opts_hash != declared_won.opts_hash
+    # And a cache hit below the top of the chain folds the same way: the hit's
+    # entry is substituted, so a declared entry's bundle is served as what it
+    # is rather than re-described by the entry above it.
+    cached_declared = resolve_chain(
+        DistillOptions(),
+        chain,
+        "local",
+        cached=lambda k: k == declared_won.opts_hash and 1,
+        probe=never_probed,
+    )
+    assert cached_declared.served_from_cache is True
+    assert cached_declared.options.cache_payload("local")["local_vision_non_local"] is True

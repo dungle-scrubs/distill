@@ -920,6 +920,203 @@ def test_a_response_body_beyond_the_cap_is_rejected(
     assert result is None
     assert failure is not None
     assert failure["code"] == "local_vision_malformed_response"
+    # The message names the cause - the cap - rather than filing it under
+    # "malformed JSON", which is the one thing an over-cap body is not:
+    # nothing was parsed, because nothing could be read whole.
+    assert "byte cap" in failure["message"]
+    assert "malformed JSON" not in failure["message"]
+
+
+def test_an_unfollowable_redirect_on_the_frame_path_names_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The same mis-report class the refusal fix closed, for the one HTTP
+    answer urllib hands back as an error without a Location to act on: a 3xx
+    is not malformed JSON - nothing was parsed - so the frame path keeps the
+    malformed-response code (a response arrived) but its message names the
+    redirect, from exception text the transport already sanitized."""
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    completions_url = f"{LOOPBACK_URL}/chat/completions"
+    transport = _FakeTransport({completions_url: _CannedResponse(completions_url, status=302)})
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
+
+    result, failure = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert failure is not None
+    assert failure["code"] == "local_vision_malformed_response"
+    assert "HTTP 302" in failure["message"]
+    assert "redirect that could not be followed" in failure["message"]
+    assert "malformed JSON" not in failure["message"]
+
+
+def test_a_truncated_frame_response_names_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A server that dies mid-body (`http.client.IncompleteRead`) is the
+    third RuntimeError the transport raises: not a refusal, not a body that
+    failed to parse - an answer that stopped arriving. The code stays
+    malformed-response and the message says what happened, from exception
+    text the transport already sanitized."""
+
+    class _TruncatingResponse(_CannedResponse):
+        def read(self, size: int = -1) -> bytes:
+            raise http.client.IncompleteRead(b"partial")
+
+        read1 = read
+
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    completions_url = f"{LOOPBACK_URL}/chat/completions"
+    transport = _FakeTransport({completions_url: _TruncatingResponse(completions_url)})
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
+
+    result, failure = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert failure is not None
+    assert failure["code"] == "local_vision_malformed_response"
+    assert "incomplete response" in failure["message"]
+    assert "malformed JSON" not in failure["message"]
+
+
+def test_an_over_cap_frame_response_carries_no_url_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """D-007 on the cause-naming messages: the RuntimeError branch copies
+    transport exception text into the warning **message**, the only part of a
+    frame failure that reaches a bundle. The byte cap was the one transport
+    error that still echoed the request URL whole - and a path is allowed to
+    carry a key (`/v1/sk-...`), so an over-cap answer from such a base_url
+    would publish that key. The message keeps the authority (which endpoint
+    answered too big to read) and drops everything after it."""
+    secret = "sk-live-9f2c7d51e4b0a3f8"
+    base_url = f"{LOOPBACK_URL}/{secret}"
+    completions_url = f"{base_url}/chat/completions"
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    transport = _FakeTransport({completions_url: _CannedResponse(completions_url, endless=True)})
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
+
+    result, failure = try_interpret_image(
+        LocalVisionConfig(base_url=base_url), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert failure is not None
+    assert failure["code"] == "local_vision_malformed_response"
+    assert "byte cap" in failure["message"]
+    assert secret not in failure["message"]
+    # The operator still learns *which* endpoint answered too big to read.
+    assert "127.0.0.1:8000" in failure["message"]
+
+
+def test_an_over_cap_probe_completion_carries_no_url_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe path echoes the same exception text (`completion attempt
+    failed: {exc}`), first into its own failure message and from there into
+    the probe's message and detail. The model is kept out of the catalog so
+    the probe attempts the completion that hits the cap."""
+    secret = "sk-live-9f2c7d51e4b0a3f8"
+    base_url = f"{LOOPBACK_URL}/{secret}"
+    models_url = f"{base_url}/models"
+    completions_url = f"{base_url}/chat/completions"
+    transport = _FakeTransport(
+        {
+            models_url: _json_response(models_url, {"data": []}),
+            completions_url: _CannedResponse(completions_url, endless=True),
+        }
+    )
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
+
+    probe = probe_local_vision(LocalVisionConfig(base_url=base_url))
+
+    assert probe.available is False
+    assert probe.code == "local_vision_model_unavailable"
+    assert secret not in probe.message
+    assert secret not in probe.warning()["message"]
+    # The attempt's own message rides in the detail; it names the cap without
+    # the key the path carried.
+    assert "byte cap" in probe.detail["completion_error"]
+    assert secret not in probe.detail["completion_error"]
+    assert secret not in json.dumps(probe.detail)
+
+
+def test_a_secret_in_userinfo_query_or_path_never_reaches_a_request_or_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shapes the cap test cannot reach: userinfo and a query are refused
+    before any request is made, so no response - over-cap or otherwise - ever
+    exists for them. What the run records instead is the rejection, and it
+    carries the token in none of its text either (D-007: the thing being
+    rejected is exactly the thing that must not appear in an error surface)."""
+    secret = "sk-live-9f2c7d51e4b0a3f8"
+    base_url = f"http://probe:{secret}@127.0.0.1:8000/v1/{secret}?api_key={secret}"
+    transport = _FakeTransport({})
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
+
+    probe = probe_local_vision(LocalVisionConfig(base_url=base_url))
+
+    assert probe.available is False
+    assert probe.code == "local_vision_endpoint_rejected"
+    assert probe.detail["reason"] == "credential_in_url"
+    assert secret not in probe.message
+    assert secret not in json.dumps(probe.detail)
+    # Refused before the request, not after it.
+    assert transport.requested == []
+
+
+def test_a_json_body_that_is_not_an_object_names_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The last cause a ValueError hid: a body that *parsed* but is not an
+    object is not "malformed JSON" either - nothing failed to parse. It joins
+    the refusal and RuntimeError causes in naming what arrived, while a body
+    that is not JSON at all keeps the wording only it may claim."""
+    image = tmp_path / "frame.png"
+    image.write_bytes(b"png")
+    completions_url = f"{LOOPBACK_URL}/chat/completions"
+    transport = _FakeTransport(
+        {completions_url: _json_response(completions_url, ["not", "an", "object"])}
+    )
+    monkeypatch.setattr("distill.rapid_mlx._OPENER", _build_opener(transport))
+
+    result, failure = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert failure is not None
+    assert failure["code"] == "local_vision_malformed_response"
+    assert "expected a JSON object" in failure["message"]
+    assert "got list" in failure["message"]
+    assert "malformed JSON" not in failure["message"]
+
+    # The control: a body that is not JSON at all keeps the malformed-JSON
+    # wording this path has always carried.
+    not_json = _CannedResponse(completions_url, body=b"<html>not json</html>")
+    monkeypatch.setattr(
+        "distill.rapid_mlx._OPENER", _build_opener(_FakeTransport({completions_url: not_json}))
+    )
+
+    result, failure = try_interpret_image(
+        LocalVisionConfig(), image, "Interpret.", prompt_profile="technical"
+    )
+
+    assert result is None
+    assert failure is not None
+    assert failure["code"] == "local_vision_malformed_response"
+    assert "malformed JSON" in failure["message"]
 
 
 def test_every_rejected_endpoint_is_logged_with_its_reason(

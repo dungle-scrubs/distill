@@ -43,6 +43,7 @@ from .options import (
 from .progress import (
     ProgressReporter,
 )
+from .rapid_mlx import REQUEST_REFUSED_CODE
 from .run_orchestrator import ProcessingRun
 from .source import (
     SourceInfo,
@@ -822,9 +823,12 @@ def local_vision_diagnostics(args: dict[str, Any] | None = None) -> dict[str, An
     # and it said no. Telling an operator to start a server points at the wrong
     # problem, and does so at the moment they are trying to work out what the
     # right one is. `local_vision_backend_unsupported` is the same shape - a
-    # configuration answer, not a missing process.
+    # configuration answer, not a missing process - and so is a refused
+    # completion request (HTTP 4xx): the server is up and refused what was
+    # asked of it, which starting a server cannot fix.
     responded = any(
-        entry["code"] in {"local_vision_auth_rejected", "local_vision_backend_unsupported"}
+        entry["code"]
+        in {"local_vision_auth_rejected", "local_vision_backend_unsupported", REQUEST_REFUSED_CODE}
         for entry in entries
     )
     report: dict[str, Any] = {

@@ -177,7 +177,11 @@ non-loopback endpoints need `https` plus `allow_remote_endpoint: true`.
   a different reader, or with the stage off, publishes a different bundle -
   that is deliberate, because the readings differ.
 - Frames and their readings cross the machine boundary when the endpoint is
-  remote. A local endpoint keeps the run local-only.
+  remote - or when a loopback endpoint is declared to forward off the machine
+  (`forwards_off_machine: true`, or `--local-vision-forwards-off-machine`;
+  ADR-0009). Such a run records a `non_local_only_processing` warning and
+  publishes under a different bundle key. A plain local endpoint keeps the
+  run local-only.
 - Without a reachable endpoint the run still publishes: frames keep their
   OCR text, the render records the gap, and the bundle is thinner. That is
   degradation, not failure - but it is the difference the poteto-post

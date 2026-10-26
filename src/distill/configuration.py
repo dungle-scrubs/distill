@@ -169,6 +169,7 @@ def _with_chain(config: LocalVisionConfig) -> LocalVisionConfig:
                 credential_configured=config.credential_configured,
                 credential_env=config.credential_env,
                 allow_remote_endpoint=config.allow_remote_endpoint,
+                forwards_off_machine=config.forwards_off_machine,
             ),
         ),
     )
@@ -192,6 +193,14 @@ def _chain_after_overrides(
     silently. Both together name one endpoint completely, and a run told to use
     that endpoint should not still carry others it might fall through to - so
     the chain is replaced.
+
+    The forwarding declaration (ADR-0009) is an endpoint field with no
+    model/address rule of its own, and it cannot land on the top-level config
+    the way the chain-wide overrides do: an explicit chain reads only its
+    entries, so the override would be lost and the run would publish the
+    file's undeclared bundles behind an operator who said declared. It is set
+    on every entry the run could select - in both directions, so `--no-`
+    clears a file's declarations as surely as `--` sets them.
     """
     chain = config.endpoints
     if chain is None:
@@ -212,10 +221,15 @@ def _chain_after_overrides(
                 {"endpoints": len(chain)},
             )
         return replace(config, endpoints=None)
+    declares_forwarding = "forwards_off_machine" in overrides
+    if not (names_address or declares_forwarding):
+        return config
     if names_address:
-        moved = replace(chain[0], base_url=str(overrides["base_url"]).rstrip("/"))
-        return replace(config, endpoints=(moved, *chain[1:]))
-    return config
+        chain = (replace(chain[0], base_url=str(overrides["base_url"]).rstrip("/")), *chain[1:])
+    if declares_forwarding:
+        declared = _coerce_bool(overrides["forwards_off_machine"], False)
+        chain = tuple(replace(entry, forwards_off_machine=declared) for entry in chain)
+    return replace(config, endpoints=chain)
 
 
 def _resolved_credential(
@@ -288,6 +302,10 @@ def _config_from_payload(
         allow_remote_endpoint=_coerce_bool(
             payload.get("allow_remote_endpoint", base.allow_remote_endpoint),
             base.allow_remote_endpoint,
+        ),
+        forwards_off_machine=_coerce_bool(
+            payload.get("forwards_off_machine", base.forwards_off_machine),
+            base.forwards_off_machine,
         ),
     )
 

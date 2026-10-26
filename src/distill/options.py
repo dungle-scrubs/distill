@@ -106,6 +106,14 @@ OPTION_SPECS: tuple[OptionSpec, ...] = (
         cache_key=False,
         vision_field="allow_remote_endpoint",
     ),
+    OptionSpec(
+        "local_vision_forwards_off_machine",
+        False,
+        bool,
+        boolean=True,
+        cache_key=False,
+        vision_field="forwards_off_machine",
+    ),
 )
 OPTION_DEFAULTS = {spec.name: spec.default for spec in OPTION_SPECS}
 GENERAL_OPTION_NAMES = tuple(
@@ -439,6 +447,7 @@ class DistillOptions:
     local_vision_base_url: str = DEFAULT_LOCAL_VISION_BASE_URL
     local_vision_timeout_sec: float = DEFAULT_TIMEOUT_SEC
     local_vision_allow_remote_endpoint: bool = False
+    local_vision_forwards_off_machine: bool = False
     # The carrier, not a string: excluded from every cache/identity/public
     # surface by those surfaces' allowlists, and from repr here. It rides
     # along only so `local_vision_config()` does not silently reconstruct an
@@ -477,6 +486,7 @@ class DistillOptions:
             timeout_sec=self.local_vision_timeout_sec,
             caption_frames=self.caption_frames,
             allow_remote_endpoint=self.local_vision_allow_remote_endpoint,
+            forwards_off_machine=self.local_vision_forwards_off_machine,
             credential=self.local_vision_credential,
             credential_configured=self.local_vision_credential_configured,
             credential_env=self.local_vision_credential_env,

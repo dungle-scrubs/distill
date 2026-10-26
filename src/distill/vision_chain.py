@@ -448,7 +448,10 @@ def _as_entry(options: DistillOptions, entry: LocalVisionConfig) -> DistillOptio
     because it is identity - it is not (ADR-0004) - it moves because
     `local_vision_non_local` is derived from it, and that boolean *is* identity
     (D-012). Substituting the model without the address would ask whether the
-    *previous* endpoint was remote while naming this one's model.
+    *previous* endpoint was remote while naming this one's model. The
+    forwarding declaration moves for the same reason: it is an input to the
+    same predicate, and leaving the previous entry's behind would fold the
+    wrong run's disclosure into this entry's key (ADR-0009).
     """
     return replace(
         options,
@@ -456,4 +459,5 @@ def _as_entry(options: DistillOptions, entry: LocalVisionConfig) -> DistillOptio
         local_vision_model=entry.model,
         local_vision_base_url=entry.base_url,
         local_vision_allow_remote_endpoint=entry.allow_remote_endpoint,
+        local_vision_forwards_off_machine=entry.forwards_off_machine,
     )
