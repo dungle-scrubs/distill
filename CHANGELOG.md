@@ -5,6 +5,40 @@ All notable changes to Distill are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-10-26
+
+### Added
+
+- **`forwards_off_machine` on a vision endpoint** (per endpoint in the
+  config, or `--local-vision-forwards-off-machine`). A loopback endpoint that
+  relays frames elsewhere, such as a local proxy to a hosted model, now marks
+  the run non-local: the run discloses it, arms the remote budget and applies
+  the credential guard, as a remote endpoint does (ADR-0009).
+
+### Fixed
+
+- **YouTube title, channel and upload date survive large caption lists.** The
+  metadata call asks yt-dlp for the six fields distill reads instead of the
+  whole `--dump-json` document. A video with many auto-translated caption
+  tracks produced a document over the 8 MiB output cap, so the JSON did not
+  parse and the bundle lost its metadata.
+- **A refused vision request is reported as refused.** A 4xx that is neither
+  an auth error nor retryable was reported as "returned malformed JSON". It now
+  reports `local_vision_request_refused` with the status and the endpoint's
+  reason, the refused frame degrades, and the run reads the next frame. A
+  redirect, a truncated read, an oversized body or a non-object JSON body
+  names its cause.
+- **Endpoint URLs in error details are sanitized.** The byte-cap error and the
+  URLs in probe and frame-path details go through the same sanitizer as other
+  messages, so a key in an endpoint's path no longer reaches a bundle or the
+  diagnostics report.
+- **PyAV is capped below 19.** faster-whisper passes an argument to `av.open`
+  that PyAV 19 removed, so transcription failed on a fresh install.
+- **The eval scorer scores the endpoint a run would use.** With an `endpoints`
+  chain configured, `tests/evals/score.py` probed the top-level `base_url`
+  instead of walking the chain. It now selects the endpoint the way a run does
+  and prints which one it scored.
+
 ## [0.4.0] - 2026-09-26
 
 ### Added
