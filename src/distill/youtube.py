@@ -91,9 +91,9 @@ def youtube_fast_path_video_id(url: str) -> str | None:
     run cannot publish under:
 
     - **A playlist is attached.** `watch?v=A&list=P` used to be the playlist to
-      yt-dlp: `--dump-json` emitted one document per entry, which does not parse
-      as one, and `canonical_youtube_id` fell back to `--print id` and took the
-      *last* line, so the URL published under some other entry's id. Every
+      yt-dlp: the metadata invocation emitted one document per entry, which does
+      not parse as one, and `canonical_youtube_id` fell back to `--print id` and
+      took the *last* line, so the URL published under some other entry's id. Every
       single-video invocation now carries `NO_PLAYLIST_ARG`, so the id written
       in such a URL *is* the id a run publishes under, and the shortcut is
       declined here on the narrower ground that widening it changes which
@@ -183,9 +183,9 @@ NO_PLAYLIST_ARG = "--no-playlist"
 
 yt-dlp reads a `list` parameter as the thing being asked for, so without this a
 URL an operator copied out of a playlist page resolves to every entry of the
-playlist: `--dump-json` emits one document per entry, `--print id` one line per
-entry, and the download points one output template at all of them. Which entry
-the run then proceeds against is whichever landed on `source.mp4`.
+playlist: the metadata `--print` emits one document per entry, `--print id` one
+line per entry, and the download points one output template at all of them.
+Which entry the run then proceeds against is whichever landed on `source.mp4`.
 
 Every yt-dlp invocation about *one video* carries it, and the one invocation
 whose subject really is a playlist - the listing a playlist job starts with -
@@ -298,9 +298,35 @@ def youtube_description(
     return proc.stdout.strip(), list(proc.warnings)
 
 
+METADATA_FIELD_TEMPLATE = "%(.{id,title,channel,uploader,upload_date,description})j"
+"""The six fields the metadata invocation asks yt-dlp for, and only those.
+
+Asked for as a JSON object rather than parsed out of a bigger document, so the
+size that matters is the size of what is read: 2.7 KB for the video whose
+whole document is 10.2 MB. The `j` conversion is yt-dlp's own, so the document
+is JSON rather than a template's rendering of one.
+"""
+
+
 def youtube_metadata(url: str, extra_args: list[str] | None = None) -> YouTubeMetadata:
+    """What yt-dlp says about one video, read from six fields and no more.
+
+    The invocation asks for the fields this function reads rather than for
+    yt-dlp's whole document, because the whole document is not the answer - it
+    is every field yt-dlp knows, including the auto-translated caption tracks a
+    widely-copied video accumulates. On the video that prompted the change,
+    `--dump-json` emitted 10.2 MB: past `OUTPUT_CAP_BYTES` (8 MiB), so the
+    capture was truncated, the JSON did not parse, and the bundle lost its
+    title, channel and upload date. The same video's six fields are 2.7 KB.
+
+    Every fallback below is unchanged: a yt-dlp that cannot answer still costs
+    the metadata and not the run, and the fast path still names the video the
+    URL names.
+    """
     try:
-        proc = _run_ytdlp([*(extra_args or []), "--skip-download", "--dump-json"], url)
+        proc = _run_ytdlp(
+            [*(extra_args or []), "--skip-download", "--print", METADATA_FIELD_TEMPLATE], url
+        )
     except DistillError:
         video_id = youtube_fast_path_video_id(url)
         if video_id is None:

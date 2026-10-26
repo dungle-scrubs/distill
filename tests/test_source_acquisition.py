@@ -1399,7 +1399,8 @@ if query.get("list") and "--no-playlist" not in argv:
     resolved = "PLAYLISTENTRY"
 else:
     resolved = (query.get("v") or [url.rsplit("/", 1)[-1]])[0]
-if "--dump-json" in argv:
+asks_for_an_object = any(arg.startswith("%(.{") for arg in argv)
+if "--dump-json" in argv or asks_for_an_object:
     sys.stdout.write(json.dumps({"id": resolved, "description": "about " + resolved}) + "\\n")
 else:
     sys.stdout.write(resolved + "\\n")

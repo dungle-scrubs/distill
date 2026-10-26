@@ -43,16 +43,21 @@ for line in [
 """
 
 # A fake yt-dlp that answers every invocation a YouTube run makes of it: the
-# `--dump-json` metadata document, the `--print` id, and the download itself. The
-# real tool is one binary doing all three, so a test about "is yt-dlp needed at
-# all" needs one fake that cannot be needed for only part of it. The video id it
-# reports is the one in the URL, which is what the real tool reports too.
+# metadata document, the `--print` id, and the download itself. The real tool is
+# one binary doing all three, so a test about "is yt-dlp needed at all" needs
+# one fake that cannot be needed for only part of it. The video id it reports is
+# the one in the URL, which is what the real tool reports too.
+#
+# The metadata invocation asks for six fields as one JSON object, so the fake
+# answers that with a document - and answers `--dump-json` too, because the X
+# client still asks for the whole document that way.
 FAKE_YTDLP_METADATA_AND_DOWNLOAD = """
 import json, pathlib, sys
 
 argv = sys.argv[1:]
 video_id = argv[-1].rsplit("=", 1)[-1].rsplit("/", 1)[-1]
-if "--dump-json" in argv:
+asks_for_an_object = any(arg.startswith("%(.{") for arg in argv)
+if "--dump-json" in argv or asks_for_an_object:
     sys.stdout.write(json.dumps({"id": video_id, "description": ""}))
 elif "-o" not in argv:
     sys.stdout.write(video_id + "\\n")
