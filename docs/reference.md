@@ -303,15 +303,23 @@ a time and the record without a `type` is the failure. Parsing the whole
 stream as one document fails at the first newline. Lines that are not JSON
 at all come from libraries Distill imports rather than from Distill.
 
+A batch run (`process-video-directory`, `process-youtube-playlist`) writes
+two interleaved progress streams: each item reports under its own
+`<job_id>-<index>`, and the parent mirrors every child event under the
+batch's job id. The two lines for one event differ in `job_id`, in
+`overall_percent` (the child's own weighted progress versus the batch's
+fraction), and in `sequence`, which each job numbers independently from 1.
+
 The event stream also supplies the job record, so a poller can inspect
 progress without reading stderr. A single-source run (`process-local-video`,
 `process-youtube-video`, `process-x-video`) notes its own stages, and a batch
 parent (`process-video-directory`, `process-youtube-playlist`) mirrors the
-stage of the child it is on while counting items as they complete. Each item
-of a batch also has its own record under `<job_id>-<index>`, written under the
-batch's output root for a directory and under the playlist folder for a
-playlist. Progress fields are absent until the first event is recorded;
-this can include runs that return through a cache-hit fast path.
+stage of the child it is on while counting items as they finish, failed
+items included. Each item of a batch also has its own record under
+`<job_id>-<index>`, written under the batch's output root for a directory and
+under the playlist folder for a playlist. Progress fields are absent until
+the first event is recorded; this can include runs that return through a
+cache-hit fast path.
 
 A record returned by `get-job-status` carries, alongside the lifecycle fields
 it always had:
@@ -329,8 +337,11 @@ it always had:
 - `updated_at`: when the record was last written, for any reason.
 
 For a batch parent, `stage` and `stage_percent` are the running child's own,
-and `overall_percent` is the batch's fraction: completed items plus the
-running child's progress, over the item count.
+and `overall_percent` is the batch's fraction: items already finished,
+failed ones included, plus the running child's own progress, over the item
+count. Before the first child starts, the parent names its own opening
+stage instead: `directory_scan` for a directory batch, `playlist_listing`
+for a playlist.
 
 These fields describe the last persisted event, not the run. How the run
 ended is `status`, and the stage that failed is `error.stage`. A `failed`

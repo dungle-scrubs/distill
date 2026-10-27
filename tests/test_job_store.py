@@ -1164,6 +1164,7 @@ def test_a_blocked_vision_request_names_the_stage_in_job_status(
     try:
         assert entered.wait(timeout=10.0), "the run never reached the vision stage"
         status = status_of(root, job_id)
+        written_status = json.loads((root / "_jobs" / f"{job_id}.json").read_text())
     finally:
         release.set()
         worker.join(timeout=10.0)
@@ -1181,6 +1182,12 @@ def test_a_blocked_vision_request_names_the_stage_in_job_status(
     assert status["started_at"]
     assert status["last_progress_at"]
     assert status["updated_at"] >= status["started_at"]
+    # The allowlist, pinned (round 2, tests lens 2): a record carries the
+    # projection's names and numbers only - the write-side sequence and the
+    # event detail never reach one, on the running record or the terminal one.
+    assert "sequence" not in status
+    assert "detail" not in status
+    assert not {"sequence", "detail"} & written_status.keys()
 
     final = status_of(root, job_id)
     assert final["status"] == "completed"
@@ -1195,6 +1202,10 @@ def test_a_blocked_vision_request_names_the_stage_in_job_status(
     assert final["stage"] == "bundle_publish"
     assert final["stage_status"] == "completed"
     assert final["last_progress_at"]
+    assert "sequence" not in final
+    assert "detail" not in final
+    written_final = json.loads((root / "_jobs" / f"{job_id}.json").read_text())
+    assert not {"sequence", "detail"} & written_final.keys()
 
 
 def test_a_blocked_frame_leaves_the_completed_frames_counted_in_job_status(
@@ -1681,6 +1692,151 @@ def test_a_note_from_a_finished_item_cannot_regress_the_next_items_parent_status
     assert final["status"] == "completed"
 
 
+def test_disarm_waits_for_an_admitted_observation_from_a_failing_item(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The admission lock's own proof (round 2, tests lens 1): disarm must wait.
+
+    The surviving mutant dropped the lock from `disarm` alone: every existing
+    proof stayed green because a live child's own later events queue on the
+    admission lock, so disarm was never contended. Here the admitted
+    observation is the *failed* item's last progress event - the child returns
+    while its observation is in flight, exactly the case disarm's lock exists
+    for - and the next item must not start until that observation lands.
+    """
+
+    def transcribe_that_fails_the_first_item_after_its_last_event(
+        resolved_path: Path,
+        _scratch_dir: Path,
+        _options: Any,
+        progress: ProgressReporter,
+        *,
+        duration_sec: float | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        if "one" not in str(resolved_path):
+            return {"language": "en", "language_probability": 1.0, "segments": ()}, []
+
+        def on_stderr_line(_line: str) -> None:
+            progress.update("transcription", percent=25.0)
+
+        run_command.stream(
+            [sys.executable, "-c", 'import sys; print("fixture progress", file=sys.stderr)'],
+            stage="transcript",
+            total_timeout_sec=30.0,
+            idle_timeout_sec=30.0,
+            on_stderr_line=on_stderr_line,
+            check=False,
+        )
+        # The report above was the item's last progress event; nothing else it
+        # does can queue behind the observation that event earned.
+        raise DistillError(
+            "E_FAILS_AFTER_LAST_EVENT", "transcript", "the item fails after its last progress event"
+        )
+
+    root = tmp_path / "output"
+    job_id = "distill-disarm-failing-item"
+    child_one = f"{job_id}-1"
+    child_two = f"{job_id}-2"
+    parked = threading.Event()
+    release_observer = threading.Event()
+    committed = threading.Event()
+    child_one_failed = threading.Event()
+    child_two_started = threading.Event()
+    genuine_write = JobStore._write
+    genuine_reporter = pipeline.ProgressReporter
+    parked_once: list[bool] = []
+    parent_built: list[bool] = []
+
+    def reporter_that_parks_the_admitted_observation(*args: Any, **kwargs: Any) -> Any:
+        reporter = genuine_reporter(*args, **kwargs)
+        if parked_once or parent_built:
+            return reporter
+        parent_built.append(True)
+        genuine_update = reporter.update
+
+        def parking_update(
+            mechanism: str, *, status: ProgressStatus = "running", **update: Any
+        ) -> Any:
+            if mechanism == "transcription" and not parked_once:
+                # Past observe's admission (the lock is held), inside the
+                # parent update it admitted: where a slow parent write sits.
+                parked_once.append(True)
+                parked.set()
+                assert release_observer.wait(timeout=10.0), "the test never released the observer"
+                try:
+                    return genuine_update(mechanism, status=status, **update)
+                finally:
+                    committed.set()
+            return genuine_update(mechanism, status=status, **update)
+
+        # Shadowing the bound method is the injection; the wrapper forwards
+        # every keyword untouched.
+        reporter.update = parking_update  # ty: ignore[invalid-assignment]
+        return reporter
+
+    def signalling_write(store: JobStore, record: Any) -> Any:
+        payload = record.to_dict()
+        written = genuine_write(store, record)
+        if payload.get("job_id") == child_one and payload.get("status") == "failed":
+            child_one_failed.set()
+        if payload.get("job_id") == child_two and payload.get("status") == "running":
+            child_two_started.set()
+        return written
+
+    monkeypatch.setattr(pipeline, "ProgressReporter", reporter_that_parks_the_admitted_observation)
+    monkeypatch.setattr(JobStore, "_write", signalling_write)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "one.mp4").write_bytes(b"one")
+    (videos / "two.mp4").write_bytes(b"two")
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        transcribe=transcribe_that_fails_the_first_item_after_its_last_event,
+        probe=an_available_probe,
+        try_interpret=a_fake_interpretation,
+    )
+    stub_each_source_uniquely(monkeypatch)
+
+    failures: list[BaseException] = []
+    outcome: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            outcome["response"] = pipeline.process_video_directory(
+                {"path": str(videos), "output_dir": str(root), "job_id": job_id, "ocr": False}
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert parked.wait(timeout=10.0), "the failed item's observation never went in flight"
+        assert child_one_failed.wait(timeout=10.0), (
+            "item one never failed around the in-flight observation"
+        )
+        # While the admitted observation is still in flight, the next item
+        # must not start. The bound is generous to the unlocked disarm, which
+        # starts item two almost at once; the locked one waits it out.
+        next_item_started_early = child_two_started.wait(timeout=2.0)
+        release_observer.set()
+        assert committed.wait(timeout=10.0), "the admitted observation never landed"
+    finally:
+        release_observer.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive()
+    assert not next_item_started_early, "item two began before the failed item's observation landed"
+
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+    assert final["result"]["error_count"] == 1
+    assert status_of(root, child_one)["error"]["code"] == "E_FAILS_AFTER_LAST_EVENT"
+    assert status_of(root, child_two)["status"] == "completed"
+
+
 def test_an_admitted_observer_write_lands_before_the_next_item_takes_over(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1908,6 +2064,171 @@ def test_a_failed_item_still_counts_toward_the_batch_fraction(
     assert final["result"]["processed_count"] == 1
     assert final["result"]["error_count"] == 1
     assert status_of(root, f"{job_id}-2")["status"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("handler", "args"),
+    [
+        ("process_video_directory", {}),
+        ("process_youtube_playlist", {"url": PLAYLIST_URL}),
+    ],
+    ids=["directory", "playlist"],
+)
+def test_a_delayed_event_from_the_current_child_cannot_regress_the_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    handler: str,
+    args: dict[str, str],
+) -> None:
+    """FAILS FIRST (round 2, panel B 1): the parent mirrored a refused event.
+
+    The child's own store refuses a note sequenced at or below the newest one
+    it committed, but the observer used to forward that refused event anyway,
+    and the parent's reporter handed it a fresh parent sequence - so while the
+    child sat blocked in vision, a transcription callback delayed on the
+    dispatcher thread pulled the parent's record back to an earlier stage and
+    left it there for the rest of the wait. The observer now rejects the
+    child's stale sequences under the admission lock, before the parent's
+    sequence is spent on them. The delay parks before the child's print,
+    outside every store lock, exactly where a slow callback sits; the child's
+    transcription event rides a real `run_command` dispatcher thread.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-delayed-current-child"
+    child_id = f"{job_id}-1"
+    entered = threading.Event()
+    release_probe = threading.Event()
+    parked = threading.Event()
+    release_delayed = threading.Event()
+    delayed_done = threading.Event()
+    regression_noted = threading.Event()
+    genuine_print = pipeline.progress_emitter
+    genuine_write = JobStore._write
+    built: list[bool] = []
+    parked_once: list[bool] = []
+
+    def print_that_delays_the_childs_first_event(job: str) -> Any:
+        print_event = genuine_print(job)
+        built.append(True)
+        if len(built) != 2:
+            # The parent's emitter is built first, the child's second; the
+            # delay lands between the event's construction (its sequence and
+            # its own overall are already fixed) and its print, outside every
+            # store lock - exactly where a slow callback sits.
+            return print_event
+
+        def delaying_print(event: Any) -> None:
+            if event.mechanism == "transcription" and not parked_once:
+                parked_once.append(True)
+                parked.set()
+                assert release_delayed.wait(timeout=10.0), "the test never released the callback"
+                try:
+                    print_event(event)
+                finally:
+                    delayed_done.set()
+                return
+            print_event(event)
+
+        return delaying_print
+
+    def regression_signalling_write(store: JobStore, record: Any) -> Any:
+        written = genuine_write(store, record)
+        payload = record.to_dict()
+        if (
+            payload.get("job_id") == job_id
+            and payload.get("stage") == "transcription"
+            and payload.get("status") == "running"
+        ):
+            # The mirror note panel B's counterexample lands: signalled after
+            # the write committed, so a read that follows observes it.
+            regression_noted.set()
+        return written
+
+    monkeypatch.setattr(pipeline, "progress_emitter", print_that_delays_the_childs_first_event)
+    monkeypatch.setattr(JobStore, "_write", regression_signalling_write)
+
+    def blocking_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+        entered.set()
+        if not release_probe.wait(timeout=10.0):
+            raise AssertionError("the poller never released the vision probe")
+        return LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_available",
+            message="available",
+            detail={},
+        )
+
+    if handler == "process_video_directory":
+        videos = tmp_path / "videos"
+        videos.mkdir()
+        (videos / "one.mp4").write_bytes(b"one")
+        call_args: dict[str, Any] = {**args, "path": str(videos)}
+        parent_root, child_root = root, root
+    else:
+        monkeypatch.setattr(pipeline, "youtube_playlist_urls", lambda *_a, **_k: [VIDEO_URL])
+        call_args = dict(args)
+        parent_root = root
+        child_root = root / "playlists" / pipeline.playlist_folder_name(PLAYLIST_URL)
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        transcribe=a_real_process_reporting_progress,
+        probe=blocking_probe,
+        try_interpret=a_fake_interpretation,
+    )
+    stub_each_source_uniquely(monkeypatch)
+
+    failures: list[BaseException] = []
+    outcome: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            outcome["response"] = getattr(pipeline, handler)(
+                {**call_args, "output_dir": str(root), "job_id": job_id, "ocr": False}
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert parked.wait(timeout=10.0), "the child's first event never went in flight"
+        assert entered.wait(timeout=10.0), "the child never reached its vision probe"
+        parent_before = status_of(parent_root, job_id)
+        child_before = status_of(child_root, child_id)
+        release_delayed.set()
+        assert delayed_done.wait(timeout=10.0), "the delayed print never returned"
+        # Give the unserialized forward every chance to land its mirror note -
+        # serialized, the observer rejects the stale sequence and this wait
+        # simply expires.
+        regression_noted.wait(timeout=2.0)
+        parent_after = status_of(parent_root, job_id)
+        child_after = status_of(child_root, child_id)
+    finally:
+        release_delayed.set()
+        release_probe.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive(), "the batch did not finish after the probe was released"
+
+    # Before the delayed event lands, both records name the blocked stage.
+    assert parent_before["stage"] == "local_vision", parent_before
+    assert child_before["stage"] == "local_vision", child_before
+
+    # After it lands: the child's store already refused the stale sequence, so
+    # its record never moved; the parent must not have moved either.
+    assert parent_after["stage"] == "local_vision", parent_after
+    assert parent_after["stage_status"] == "running", parent_after
+    assert parent_after["overall_percent"] >= parent_before["overall_percent"], parent_after
+    assert child_after["stage"] == "local_vision", child_after
+
+    final = status_of(parent_root, job_id)
+    assert final["status"] == "completed"
+    assert final["result"]["processed_count"] == 1
 
 
 def test_only_the_run_holding_a_job_may_note_its_progress(tmp_path: Path) -> None:
@@ -2341,6 +2662,114 @@ def test_a_stale_sequenced_note_cannot_regress_the_newer_observed_stage(
     assert final["status"] == "completed"
 
 
+def test_a_fast_failing_frame_does_not_silence_the_frames_that_succeeded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (round 2, panel A 2): one fast failure withheld every success.
+
+    `future.result()` re-raises a worker's exception, so the first failing
+    frame to complete used to abort the consumption loop before any other
+    future was yielded: the frames that had already answered were left
+    unreported, and the record stood at the stage-entry note for the rest of
+    the wait - the same silence the issue describes, reached from the failure
+    side. The pool is now drained on failure: successes still count, and the
+    first failure is re-raised once the executor has finished, so the run ends
+    in the same fatal error rather than silently degrading.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-fast-failing-frame"
+    entered = threading.Event()
+    release = threading.Event()
+    frame_two_failed = threading.Event()
+    milestone_noted = threading.Event()
+    genuine_write = JobStore._write
+
+    def milestone_signalling_write(store: JobStore, record: Any) -> Any:
+        written = genuine_write(store, record)
+        payload = record.to_dict()
+        if (
+            payload.get("status") == "running"
+            and payload.get("stage") == "local_vision"
+            and payload.get("stage_percent") == 33.333
+        ):
+            milestone_noted.set()
+        return written
+
+    monkeypatch.setattr(JobStore, "_write", milestone_signalling_write)
+
+    def interpret(
+        config: LocalVisionConfig,
+        image_path: Path,
+        _prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[Interpretation, None]:
+        if image_path.name == "frame_0002.png":
+            frame_two_failed.set()
+            raise DistillError("E_FRAME_TWO", "local_vision", "the second frame fails immediately")
+        if image_path.name == "frame_0001.png":
+            # Succeeds only once the failure has happened, so the failing
+            # future is already complete when this answer lands.
+            assert frame_two_failed.wait(timeout=10.0), "frame two never failed"
+            return an_interpretation(config, image_path, prompt_profile), None
+        entered.set()
+        assert release.wait(timeout=10.0), "the poller never released the third frame"
+        return an_interpretation(config, image_path, prompt_profile), None
+
+    fake_stage_producers(monkeypatch, frame_count=3)
+    configure_run(
+        monkeypatch,
+        probe=an_available_probe,
+        try_interpret=interpret,
+        max_parallel=3,
+    )
+    stub_acquisition(monkeypatch, provenance=a_provenance())
+
+    failures: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            pipeline.process_local_video(
+                {
+                    "path": "/stub/video.mp4",
+                    "output_dir": str(root),
+                    "job_id": job_id,
+                    "ocr": False,
+                }
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert entered.wait(timeout=10.0), "the run never reached the third frame"
+        # The successful frame's milestone must reach the record while the
+        # third frame is still in flight. The bound is generous to the
+        # aborting loop, which never writes it at all.
+        assert milestone_noted.wait(timeout=2.0), "the successful frame's milestone never landed"
+        status = status_of(root, job_id)
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+    assert not worker.is_alive(), "the run did not finish after the third frame was released"
+
+    assert status["status"] == "running"
+    assert status["stage"] == "local_vision"
+    assert status["stage_percent"] == pytest.approx(33.333)
+    assert status["last_progress_at"]
+
+    # The run ends in the worker's own failure, not a degradation: the first
+    # completion-order exception is re-raised once the executor has drained.
+    assert len(failures) == 1
+    assert isinstance(failures[0], DistillError)
+    assert failures[0].code == "E_FRAME_TWO"
+
+    final = status_of(root, job_id)
+    assert final["status"] == "failed"
+    assert final["error"]["code"] == "E_FRAME_TWO"
+
+
 def test_a_blocked_first_frame_does_not_silence_finished_frames_in_parallel(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2468,12 +2897,96 @@ def test_a_blocked_first_frame_does_not_silence_finished_frames_in_parallel(
 
 PINNED_START = 1793029200.0
 PINNED_EVENT = 1793029260.0
+PINNED_FAILED_NOTE_EVENT = 1793029290.0
 PINNED_FINISH = 1793029320.0
 
 
 def pinned_at(epoch: dict[str, float]) -> str:
     """The fake store clock's reading, through the format a record uses."""
     return job_store.format_timestamp(epoch["epoch"])
+
+
+def test_a_failed_note_leaves_the_carry_at_the_last_written_progress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The unpinned clause (round 2, tests lens 3): a failed note changes nothing.
+
+    The hold is the write-side carry for the record's progress, and it moves
+    only after the write succeeded - so a note whose write fails leaves the
+    carry describing exactly what the record on disk says. A stage that emits
+    a committed 10 percent, a 20 percent whose note write fails, and then
+    nothing but its own fatal error, must leave a failed record still carrying
+    the 10 percent and *that* event's time. The mutant that moves the hold
+    update ahead of the write would publish the unwritten 20 percent and its
+    later time, and dies here. Injection is at the write boundary only; both
+    clocks are pinned so every expected value is a literal.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-failed-note"
+    store_clock = {"epoch": PINNED_START}
+    event_clock = {"epoch": PINNED_START}
+    monotonic = {"now": 0.0}
+    monkeypatch.setattr(job_store, "_timestamp", lambda: pinned_at(store_clock))
+    monkeypatch.setattr(
+        pipeline, "ProgressReporter", partial(ProgressReporter, clock=lambda: event_clock["epoch"])
+    )
+    monkeypatch.setattr(pipeline, "_monotonic", lambda: monotonic["now"])
+    genuine_write = JobStore._write
+
+    def refusing_write(store: JobStore, record: Any) -> Any:
+        payload = record.to_dict()
+        if (
+            payload.get("status") == "running"
+            and payload.get("stage") == "transcription"
+            and payload.get("stage_percent") == 20.0
+        ):
+            raise OSError("the record directory vanished mid-note")
+        return genuine_write(store, record)
+
+    monkeypatch.setattr(JobStore, "_write", refusing_write)
+
+    def transcribe_that_loses_its_second_note(
+        _resolved_path: Path,
+        _scratch_dir: Path,
+        _options: Any,
+        progress: ProgressReporter,
+        *,
+        duration_sec: float | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        event_clock["epoch"] = PINNED_EVENT
+        progress.update("transcription", percent=10.0)
+        # Past the throttle floor, so the second event's note is genuinely
+        # attempted and its write is the one that fails.
+        monotonic["now"] += 2.0
+        event_clock["epoch"] = PINNED_FAILED_NOTE_EVENT
+        progress.update("transcription", percent=20.0)
+        # Fatal, immediately: no later event can repaint the record.
+        raise DistillError("E_FATAL_AFTER_NOTE", "transcript", "the stage fails right after")
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        transcribe=transcribe_that_loses_its_second_note,
+        probe=an_available_probe,
+        try_interpret=a_fake_interpretation,
+    )
+    stub_acquisition(monkeypatch, provenance=a_provenance())
+
+    with pytest.raises(DistillError) as failure:
+        pipeline.process_local_video(
+            {"path": "/stub/video.mp4", "output_dir": str(root), "job_id": job_id, "ocr": False}
+        )
+    assert failure.value.code == "E_FATAL_AFTER_NOTE"
+
+    final = status_of(root, job_id)
+    assert final["status"] == "failed"
+    assert final["error"]["code"] == "E_FATAL_AFTER_NOTE"
+    # The committed event, whole: its percent and its own minute, not the
+    # failed note's later time.
+    assert final["stage"] == "transcription"
+    assert final["stage_percent"] == 10.0
+    assert final["last_progress_at"] == "2026-10-26T15:41:00Z"
+    assert final["started_at"] == "2026-10-26T15:40:00Z"
 
 
 def test_start_time_is_immutable_and_progress_carries_the_events_own_time(

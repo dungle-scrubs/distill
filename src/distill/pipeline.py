@@ -259,14 +259,12 @@ def process_x_video(
     args: dict[str, Any],
     *,
     lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
-    progress_observer: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Any]:
     options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
     root = validate_output_root(options.output_dir)
     store = JobStore.open(root)
-    progress = ProgressReporter(
-        emitter=job_progress_emitter(store, options.job_id, observer=progress_observer)
-    )
+    # No observer argument: no batch calls the X handler, so its sink is its own.
+    progress = ProgressReporter(emitter=job_progress_emitter(store, options.job_id))
 
     def work() -> dict[str, Any]:
         return acquire_and_process(
@@ -299,9 +297,10 @@ occurred. Full semantics in `docs/reference.md`.
 def _is_frame_milestone(event: ProgressEvent) -> bool:
     """Whether `event` is a consumed vision frame milestone.
 
-    The mechanism name plus the frame-count markers in the detail - counts
-    only, never text - is what `FrameInterpreter` puts on every consumed frame
-    outcome, and nothing else emits.
+    The frame-count markers in the detail - counts only, never text - are
+    what `FrameInterpreter` puts on every consumed frame outcome, but the OCR
+    stage's per-frame events carry the same markers, so the mechanism name is
+    the load-bearing part: only `local_vision` frames are milestones.
     """
     detail = event.detail or {}
     return event.mechanism == "local_vision" and "frame" in detail and "frames" in detail
@@ -479,19 +478,30 @@ def armed_child_observer(
     `(items already attempted + this child's fraction) / items in the batch`
     through the reporter's explicit `overall_percent` override; the parent
     sequences its own events, and `detail` passes through only for the parent's
-    frame-milestone rule. Admission - the forwarding check plus the parent
-    update it admits - and disarm hold one lock, so disarm waits out an update
-    an arriving event already earned and a late callback from a finished item
-    lands nowhere. The lock is observer-local; the child's own note returns
-    before the observer runs, so no child store lock is held under it.
+    frame-milestone rule. A child event sequenced at or before the newest one
+    this observer successfully forwarded is rejected before `parent.update`:
+    the child's own store has already refused it, and forwarding it would spend
+    a fresh parent sequence on a stage the child has moved past. Admission -
+    the forwarding check, the sequence check and the parent update it admits -
+    and disarm hold one lock, so disarm waits out an update an arriving event
+    already earned and a late callback from a finished item lands nowhere. The
+    lock is observer-local; the child's own note returns before the observer
+    runs, so no child store lock is held under it.
     """
     forwarding = threading.Event()
     forwarding.set()
     admission = threading.Lock()
+    last_forwarded: list[int | None] = [None]
 
     def observe(event: ProgressEvent) -> None:
         with admission:
             if not forwarding.is_set():
+                return
+            if (
+                event.sequence is not None
+                and last_forwarded[0] is not None
+                and event.sequence <= last_forwarded[0]
+            ):
                 return
             parent.update(
                 event.mechanism,
@@ -504,6 +514,7 @@ def armed_child_observer(
                 ),
                 detail=event.detail,
             )
+            last_forwarded[0] = event.sequence
 
     def disarm() -> None:
         with admission:

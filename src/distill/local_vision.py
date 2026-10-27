@@ -1249,6 +1249,14 @@ class FrameInterpreter:
         the frames that already answered (issue #45). The progress a poller
         sees counts consumed outcomes, not frame positions, which is what makes
         it monotonic under any completion order.
+
+        A failing frame does not withhold them either: the first
+        completion-order ``Exception`` is captured, the remaining futures keep
+        draining and their successful outcomes still count, and the original
+        exception is re-raised once the executor has finished - so the run ends
+        in the same fatal error while the record keeps the frames that
+        answered. Interruptions (``KeyboardInterrupt`` and friends) are not
+        captured; they end the wait exactly as they did.
         """
         frame_count = len(frames)
         completed = 0
@@ -1262,16 +1270,27 @@ class FrameInterpreter:
         else:
             workers = min(self._max_parallel, frame_count)
             ordered: list[_FrameOutcome | None] = [None] * frame_count
+            failure: Exception | None = None
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
                     pool.submit(self._interpret_one, config, index, frame, frame_count)
                     for index, frame in enumerate(frames)
                 ]
                 for future in as_completed(futures):
-                    outcome = future.result()
+                    try:
+                        outcome = future.result()
+                    except Exception as exc:
+                        # Keep draining: the frames that already answered still
+                        # owe their milestones, and the executor's own exit
+                        # waits for the rest either way.
+                        if failure is None:
+                            failure = exc
+                        continue
                     ordered[outcome.index] = outcome
                     completed += 1
                     self._emit_frame_progress(completed, frame_count)
+            if failure is not None:
+                raise failure
             outcomes = [outcome for outcome in ordered if outcome is not None]
         interpreted = self._merge_outcomes(outcomes, warnings)
         breaker_warning = self._breaker.summary_warning(frame_count)
