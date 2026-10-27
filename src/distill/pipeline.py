@@ -478,10 +478,13 @@ def armed_child_observer(
     `(items already attempted + this child's fraction) / items in the batch`
     through the reporter's explicit `overall_percent` override; the parent
     sequences its own events, and `detail` passes through only for the parent's
-    frame-milestone rule. A child event sequenced at or before the newest one
-    this observer successfully forwarded is rejected before `parent.update`:
-    the child's own store has already refused it, and forwarding it would spend
-    a fresh parent sequence on a stage the child has moved past. Admission -
+    frame-milestone rule. The observer orders the child observations it
+    successfully FORWARDS: one sequenced at or below the newest forwarded is
+    rejected before `parent.update`, so no parent sequence is spent on an
+    observation the child has moved past. The child's store independently
+    orders the notes it COMMITS; each sink keeps its own sample under its own
+    throttle and failure policy, and either can retain an event the other
+    dropped - no single comparison settles both. Admission -
     the forwarding check, the sequence check and the parent update it admits -
     and disarm hold one lock, so disarm waits out an update an arriving event
     already earned and a late callback from a finished item lands nowhere. The
@@ -491,17 +494,14 @@ def armed_child_observer(
     forwarding = threading.Event()
     forwarding.set()
     admission = threading.Lock()
-    last_forwarded: list[int | None] = [None]
+    last_forwarded: int | None = None
 
     def observe(event: ProgressEvent) -> None:
+        nonlocal last_forwarded
         with admission:
             if not forwarding.is_set():
                 return
-            if (
-                event.sequence is not None
-                and last_forwarded[0] is not None
-                and event.sequence <= last_forwarded[0]
-            ):
+            if last_forwarded is not None and event.sequence <= last_forwarded:
                 return
             parent.update(
                 event.mechanism,
@@ -514,7 +514,7 @@ def armed_child_observer(
                 ),
                 detail=event.detail,
             )
-            last_forwarded[0] = event.sequence
+            last_forwarded = event.sequence
 
     def disarm() -> None:
         with admission:

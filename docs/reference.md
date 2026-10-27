@@ -305,10 +305,14 @@ at all come from libraries Distill imports rather than from Distill.
 
 A batch run (`process-video-directory`, `process-youtube-playlist`) writes
 two interleaved progress streams: each item reports under its own
-`<job_id>-<index>`, and the parent mirrors every child event under the
-batch's job id. The two lines for one event differ in `job_id`, in
-`overall_percent` (the child's own weighted progress versus the batch's
-fraction), and in `sequence`, which each job numbers independently from 1.
+`<job_id>-<index>`, and the parent mirrors that child's admitted events
+under the batch's job id while the child is the current one. A mirrored
+line is a new parent event: its `timestamp` is the parent's observation
+time, its `sequence` belongs to the parent's own numbering, and its
+`overall_percent` is the batch's fraction. The child's own line for the same
+occurrence keeps the child's timestamp and numbering. Stale or late child
+events - ones the child's record already refused, or callbacks that
+outlived their item - can have no parent line at all.
 
 The event stream also supplies the job record, so a poller can inspect
 progress without reading stderr. A single-source run (`process-local-video`,
@@ -341,7 +345,11 @@ and `overall_percent` is the batch's fraction: items already finished,
 failed ones included, plus the running child's own progress, over the item
 count. Before the first child starts, the parent names its own opening
 stage instead: `directory_scan` for a directory batch, `playlist_listing`
-for a playlist.
+for a playlist. A mirror's `stage` and `stage_percent` come from the child
+event it forwarded, but parent and child records can carry different
+last-observed samples, because each record throttles and fails
+independently; the parent's record is not a byte-identical snapshot of the
+child's.
 
 These fields describe the last persisted event, not the run. How the run
 ended is `status`, and the stage that failed is `error.stage`. A `failed`

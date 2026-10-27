@@ -22,6 +22,7 @@ descriptors release, and a holder that tidied up after itself is not a dead one.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -1837,6 +1838,185 @@ def test_disarm_waits_for_an_admitted_observation_from_a_failing_item(
     assert status_of(root, child_two)["status"] == "completed"
 
 
+def test_a_late_callback_from_a_failed_item_cannot_take_the_parent_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The lifetime layer's own proof (round 3, tests lens 1; round 4 matrix).
+
+    The forwarding flag inside `disarm` is load-bearing on its own: the
+    sequence guard cannot mask it, because a failed item's last progress
+    event can be one its observer never saw - parked on the dispatcher
+    thread before the child's print - and therefore newer than anything that
+    observer forwarded. The first child fails right after its single event;
+    the batch moves on and the second child blocks in vision; only then is
+    the unseen callback released. Disarmed, it lands nowhere: the parent and
+    the second child keep naming `local_vision`. With only `forwarding.clear`
+    removed, the still-armed observer forwards the unseen event - its
+    sequence is new to it - and the parent regresses to the dead item's
+    stage. The admission lock and the sequence guard stay in place in both
+    runs, so neither can answer for the flag.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-unseen-late-callback"
+    child_one = f"{job_id}-1"
+    child_two = f"{job_id}-2"
+    entered = threading.Event()
+    release_probe = threading.Event()
+    parked = threading.Event()
+    release_delayed = threading.Event()
+    delayed_done = threading.Event()
+    regression_noted = threading.Event()
+    child_one_failed = threading.Event()
+    genuine_print = pipeline.progress_emitter
+    genuine_write = JobStore._write
+    built: list[bool] = []
+    parked_once: list[bool] = []
+
+    def print_that_parks_the_failed_items_only_event(job: str) -> Any:
+        print_event = genuine_print(job)
+        built.append(True)
+        if len(built) != 2:
+            # The parent's emitter is built first; the failing child's is
+            # second, and its event is parked before the print - before the
+            # child's note and before its observer, so the event is unseen by
+            # both sinks and outside every store or observer lock.
+            return print_event
+
+        def parking_print(event: Any) -> None:
+            if event.mechanism == "transcription" and not parked_once:
+                parked_once.append(True)
+                parked.set()
+                assert release_delayed.wait(timeout=10.0), "the test never released the callback"
+                print_event(event)
+                return
+            print_event(event)
+
+        return parking_print
+
+    def signalling_write(store: JobStore, record: Any) -> Any:
+        payload = record.to_dict()
+        written = genuine_write(store, record)
+        if payload.get("job_id") == child_one and payload.get("status") == "failed":
+            child_one_failed.set()
+        if (
+            payload.get("job_id") == job_id
+            and payload.get("stage") == "transcription"
+            and payload.get("status") == "running"
+        ):
+            regression_noted.set()
+        return written
+
+    monkeypatch.setattr(pipeline, "progress_emitter", print_that_parks_the_failed_items_only_event)
+    monkeypatch.setattr(JobStore, "_write", signalling_write)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "one.mp4").write_bytes(b"one")
+    (videos / "two.mp4").write_bytes(b"two")
+
+    def transcribe_that_fails_item_one_before_its_event_lands(
+        resolved_path: Path,
+        _scratch_dir: Path,
+        _options: Any,
+        progress: ProgressReporter,
+        *,
+        duration_sec: float | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        if "one" not in str(resolved_path):
+            return {"language": "en", "language_probability": 1.0, "segments": ()}, []
+
+        def on_stderr_line(_line: str) -> None:
+            try:
+                progress.update("transcription", percent=25.0)
+            finally:
+                # The note and parent observer have returned, not only the print.
+                delayed_done.set()
+
+        run_command.stream(
+            [sys.executable, "-c", 'import sys; print("fixture progress", file=sys.stderr)'],
+            stage="transcript",
+            total_timeout_sec=30.0,
+            idle_timeout_sec=30.0,
+            on_stderr_line=on_stderr_line,
+            check=False,
+        )
+        # The parked event is this item's only and last progress: it fails
+        # here, before any later event could exist.
+        raise DistillError(
+            "E_FAILS_UNSEEN", "transcript", "the item fails before its event ever lands"
+        )
+
+    def blocking_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+        entered.set()
+        if not release_probe.wait(timeout=10.0):
+            raise AssertionError("the poller never released the second child's probe")
+        return LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_available",
+            message="available",
+            detail={},
+        )
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        transcribe=transcribe_that_fails_item_one_before_its_event_lands,
+        probe=blocking_probe,
+        try_interpret=a_fake_interpretation,
+    )
+    stub_each_source_uniquely(monkeypatch)
+
+    failures: list[BaseException] = []
+    outcome: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            outcome["response"] = pipeline.process_video_directory(
+                {"path": str(videos), "output_dir": str(root), "job_id": job_id, "ocr": False}
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert parked.wait(timeout=10.0), "the failed item's event never went in flight"
+        assert child_one_failed.wait(timeout=10.0), "item one never failed around its parked event"
+        assert entered.wait(timeout=10.0), "the batch never reached its second child"
+        parent_before = status_of(root, job_id)
+        child_two_before = status_of(root, child_two)
+        release_delayed.set()
+        assert delayed_done.wait(timeout=10.0), "the delayed callback never returned"
+        # Give the still-armed observer every chance to land its mirror -
+        # disarmed, the event lands nowhere and this wait simply expires.
+        regression_noted.wait(timeout=2.0)
+        parent_after = status_of(root, job_id)
+    finally:
+        release_delayed.set()
+        release_probe.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive()
+
+    # Before the release: the parent and the live child name the blocked stage.
+    assert parent_before["stage"] == "local_vision", parent_before
+    assert child_two_before["stage"] == "local_vision", child_two_before
+
+    # After it: the unseen event from the dead item lands nowhere. Its
+    # sequence was new to that item's observer, so only the forwarding flag
+    # could refuse it.
+    assert parent_after["stage"] == "local_vision", parent_after
+    assert parent_after["overall_percent"] >= parent_before["overall_percent"], parent_after
+    assert status_of(root, child_one)["status"] == "failed"
+
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+    assert final["result"]["error_count"] == 1
+    assert status_of(root, child_two)["status"] == "completed"
+
+
 def test_an_admitted_observer_write_lands_before_the_next_item_takes_over(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2675,14 +2855,35 @@ def test_a_fast_failing_frame_does_not_silence_the_frames_that_succeeded(
     side. The pool is now drained on failure: successes still count, and the
     first failure is re-raised once the executor has finished, so the run ends
     in the same fatal error rather than silently degrading.
+
+    The schedule is pinned from the consumer side (round 4, tests lens 3): a
+    wrapper at the `concurrent.futures.Future.result` boundary signals the
+    fixture's failure only once a caller has actually received it, and the
+    successful frame waits for that signal before answering - so the failing
+    future is consumed first under any scheduling, and an aborting loop has
+    no successful outcome left to report. The wrapper only observes real
+    result delivery; production code is unchanged.
     """
     root = tmp_path / "output"
     job_id = "distill-fast-failing-frame"
     entered = threading.Event()
     release = threading.Event()
-    frame_two_failed = threading.Event()
+    failure_consumed = threading.Event()
     milestone_noted = threading.Event()
     genuine_write = JobStore._write
+    genuine_result = concurrent.futures.Future.result
+
+    def result_that_signals_the_consumed_failure(
+        future: concurrent.futures.Future, timeout: Any = None
+    ) -> Any:
+        try:
+            return genuine_result(future, timeout)
+        except DistillError as exc:
+            if exc.code == "E_FRAME_TWO":
+                # The caller has now actually received this failure; until it
+                # does, the successful frame stays unready by construction.
+                failure_consumed.set()
+            raise
 
     def milestone_signalling_write(store: JobStore, record: Any) -> Any:
         written = genuine_write(store, record)
@@ -2695,6 +2896,9 @@ def test_a_fast_failing_frame_does_not_silence_the_frames_that_succeeded(
             milestone_noted.set()
         return written
 
+    monkeypatch.setattr(
+        concurrent.futures.Future, "result", result_that_signals_the_consumed_failure
+    )
     monkeypatch.setattr(JobStore, "_write", milestone_signalling_write)
 
     def interpret(
@@ -2705,12 +2909,13 @@ def test_a_fast_failing_frame_does_not_silence_the_frames_that_succeeded(
         prompt_profile: str = "technical",
     ) -> tuple[Interpretation, None]:
         if image_path.name == "frame_0002.png":
-            frame_two_failed.set()
             raise DistillError("E_FRAME_TWO", "local_vision", "the second frame fails immediately")
         if image_path.name == "frame_0001.png":
-            # Succeeds only once the failure has happened, so the failing
-            # future is already complete when this answer lands.
-            assert frame_two_failed.wait(timeout=10.0), "frame two never failed"
+            # Answers only once a consumer has actually received the failure,
+            # so this future cannot become ready ahead of it: the first future
+            # the loop can consume is the failing one, whichever worker
+            # finished first.
+            assert failure_consumed.wait(timeout=10.0), "the failure was never consumed"
             return an_interpretation(config, image_path, prompt_profile), None
         entered.set()
         assert release.wait(timeout=10.0), "the poller never released the third frame"

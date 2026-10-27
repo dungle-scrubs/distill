@@ -25,7 +25,7 @@ the cryptographic sense, and nothing verifies who produced it.
 
 from __future__ import annotations
 
-PIPELINE_VERSION = 87
+PIPELINE_VERSION = 88
 
 # Output-affecting source files covered by PIPELINE_SIGNATURE, named by their
 # path relative to `src/distill/` in posix form so that modules in subpackages
@@ -160,4 +160,4 @@ EXEMPT_MODULES: dict[str, str] = {
 }
 
 # Hash of output-affecting source files covered by the pipeline signature test.
-PIPELINE_SIGNATURE = "0fa4d3e888723e7da5478cd62892b3af54049862c020262871c25e981b7169cc"
+PIPELINE_SIGNATURE = "e6724db222a43de1bafb79a29bbaceb00d4a6de0ab6b77f4291b23741c66e751"

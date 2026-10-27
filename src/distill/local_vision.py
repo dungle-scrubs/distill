@@ -1250,13 +1250,16 @@ class FrameInterpreter:
         sees counts consumed outcomes, not frame positions, which is what makes
         it monotonic under any completion order.
 
-        A failing frame does not withhold them either: the first
-        completion-order ``Exception`` is captured, the remaining futures keep
-        draining and their successful outcomes still count, and the original
-        exception is re-raised once the executor has finished - so the run ends
-        in the same fatal error while the record keeps the frames that
-        answered. Interruptions (``KeyboardInterrupt`` and friends) are not
-        captured; they end the wait exactly as they did.
+        In the parallel pool, a failing frame does not withhold them either:
+        the first completion-order ``Exception`` is captured, the futures
+        already submitted keep draining and their successful outcomes still
+        count, and the original exception is re-raised once the executor has
+        finished - so the run ends in the same fatal error while the record
+        keeps the frames that answered. The serial default still stops at the
+        first failure: with one frame in flight there is no submitted work to
+        drain, and stopping avoids starting any. Interruptions
+        (``KeyboardInterrupt`` and friends) are not captured on either path;
+        they end the wait exactly as they did.
         """
         frame_count = len(frames)
         completed = 0
