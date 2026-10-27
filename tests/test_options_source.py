@@ -243,6 +243,9 @@ def test_content_mode_reports_byte_accurate_fingerprint_progress(
 
     events = [event for event in progress.events if event.mechanism == "source_fingerprint"]
     assert events
+    # The mechanism ends where the hashing ends: a finished run must not
+    # publish a stage that is still `running` at 100 percent (review round 1).
+    assert events[-1].status == "completed"
     assert events[-1].percent == 100.0
     assert events[-1].detail == {
         "cache_mode": "content",
@@ -260,22 +263,29 @@ def test_fingerprint_mode_reports_bounded_sample_progress(tmp_path: Path) -> Non
 
     events = [event for event in progress.events if event.mechanism == "source_fingerprint"]
     anchors = FINGERPRINT_INTERIOR_ANCHORS + 2
-    assert [event.detail["sample"] for event in events if event.detail] == [
+    # The reads are the sample updates; the mechanism's completion after the
+    # last one is a fact about the stage, not a read, so it is asserted apart.
+    updates = [event for event in events if event.status == "running"]
+    assert [event.detail["sample"] for event in updates if event.detail] == [
         "first",
         *["interior"] * FINGERPRINT_INTERIOR_ANCHORS,
         "last",
     ]
-    assert [event.percent for event in events] == [
+    assert [event.percent for event in updates] == [
         round((index + 1) / anchors * 100, 3) for index in range(anchors)
     ]
-    assert events[0].detail == {
+    # The mechanism ends where the hashing ends: a finished run must not
+    # publish a stage that is still `running` at 100 percent (review round 1).
+    assert events[-1].status == "completed"
+    assert events[-1].percent == 100.0
+    assert updates[0].detail == {
         "cache_mode": "fingerprint",
         "sample": "first",
         "offset": 0,
         "samples_done": 1,
         "samples_total": anchors,
     }
-    assert events[-1].detail == {
+    assert updates[-1].detail == {
         "cache_mode": "fingerprint",
         "sample": "last",
         "offset": 1024 * 1024 - FINGERPRINT_SAMPLE_BYTES,
@@ -296,8 +306,13 @@ def test_fingerprint_mode_anchor_count_does_not_grow_with_source_size(
     local_fingerprint(path, "fingerprint", progress)
 
     events = [event for event in progress.events if event.mechanism == "source_fingerprint"]
-    assert len(events) == FINGERPRINT_INTERIOR_ANCHORS + 2
-    offsets = [event.detail["offset"] for event in events if event.detail]
+    # One update per anchor read, plus the one completion that follows the
+    # hashing; the completion reads nothing, so the read count is still the
+    # anchors alone.
+    updates = [event for event in events if event.status == "running"]
+    assert len(updates) == FINGERPRINT_INTERIOR_ANCHORS + 2
+    assert len(events) == len(updates) + 1
+    offsets = [event.detail["offset"] for event in updates if event.detail]
     assert offsets == sorted(offsets)
     assert offsets[-1] == 512 * 1024 * 1024 - FINGERPRINT_SAMPLE_BYTES
 

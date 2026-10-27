@@ -22,6 +22,7 @@ descriptors release, and a holder that tidied up after itself is not a dead one.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import threading
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -37,13 +39,14 @@ from typing import Any
 import pytest
 from runtime_fakes import configure_run
 
-from distill import bundle_store, pipeline
+import distill.job_store as job_store
+from distill import bundle_store, pipeline, run_command
 from distill.artifacts import FrameArtifact, Interpretation, Provenance, RedactionState
 from distill.bundle_store import ExclusiveLock
 from distill.errors import DistillError
 from distill.job_store import JobOutcome, JobProgress, JobStore
 from distill.local_vision import LocalVisionConfig, LocalVisionProbe
-from distill.progress import ProgressReporter
+from distill.progress import ProgressReporter, ProgressStatus
 from distill.source import SourceInfo, SourceResolution
 
 STAGE_FAILURE = DistillError("E_STAGE_BOOM", "keyframes", "keyframe selection failed")
@@ -1239,10 +1242,12 @@ def test_a_blocked_frame_leaves_the_completed_frames_counted_in_job_status(
             if not release.wait(timeout=10.0):
                 raise AssertionError("the poller never released the frame")
         else:
-            # Past the throttle, so the frame's completion note is written the
-            # moment the frame lands - this is the clock a run's own slow
-            # frames would move.
-            clock["now"] += 2.0
+            # A frame that lands fast - well inside the note throttle's window,
+            # which is what a real run's early frames do. Frame milestones are
+            # persisted the moment they are consumed, so no clock advance is
+            # needed to make one visible; the clock still moves so the run's
+            # later events are not mistaken for a frozen stream.
+            clock["now"] += 0.25
         return an_interpretation(config, image_path, prompt_profile), None
 
     fake_stage_producers(monkeypatch, frame_count=3)
@@ -1278,12 +1283,12 @@ def test_a_blocked_frame_leaves_the_completed_frames_counted_in_job_status(
     # One frame of three has completed; the second is in flight. A poller that
     # cannot see the event stream still knows both facts: the position, and
     # that the last activity was that frame's completion. The percent carries
-    # the reporter's 3-decimal rounding (`clamp_percent`), which is part of
-    # every percent a run has ever reported.
+    # the reporter's 3-decimal rounding (`clamp_percent`) - one frame of three
+    # is 33.333 however the code computes it.
     assert status["status"] == "running"
     assert status["stage"] == "local_vision"
     assert status["stage_status"] == "running"
-    assert status["stage_percent"] == pytest.approx(round(100.0 / 3, 3))
+    assert status["stage_percent"] == pytest.approx(33.333)
     assert status["last_progress_at"]
 
     final = status_of(root, job_id)
@@ -1325,6 +1330,584 @@ def test_a_record_written_before_progress_fields_reads_as_it_always_did(
     assert "overall_percent" not in status
     assert "started_at" not in status
     assert "last_progress_at" not in status
+
+
+def a_foreign_record(root: Path, job_id: str, **fields: Any) -> None:
+    """Write a record this run did not write, as a poller might find one.
+
+    `get_job_status` answers for any record under the root, and a hand-edited
+    or corrupt one is exactly the case lenient reading was written for, so the
+    parse's answers are pinned from the same surface a caller reads.
+    """
+    (root / "_jobs").mkdir(parents=True, exist_ok=True)
+    (root / "_jobs" / f"{job_id}.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "tool": "process_local_video",
+                # Terminal, so the read is a parse and not a liveness question:
+                # no holder exists for a record nobody's run is behind.
+                "status": "completed",
+                "updated_at": "2026-10-27T09:00:00Z",
+                **fields,
+            }
+        )
+    )
+
+
+def test_a_half_projected_progress_is_absent_rather_than_halved(tmp_path: Path) -> None:
+    """FAILS FIRST (review round 1): a stage with no status read back as one.
+
+    `JobProgress` exists so a projection cannot be handed a stage with no
+    status; the parse undid that by reading five independent optionals. A
+    record that carries `stage` and not `stage_status` is either corrupt or
+    foreign, and the honest answer is no projection at all - not the half of
+    one, which reads as a stage that is somehow in no state.
+    """
+    root = tmp_path / "output"
+    a_foreign_record(
+        root, "distill-half", stage="local_vision", last_progress_at="2026-10-27T09:00:00Z"
+    )
+
+    status = status_of(root, "distill-half")
+
+    assert status["status"] == "completed"
+    assert "stage" not in status
+    assert "stage_status" not in status
+    assert "stage_percent" not in status
+    assert "overall_percent" not in status
+    assert "last_progress_at" not in status
+
+
+def test_percents_a_percent_cannot_be_do_not_reach_the_status_json(
+    tmp_path: Path,
+) -> None:
+    """FAILS FIRST (review round 1): `NaN` and `1e9` read back as percents.
+
+    The writer can only write `clamp_percent`'s answers, but the reader answers
+    for any record under the root, and Python's JSON accepts `NaN` and
+    `Infinity` on the way in and re-emits them on the way out - so one corrupt
+    field made the whole `get-job-status` document one a strict parser rejects.
+    A percent that is not a finite number inside 0..100 is absent; the record
+    still reads, and the stage it names still answers.
+    """
+    root = tmp_path / "output"
+    a_foreign_record(
+        root,
+        "distill-nan",
+        stage="local_vision",
+        stage_status="running",
+        last_progress_at="2026-10-27T09:00:00Z",
+        stage_percent=float("nan"),
+        overall_percent=1e9,
+    )
+
+    status = status_of(root, "distill-nan")
+
+    assert status["stage"] == "local_vision"
+    assert status["stage_status"] == "running"
+    assert "stage_percent" not in status
+    assert "overall_percent" not in status
+    # The proof of the leak: the answer a caller is handed re-serializes as
+    # strict JSON, `NaN` and all.
+    assert "NaN" not in json.dumps(status)
+    assert "Infinity" not in json.dumps(status)
+
+    a_foreign_record(
+        root,
+        "distill-out-of-range",
+        stage="local_vision",
+        stage_status="running",
+        last_progress_at="2026-10-27T09:00:00Z",
+        stage_percent=150.0,
+        overall_percent=-5.0,
+    )
+    bounded = status_of(root, "distill-out-of-range")
+    assert "stage_percent" not in bounded
+    assert "overall_percent" not in bounded
+
+
+# --- A batch's parent answers for its children (review round 1) ------------
+#
+# The ticket's promise is written for "a running job", and a playlist or
+# directory run is exactly the long job whose caller polls. The parent record
+# used to carry lifecycle fields only: the stage lived in each child's own
+# record, so a caller polling the parent it started still saw `running` with
+# no stage - the original silence, one level up. The parent now observes its
+# children: it mirrors the child's own stage and status, maps the child's
+# progress onto the batch's fraction, and counts items as they complete,
+# while each child keeps its own record under its own job id.
+
+
+def stub_each_source_uniquely(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let a batch's children past acquisition as *different* sources.
+
+    One shared stub hash would name one **bundle key**, and the second child
+    would be served the first child's generation as a cache hit - never
+    reaching the vision stage the batch test blocks in. Each value the batch
+    hands the handler gets its own hash, so every child runs for real.
+    """
+
+    def resolve(
+        _source_type: str,
+        value: str,
+        _options: Any,
+        *,
+        progress: Any = None,
+        downloader: Any = None,
+        lock_wait_sec: float = 0.0,
+    ) -> SourceResolution:
+        digest = hashlib.sha256(str(value).encode()).hexdigest()[:32]
+        return SourceResolution(
+            SourceInfo(
+                "local",
+                Path(value),
+                1.0,
+                "fingerprint",
+                digest,
+                [],
+                provenance=a_provenance(),
+            ),
+            output_root=None,
+            progress=progress,
+        )
+
+    monkeypatch.setattr(pipeline, "resolve_source_for_processing", resolve)
+
+
+def a_blocking_probe_for_the_second_child(
+    entered: threading.Event, release: threading.Event
+) -> Callable[[LocalVisionConfig], LocalVisionProbe]:
+    """An available probe that blocks the second child's vision request.
+
+    Children run one at a time, so the second probe call this store sees is
+    the second child's - the run a caller is left waiting on.
+    """
+    calls: list[int] = []
+
+    def probe(config: LocalVisionConfig) -> LocalVisionProbe:
+        calls.append(len(calls) + 1)
+        if len(calls) == 2:
+            entered.set()
+            if not release.wait(timeout=10.0):
+                raise AssertionError("the poller never released the second child")
+        return LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_available",
+            message="available",
+            detail={},
+        )
+
+    return probe
+
+
+@pytest.mark.parametrize(
+    ("handler", "args"),
+    [
+        ("process_video_directory", {"path": "__REPLACED__"}),
+        ("process_youtube_playlist", {"url": PLAYLIST_URL}),
+    ],
+    ids=["directory", "playlist"],
+)
+def test_a_blocked_child_names_the_stage_in_the_parent_record_too(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    handler: str,
+    args: dict[str, str],
+) -> None:
+    """FAILS FIRST (review round 1): the parent answered `running` with no stage.
+
+    One item completes; the second blocks inside its vision request. What a
+    poller reads then, from the parent's own record and the child's, is the
+    whole of the parent's coverage: the parent mirrors the child's stage and
+    carries the batch's fraction - one of two items done, the second partway -
+    while the child's record says the same thing about itself under its own
+    job id, in its own record root for a playlist.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-batch-parent"
+    entered = threading.Event()
+    release = threading.Event()
+
+    if handler == "process_video_directory":
+        videos = tmp_path / "videos"
+        videos.mkdir()
+        (videos / "one.mp4").write_bytes(b"one")
+        (videos / "two.mp4").write_bytes(b"two")
+        call_args = {**args, "path": str(videos)}
+        parent_root, child_root = root, root
+    else:
+        monkeypatch.setattr(
+            pipeline, "youtube_playlist_urls", lambda *_a, **_k: [VIDEO_URL, PLAYLIST_URL]
+        )
+        call_args = dict(args)
+        parent_root = root
+        child_root = root / "playlists" / pipeline.playlist_folder_name(PLAYLIST_URL)
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        probe=a_blocking_probe_for_the_second_child(entered, release),
+        try_interpret=a_fake_interpretation,
+    )
+    stub_each_source_uniquely(monkeypatch)
+
+    failures: list[BaseException] = []
+    outcome: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            outcome["response"] = getattr(pipeline, handler)(
+                {**call_args, "output_dir": str(root), "job_id": job_id, "ocr": False}
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert entered.wait(timeout=10.0), "the batch never reached its second child"
+        parent = status_of(parent_root, job_id)
+        child = status_of(child_root, f"{job_id}-2")
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive(), "the batch did not finish after the child was released"
+
+    # The parent mirrors the blocked child's own answer: the stage by name,
+    # running, with real activity time and the start preserved - plus the one
+    # fact only the parent knows, that one item of two is already done.
+    assert parent["status"] == "running"
+    assert parent["stage"] == "local_vision"
+    assert parent["stage_status"] == "running"
+    assert parent["started_at"]
+    assert parent["last_progress_at"]
+    assert 50.0 <= parent["overall_percent"] < 100.0
+
+    # The child answers for itself under its own job id, in its own root.
+    assert child["status"] == "running"
+    assert child["stage"] == "local_vision"
+    assert child["stage_status"] == "running"
+
+    final_parent = status_of(parent_root, job_id)
+    assert final_parent["status"] == "completed"
+    assert final_parent["result"]["processed_count"] == 2
+    assert status_of(child_root, f"{job_id}-1")["status"] == "completed"
+    assert status_of(child_root, f"{job_id}-2")["status"] == "completed"
+
+
+def test_a_note_from_a_finished_item_cannot_regress_the_next_items_parent_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (review round 1): nothing observed children, or anything could.
+
+    A dispatcher callback can outlive the invocation that queued it, so a
+    batch item's own emitter may still be holding events when the *next* item
+    is running. Forwarding is therefore armed per child call and disarmed the
+    moment the child returns: a late event from item one lands nowhere, and
+    the parent keeps describing item two - the item that is actually live.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-stale-item"
+    entered = threading.Event()
+    release = threading.Event()
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "one.mp4").write_bytes(b"one")
+    (videos / "two.mp4").write_bytes(b"two")
+    stale_emitters: list[Any] = []
+    stale_events: list[Any] = []
+
+    def ocr_capturing_the_first_childs_emitter(
+        frames: list[FrameArtifact],
+        _language: str,
+        _enabled: bool,
+        progress: ProgressReporter,
+        _preprocess: bool = True,
+    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+        # The first child's sink, held past its run the way a slow dispatcher
+        # callback would hold it.
+        if not stale_emitters and progress.emitter is not None:
+            stale_emitters.append(progress.emitter)
+            stale_events.append(progress.update("ocr", percent=50.0))
+        return frames, []
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        ocr_frames=ocr_capturing_the_first_childs_emitter,
+        probe=a_blocking_probe_for_the_second_child(entered, release),
+        try_interpret=a_fake_interpretation,
+    )
+    stub_each_source_uniquely(monkeypatch)
+
+    failures: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            pipeline.process_video_directory(
+                {
+                    "path": str(videos),
+                    "output_dir": str(root),
+                    "job_id": job_id,
+                    "ocr": False,
+                }
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert entered.wait(timeout=10.0), "the batch never reached its second child"
+        # Item one is finished and its sink is still held: replay its event, as
+        # a delayed delivery would.
+        stale_emitters[0](stale_events[0])
+        parent = status_of(root, job_id)
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive()
+
+    assert parent["stage"] == "local_vision", parent
+    assert parent["stage_status"] == "running", parent
+
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+
+
+def test_an_admitted_observer_write_lands_before_the_next_item_takes_over(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (lead's finalization): disarm did not wait for an admitted write.
+
+    A child event delivered on a dispatcher thread can be mid-observation when
+    the child call returns, because the supervisor's shutdown is bounded rather
+    than waited for. The observation is admitted the moment its forwarding
+    check passes; disarming the item used to clear forwarding independently,
+    so the batch moved on to the next item while an admitted event from item
+    one was still in flight - the same ordering hole the terminal-outcome
+    regression closed for `finish`, one level up. The pause is injected
+    between admission and the parent's write, exactly where a slow thread
+    leaves one: unserialized, item two's record opens before the observation
+    lands; serialized, item one's remaining events wait their turn and item
+    two cannot start.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-admitted-observer"
+    child_two = f"{job_id}-2"
+    entered = threading.Event()
+    release_probe = threading.Event()
+    parked = threading.Event()
+    release_observer = threading.Event()
+    committed = threading.Event()
+    child_two_started = threading.Event()
+    genuine_write = JobStore._write
+    genuine_reporter = pipeline.ProgressReporter
+    parked_once: list[bool] = []
+    parent_built: list[bool] = []
+
+    def reporter_that_parks_the_first_child_mirror(*args: Any, **kwargs: Any) -> Any:
+        reporter = genuine_reporter(*args, **kwargs)
+        if parked_once or parent_built:
+            return reporter
+        parent_built.append(True)
+        genuine_update = reporter.update
+
+        def parking_update(
+            mechanism: str, *, status: ProgressStatus = "running", **update: Any
+        ) -> Any:
+            if mechanism == "transcription" and not parked_once:
+                # Item one's mirrored event, admitted by the forwarding check
+                # and paused before the parent's reporter sees it: the window
+                # disarm has to close.
+                parked_once.append(True)
+                parked.set()
+                assert release_observer.wait(timeout=10.0), "the test never released the observer"
+                try:
+                    return genuine_update(mechanism, status=status, **update)
+                finally:
+                    committed.set()
+            return genuine_update(mechanism, status=status, **update)
+
+        # Shadowing the bound method is the injection; the wrapper forwards
+        # every keyword untouched.
+        reporter.update = parking_update  # ty: ignore[invalid-assignment]
+        return reporter
+
+    def signalling_write(store: JobStore, record: Any) -> Any:
+        payload = record.to_dict()
+        written = genuine_write(store, record)
+        if payload.get("job_id") == child_two and payload.get("status") == "running":
+            child_two_started.set()
+        return written
+
+    # The batch's parent is the first reporter built under the handler; the
+    # children built after it are untouched.
+    monkeypatch.setattr(pipeline, "ProgressReporter", reporter_that_parks_the_first_child_mirror)
+    monkeypatch.setattr(JobStore, "_write", signalling_write)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "one.mp4").write_bytes(b"one")
+    (videos / "two.mp4").write_bytes(b"two")
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        transcribe=a_real_process_reporting_progress,
+        probe=a_blocking_probe_for_the_second_child(entered, release_probe),
+        try_interpret=a_fake_interpretation,
+    )
+    stub_each_source_uniquely(monkeypatch)
+
+    failures: list[BaseException] = []
+    outcome: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            outcome["response"] = pipeline.process_video_directory(
+                {"path": str(videos), "output_dir": str(root), "job_id": job_id, "ocr": False}
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert parked.wait(timeout=10.0), "item one's observation never went in flight"
+        # While the admitted observation is still in flight, the next item
+        # must not start. The bound is generous to the unserialized code,
+        # which starts item two almost at once; the serialized one holds item
+        # one's remaining events at the admission lock instead.
+        next_item_started_early = child_two_started.wait(timeout=2.0)
+        release_observer.set()
+        assert committed.wait(timeout=10.0), "the admitted observation never landed"
+        assert entered.wait(timeout=10.0), "the batch never reached its second child"
+        parent = status_of(root, job_id)
+    finally:
+        release_observer.set()
+        release_probe.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive()
+    assert not next_item_started_early, (
+        "item two began before item one's admitted observation landed"
+    )
+
+    # The parent describes the child that is live, not the item whose
+    # observation was in flight when that item ended.
+    assert parent["stage"] == "local_vision", parent
+    assert parent["stage_status"] == "running", parent
+
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+    assert final["result"]["processed_count"] == 2
+
+
+def test_a_failed_item_still_counts_toward_the_batch_fraction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (lead's finalization): a failed item's slot never advanced.
+
+    With `continue_on_error` a failed item is a slot the batch has spent: it
+    will never emit again. Counting only successful items left its fraction
+    pinned at zero, so the second child's whole run mapped onto
+    `(0 + child_fraction) / 2` and a poller watched the last item capped below
+    half the batch. The slot moves in the item's `finally`, after forwarding
+    stops, so the next item's events map onto the batch as it actually stands.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-failed-item"
+    entered = threading.Event()
+    release = threading.Event()
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "one.mp4").write_bytes(b"one")
+    (videos / "two.mp4").write_bytes(b"two")
+
+    def transcribe_that_fails_the_first_item(
+        resolved_path: Path,
+        _scratch_dir: Path,
+        _options: Any,
+        _progress: ProgressReporter,
+        *,
+        duration_sec: float | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        if "one" in str(resolved_path):
+            raise DistillError("E_CHILD_ONE", "transcript", "the first item fails on purpose")
+        return {"language": "en", "language_probability": 1.0, "segments": ()}, []
+
+    def blocking_first_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+        # The first item fails before vision, so this call is the second
+        # child's - the run the batch is left waiting on.
+        entered.set()
+        if not release.wait(timeout=10.0):
+            raise AssertionError("the poller never released the second child")
+        return LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_available",
+            message="available",
+            detail={},
+        )
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        transcribe=transcribe_that_fails_the_first_item,
+        probe=blocking_first_probe,
+        try_interpret=a_fake_interpretation,
+    )
+    stub_each_source_uniquely(monkeypatch)
+
+    failures: list[BaseException] = []
+    outcome: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            outcome["response"] = pipeline.process_video_directory(
+                {
+                    "path": str(videos),
+                    "output_dir": str(root),
+                    "job_id": job_id,
+                    "ocr": False,
+                }
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert entered.wait(timeout=10.0), "the batch never reached its second child"
+        parent = status_of(root, job_id)
+        child_one = status_of(root, f"{job_id}-1")
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive()
+
+    # The first item is spent either way: its slot is gone, its record says
+    # failed, and the batch's fraction says one item of two is behind us.
+    assert child_one["status"] == "failed"
+    assert child_one["error"]["code"] == "E_CHILD_ONE"
+    assert parent["status"] == "running"
+    assert parent["stage"] == "local_vision"
+    assert 50.0 <= parent["overall_percent"] < 100.0, parent
+
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+    assert final["result"]["processed_count"] == 1
+    assert final["result"]["error_count"] == 1
+    assert status_of(root, f"{job_id}-2")["status"] == "completed"
 
 
 def test_only_the_run_holding_a_job_may_note_its_progress(tmp_path: Path) -> None:
@@ -1566,3 +2149,396 @@ def test_remote_source_handlers_persist_their_progress_too(
     assert status["stage_status"] == "completed"
     assert status["started_at"]
     assert status["last_progress_at"]
+
+
+# --- A note in flight cannot take the outcome away (review round 1) ---------
+#
+# Progress callbacks run on the dispatcher threads of the tools a run drives,
+# and the supervisor that owns those threads shuts them down on a bounded
+# window rather than waiting for the callback: a note whose filesystem write is
+# slow is still "in flight" when the run moves on to `finish`. Without
+# serialization, that note's atomic replace lands after the terminal record and
+# erases it - a run that succeeded reads `abandoned`, result and all gone. The
+# ownership check has already passed by then, so checking again cannot fix it:
+# the whole check/write/release lifecycle of a record has to be one serialized
+# thing, and a note sequenced before the newest one already committed must not
+# overwrite it.
+
+
+def a_real_process_reporting_progress(
+    _resolved_path: Path,
+    _scratch_dir: Path,
+    _options: Any,
+    progress: ProgressReporter,
+    *,
+    duration_sec: float | None = None,
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """A transcription stage that reports through a real `run_command` child.
+
+    The child is a Python one-liner, not ffmpeg: what is under test is the
+    delivery path - a real subprocess, a real dispatcher thread, a callback on
+    that thread folding an event into the job record while the run's own thread
+    carries on. That is the thread the production callbacks run on, reached
+    without a network, a model or an installed tool.
+    """
+
+    def on_stderr_line(_line: str) -> None:
+        progress.update("transcription", percent=25.0)
+
+    run_command.stream(
+        [sys.executable, "-c", 'import sys; print("fixture progress", file=sys.stderr)'],
+        stage="transcript",
+        total_timeout_sec=30.0,
+        idle_timeout_sec=30.0,
+        on_stderr_line=on_stderr_line,
+        check=False,
+    )
+    return {"language": "en", "language_probability": 1.0, "segments": ()}, []
+
+
+def test_a_note_in_flight_cannot_erase_the_terminal_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (review round 1): a slow note write beat the terminal record.
+
+    The record write is paused after the note's ownership check has passed -
+    exactly where a slow filesystem leaves one - while the run finishes around
+    it: the supervisor's dispatcher shutdown is bounded and does not wait for
+    the callback, by design. Unserialized, the paused note commits last and
+    replaces the `completed` record with a stale `running` one, so a poller is
+    told `abandoned` and the result is gone. Serialized, the terminal write
+    waits for the in-flight note (one authoritative owner), and the outcome
+    persists whichever write began first.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-delayed-note"
+    genuine_write = JobStore._write
+    parked = threading.Event()
+    release = threading.Event()
+    committed = threading.Event()
+    parked_once: list[bool] = []
+
+    def pausing_write(store: JobStore, record: Any) -> Any:
+        payload = record.to_dict()
+        if (
+            not parked_once
+            and payload.get("status") == "running"
+            and payload.get("stage") == "transcription"
+        ):
+            # The one admitted note, held between its check and its commit.
+            parked_once.append(True)
+            parked.set()
+            assert release.wait(timeout=10.0), "the test never released the parked note"
+            try:
+                return genuine_write(store, record)
+            finally:
+                committed.set()
+        return genuine_write(store, record)
+
+    monkeypatch.setattr(JobStore, "_write", pausing_write)
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        transcribe=a_real_process_reporting_progress,
+        probe=an_available_probe,
+        try_interpret=a_fake_interpretation,
+    )
+    stub_acquisition(monkeypatch, provenance=a_provenance())
+
+    result: dict[str, Any] = {}
+    failures: list[BaseException] = []
+    handler_returned = threading.Event()
+
+    def work() -> None:
+        try:
+            result["response"] = pipeline.process_local_video(
+                {
+                    "path": "/stub/video.mp4",
+                    "output_dir": str(root),
+                    "job_id": job_id,
+                    "ocr": False,
+                }
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+        finally:
+            handler_returned.set()
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert parked.wait(timeout=10.0), "the run never delivered a progress note"
+        # The whole claim under test is that the run finished while the note was
+        # still in flight. Bounded, because under serialization it never can:
+        # the wait expires and the release below is what lets the run proceed.
+        # Unserialized the run reaches this in about the dispatcher's one-second
+        # shutdown grace, so the bound is generous to it on purpose.
+        finished_around_the_note = handler_returned.wait(timeout=3.0)
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive(), "the run did not finish after the note was released"
+    assert committed.wait(timeout=10.0), "the parked note never committed"
+
+    assert not finished_around_the_note, "the run closed its record around a note in flight"
+    final = status_of(root, job_id)
+    assert final["status"] == "completed", final
+    assert final["result"]["manifest_path"] == result["response"]["manifest_path"]
+    assert final["result"]["manifest_path"]
+
+
+def test_a_stale_sequenced_note_cannot_regress_the_newer_observed_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (review round 1): a delayed callback answered last, and won.
+
+    Two events from one run can be delivered out of order when the earlier one
+    rides a slower thread. The note carrier now carries the event's sequence,
+    and the store ignores a note sequenced at or before the newest one it has
+    committed, so the older event cannot overwrite the newer stage a poller has
+    already been shown.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-stale-sequence"
+    observed: dict[str, Any] = {}
+
+    def ocr_with_a_delayed_callback(
+        frames: list[FrameArtifact],
+        _language: str,
+        _enabled: bool,
+        progress: ProgressReporter,
+        _preprocess: bool = True,
+    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+        assert progress is not None
+        early = progress.update("ocr", percent=10.0)
+        progress.complete("ocr")
+        # The sink is the handler's own composed emitter: this is the exact call
+        # a delayed dispatcher callback would make with the older event.
+        assert progress.emitter is not None
+        progress.emitter(early)
+        observed.update(status_of(root, job_id))
+        return frames, []
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        ocr_frames=ocr_with_a_delayed_callback,
+        probe=an_available_probe,
+        try_interpret=a_fake_interpretation,
+    )
+    stub_acquisition(monkeypatch, provenance=a_provenance())
+
+    pipeline.process_local_video(
+        {"path": "/stub/video.mp4", "output_dir": str(root), "job_id": job_id, "ocr": False}
+    )
+
+    assert observed["stage"] == "ocr"
+    assert observed["stage_status"] == "completed", observed
+    assert observed["stage_percent"] == 100.0, observed
+
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+
+
+def test_a_blocked_first_frame_does_not_silence_finished_frames_in_parallel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (review round 1): the pool reported in frame order, not completion order.
+
+    With `max_parallel > 1`, the pool was consumed through `map`, which yields
+    in submission order: frame 1's event waited for frame 1 itself, so a hung
+    first frame withheld the milestones of every frame that had already
+    answered - the record stuck at the stage-entry note, which is the silence
+    the issue describes, in the parallel path. Consumed in completion order,
+    the percent a poller sees counts answered frames - 2 of 3 here - and the
+    merged output stays in keyframe order when the block clears.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-parallel-blocked-frame"
+    entered = threading.Event()
+    release = threading.Event()
+    second_answer_noted = threading.Event()
+    genuine_write = JobStore._write
+
+    def signposting_write(store: JobStore, record: Any) -> Any:
+        written = genuine_write(store, record)
+        payload = record.to_dict()
+        if (
+            payload.get("status") == "running"
+            and payload.get("stage") == "local_vision"
+            and isinstance(payload.get("stage_percent"), float)
+            and payload["stage_percent"] >= 60.0
+        ):
+            # Two of three frames answered and the count reached the record -
+            # signalled after the write committed, so a read that follows it
+            # cannot race the pool, only observe it.
+            second_answer_noted.set()
+        return written
+
+    monkeypatch.setattr(JobStore, "_write", signposting_write)
+
+    def available_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+        return LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_available",
+            message="available",
+            detail={},
+        )
+
+    def interpret(
+        config: LocalVisionConfig,
+        image_path: Path,
+        _prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[Interpretation, None]:
+        if image_path.name == "frame_0001.png":
+            entered.set()
+            if not release.wait(timeout=10.0):
+                raise AssertionError("the poller never released the first frame")
+        return an_interpretation(config, image_path, prompt_profile), None
+
+    fake_stage_producers(monkeypatch, frame_count=3)
+    configure_run(
+        monkeypatch,
+        probe=available_probe,
+        try_interpret=interpret,
+        max_parallel=3,
+    )
+    stub_acquisition(monkeypatch, provenance=a_provenance())
+
+    result: dict[str, Any] = {}
+    failures: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            result["response"] = pipeline.process_local_video(
+                {
+                    "path": "/stub/video.mp4",
+                    "output_dir": str(root),
+                    "job_id": job_id,
+                    "ocr": False,
+                }
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert entered.wait(timeout=10.0), "the run never reached the first frame"
+        assert second_answer_noted.wait(timeout=10.0), (
+            "the finished frames never reached the record"
+        )
+        status = status_of(root, job_id)
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive(), "the run did not finish after the frame was released"
+
+    # Frames 2 and 3 of 3 have answered while frame 1 is still in flight: a
+    # poller sees the count, not the position of the hung frame.
+    assert status["status"] == "running"
+    assert status["stage"] == "local_vision"
+    assert status["stage_percent"] == pytest.approx(66.667)
+    assert status["last_progress_at"]
+
+    # The merged output is unchanged by completion order: frames in keyframe
+    # order, each carrying its own reading.
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+    frames = result["response"]["frames"]
+    assert [frame["index"] for frame in frames] == [1, 2, 3]
+    assert all(frame.get("visual_interpretation") for frame in frames)
+
+
+# --- One run, one start time, observed at literal instants (review round 1) ---
+#
+# Timestamps are second-granular, so a test that reads two of them inside one
+# second cannot tell a rewrite from a preservation: the mutant that stamps
+# `started_at` with the finish clock survives it. These tests pin both clocks
+# the record reads - the store's write clock and the reporter's event clock -
+# to literals a full minute apart, so every assertion names an instant rather
+# than a coincidence of timing.
+
+PINNED_START = 1793029200.0
+PINNED_EVENT = 1793029260.0
+PINNED_FINISH = 1793029320.0
+
+
+def pinned_at(epoch: dict[str, float]) -> str:
+    """The fake store clock's reading, through the format a record uses."""
+    return job_store.format_timestamp(epoch["epoch"])
+
+
+def test_start_time_is_immutable_and_progress_carries_the_events_own_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (review round 1): nothing pinned `started_at` against a rewrite.
+
+    The start is one fact, set when the record opens; the last progress event
+    is another, carrying the event's own time rather than the write's. A finish
+    that stamps `started_at` from its own clock - the surviving mutant - reads
+    as a run that began when it ended, and a note written in the same second as
+    the start makes `updated_at == started_at` true twice, so agreement proves
+    nothing. Both clocks are pinned, every expected time is a literal, and the
+    finish lands two minutes after the start.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-pinned-clocks"
+    store_clock = {"epoch": PINNED_START}
+    event_clock = {"epoch": PINNED_START}
+    monkeypatch.setattr(job_store, "_timestamp", lambda: pinned_at(store_clock))
+    monkeypatch.setattr(
+        pipeline, "ProgressReporter", partial(ProgressReporter, clock=lambda: event_clock["epoch"])
+    )
+    observed: dict[str, Any] = {}
+
+    def ocr_at_pinned_times(
+        frames: list[FrameArtifact],
+        _language: str,
+        _enabled: bool,
+        progress: ProgressReporter,
+        _preprocess: bool = True,
+    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+        assert progress is not None
+        # The event happens a minute after the start; its note is written in
+        # the start's own second, so `updated_at` agrees with `started_at`
+        # without being the same reading.
+        event_clock["epoch"] = PINNED_EVENT
+        progress.update("ocr", percent=40.0)
+        observed["running"] = status_of(root, job_id)
+        # The finish stamp comes later; every write from here on carries it.
+        store_clock["epoch"] = PINNED_FINISH
+        return frames, []
+
+    fake_stage_producers(monkeypatch)
+    configure_run(
+        monkeypatch,
+        ocr_frames=ocr_at_pinned_times,
+        probe=an_available_probe,
+        try_interpret=a_fake_interpretation,
+    )
+    stub_acquisition(monkeypatch, provenance=a_provenance())
+
+    pipeline.process_local_video(
+        {"path": "/stub/video.mp4", "output_dir": str(root), "job_id": job_id, "ocr": False}
+    )
+
+    # While running: the start is the pinned start, the last progress time is
+    # the event's own minute (not the write's second), and `updated_at` agrees
+    # with `started_at` only because both were pinned to the same second.
+    assert observed["running"]["started_at"] == "2026-10-26T15:40:00Z"
+    assert observed["running"]["updated_at"] == "2026-10-26T15:40:00Z"
+    assert observed["running"]["last_progress_at"] == "2026-10-26T15:41:00Z"
+
+    # After a finish stamped two minutes later, the start is still the start.
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+    assert final["started_at"] == "2026-10-26T15:40:00Z"
+    assert final["updated_at"] == "2026-10-26T15:42:00Z"

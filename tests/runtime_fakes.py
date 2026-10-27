@@ -22,7 +22,7 @@ def configure_run(monkeypatch: pytest.MonkeyPatch, **dependencies: Any) -> None:
         factory = interpret.keywords.get("interpreter_factory")
         if isinstance(factory, partial):
             interpreter_options.update(factory.keywords)
-    for name in ("probe", "try_interpret"):
+    for name in ("probe", "try_interpret", "max_parallel"):
         if name in dependencies:
             interpreter_options[name] = dependencies.pop(name)
     if interpreter_options:

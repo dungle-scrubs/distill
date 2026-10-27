@@ -132,11 +132,24 @@ def local_fingerprint(
                             "total_bytes": stat.st_size,
                         },
                     )
-        if progress and stat.st_size == 0:
-            progress.complete(
-                "source_fingerprint",
-                detail={"cache_mode": "content", "total_bytes": 0},
-            )
+        if progress:
+            if stat.st_size == 0:
+                progress.complete(
+                    "source_fingerprint",
+                    detail={"cache_mode": "content", "total_bytes": 0},
+                )
+            else:
+                # Completed where the hashing ends: a reporter this run
+                # publishes from must not say a finished mechanism is still
+                # `running` at 100 percent (review round 1, issue #45).
+                progress.complete(
+                    "source_fingerprint",
+                    detail={
+                        "cache_mode": "content",
+                        "bytes_read": bytes_read,
+                        "total_bytes": stat.st_size,
+                    },
+                )
         return digest.hexdigest()
 
     digest = hashlib.sha256()
@@ -165,6 +178,14 @@ def local_fingerprint(
                         "samples_total": sample_total,
                     },
                 )
+    if progress:
+        # Completed where the hashing ends: a reporter this run publishes
+        # from must not say a finished mechanism is still `running` at 100
+        # percent (review round 1, issue #45).
+        progress.complete(
+            "source_fingerprint",
+            detail={"cache_mode": "fingerprint", "samples_total": sample_total},
+        )
     return digest.hexdigest()
 
 

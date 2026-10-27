@@ -71,11 +71,14 @@ not be load-bearing for the run it observes.
 from __future__ import annotations
 
 import json
+import math
 import re
+import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from .bundle_store import (
     ExclusiveLock,
@@ -160,20 +163,42 @@ live run is dead.
 """
 
 
+def format_timestamp(epoch: float) -> str:
+    """The one instant format a job record's timestamps are written in.
+
+    Owned here, exported, and used by everything that puts a time into a
+    record - the store's own writes through `_timestamp`, and the pipeline's
+    formatting of an event's timestamp for the note it lands in - so
+    `updated_at`, `started_at` and `last_progress_at` cannot drift into
+    different shapes when one of the call sites is edited. Accepts an epoch;
+    a caller holding a formatted string (a parsed record) never needs to
+    round-trip it.
+    """
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
 def _timestamp() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return format_timestamp(time.time())
 
 
 def _percent_or_none(value: Any) -> float | None:
-    """A recorded percent, or nothing. A boolean is not a percent.
+    """A recorded percent, or nothing. A boolean is not a percent, and neither
+    is a number a percent cannot be.
 
     `True` is an `int` to `isinstance`, and a record that grew a `1` for a
-    percent would be reporting progress that never happened. The percent a
-    reader sees came from an event or from nowhere.
+    percent would be reporting progress that never happened. `NaN`, either
+    infinity, and anything outside 0..100 are refused for the reader's sake:
+    Python's JSON accepts them on the way in and re-emits them on the way out,
+    so one such field in a hand-edited or corrupt record would make the whole
+    `get-job-status` answer a document a strict JSON parser rejects. Absent is
+    the honest answer for a number that was never a percent.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    number = float(value)
+    if not math.isfinite(number) or not 0.0 <= number <= 100.0:
+        return None
+    return number
 
 
 def validate_job_id(job_id: str) -> str:
@@ -268,6 +293,69 @@ class JobProgress:
     stage_percent: float | None
     overall_percent: float | None
     observed_at: str
+    sequence: int | None = None
+    """The emitting reporter's event sequence, for write-side ordering only.
+
+    Two events from one run can be delivered out of order when the earlier one
+    rides a slower thread, so the store compares sequences and ignores a note
+    at or before the newest one it has committed. `None` - a carrier built by
+    hand, or read back from a record - simply does not participate: there is
+    nothing to compare it against, and the note is judged by ownership alone.
+    It is deliberately absent from every written record: it is a property of
+    the *emitting* reporter, meaningless across the run boundary a record
+    crosses, and `to_dict`'s allowlist keeps it out.
+    """
+
+    def to_dict(self) -> dict[str, Any]:
+        """The wire keys a record carries for this event, and nothing else.
+
+        An explicit allowlist rather than a walk over the dataclass's fields:
+        a field joins a record only by being named here, so what may reach a
+        reader is decided once, in one place, rather than inherited by
+        whatever the carrier happens to grow. That is the same rule that keeps
+        `detail` out - it can carry text-bearing fields, and a record that
+        projected it would be persisting **extracted text** that crossed no
+        **redaction sink** - and it is why the write-side `sequence` has no key.
+        """
+        payload: dict[str, Any] = {
+            "stage": self.stage,
+            "stage_status": self.stage_status,
+            "last_progress_at": self.observed_at,
+        }
+        if self.stage_percent is not None:
+            payload["stage_percent"] = self.stage_percent
+        if self.overall_percent is not None:
+            payload["overall_percent"] = self.overall_percent
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> JobProgress | None:
+        """A whole projection from a record's keys, or no projection at all.
+
+        Whole or nothing, because a record carrying a stage with no status is
+        exactly the half projection this carrier exists to make unrepresentable
+        - reading it back field by field would rebuild it. The stage, the
+        status and the event's time are required; the percents are optional
+        and each is absent rather than carried when it is not a number a
+        percent can be. Old records - no progress keys at all - read as `None`
+        here and exactly as they always did.
+        """
+        stage = payload.get("stage")
+        stage_status = payload.get("stage_status")
+        observed_at = payload.get("last_progress_at")
+        if (
+            not isinstance(stage, str)
+            or stage_status not in PROGRESS_STATUSES
+            or not isinstance(observed_at, str)
+        ):
+            return None
+        return cls(
+            stage=stage,
+            stage_status=stage_status,
+            stage_percent=_percent_or_none(payload.get("stage_percent")),
+            overall_percent=_percent_or_none(payload.get("overall_percent")),
+            observed_at=observed_at,
+        )
 
 
 @dataclass(frozen=True)
@@ -277,11 +365,12 @@ class JobRecord:
     `status` is what the reader is told, which is not always what is on disk: a
     `running` record whose holder is gone is reported `abandoned`.
 
-    The progress fields are the projection of the run's last observed event -
-    `None` until one is noted, and absent from `to_dict` rather than `null`, so
-    a record written before they existed reads now exactly as it did then.
-    `started_at` is set once by `start` and never rewritten; `updated_at` is
-    whenever this record was last written, whatever wrote it.
+    `progress` is the projection of the run's last observed event, carried as
+    the same whole it was noted in - `None` until one is, and flattened into
+    the record's own keys by `to_dict` rather than kept as a nested object, so
+    the wire format a poller reads is unchanged. `started_at` is set once by
+    `start` and never rewritten; `updated_at` is whenever this record was last
+    written, whatever wrote it.
     """
 
     job_id: str
@@ -289,11 +378,7 @@ class JobRecord:
     status: ReportedStatus
     updated_at: str
     started_at: str | None = None
-    stage: str | None = None
-    stage_status: ProgressStatus | None = None
-    stage_percent: float | None = None
-    overall_percent: float | None = None
-    last_progress_at: str | None = None
+    progress: JobProgress | None = None
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
 
@@ -310,16 +395,8 @@ class JobRecord:
         }
         if self.started_at is not None:
             payload["started_at"] = self.started_at
-        if self.stage is not None:
-            payload["stage"] = self.stage
-        if self.stage_status is not None:
-            payload["stage_status"] = self.stage_status
-        if self.stage_percent is not None:
-            payload["stage_percent"] = self.stage_percent
-        if self.overall_percent is not None:
-            payload["overall_percent"] = self.overall_percent
-        if self.last_progress_at is not None:
-            payload["last_progress_at"] = self.last_progress_at
+        if self.progress is not None:
+            payload.update(self.progress.to_dict())
         if self.result is not None:
             payload["result"] = self.result
         if self.error is not None:
@@ -363,6 +440,25 @@ class JobStore:
 
     root: Path
     _held: dict[str, JobHold] = field(default_factory=dict)
+    _record_mutex: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False, compare=False
+    )
+    """Serializes this store's whole write lifecycle: check, write, release.
+
+    Progress callbacks run on the dispatcher threads of the tools a run drives,
+    and those threads are shut down on a bounded window rather than waited for,
+    so a note and the `finish` that follows it can be in flight at the same
+    time. Atomic replace keeps any one write half-done from being read; it
+    cannot keep a slower writer from landing *after* a faster one, which is how
+    an in-flight note used to replace a terminal record and erase the outcome.
+    One owner at a time - ownership check, record write, hold change and lock
+    release inside this mutex - is what makes "last writer" also "the
+    authoritative writer". The terminal write may therefore wait for an
+    in-flight note; that is the cost of one authoritative owner, and it is paid
+    in this process only: across processes the `ExclusiveLock` on the job id
+    remains the whole of the rule, and `read` stays a filesystem snapshot that
+    blocks on nothing here.
+    """
 
     @classmethod
     def open(cls, root: Path) -> JobStore:
@@ -377,31 +473,36 @@ class JobStore:
         that is killed outright cannot leave the *previous* run's `completed`
         standing as though it described this one.
 
-        The one timestamp taken here is both `updated_at` and `started_at`, the
-        only moment the two agree: everything afterwards moves `updated_at` and
-        leaves `started_at` alone, so the two times answer different questions
-        - when the job began, and when its record was last written.
+        The one timestamp taken here is the clock reading both `updated_at` and
+        `started_at` are set from - the only write made from one reading on
+        purpose. Everything afterwards moves `updated_at` and leaves
+        `started_at` alone, so the two times answer different questions - when
+        the job began, and when its record was last written. They can still
+        hold equal strings: timestamps are second-granular, so a write soon
+        after the start lands in the same second, and equality of the two is a
+        coincidence of timing rather than evidence that nothing was written.
         """
         validate_job_id(job_id)
         started_at = _timestamp()
-        self._take_hold(job_id, tool, started_at)
-        try:
-            return self._write(
-                JobRecord(
-                    job_id=job_id,
-                    tool=tool,
-                    status=RUNNING,
-                    updated_at=started_at,
-                    started_at=started_at,
+        with self._record_mutex:
+            self._take_hold(job_id, tool, started_at)
+            try:
+                return self._write(
+                    JobRecord(
+                        job_id=job_id,
+                        tool=tool,
+                        status=RUNNING,
+                        updated_at=started_at,
+                        started_at=started_at,
+                    )
                 )
-            )
-        except BaseException as failure:
-            # A hold whose record was never written names a run that is not
-            # happening. Distill's tools run inside a long-lived session, so a
-            # descriptor kept past that point is an identifier nothing can ever
-            # start again: one failed write, then `E_JOB_RUNNING` forever.
-            self._release_without_replacing(job_id, during=failure)
-            raise
+            except BaseException as failure:
+                # A hold whose record was never written names a run that is not
+                # happening. Distill's tools run inside a long-lived session, so a
+                # descriptor kept past that point is an identifier nothing can ever
+                # start again: one failed write, then `E_JOB_RUNNING` forever.
+                self._release_without_replacing(job_id, during=failure)
+                raise
 
     def note_progress(self, job_id: str, progress: JobProgress) -> None:
         """Fold one observed progress event into this store's `running` record.
@@ -418,24 +519,40 @@ class JobStore:
         Terminal records keep what was last noted: `finish` carries the hold's
         progress into the record it writes, so "where was it?" survives the run
         that knew the answer.
+
+        The whole note - ownership check, write, hold update - holds the store's
+        record mutex, for the reason the field's docstring gives: a note whose
+        write is slow must not land after the `finish` that followed it. The
+        mutex is also why a note sequenced at or before the newest committed one
+        can be ignored here rather than written: under it, "newest committed" is
+        a fact, not a guess racing another thread. A sequenced note the mutex
+        finds stale returns without writing and without error - the newer event
+        it would overwrite is already the record - and the hold is updated only
+        after the write succeeded, so a failed note leaves the carry describing
+        exactly what the record on disk says.
         """
         validate_job_id(job_id)
-        hold = self._require_hold(job_id)
-        self._held[job_id] = replace(hold, last_progress=progress)
-        self._write(
-            JobRecord(
-                job_id=job_id,
-                tool=hold.tool,
-                status=RUNNING,
-                updated_at=_timestamp(),
-                started_at=hold.started_at,
-                stage=progress.stage,
-                stage_status=progress.stage_status,
-                stage_percent=progress.stage_percent,
-                overall_percent=progress.overall_percent,
-                last_progress_at=progress.observed_at,
+        with self._record_mutex:
+            hold = self._require_hold(job_id)
+            last = hold.last_progress
+            if (
+                progress.sequence is not None
+                and last is not None
+                and last.sequence is not None
+                and progress.sequence <= last.sequence
+            ):
+                return
+            self._write(
+                JobRecord(
+                    job_id=job_id,
+                    tool=hold.tool,
+                    status=RUNNING,
+                    updated_at=_timestamp(),
+                    started_at=hold.started_at,
+                    progress=progress,
+                )
             )
-        )
+            self._held[job_id] = replace(hold, last_progress=progress)
 
     def finish(self, job_id: str, outcome: JobOutcome) -> JobRecord:
         """Replace this store's `running` record with a terminal one, releasing the lock.
@@ -449,38 +566,40 @@ class JobStore:
         that holder carries on working - or this store finishing twice. Both
         write an outcome for a run that did not end, so both are refused
         (`_require_hold`).
+
+        Under the record mutex like every other write, which is what keeps a
+        note still in flight from landing after the terminal record it must not
+        outlive: `finish` either waits for that note (and then writes the
+        terminal record after it) or refuses it outright once the hold is gone.
         """
         validate_job_id(job_id)
-        hold = self._require_hold(job_id)
-        last = hold.last_progress
-        try:
-            record = self._write(
-                JobRecord(
-                    job_id=job_id,
-                    tool=hold.tool,
-                    status=outcome.status,
-                    updated_at=_timestamp(),
-                    started_at=hold.started_at,
-                    stage=None if last is None else last.stage,
-                    stage_status=None if last is None else last.stage_status,
-                    stage_percent=None if last is None else last.stage_percent,
-                    overall_percent=None if last is None else last.overall_percent,
-                    last_progress_at=None if last is None else last.observed_at,
-                    result=outcome.result,
-                    error=outcome.error,
+        with self._record_mutex:
+            hold = self._require_hold(job_id)
+            last = hold.last_progress
+            try:
+                record = self._write(
+                    JobRecord(
+                        job_id=job_id,
+                        tool=hold.tool,
+                        status=outcome.status,
+                        updated_at=_timestamp(),
+                        started_at=hold.started_at,
+                        progress=last,
+                        result=outcome.result,
+                        error=outcome.error,
+                    )
                 )
-            )
-        except BaseException as failure:
-            # Released whether or not the record could be written: the run is
-            # over either way, and a hold outliving it is a lock nothing will
-            # come back to give up. Never in a bare `finally`, because a release
-            # that raises there takes the failing write's place.
-            self._release_without_replacing(job_id, during=failure)
-            raise
-        # Nothing in flight, so a release failure is raised normally: it is the
-        # only report that a hold was not given up.
-        self._release(job_id)
-        return record
+            except BaseException as failure:
+                # Released whether or not the record could be written: the run is
+                # over either way, and a hold outliving it is a lock nothing will
+                # come back to give up. Never in a bare `finally`, because a release
+                # that raises there takes the failing write's place.
+                self._release_without_replacing(job_id, during=failure)
+                raise
+            # Nothing in flight, so a release failure is raised normally: it is the
+            # only report that a hold was not given up.
+            self._release(job_id)
+            return record
 
     def read(self, job_id: str) -> JobRecord | None:
         """The record for `job_id`, or `None` if there is none.
@@ -659,11 +778,12 @@ class JobStore:
         reporting that as a job's outcome would be reporting a stranger's word as
         Distill's.
 
-        The progress fields are read leniently - present or absent, and the
-        right shape or absent - because a record written before they existed is
-        still a record: `running` with no stage in it was the truth for every
-        job Distill has ever run, and refusing it now would be telling every
-        poller their history is unreadable.
+        The progress projection is read whole or not at all
+        (`JobProgress.from_payload`), and the fields are read leniently because
+        a record written before they existed is still a record: `running` with
+        no stage in it was the truth for every job Distill has ever run, and
+        refusing it now would be telling every poller their history is
+        unreadable.
         """
         try:
             payload = json.loads(text)
@@ -685,24 +805,13 @@ class JobStore:
         result = payload.get("result")
         error = payload.get("error")
         started_at = payload.get("started_at")
-        stage = payload.get("stage")
-        stage_status = payload.get("stage_status")
-        stage_percent = payload.get("stage_percent")
-        overall_percent = payload.get("overall_percent")
-        last_progress_at = payload.get("last_progress_at")
         return JobRecord(
             job_id=str(payload.get("job_id", job_id)),
             tool=str(payload.get("tool", "")),
             status=status,
             updated_at=str(payload.get("updated_at", "")),
             started_at=started_at if isinstance(started_at, str) else None,
-            stage=stage if isinstance(stage, str) else None,
-            stage_status=(
-                cast(ProgressStatus, stage_status) if stage_status in PROGRESS_STATUSES else None
-            ),
-            stage_percent=_percent_or_none(stage_percent),
-            overall_percent=_percent_or_none(overall_percent),
-            last_progress_at=last_progress_at if isinstance(last_progress_at, str) else None,
+            progress=JobProgress.from_payload(payload),
             result=result if isinstance(result, dict) else None,
             error=error if isinstance(error, dict) else None,
         )

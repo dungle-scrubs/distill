@@ -43,7 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
@@ -1243,24 +1243,35 @@ class FrameInterpreter:
         ordering, and run-state counters are identical whether the pool ran
         serially (``max_parallel<=1``) or in parallel. ``_interpret_frame`` never
         mutates shared interpreter state, so it is safe to run on worker threads.
+
+        Outcomes are consumed in the caller thread as they complete - never in
+        submission order - so one slow frame cannot withhold the milestones of
+        the frames that already answered (issue #45). The progress a poller
+        sees counts consumed outcomes, not frame positions, which is what makes
+        it monotonic under any completion order.
         """
         frame_count = len(frames)
+        completed = 0
         if self._max_parallel <= 1 or frame_count <= 1:
             outcomes = []
             for index, frame in enumerate(frames):
                 outcome = self._interpret_one(config, index, frame, frame_count)
-                self._emit_frame_progress(index, frame_count)
                 outcomes.append(outcome)
+                completed += 1
+                self._emit_frame_progress(completed, frame_count)
         else:
             workers = min(self._max_parallel, frame_count)
             ordered: list[_FrameOutcome | None] = [None] * frame_count
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for outcome in pool.map(
-                    lambda item: self._interpret_one(config, item[0], item[1], frame_count),
-                    list(enumerate(frames)),
-                ):
+                futures = [
+                    pool.submit(self._interpret_one, config, index, frame, frame_count)
+                    for index, frame in enumerate(frames)
+                ]
+                for future in as_completed(futures):
+                    outcome = future.result()
                     ordered[outcome.index] = outcome
-                    self._emit_frame_progress(outcome.index, frame_count)
+                    completed += 1
+                    self._emit_frame_progress(completed, frame_count)
             outcomes = [outcome for outcome in ordered if outcome is not None]
         interpreted = self._merge_outcomes(outcomes, warnings)
         breaker_warning = self._breaker.summary_warning(frame_count)
@@ -1346,23 +1357,22 @@ class FrameInterpreter:
             )
         return frames
 
-    def _emit_frame_progress(self, index: int, frame_count: int) -> None:
-        """One per-frame progress event, from the caller thread, as each frame lands.
+    def _emit_frame_progress(self, completed_count: int, frame_count: int) -> None:
+        """One per-frame progress event, from the caller thread, as each outcome is consumed.
 
-        Emitted where the outcome is consumed rather than where it is produced:
-        the serial path consumes as it goes, and the pool's `map` yields in
-        frame order, so the event stream reports frames completing as they
-        complete, in order, on either path - not as one burst after the whole
-        list returns, which kept a run's entire vision stage silent until its
-        last frame did (issue #45). `index` is the frame's position, so the
-        percent a reader sees is "frames 1..index+1 of frame_count have
-        answers".
+        Emitted where the outcome is consumed rather than where it is produced,
+        and `completed_count` counts consumed outcomes rather than naming a
+        frame: consumption follows completion, so the event stream reports how
+        many frames have answers - a number that only rises - rather than a
+        position that waits for the frames ahead of it (issue #45). `detail`
+        carries the count markers (``frame``/``frames``) the record's frame
+        milestone rule reads; it names no frame and quotes no text.
         """
         if self.progress:
             self.progress.update(
                 "local_vision",
-                percent=((index + 1) / frame_count) * 100,
-                detail={"frame": index + 1, "frames": frame_count},
+                percent=(completed_count / frame_count) * 100,
+                detail={"frame": completed_count, "frames": frame_count},
             )
 
     def debug_info(self) -> dict[str, Any]:

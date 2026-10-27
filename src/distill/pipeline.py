@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ from .cache_doctor import inspect_cache
 from .configuration import local_vision_config_from_args, resolve_options, resolve_run_config
 from .errors import DistillError
 from .filtered_view import filtered_view_markdown
-from .job_store import JobOutcome, JobProgress, JobStore
+from .job_store import JobOutcome, JobProgress, JobStore, format_timestamp
 from .local_vision import MAX_SOCKET_TIMEOUT_SEC, probe_local_vision
 from .options import (
     GENERAL_OPTION_NAMES,
@@ -44,6 +45,7 @@ from .progress import (
     ProgressEvent,
     ProgressReporter,
     ProgressStatus,
+    clamp_percent,
 )
 from .rapid_mlx import REQUEST_REFUSED_CODE
 from .run_orchestrator import ProcessingRun
@@ -73,13 +75,9 @@ TOOLS = {
 LOGGER = logging.getLogger(__name__)
 
 _monotonic = time.monotonic
-"""Injectable monotonic clock for the progress-note throttle.
-
-Module-level like local_vision's `_sleep`, and for the same reason: a test
-that had to sleep a wall-clock second per throttled note would be slow and
-flaky, and one that monkeypatched `time.monotonic` itself would reach every
-user of monotonic time in the process, not the throttle it meant to drive.
-"""
+"""Injectable monotonic clock for the progress-note throttle: a test drives
+the throttle by moving this rather than sleeping or patching `time.monotonic`
+itself, which would reach every monotonic user in the process."""
 
 PIPELINE_EVENT_TYPE = "distill.pipeline"
 
@@ -201,16 +199,20 @@ def acquire_and_process(
 
 
 def process_local_video(
-    args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+    args: dict[str, Any],
+    *,
+    lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
+    progress_observer: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Any]:
     options = resolve_run_config(args).options
     root = validate_output_root(options.output_dir)
     store = JobStore.open(root)
-    # The reporter is built here, against this run's own store, so the whole
-    # run - acquisition included - reports through the one emitter that also
-    # persists progress into the record a poller reads. Nothing is invented on
-    # the way: an event that was not emitted is a stage that never ran.
-    progress = ProgressReporter(emitter=job_progress_emitter(store, options.job_id))
+    # One reporter for the whole run - acquisition included - through the one
+    # emitter that also persists progress into the record a poller reads.
+    # `progress_observer` is internal, for a batch parent mirroring this child.
+    progress = ProgressReporter(
+        emitter=job_progress_emitter(store, options.job_id, observer=progress_observer)
+    )
 
     def work() -> dict[str, Any]:
         return acquire_and_process(
@@ -227,12 +229,17 @@ def process_local_video(
 
 
 def process_youtube_video(
-    args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+    args: dict[str, Any],
+    *,
+    lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
+    progress_observer: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Any]:
     options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
     root = validate_output_root(options.output_dir)
     store = JobStore.open(root)
-    progress = ProgressReporter(emitter=job_progress_emitter(store, options.job_id))
+    progress = ProgressReporter(
+        emitter=job_progress_emitter(store, options.job_id, observer=progress_observer)
+    )
 
     def work() -> dict[str, Any]:
         return acquire_and_process(
@@ -249,12 +256,17 @@ def process_youtube_video(
 
 
 def process_x_video(
-    args: dict[str, Any], *, lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC
+    args: dict[str, Any],
+    *,
+    lock_wait_sec: float = SINGLE_SOURCE_LOCK_WAIT_SEC,
+    progress_observer: Callable[[ProgressEvent], None] | None = None,
 ) -> dict[str, Any]:
     options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
     root = validate_output_root(options.output_dir)
     store = JobStore.open(root)
-    progress = ProgressReporter(emitter=job_progress_emitter(store, options.job_id))
+    progress = ProgressReporter(
+        emitter=job_progress_emitter(store, options.job_id, observer=progress_observer)
+    )
 
     def work() -> dict[str, Any]:
         return acquire_and_process(
@@ -273,46 +285,48 @@ def process_x_video(
 PROGRESS_NOTE_MIN_INTERVAL_SEC = 1.0
 """The floor between two progress notes to one job record, in monotonic seconds.
 
-A note is an atomic replace with a directory fsync per write, so an unthrottled
-note per event would turn the event stream into the record store's workload:
-the issue's own run carried 912 of them. Transitions are exempt - a stage
-change or a status change is written at once, because "which stage" going
-stale by a second is exactly the silence the issue described - and same-stage
-heartbeats cost at most one write per second. Alternating mechanisms (an OCR
-event after each vision event) write per event by the transition rule, bounded
-by how fast a run can actually change stages.
+A note is an atomic replace with a directory fsync, so one note per event would
+make the event stream the record store's workload. Transitions (mechanism or
+status, including a stage completing, being skipped or failing) and consumed
+`local_vision` frame milestones are written at once; everything else inside one
+stage costs at most one note per second, and a throttled event is dropped,
+never flushed later. The record holds the most recent persisted real event, so
+a frozen `last_progress_at` proves no recorded activity, not that none
+occurred. Full semantics in `docs/reference.md`.
 """
+
+
+def _is_frame_milestone(event: ProgressEvent) -> bool:
+    """Whether `event` is a consumed vision frame milestone.
+
+    The mechanism name plus the frame-count markers in the detail - counts
+    only, never text - is what `FrameInterpreter` puts on every consumed frame
+    outcome, and nothing else emits.
+    """
+    detail = event.detail or {}
+    return event.mechanism == "local_vision" and "frame" in detail and "frames" in detail
 
 
 def job_progress_emitter(
     store: JobStore,
     job_id: str,
     *,
-    min_note_interval_sec: float = PROGRESS_NOTE_MIN_INTERVAL_SEC,
+    observer: Callable[[ProgressEvent], None] | None = None,
 ) -> Callable[[ProgressEvent], None]:
     """One emitter that prints the event and folds it into the job record.
 
-    Composes `progress_emitter` rather than duplicating its printing, so the
-    stderr stream stays exactly the stream it was - payload, `job_id`, flush -
-    with the record written on the way past. The note carries names and numbers
-    only: mechanism, status and percents, and the event's own timestamp as
-    `last_progress_at`. Detail never reaches a record (it can carry counts today
-    and text-bearing fields later).
-
-    Writes are throttled to one per `min_note_interval_sec` of monotonic time,
-    with mechanism and status transitions written immediately - including
-    `completed`/`skipped_or_cached`/`failed`, so a stage that ends is never
-    reported as still running by a throttle window that has not elapsed. There
-    is no timer: a note exists only because an event did, so a record that has
-    not moved says the run emitted nothing, which is the fact a poller wants.
-
-    A note that cannot be written must not fail the run: the exception is
-    caught, and the first failure is reported once as a warning. Once, because
-    a store that cannot write one note cannot write the next nine hundred
-    either, and one warning per event would be the flood the notes themselves
-    are throttled to avoid. The stderr print is outside that protection: an
-    event the caller chose to print that cannot be printed is that caller's
-    failure to know about, not something to swallow here.
+    Composes `progress_emitter`, so stderr keeps its exact shape. The note
+    carries names and numbers only - mechanism, status, percents, the event's
+    own timestamp, its sequence for the store's write-side ordering; detail
+    never reaches a record. The print runs first and outside the note's
+    exception protection, so the stream neither waits behind a note's fsyncs
+    nor dies with one. Throttling is `PROGRESS_NOTE_MIN_INTERVAL_SEC`'s rule;
+    there is no timer. A note that cannot be written never fails the run: the
+    first failure warns once, because one warning per event would be the flood
+    the notes are throttled to avoid. `observer`, when a batch parent supplies
+    one, runs after the child's note returns - no child store lock is held
+    across the parent's write - and sees every event; the parent throttles
+    itself.
     """
     print_event = progress_emitter(job_id)
     last_mechanism: str | None = None
@@ -322,12 +336,15 @@ def job_progress_emitter(
 
     def emit(event: ProgressEvent) -> None:
         nonlocal last_mechanism, last_status, last_note_at, note_failure_reported
-        # What was last *noted*, not last seen: a note that failed leaves the
-        # record saying the previous thing, so the next transition is still a
-        # transition and the store gets another chance to say something newer.
+        print_event(event)
+        # Compared against what was last *noted*, not last seen, so a failed
+        # note leaves the next transition a transition.
         transition = event.mechanism != last_mechanism or event.status != last_status
-        elapsed = last_note_at is None or (_monotonic() - last_note_at) >= min_note_interval_sec
-        if transition or elapsed:
+        frame_milestone = _is_frame_milestone(event)
+        elapsed = (
+            last_note_at is None or (_monotonic() - last_note_at) >= PROGRESS_NOTE_MIN_INTERVAL_SEC
+        )
+        if transition or frame_milestone or elapsed:
             try:
                 store.note_progress(
                     job_id,
@@ -336,9 +353,8 @@ def job_progress_emitter(
                         stage_status=event.status,
                         stage_percent=event.percent,
                         overall_percent=event.overall_percent,
-                        observed_at=time.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(event.timestamp)
-                        ),
+                        observed_at=format_timestamp(event.timestamp),
+                        sequence=event.sequence,
                     ),
                 )
             except Exception:
@@ -354,7 +370,8 @@ def job_progress_emitter(
                 last_mechanism = event.mechanism
                 last_status = event.status
                 last_note_at = _monotonic()
-        print_event(event)
+        if observer is not None:
+            observer(event)
 
     return emit
 
@@ -449,6 +466,52 @@ def process_resolved_source(
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 
 
+def armed_child_observer(
+    parent: ProgressReporter,
+    attempted_items: list[int],
+    item_count: list[int],
+) -> tuple[Callable[[ProgressEvent], None], Callable[[], None]]:
+    """One batch item's observer into the parent's record, armed for that item.
+
+    Returns the observer a child handler is handed and the disarm call its
+    `finally` owes. Mirrors the child's mechanism, status and stage percent,
+    mapping its overall progress onto the batch fraction
+    `(items already attempted + this child's fraction) / items in the batch`
+    through the reporter's explicit `overall_percent` override; the parent
+    sequences its own events, and `detail` passes through only for the parent's
+    frame-milestone rule. Admission - the forwarding check plus the parent
+    update it admits - and disarm hold one lock, so disarm waits out an update
+    an arriving event already earned and a late callback from a finished item
+    lands nowhere. The lock is observer-local; the child's own note returns
+    before the observer runs, so no child store lock is held under it.
+    """
+    forwarding = threading.Event()
+    forwarding.set()
+    admission = threading.Lock()
+
+    def observe(event: ProgressEvent) -> None:
+        with admission:
+            if not forwarding.is_set():
+                return
+            parent.update(
+                event.mechanism,
+                status=event.status,
+                percent=event.percent,
+                overall_percent=clamp_percent(
+                    (attempted_items[0] + event.overall_percent / 100.0)
+                    / max(item_count[0], 1)
+                    * 100
+                ),
+                detail=event.detail,
+            )
+
+    def disarm() -> None:
+        with admission:
+            forwarding.clear()
+
+    return observe, disarm
+
+
 def bool_arg(value: Any, default: bool) -> bool:
     if value is None:
         return default
@@ -521,14 +584,28 @@ def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
     max_items = validated_count("max_items", args.get("max_items", 50))
     recursive = bool(args.get("recursive", False))
     continue_on_error = bool_arg(args.get("continue_on_error"), True)
+    parent_store = JobStore.open(root)
+    parent_progress = ProgressReporter(emitter=job_progress_emitter(parent_store, options.job_id))
+    item_count: list[int] = [0]
+    attempted_items: list[int] = [0]
 
     def process_item(path_text: str, index: int) -> dict[str, Any]:
         child_args = {**args, "path": path_text, "job_id": f"{options.job_id}-{index}"}
-        return process_local_video(child_args, lock_wait_sec=BATCH_ITEM_LOCK_WAIT_SEC)
+        observe, disarm = armed_child_observer(parent_progress, attempted_items, item_count)
+        try:
+            return process_local_video(
+                child_args, lock_wait_sec=BATCH_ITEM_LOCK_WAIT_SEC, progress_observer=observe
+            )
+        finally:
+            # The slot moves on failure too: a failed item never emits again,
+            # so its fraction is spent for the next item's mapping.
+            disarm()
+            attempted_items[0] += 1
 
     def work() -> dict[str, Any]:
-        # Inside the record, because scanning a directory is work: the path may
-        # not be one, and a batch that finds nothing to do still ran.
+        # Inside the record: the scan is work and can fail, and naming it
+        # first means a batch poller sees a stage before any child exists.
+        parent_progress.update("directory_scan", status="running", percent=0.0)
         directory = Path(str(args.get("path", ""))).expanduser()
         if source_path_kind(directory) != "directory":
             raise DistillError(
@@ -540,6 +617,8 @@ def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
             for path in sorted(directory.glob(pattern))
             if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
         ][:max_items]
+        item_count[0] = len(files)
+        parent_progress.complete("directory_scan", detail={"files": len(files)})
         runner = BatchRunner(
             job_id=options.job_id,
             tool="process_video_directory",
@@ -558,7 +637,7 @@ def process_video_directory(args: dict[str, Any]) -> dict[str, Any]:
             "errors": errors,
         }
 
-    return record_job(JobStore.open(root), options.job_id, "process_video_directory", work)
+    return record_job(parent_store, options.job_id, "process_video_directory", work)
 
 
 def playlist_folder_name(url: str) -> str:
@@ -580,6 +659,10 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
     playlist_root = root / "playlists" / playlist_folder_name(url)
     max_items = validated_count("max_items", args.get("max_items", 25))
     continue_on_error = bool_arg(args.get("continue_on_error"), True)
+    parent_store = JobStore.open(root)
+    parent_progress = ProgressReporter(emitter=job_progress_emitter(parent_store, options.job_id))
+    item_count: list[int] = [0]
+    attempted_items: list[int] = [0]
 
     def process_item(video_url: str, index: int) -> dict[str, Any]:
         child_args = {
@@ -588,18 +671,30 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
             "output_dir": str(playlist_root),
             "job_id": f"{options.job_id}-{index}",
         }
-        return process_youtube_video(child_args, lock_wait_sec=BATCH_ITEM_LOCK_WAIT_SEC)
+        observe, disarm = armed_child_observer(parent_progress, attempted_items, item_count)
+        try:
+            return process_youtube_video(
+                child_args, lock_wait_sec=BATCH_ITEM_LOCK_WAIT_SEC, progress_observer=observe
+            )
+        finally:
+            # The slot moves on failure too: a failed item never emits again,
+            # so its fraction is spent for the next item's mapping.
+            disarm()
+            attempted_items[0] += 1
 
     def work() -> dict[str, Any]:
         # Inside the record: creating the playlist root writes, and listing the
         # playlist is a yt-dlp call - the parent job's first real step and the
         # first thing that can fail without a single item ever being tried.
+        parent_progress.update("playlist_listing", status="running", percent=0.0)
         ensure_safe_directory(playlist_root, root)
         urls = youtube_playlist_urls(
             url,
             max_items,
             ytdlp_auth_args(options.cookies, options.cookies_from_browser),
         )
+        item_count[0] = len(urls)
+        parent_progress.complete("playlist_listing", detail={"videos": len(urls)})
         runner = BatchRunner(
             job_id=options.job_id,
             tool="process_youtube_playlist",
@@ -631,7 +726,7 @@ def process_youtube_playlist(args: dict[str, Any]) -> dict[str, Any]:
         )
         return summary
 
-    return record_job(JobStore.open(root), options.job_id, "process_youtube_playlist", work)
+    return record_job(parent_store, options.job_id, "process_youtube_playlist", work)
 
 
 def _prune_policy(args: dict[str, Any]) -> PrunePolicy:
