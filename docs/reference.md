@@ -303,6 +303,39 @@ a time and the record without a `type` is the failure. Parsing the whole
 stream as one document fails at the first newline. Lines that are not JSON
 at all come from libraries Distill imports rather than from Distill.
 
+The same events reach the job record, so a poller that cannot read stderr
+still sees them. A record returned by `get-job-status` carries, alongside
+the lifecycle fields it always had:
+
+- `started_at`: when this run's record was opened. Written once by the run
+  that started the job and never changed afterwards. A reused job id is a
+  new run, and its `start` writes a fresh `started_at`.
+- `stage`, `stage_status`, `stage_percent`, `overall_percent`: the last
+  progress event the run observed. `stage` is a mechanism name such as
+  `transcription` or `local_vision`; `stage_status` tells a stage that is
+  running from one that completed, was skipped, or failed.
+- `last_progress_at`: the time of that event.
+- `updated_at`: when the record was last written, for any reason.
+
+Three properties of those fields:
+
+- They are a projection of the run's own events, and of nothing else. No
+  timer moves them, so `last_progress_at` advances only when the run
+  emitted an event. A record saying `stage: local_vision` with a frozen
+  `last_progress_at` tells you the vision stage was entered and nothing
+  further was observed; it does not say why, and it proves nothing about
+  work done since that event. It is not a stall diagnosis and not a cause.
+- Notes are throttled. A stage change or a status change, including a stage
+  completing, being skipped, or failing, is written the moment it happens.
+  Otherwise at most one note per second is written, so within one stage the
+  stored percent can trail the newest event by up to a second.
+- Liveness is still the kernel lock, not these fields. A `running` record
+  whose holder is gone is reported `abandoned` exactly as before, and a
+  stage that looks stuck never changes that answer.
+
+Records written before these fields existed still read, without the new
+keys, so an output root's older records answer as they always did.
+
 "Nothing on stdout" means nothing was written there, not that a write can
 be taken back. A failing command fails before it prints a result, so
 stdout stays empty. The exception is a caller who closes the pipe

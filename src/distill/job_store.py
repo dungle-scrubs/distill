@@ -51,6 +51,21 @@ snapshot - and what a run computes. It stores the result a run reports; it does
 not interpret it. It does not own where a run's envelope goes either: `pipeline`
 opens one per tool call, and this module only enforces that a second one under
 the same identifier cannot.
+
+Progress notes are the third thing a record can carry, and they are a
+projection rather than a narrative: the run that owns the job folds its own
+progress events into `stage`, `stage_status` and two percents as it goes
+(`note_progress`), and the record answers "what was it doing, and when was it
+last seen doing anything". Two rules hold that shape together. Only actual
+observed events are ever written - there is no timer, so a frozen
+`last_progress_at` is itself the diagnostic: it proves nothing about work since
+that event, and it is not a heartbeat. And only names and numbers are carried:
+an event's `detail` can hold counts today and text-bearing fields later, so it
+never reaches a record. How often notes are written is the writer's policy
+(`pipeline` throttles them), not this module's; a note is refused exactly the
+way `finish` is - only the run holding the identifier may write one - and a
+refused or failed note is the caller's to survive, because observability must
+not be load-bearing for the run it observes.
 """
 
 from __future__ import annotations
@@ -58,9 +73,9 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from .bundle_store import (
     ExclusiveLock,
@@ -70,6 +85,7 @@ from .bundle_store import (
     ensure_safe_directory,
 )
 from .errors import DistillError
+from .progress import PROGRESS_STATUSES, ProgressStatus
 
 JOB_DIR_NAME = "_jobs"
 """Where job records live: beside the bundles, under the output root.
@@ -148,6 +164,18 @@ def _timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _percent_or_none(value: Any) -> float | None:
+    """A recorded percent, or nothing. A boolean is not a percent.
+
+    `True` is an `int` to `isinstance`, and a record that grew a `1` for a
+    percent would be reporting progress that never happened. The percent a
+    reader sees came from an event or from nowhere.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def validate_job_id(job_id: str) -> str:
     """Return `job_id` if it is in the domain, and refuse it if it is not."""
     if not JOB_ID_RE.fullmatch(job_id):
@@ -220,17 +248,52 @@ class JobOutcome:
 
 
 @dataclass(frozen=True)
+class JobProgress:
+    """The last progress event a run observed, as its record carries it.
+
+    A value carrier rather than a bag of arguments, so `note_progress` cannot
+    be handed half a projection - a stage with no status, or a percent with no
+    event it came from. `observed_at` is the event's own timestamp, formatted
+    by the caller that has the event, so the record never invents a time the
+    run did not report.
+
+    Names and numbers only. An event's `detail` is deliberately absent: it can
+    carry counts today and text-bearing fields later, and a record that
+    projected it would be persisting **extracted text** that crossed no
+    **redaction sink**.
+    """
+
+    stage: str
+    stage_status: ProgressStatus
+    stage_percent: float | None
+    overall_percent: float | None
+    observed_at: str
+
+
+@dataclass(frozen=True)
 class JobRecord:
     """One job's state as a reader sees it.
 
     `status` is what the reader is told, which is not always what is on disk: a
     `running` record whose holder is gone is reported `abandoned`.
+
+    The progress fields are the projection of the run's last observed event -
+    `None` until one is noted, and absent from `to_dict` rather than `null`, so
+    a record written before they existed reads now exactly as it did then.
+    `started_at` is set once by `start` and never rewritten; `updated_at` is
+    whenever this record was last written, whatever wrote it.
     """
 
     job_id: str
     tool: str
     status: ReportedStatus
     updated_at: str
+    started_at: str | None = None
+    stage: str | None = None
+    stage_status: ProgressStatus | None = None
+    stage_percent: float | None = None
+    overall_percent: float | None = None
+    last_progress_at: str | None = None
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
 
@@ -245,6 +308,18 @@ class JobRecord:
             "tool": self.tool,
             "updated_at": self.updated_at,
         }
+        if self.started_at is not None:
+            payload["started_at"] = self.started_at
+        if self.stage is not None:
+            payload["stage"] = self.stage
+        if self.stage_status is not None:
+            payload["stage_status"] = self.stage_status
+        if self.stage_percent is not None:
+            payload["stage_percent"] = self.stage_percent
+        if self.overall_percent is not None:
+            payload["overall_percent"] = self.overall_percent
+        if self.last_progress_at is not None:
+            payload["last_progress_at"] = self.last_progress_at
         if self.result is not None:
             payload["result"] = self.result
         if self.error is not None:
@@ -254,16 +329,26 @@ class JobRecord:
 
 @dataclass(frozen=True)
 class JobHold:
-    """One live claim this store has on an identifier: the lock, and the tool.
+    """One live claim this store has on an identifier: the lock, the tool, and
+    what the run has been seen doing.
 
-    The two are one fact, not two, so they are kept as one. Held separately they
-    can disagree, and the disagreement is a record closed out under a tool no
-    run ever started: `finish` is told the outcome, never the tool, because the
-    tool is not something an ending run gets to change.
+    The three are one fact, not three, so they are kept as one. Held separately
+    they can disagree, and the disagreement is a record closed out under a tool
+    no run ever started: `finish` is told the outcome, never the tool, because
+    the tool is not something an ending run gets to change.
+
+    `started_at` is the timestamp of the `running` record this hold was opened
+    with, and `last_progress` is the latest progress this store noted - the
+    write-side carry for the record's progress fields, so `finish` can write a
+    terminal record that preserves them without reading disk. The hold is
+    frozen, so a note replaces the hold rather than mutating it: nothing about
+    a claim is editable in place, least of all the evidence a poller is reading.
     """
 
     lock: ExclusiveLock
     tool: str
+    started_at: str
+    last_progress: JobProgress | None = None
 
 
 @dataclass
@@ -291,12 +376,24 @@ class JobStore:
         this identifier is replaced here rather than left to `finish`, so a run
         that is killed outright cannot leave the *previous* run's `completed`
         standing as though it described this one.
+
+        The one timestamp taken here is both `updated_at` and `started_at`, the
+        only moment the two agree: everything afterwards moves `updated_at` and
+        leaves `started_at` alone, so the two times answer different questions
+        - when the job began, and when its record was last written.
         """
         validate_job_id(job_id)
-        self._take_hold(job_id, tool)
+        started_at = _timestamp()
+        self._take_hold(job_id, tool, started_at)
         try:
             return self._write(
-                JobRecord(job_id=job_id, tool=tool, status=RUNNING, updated_at=_timestamp())
+                JobRecord(
+                    job_id=job_id,
+                    tool=tool,
+                    status=RUNNING,
+                    updated_at=started_at,
+                    started_at=started_at,
+                )
             )
         except BaseException as failure:
             # A hold whose record was never written names a run that is not
@@ -305,6 +402,40 @@ class JobStore:
             # start again: one failed write, then `E_JOB_RUNNING` forever.
             self._release_without_replacing(job_id, during=failure)
             raise
+
+    def note_progress(self, job_id: str, progress: JobProgress) -> None:
+        """Fold one observed progress event into this store's `running` record.
+
+        Noted by the run that owns the job, while it owns it - the same refusal
+        `finish` makes, for the same reason: a stranger's note would overwrite
+        the record a live holder backs. Unlike `finish`, a refusal or a failed
+        write does not end anything; the caller decides how to survive it,
+        because a progress note is observation, and observation must never be
+        load-bearing for the run it observes. The hold is replaced rather than
+        mutated, so even in-flight readers of an older hold see one consistent
+        claim.
+
+        Terminal records keep what was last noted: `finish` carries the hold's
+        progress into the record it writes, so "where was it?" survives the run
+        that knew the answer.
+        """
+        validate_job_id(job_id)
+        hold = self._require_hold(job_id)
+        self._held[job_id] = replace(hold, last_progress=progress)
+        self._write(
+            JobRecord(
+                job_id=job_id,
+                tool=hold.tool,
+                status=RUNNING,
+                updated_at=_timestamp(),
+                started_at=hold.started_at,
+                stage=progress.stage,
+                stage_status=progress.stage_status,
+                stage_percent=progress.stage_percent,
+                overall_percent=progress.overall_percent,
+                last_progress_at=progress.observed_at,
+            )
+        )
 
     def finish(self, job_id: str, outcome: JobOutcome) -> JobRecord:
         """Replace this store's `running` record with a terminal one, releasing the lock.
@@ -316,17 +447,12 @@ class JobStore:
         run whose record this is: it is either a process that never started the
         job - whose terminal status would overwrite a live holder's record while
         that holder carries on working - or this store finishing twice. Both
-        write an outcome for a run that did not end, so both are refused.
+        write an outcome for a run that did not end, so both are refused
+        (`_require_hold`).
         """
         validate_job_id(job_id)
-        hold = self._held.get(job_id)
-        if hold is None:
-            raise DistillError(
-                "E_JOB_NOT_HELD",
-                JOB_STAGE,
-                "only the run holding a job_id may record its outcome",
-                {"job_id": job_id},
-            )
+        hold = self._require_hold(job_id)
+        last = hold.last_progress
         try:
             record = self._write(
                 JobRecord(
@@ -334,6 +460,12 @@ class JobStore:
                     tool=hold.tool,
                     status=outcome.status,
                     updated_at=_timestamp(),
+                    started_at=hold.started_at,
+                    stage=None if last is None else last.stage,
+                    stage_status=None if last is None else last.stage_status,
+                    stage_percent=None if last is None else last.stage_percent,
+                    overall_percent=None if last is None else last.overall_percent,
+                    last_progress_at=None if last is None else last.observed_at,
                     result=outcome.result,
                     error=outcome.error,
                 )
@@ -371,14 +503,10 @@ class JobStore:
                 return record
         if record is None:
             return None
-        return JobRecord(
-            job_id=record.job_id,
-            tool=record.tool,
-            status=ABANDONED,
-            updated_at=record.updated_at,
-            result=record.result,
-            error=record.error,
-        )
+        # Rebuilt field by field, this is where a new field goes stale: whatever
+        # a record grows, `abandoned` reports the record that was read, changed
+        # only in the one field it is this function's business to change.
+        return replace(record, status=ABANDONED)
 
     def record_path(self, job_id: str) -> Path:
         """Where `job_id`'s record lives. Validates and confines; creates nothing."""
@@ -416,7 +544,7 @@ class JobStore:
         )
         return record
 
-    def _take_hold(self, job_id: str, tool: str) -> None:
+    def _take_hold(self, job_id: str, tool: str, started_at: str) -> None:
         """Claim liveness for `job_id`, refusing a job any run is live on.
 
         Two runs sharing one identifier would share one record, which is the
@@ -443,7 +571,25 @@ class JobStore:
                 "another run is live under this job_id",
                 {"job_id": job_id},
             )
-        self._held[job_id] = JobHold(lock=lock, tool=tool)
+        self._held[job_id] = JobHold(lock=lock, tool=tool, started_at=started_at)
+
+    def _require_hold(self, job_id: str) -> JobHold:
+        """This store's hold on `job_id`, or the refusal `finish` has always made.
+
+        One rule, one place, because `finish` and `note_progress` are the same
+        question asked twice: writing to a record is a thing only the run
+        holding the identifier may do, and there is no way for a process to
+        write to a record it did not open.
+        """
+        hold = self._held.get(job_id)
+        if hold is None:
+            raise DistillError(
+                "E_JOB_NOT_HELD",
+                JOB_STAGE,
+                "only the run holding a job_id may write to its record",
+                {"job_id": job_id},
+            )
+        return hold
 
     def _release(self, job_id: str) -> None:
         hold = self._held.pop(job_id, None)
@@ -512,6 +658,12 @@ class JobStore:
         state this can see. What it can see is a file somebody else put here, and
         reporting that as a job's outcome would be reporting a stranger's word as
         Distill's.
+
+        The progress fields are read leniently - present or absent, and the
+        right shape or absent - because a record written before they existed is
+        still a record: `running` with no stage in it was the truth for every
+        job Distill has ever run, and refusing it now would be telling every
+        poller their history is unreadable.
         """
         try:
             payload = json.loads(text)
@@ -532,11 +684,25 @@ class JobStore:
             )
         result = payload.get("result")
         error = payload.get("error")
+        started_at = payload.get("started_at")
+        stage = payload.get("stage")
+        stage_status = payload.get("stage_status")
+        stage_percent = payload.get("stage_percent")
+        overall_percent = payload.get("overall_percent")
+        last_progress_at = payload.get("last_progress_at")
         return JobRecord(
             job_id=str(payload.get("job_id", job_id)),
             tool=str(payload.get("tool", "")),
             status=status,
             updated_at=str(payload.get("updated_at", "")),
+            started_at=started_at if isinstance(started_at, str) else None,
+            stage=stage if isinstance(stage, str) else None,
+            stage_status=(
+                cast(ProgressStatus, stage_status) if stage_status in PROGRESS_STATUSES else None
+            ),
+            stage_percent=_percent_or_none(stage_percent),
+            overall_percent=_percent_or_none(overall_percent),
+            last_progress_at=last_progress_at if isinstance(last_progress_at, str) else None,
             result=result if isinstance(result, dict) else None,
             error=error if isinstance(error, dict) else None,
         )

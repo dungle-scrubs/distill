@@ -28,17 +28,22 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from runtime_fakes import configure_run
 
 from distill import bundle_store, pipeline
+from distill.artifacts import FrameArtifact, Interpretation, Provenance, RedactionState
 from distill.bundle_store import ExclusiveLock
 from distill.errors import DistillError
-from distill.job_store import JobOutcome, JobStore
+from distill.job_store import JobOutcome, JobProgress, JobStore
+from distill.local_vision import LocalVisionConfig, LocalVisionProbe
+from distill.progress import ProgressReporter
 from distill.source import SourceInfo, SourceResolution
 
 STAGE_FAILURE = DistillError("E_STAGE_BOOM", "keyframes", "keyframe selection failed")
@@ -51,24 +56,46 @@ import signal
 import sys
 from pathlib import Path
 
-from distill.job_store import JobStore
+from distill.job_store import JobProgress, JobStore
 
-JobStore.open(Path(sys.argv[1])).start(sys.argv[2], "process_local_video")
+store = JobStore.open(Path(sys.argv[1]))
+store.start(sys.argv[2], "process_local_video")
+store.note_progress(
+    sys.argv[2],
+    JobProgress(
+        stage="local_vision",
+        stage_status="running",
+        stage_percent=50.0,
+        overall_percent=42.0,
+        observed_at="2026-10-27T09:00:00Z",
+    ),
+)
 os.kill(os.getpid(), signal.SIGKILL)
 """
-"""A run that starts a job and never gets to finish it.
+"""A run that starts a job, is seen partway through, and never gets to finish.
 
 Killed with `SIGKILL` from inside, so nothing in Distill and nothing in Python
 runs afterwards: no `finally`, no atexit, no interpreter shutdown. What is left
-on disk is exactly what a `kill -9` leaves.
+on disk is exactly what a `kill -9` leaves - a `running` record carrying the
+last progress the run was seen making.
 """
 
 
-def stub_acquisition(monkeypatch: pytest.MonkeyPatch, source_hash: str = "abc123") -> None:
+def stub_acquisition(
+    monkeypatch: pytest.MonkeyPatch,
+    source_hash: str = "abc123",
+    *,
+    provenance: Provenance | None = None,
+) -> None:
     """Let a run past acquisition without a file, a probe or a network.
 
     Acquisition is what these tests need to *survive*, not what they are about:
     the tests that care about it fail it on purpose through the real path.
+
+    `provenance` is passed through for the runs that go all the way to a
+    **generation** through the real `ProcessingRun`: a self-contained render is
+    refused without it, and the source stub's stand-in file never existed, so
+    there is nowhere else it could have come from.
     """
 
     def resolve(
@@ -81,7 +108,15 @@ def stub_acquisition(monkeypatch: pytest.MonkeyPatch, source_hash: str = "abc123
         lock_wait_sec: float = 0.0,
     ) -> SourceResolution:
         return SourceResolution(
-            SourceInfo("local", Path("fixture.mp4"), 1.0, "fingerprint", source_hash, []),
+            SourceInfo(
+                "local",
+                Path("fixture.mp4"),
+                1.0,
+                "fingerprint",
+                source_hash,
+                [],
+                provenance=provenance,
+            ),
             output_root=None,
             progress=progress,
         )
@@ -95,7 +130,7 @@ def run(
     job_id: str,
     *,
     outcome: dict[str, Any] | BaseException,
-    during: Callable[[], None] | None = None,
+    during: Callable[[ProgressReporter | None], None] | None = None,
     source_hash: str = "abc123",
 ) -> dict[str, Any]:
     """Drive one `process_local_video` call to `outcome`, through the tool handler.
@@ -107,18 +142,29 @@ def run(
     either reaches a result or raises, and both have to leave a record.
 
     `during` runs inside that stage, at the point a real run is midway through
-    its work. It is the only moment from which "what does a poller see while
-    this is still running?" can be asked at all.
+    its work, and is handed the **progress reporter** the run is actually
+    carrying - the one the handler built, flowing through the same reporter a
+    real stage emits through - so a test can ask what a poller would be shown
+    for events a run really sent. It is the only moment from which "what does a
+    poller see while this is still running?" can be asked at all.
     """
+    captured: list[ProgressReporter | None] = []
+
+    def fake_processing_run(*args: Any) -> Any:
+        # The reporter is the fourth thing a run is handed, after the source,
+        # the options and the output root; capturing it is what lets `during`
+        # emit through the run's own reporter rather than a test's own.
+        captured.append(args[3] if len(args) > 3 else None)
+        return SimpleNamespace(execute=produce)
 
     def produce() -> dict[str, Any]:
         if during is not None:
-            during()
+            during(captured[-1] if captured else None)
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(pipeline, "ProcessingRun", lambda *_args: SimpleNamespace(execute=produce))
+    monkeypatch.setattr(pipeline, "ProcessingRun", fake_processing_run)
     stub_acquisition(monkeypatch, source_hash)
     root.mkdir(parents=True, exist_ok=True)
     return pipeline.process_local_video(
@@ -468,7 +514,7 @@ def test_running_is_recorded_before_the_work_begins(
     root = tmp_path / "output"
     observed: dict[str, Any] = {}
 
-    def observe() -> None:
+    def observe(_progress: ProgressReporter | None) -> None:
         observed.update(status_of(root, "distill-inflight"))
 
     run(
@@ -963,3 +1009,560 @@ def test_two_distinct_job_ids_cannot_collide_onto_one_record(
     status = status_of(root, "job____escape")
     assert status["status"] == "completed"
     assert status["result"]["manifest_path"] == "/first/manifest.json"
+
+
+# --- The record names the stage a run is in (issue #45) ----------------------
+#
+# `running` answered "is it still going" and nothing else: a run whose last
+# event said `ocr` completed and whose vision stage then went silent had a
+# record with no stage and no activity time in it, so a poller could not tell
+# a slow run from a stuck one. These tests hold the projection of the run's
+# own progress events into the record a poller reads - names and numbers only,
+# written by the run that owns the job, while it owns it.
+
+
+def fake_stage_producers(monkeypatch: pytest.MonkeyPatch, frame_count: int = 2) -> None:
+    """Stages that produce real carriers without ffmpeg, whisper or tesseract.
+
+    The stages a poller is not asking about run as themselves with their
+    external dependency injected, which is the `runtime_fakes` seam. The vision
+    stage is not injected at all - it runs for real, the one whose silence the
+    issue describes - and a test blocks it through the `probe=`/`try_interpret=`
+    injection `configure_run` already offers.
+    """
+
+    def transcribe(*_args: Any, **_kwargs: Any) -> tuple[None, list[dict[str, str]]]:
+        return None, []
+
+    def select_keyframes(
+        _video: Path,
+        frames_dir: Path,
+        *_args: Any,
+        redaction: RedactionState,
+        **_kwargs: Any,
+    ) -> tuple[list[FrameArtifact], list[dict[str, str]]]:
+        artifacts: list[FrameArtifact] = []
+        for index in range(1, frame_count + 1):
+            image = frames_dir / f"frame_{index:04d}.png"
+            image.write_bytes(b"\x89PNG\r\n\x1a\n")
+            artifacts.append(
+                FrameArtifact(
+                    index=index,
+                    timestamp_sec=float(index),
+                    path=str(image),
+                    relative_path=f"frames/frame_{index:04d}.png",
+                    extracted_text="a frame this test never reads",
+                    redaction=redaction,
+                )
+            )
+        return artifacts, []
+
+    configure_run(monkeypatch, transcribe=transcribe, select_keyframes=select_keyframes)
+
+
+def an_interpretation(config: LocalVisionConfig, image_path: Path, prompt_profile: str) -> Any:
+    """A reading the vision stage accepts as one, from no model at all."""
+    return Interpretation(
+        visual_summary=image_path.name,
+        detected_elements=(),
+        interpretation="a reading this test supplied",
+        uncertainty="Low",
+        backend=config.backend,
+        model=config.model,
+        prompt_profile=prompt_profile,
+    )
+
+
+def an_available_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+    return LocalVisionProbe(
+        available=True,
+        backend=config.backend,
+        model=config.model,
+        base_url=config.base_url,
+        code="local_vision_available",
+        message="available",
+        detail={},
+    )
+
+
+def a_fake_interpretation(
+    config: LocalVisionConfig, image_path: Path, _prompt: str, *, prompt_profile: str = "technical"
+) -> tuple[Interpretation, None]:
+    return an_interpretation(config, image_path, prompt_profile), None
+
+
+def a_provenance() -> Provenance:
+    return Provenance(title="fixture.mp4", duration_sec=1.0, processed_at="2026-10-27T09:00:00Z")
+
+
+def test_a_blocked_vision_request_names_the_stage_in_job_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (issue #45): a silent run answered `running` with no stage.
+
+    A vision request that never returns is the exact wait the issue could not
+    see: the run's last event said `ocr` completed, the record said nothing but
+    `running`, and a caller timed out without knowing what it was waiting for.
+    The run is driven through the real handler with the real `ProcessingRun`
+    and the real `FrameInterpreter` - only the probe is injected, and it blocks
+    - so the stage a poller is shown is announced by the code a real run runs,
+    not by a test re-implementing its events.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-blocked-vision"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+        entered.set()
+        if not release.wait(timeout=10.0):
+            raise AssertionError("the poller never released the probe")
+        return LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_available",
+            message="available",
+            detail={},
+        )
+
+    def interpret(
+        config: LocalVisionConfig,
+        image_path: Path,
+        _prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[Interpretation, None]:
+        return an_interpretation(config, image_path, prompt_profile), None
+
+    fake_stage_producers(monkeypatch)
+    configure_run(monkeypatch, probe=blocked_probe, try_interpret=interpret)
+    stub_acquisition(monkeypatch, provenance=a_provenance())
+
+    result: dict[str, Any] = {}
+    failures: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            result["response"] = pipeline.process_local_video(
+                {
+                    "path": "/stub/video.mp4",
+                    "output_dir": str(root),
+                    "job_id": job_id,
+                    "ocr": False,
+                }
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert entered.wait(timeout=10.0), "the run never reached the vision stage"
+        status = status_of(root, job_id)
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive(), "the run did not finish after the probe was released"
+
+    # What a poller sees while the vision request is still in flight: the
+    # stage by name, that it is running, and the two times that separate
+    # "when this job began" from "when it was last seen to do anything".
+    assert status["status"] == "running"
+    assert status["stage"] == "local_vision"
+    assert status["stage_status"] == "running"
+    assert status["stage_percent"] == 0.0
+    assert "overall_percent" in status
+    assert status["started_at"]
+    assert status["last_progress_at"]
+    assert status["updated_at"] >= status["started_at"]
+
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+    assert final["result"]["manifest_path"]
+    # The start is one fact, set when the record was opened, and is not
+    # rewritten by anything the run does afterwards - including its ending.
+    assert final["started_at"] == status["started_at"]
+    # A terminal record preserves the last stage the run was seen in. A run
+    # that finished moves on after vision - rendering, publish - so for a
+    # completed run the last observed stage is the publish; what the assertion
+    # holds is that it is the run's own last event and not a blank.
+    assert final["stage"] == "bundle_publish"
+    assert final["stage_status"] == "completed"
+    assert final["last_progress_at"]
+
+
+def test_a_blocked_frame_leaves_the_completed_frames_counted_in_job_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FAILS FIRST (issue #45): per-frame vision events arrived only in one burst.
+
+    The vision stage interpreted every frame and *then* reported all of them at
+    once, so a poller watching a run whose second frame hung saw a stage that
+    had entered and nothing more - the whole vision pass silent until its last
+    frame returned. The frame events are now reported as each frame completes,
+    in the caller thread, so the record names the position: frame 1 of 3 done,
+    no further activity.
+    """
+    root = tmp_path / "output"
+    job_id = "distill-blocked-frame"
+    entered = threading.Event()
+    release = threading.Event()
+    # A deterministic monotonic clock, advanced by the frame fakes rather than
+    # by sleeping: the note throttle is a second of monotonic time, and a test
+    # that waited out real seconds to pass it would be slow for no evidence.
+    clock = {"now": 0.0}
+    monkeypatch.setattr(pipeline, "_monotonic", lambda: clock["now"])
+
+    def available_probe(config: LocalVisionConfig) -> LocalVisionProbe:
+        return LocalVisionProbe(
+            available=True,
+            backend=config.backend,
+            model=config.model,
+            base_url=config.base_url,
+            code="local_vision_available",
+            message="available",
+            detail={},
+        )
+
+    def interpret(
+        config: LocalVisionConfig,
+        image_path: Path,
+        _prompt: str,
+        *,
+        prompt_profile: str = "technical",
+    ) -> tuple[Interpretation, None]:
+        if image_path.name == "frame_0002.png":
+            entered.set()
+            if not release.wait(timeout=10.0):
+                raise AssertionError("the poller never released the frame")
+        else:
+            # Past the throttle, so the frame's completion note is written the
+            # moment the frame lands - this is the clock a run's own slow
+            # frames would move.
+            clock["now"] += 2.0
+        return an_interpretation(config, image_path, prompt_profile), None
+
+    fake_stage_producers(monkeypatch, frame_count=3)
+    configure_run(monkeypatch, probe=available_probe, try_interpret=interpret)
+    stub_acquisition(monkeypatch, provenance=a_provenance())
+
+    failures: list[BaseException] = []
+
+    def work() -> None:
+        try:
+            pipeline.process_local_video(
+                {
+                    "path": "/stub/video.mp4",
+                    "output_dir": str(root),
+                    "job_id": job_id,
+                    "ocr": False,
+                }
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert entered.wait(timeout=10.0), "the run never reached the second frame"
+        status = status_of(root, job_id)
+    finally:
+        release.set()
+        worker.join(timeout=10.0)
+    assert not failures
+    assert not worker.is_alive(), "the run did not finish after the frame was released"
+
+    # One frame of three has completed; the second is in flight. A poller that
+    # cannot see the event stream still knows both facts: the position, and
+    # that the last activity was that frame's completion. The percent carries
+    # the reporter's 3-decimal rounding (`clamp_percent`), which is part of
+    # every percent a run has ever reported.
+    assert status["status"] == "running"
+    assert status["stage"] == "local_vision"
+    assert status["stage_status"] == "running"
+    assert status["stage_percent"] == pytest.approx(round(100.0 / 3, 3))
+    assert status["last_progress_at"]
+
+    final = status_of(root, job_id)
+    assert final["status"] == "completed"
+
+
+def test_a_record_written_before_progress_fields_reads_as_it_always_did(
+    tmp_path: Path,
+) -> None:
+    """Every record Distill wrote before this change is still a record.
+
+    The progress fields are read leniently because their absence was the truth
+    for every job ever run: refusing an old record now would be telling every
+    poller that their history is unreadable, in exchange for nothing - the
+    fields are a projection, and a run that never noted one was a run whose
+    stages had nothing to say.
+    """
+    root = tmp_path / "output"
+    (root / "_jobs").mkdir(parents=True)
+    (root / "_jobs" / "distill-old.json").write_text(
+        json.dumps(
+            {
+                "job_id": "distill-old",
+                "tool": "process_youtube_video",
+                "status": "completed",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "result": {"manifest_path": "/old/manifest.json"},
+            }
+        )
+    )
+
+    status = status_of(root, "distill-old")
+
+    assert status["status"] == "completed"
+    assert status["result"]["manifest_path"] == "/old/manifest.json"
+    assert "stage" not in status
+    assert "stage_status" not in status
+    assert "stage_percent" not in status
+    assert "overall_percent" not in status
+    assert "started_at" not in status
+    assert "last_progress_at" not in status
+
+
+def test_only_the_run_holding_a_job_may_note_its_progress(tmp_path: Path) -> None:
+    """A note is a write to a record, so it answers to the same rule as `finish`.
+
+    Without the refusal, a second store could fold its own progress into a live
+    holder's record while that holder carried on working - two runs' stages
+    alternating in one record, which describes neither run. The refusal is the
+    one `finish` already makes; what is new is only the thing being refused.
+    """
+    root = tmp_path / "output"
+    holder = JobStore.open(root)
+    holder.start("distill-noted", "process_local_video")
+    progress = JobProgress(
+        stage="local_vision",
+        stage_status="running",
+        stage_percent=50.0,
+        overall_percent=42.0,
+        observed_at="2026-10-27T09:00:00Z",
+    )
+
+    with pytest.raises(DistillError) as raised:
+        JobStore.open(root).note_progress("distill-noted", progress)
+    assert raised.value.code == "E_JOB_NOT_HELD"
+
+    holder.note_progress("distill-noted", progress)
+    status = status_of(root, "distill-noted")
+    assert status["status"] == "running"
+    assert status["stage"] == "local_vision"
+    assert status["stage_percent"] == 50.0
+    assert status["last_progress_at"] == "2026-10-27T09:00:00Z"
+
+
+def test_a_killed_run_leaves_its_last_stage_in_the_abandoned_answer(
+    tmp_path: Path,
+) -> None:
+    """`abandoned` is reported, not written - so it reports all that was read.
+
+    The record the dead holder left is the only evidence of what it was doing,
+    and `read`'s abandoned answer is the last thing anybody will ever say about
+    that run. Rebuilding the record field by field here would have dropped the
+    stage the run died in - the one fact the issue's caller was missing.
+    """
+    root = tmp_path / "output"
+    root.mkdir(parents=True)
+
+    killed = subprocess.run(
+        [sys.executable, "-c", KILLED_MID_RUN, str(root), "distill-killed-mid-stage"],
+        capture_output=True,
+    )
+    assert killed.returncode == -signal.SIGKILL, killed.stderr.decode()
+
+    status = status_of(root, "distill-killed-mid-stage")
+    assert status["status"] == "abandoned"
+    assert status["stage"] == "local_vision"
+    assert status["stage_status"] == "running"
+    assert status["stage_percent"] == 50.0
+    assert status["last_progress_at"] == "2026-10-27T09:00:00Z"
+    assert status["started_at"]
+
+
+def test_a_reused_job_id_starts_over_rather_than_inheriting_the_previous_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A reused identifier is a new run, and its record says so from the start.
+
+    Identifiers are reused, and the previous run's record - stage and all - was
+    still standing when this one started. A start that carried the old stage
+    over would have a poller told the new run was in the old run's stage, with
+    the old run's last-activity time, before it had done anything at all.
+    """
+    root = tmp_path / "output"
+
+    def first_run(progress: ProgressReporter | None) -> None:
+        assert progress is not None
+        progress.update("local_vision", percent=50.0)
+
+    run(
+        monkeypatch,
+        root,
+        "distill-recycled",
+        outcome={"manifest_path": "/first/manifest.json"},
+        during=first_run,
+    )
+    assert status_of(root, "distill-recycled")["stage"] == "local_vision"
+
+    observed: dict[str, Any] = {}
+
+    def second_run(progress: ProgressReporter | None) -> None:
+        assert progress is not None
+        observed.update(status_of(root, "distill-recycled"))
+        progress.update("transcription", status="running", percent=25.0)
+        observed["after"] = status_of(root, "distill-recycled")
+
+    with pytest.raises(DistillError):
+        run(
+            monkeypatch,
+            root,
+            "distill-recycled",
+            outcome=STAGE_FAILURE,
+            during=second_run,
+        )
+
+    # The fresh start wrote a record with nothing inherited: no stage until the
+    # new run emitted one, and then the new run's own stage.
+    assert "stage" not in observed
+    assert observed["after"]["stage"] == "transcription"
+    assert observed["after"]["stage_percent"] == 25.0
+
+    final = status_of(root, "distill-recycled")
+    assert final["status"] == "failed"
+    assert final["error"]["code"] == "E_STAGE_BOOM"
+    assert final["stage"] == "transcription"
+    assert "result" not in final
+
+
+def test_a_note_that_cannot_be_written_warns_once_and_never_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """Observation is not load-bearing: a run survives its own progress notes.
+
+    A record store that cannot take a note is degraded, not broken - the run's
+    result and its terminal record are the things a caller is owed. The first
+    failure says so once with the cause attached; the next nine hundred events
+    say nothing, because a store that cannot write one note cannot write the
+    rest either, and one warning per event is the flood the notes are throttled
+    to avoid.
+    """
+    root = tmp_path / "output"
+
+    def refuse_notes(_store: Any, _job_id: str, _progress: Any) -> None:
+        raise OSError("the record directory vanished")
+
+    monkeypatch.setattr(JobStore, "note_progress", refuse_notes)
+    caplog.set_level(logging.WARNING, logger=pipeline.LOGGER.name)
+
+    def emit_a_burst(progress: ProgressReporter | None) -> None:
+        assert progress is not None
+        for percent in (10.0, 20.0, 30.0, 40.0, 50.0):
+            progress.update("transcription", percent=percent)
+
+    result = run(
+        monkeypatch,
+        root,
+        "distill-silent-notes",
+        outcome={"manifest_path": "/x/manifest.json"},
+        during=emit_a_burst,
+    )
+
+    assert result["manifest_path"] == "/x/manifest.json"
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == pipeline.LOGGER.name and "job progress note" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "distill-silent-notes" in warnings[0].getMessage()
+
+    status = status_of(root, "distill-silent-notes")
+    assert status["status"] == "completed"
+    assert status["result"]["manifest_path"] == "/x/manifest.json"
+
+
+def test_same_stage_events_note_the_first_and_a_transition_writes_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The throttle, with a clock that does not move: burst, then transition.
+
+    A frozen monotonic clock makes the throttle's behaviour deterministic - no
+    wall-clock assertion, no sleeping - so what this pins is the rule itself:
+    within one stage, one note stands for the burst; the stage's completion is
+    a transition, and a transition is written the moment it happens, whatever
+    the clock says.
+    """
+    root = tmp_path / "output"
+    monkeypatch.setattr(pipeline, "_monotonic", lambda: 0.0)
+    observed: dict[str, Any] = {}
+
+    def burst_and_finish(progress: ProgressReporter | None) -> None:
+        assert progress is not None
+        for percent in (10.0, 20.0, 30.0):
+            progress.update("transcription", percent=percent)
+        observed["burst"] = status_of(root, "distill-throttled")
+        progress.complete("transcription")
+        observed["complete"] = status_of(root, "distill-throttled")
+
+    run(
+        monkeypatch,
+        root,
+        "distill-throttled",
+        outcome={"manifest_path": "/x/manifest.json"},
+        during=burst_and_finish,
+    )
+
+    # One note stood for the whole same-stage burst: the first event's percent,
+    # not the last's, and `running` - the events between were throttled away.
+    assert observed["burst"]["status"] == "running"
+    assert observed["burst"]["stage"] == "transcription"
+    assert observed["burst"]["stage_percent"] == 10.0
+    # The completion did not wait out the interval: a stage that ended is
+    # reported ended at once, or a poller would watch a finished stage "still
+    # running" for up to the throttle window.
+    assert observed["complete"]["stage"] == "transcription"
+    assert observed["complete"]["stage_status"] == "completed"
+    assert observed["complete"]["stage_percent"] == 100.0
+
+
+@pytest.mark.parametrize(
+    ("handler", "args"),
+    [
+        ("process_youtube_video", {"url": VIDEO_URL}),
+        ("process_x_video", {"url": "https://x.com/example/status/1234567890"}),
+    ],
+    ids=["youtube", "x"],
+)
+def test_remote_source_handlers_persist_their_progress_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, handler: str, args: dict[str, str]
+) -> None:
+    """The download half is where a remote run spends most of its wall clock.
+
+    A YouTube or X run is acquisition for most of its life, so a record that
+    only learned about stages after acquisition would be silent for exactly the
+    window a poller is most likely to be asking in. Both handlers run through
+    their own real stages here - only the external tools are injected - and the
+    completed record carries the projection their own runs emitted.
+    """
+    root = tmp_path / "output"
+    job_id = f"distill-{handler}"
+
+    fake_stage_producers(monkeypatch)
+    configure_run(monkeypatch, probe=an_available_probe, try_interpret=a_fake_interpretation)
+    stub_acquisition(monkeypatch, provenance=a_provenance())
+
+    getattr(pipeline, handler)({**args, "output_dir": str(root), "job_id": job_id, "ocr": False})
+
+    status = status_of(root, job_id)
+    assert status["status"] == "completed"
+    assert status["stage"] == "bundle_publish"
+    assert status["stage_status"] == "completed"
+    assert status["started_at"]
+    assert status["last_progress_at"]

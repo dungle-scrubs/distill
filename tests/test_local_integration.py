@@ -410,8 +410,18 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
     configure_run(monkeypatch, ocr_frames=fake_ocr)
     configure_run(monkeypatch, probe=fake_probe)
     configure_run(monkeypatch, try_interpret=fake_interpret)
-    reporter = ProgressReporter()
-    monkeypatch.setattr(distill_session, "ProgressReporter", lambda **_kwargs: reporter)
+    # One reporter per call. The handler builds the run's reporter itself now,
+    # and the run's heartbeat stops it when the run ends - so a single shared
+    # instance would make the second, cache-hit call surface as a
+    # stopped-reporter fault instead of its own fresh stream. The first is the
+    # one this test reads; the second call's events are not what it asserts.
+    reporters: list[ProgressReporter] = []
+
+    def new_reporter(**_kwargs: Any) -> ProgressReporter:
+        reporters.append(ProgressReporter())
+        return reporters[-1]
+
+    monkeypatch.setattr(distill_session, "ProgressReporter", new_reporter)
 
     response = distill_session.process_local_video(
         {
@@ -424,6 +434,8 @@ def test_caption_frames_store_visual_interpretation_without_changing_ocr(
             "max_static_window_sec": 1,
         }
     )
+
+    reporter = reporters[0]
 
     frame = response["frames"][0]
     assert frame["ocr_text"] == "Visible OCR text"

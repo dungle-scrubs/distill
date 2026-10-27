@@ -32,7 +32,7 @@ from .cache_doctor import inspect_cache
 from .configuration import local_vision_config_from_args, resolve_options, resolve_run_config
 from .errors import DistillError
 from .filtered_view import filtered_view_markdown
-from .job_store import JobOutcome, JobStore
+from .job_store import JobOutcome, JobProgress, JobStore
 from .local_vision import MAX_SOCKET_TIMEOUT_SEC, probe_local_vision
 from .options import (
     GENERAL_OPTION_NAMES,
@@ -41,7 +41,9 @@ from .options import (
     validated_number,
 )
 from .progress import (
+    ProgressEvent,
     ProgressReporter,
+    ProgressStatus,
 )
 from .rapid_mlx import REQUEST_REFUSED_CODE
 from .run_orchestrator import ProcessingRun
@@ -69,6 +71,15 @@ TOOLS = {
     "get_job_status": "Read a Distill job status record by job id",
 }
 LOGGER = logging.getLogger(__name__)
+
+_monotonic = time.monotonic
+"""Injectable monotonic clock for the progress-note throttle.
+
+Module-level like local_vision's `_sleep`, and for the same reason: a test
+that had to sleep a wall-clock second per throttled note would be slow and
+flaky, and one that monkeypatched `time.monotonic` itself would reach every
+user of monotonic time in the process, not the throttle it meant to drive.
+"""
 
 PIPELINE_EVENT_TYPE = "distill.pipeline"
 
@@ -194,6 +205,12 @@ def process_local_video(
 ) -> dict[str, Any]:
     options = resolve_run_config(args).options
     root = validate_output_root(options.output_dir)
+    store = JobStore.open(root)
+    # The reporter is built here, against this run's own store, so the whole
+    # run - acquisition included - reports through the one emitter that also
+    # persists progress into the record a poller reads. Nothing is invented on
+    # the way: an event that was not emitted is a stage that never ran.
+    progress = ProgressReporter(emitter=job_progress_emitter(store, options.job_id))
 
     def work() -> dict[str, Any]:
         return acquire_and_process(
@@ -201,12 +218,12 @@ def process_local_video(
             str(args.get("path", "")),
             options,
             root,
-            progress=None,
+            progress=progress,
             tool="process_local_video",
             lock_wait_sec=lock_wait_sec,
         )
 
-    return record_job(JobStore.open(root), options.job_id, "process_local_video", work)
+    return record_job(store, options.job_id, "process_local_video", work)
 
 
 def process_youtube_video(
@@ -214,7 +231,8 @@ def process_youtube_video(
 ) -> dict[str, Any]:
     options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
     root = validate_output_root(options.output_dir)
-    progress = ProgressReporter(emitter=progress_emitter(options.job_id))
+    store = JobStore.open(root)
+    progress = ProgressReporter(emitter=job_progress_emitter(store, options.job_id))
 
     def work() -> dict[str, Any]:
         return acquire_and_process(
@@ -227,7 +245,7 @@ def process_youtube_video(
             lock_wait_sec=lock_wait_sec,
         )
 
-    return record_job(JobStore.open(root), options.job_id, "process_youtube_video", work)
+    return record_job(store, options.job_id, "process_youtube_video", work)
 
 
 def process_x_video(
@@ -235,7 +253,8 @@ def process_x_video(
 ) -> dict[str, Any]:
     options = resolve_run_config({**args, "cache_mode": "fingerprint"}).options
     root = validate_output_root(options.output_dir)
-    progress = ProgressReporter(emitter=progress_emitter(options.job_id))
+    store = JobStore.open(root)
+    progress = ProgressReporter(emitter=job_progress_emitter(store, options.job_id))
 
     def work() -> dict[str, Any]:
         return acquire_and_process(
@@ -248,7 +267,96 @@ def process_x_video(
             lock_wait_sec=lock_wait_sec,
         )
 
-    return record_job(JobStore.open(root), options.job_id, "process_x_video", work)
+    return record_job(store, options.job_id, "process_x_video", work)
+
+
+PROGRESS_NOTE_MIN_INTERVAL_SEC = 1.0
+"""The floor between two progress notes to one job record, in monotonic seconds.
+
+A note is an atomic replace with a directory fsync per write, so an unthrottled
+note per event would turn the event stream into the record store's workload:
+the issue's own run carried 912 of them. Transitions are exempt - a stage
+change or a status change is written at once, because "which stage" going
+stale by a second is exactly the silence the issue described - and same-stage
+heartbeats cost at most one write per second. Alternating mechanisms (an OCR
+event after each vision event) write per event by the transition rule, bounded
+by how fast a run can actually change stages.
+"""
+
+
+def job_progress_emitter(
+    store: JobStore,
+    job_id: str,
+    *,
+    min_note_interval_sec: float = PROGRESS_NOTE_MIN_INTERVAL_SEC,
+) -> Callable[[ProgressEvent], None]:
+    """One emitter that prints the event and folds it into the job record.
+
+    Composes `progress_emitter` rather than duplicating its printing, so the
+    stderr stream stays exactly the stream it was - payload, `job_id`, flush -
+    with the record written on the way past. The note carries names and numbers
+    only: mechanism, status and percents, and the event's own timestamp as
+    `last_progress_at`. Detail never reaches a record (it can carry counts today
+    and text-bearing fields later).
+
+    Writes are throttled to one per `min_note_interval_sec` of monotonic time,
+    with mechanism and status transitions written immediately - including
+    `completed`/`skipped_or_cached`/`failed`, so a stage that ends is never
+    reported as still running by a throttle window that has not elapsed. There
+    is no timer: a note exists only because an event did, so a record that has
+    not moved says the run emitted nothing, which is the fact a poller wants.
+
+    A note that cannot be written must not fail the run: the exception is
+    caught, and the first failure is reported once as a warning. Once, because
+    a store that cannot write one note cannot write the next nine hundred
+    either, and one warning per event would be the flood the notes themselves
+    are throttled to avoid. The stderr print is outside that protection: an
+    event the caller chose to print that cannot be printed is that caller's
+    failure to know about, not something to swallow here.
+    """
+    print_event = progress_emitter(job_id)
+    last_mechanism: str | None = None
+    last_status: ProgressStatus | None = None
+    last_note_at: float | None = None
+    note_failure_reported = False
+
+    def emit(event: ProgressEvent) -> None:
+        nonlocal last_mechanism, last_status, last_note_at, note_failure_reported
+        # What was last *noted*, not last seen: a note that failed leaves the
+        # record saying the previous thing, so the next transition is still a
+        # transition and the store gets another chance to say something newer.
+        transition = event.mechanism != last_mechanism or event.status != last_status
+        elapsed = last_note_at is None or (_monotonic() - last_note_at) >= min_note_interval_sec
+        if transition or elapsed:
+            try:
+                store.note_progress(
+                    job_id,
+                    JobProgress(
+                        stage=event.mechanism,
+                        stage_status=event.status,
+                        stage_percent=event.percent,
+                        overall_percent=event.overall_percent,
+                        observed_at=time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(event.timestamp)
+                        ),
+                    ),
+                )
+            except Exception:
+                if not note_failure_reported:
+                    note_failure_reported = True
+                    LOGGER.warning(
+                        "job progress note for %s could not be written; further "
+                        "note failures for this run will not be logged",
+                        job_id,
+                        exc_info=True,
+                    )
+            else:
+                last_mechanism = event.mechanism
+                last_status = event.status
+                last_note_at = _monotonic()
+        print_event(event)
+
+    return emit
 
 
 def progress_emitter(job_id: str) -> Any:

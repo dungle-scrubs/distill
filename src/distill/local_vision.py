@@ -1122,6 +1122,14 @@ class FrameInterpreter:
             self._record_warning(non_local)
             provenance_warnings.append(non_local)
         probing_config = self._probing_config()
+        if self.progress:
+            # Announced before any I/O - the probe included - so a run whose
+            # probe never returns is a run whose record already names the stage
+            # it is stuck in (issue #45). `percent=0` says "entered, nothing
+            # finished": the first frame has not been read, let alone answered.
+            self.progress.update(
+                "local_vision", status="running", percent=0.0, detail={"frames": len(frames)}
+            )
         probe = self.probe(probing_config)
         self._last_probe = probe
         # Cap the worker pool at the configured admission limit; never unbounded.
@@ -1238,10 +1246,11 @@ class FrameInterpreter:
         """
         frame_count = len(frames)
         if self._max_parallel <= 1 or frame_count <= 1:
-            outcomes = [
-                self._interpret_one(config, index, frame, frame_count)
-                for index, frame in enumerate(frames)
-            ]
+            outcomes = []
+            for index, frame in enumerate(frames):
+                outcome = self._interpret_one(config, index, frame, frame_count)
+                self._emit_frame_progress(index, frame_count)
+                outcomes.append(outcome)
         else:
             workers = min(self._max_parallel, frame_count)
             ordered: list[_FrameOutcome | None] = [None] * frame_count
@@ -1251,6 +1260,7 @@ class FrameInterpreter:
                     list(enumerate(frames)),
                 ):
                     ordered[outcome.index] = outcome
+                    self._emit_frame_progress(outcome.index, frame_count)
             outcomes = [outcome for outcome in ordered if outcome is not None]
         interpreted = self._merge_outcomes(outcomes, warnings)
         breaker_warning = self._breaker.summary_warning(frame_count)
@@ -1304,7 +1314,6 @@ class FrameInterpreter:
         outcomes: list[_FrameOutcome],
         warnings: list[WarningRecord],
     ) -> list[FrameArtifact]:
-        frame_count = len(outcomes)
         frames: list[FrameArtifact] = []
         for outcome in outcomes:
             self._trace(
@@ -1327,12 +1336,6 @@ class FrameInterpreter:
             for frame_warning in outcome.warnings:
                 warnings.append(frame_warning)
                 self._record_warning(frame_warning)
-            if self.progress:
-                self.progress.update(
-                    "local_vision",
-                    percent=((outcome.index + 1) / frame_count) * 100,
-                    detail={"frame": outcome.index + 1, "frames": frame_count},
-                )
             self._trace(
                 "frame.complete",
                 {
@@ -1342,6 +1345,25 @@ class FrameInterpreter:
                 },
             )
         return frames
+
+    def _emit_frame_progress(self, index: int, frame_count: int) -> None:
+        """One per-frame progress event, from the caller thread, as each frame lands.
+
+        Emitted where the outcome is consumed rather than where it is produced:
+        the serial path consumes as it goes, and the pool's `map` yields in
+        frame order, so the event stream reports frames completing as they
+        complete, in order, on either path - not as one burst after the whole
+        list returns, which kept a run's entire vision stage silent until its
+        last frame did (issue #45). `index` is the frame's position, so the
+        percent a reader sees is "frames 1..index+1 of frame_count have
+        answers".
+        """
+        if self.progress:
+            self.progress.update(
+                "local_vision",
+                percent=((index + 1) / frame_count) * 100,
+                detail={"frame": index + 1, "frames": frame_count},
+            )
 
     def debug_info(self) -> dict[str, Any]:
         return {
